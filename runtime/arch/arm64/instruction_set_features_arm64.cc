@@ -85,6 +85,7 @@ Arm64FeaturesUniquePtr Arm64InstructionSetFeatures::FromVariant(
       "kryo",
       "kryo385",
       "kryo485",
+      "kryo585",
       "kryo785",
   };
 
@@ -96,6 +97,7 @@ Arm64FeaturesUniquePtr Arm64InstructionSetFeatures::FromVariant(
       "cortex-a76",
       "kryo385",
       "kryo485",
+      "kryo585",
       "kryo785",
   };
 
@@ -107,6 +109,7 @@ Arm64FeaturesUniquePtr Arm64InstructionSetFeatures::FromVariant(
       "cortex-a76",
       "kryo385",
       "kryo485",
+      "kryo585",
       "kryo785",
   };
 
@@ -117,6 +120,7 @@ Arm64FeaturesUniquePtr Arm64InstructionSetFeatures::FromVariant(
       "cortex-a75",
       "cortex-a76",
       "kryo485",
+      "kryo585",
       "kryo785",
   };
 
@@ -162,6 +166,7 @@ Arm64FeaturesUniquePtr Arm64InstructionSetFeatures::FromVariant(
         "kryo300",
         "kryo385",
         "kryo485",
+        "kryo585",
         "kryo785",
         "oryon",
     };
