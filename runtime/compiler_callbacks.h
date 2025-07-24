@@ -18,12 +18,16 @@
 #define ART_RUNTIME_COMPILER_CALLBACKS_H_
 
 #include "base/locks.h"
-#include "dex/class_reference.h"
+#include "base/macros.h"
 #include "class_status.h"
+#include "dex/class_reference.h"
+#include "dex/method_reference.h"
 
-namespace art {
+namespace art HIDDEN {
 
+class ClassLinker;
 class CompilerDriver;
+class InternTable;
 
 namespace mirror {
 
@@ -33,7 +37,6 @@ class Class;
 
 namespace verifier {
 
-class MethodVerifier;
 class VerifierDeps;
 
 }  // namespace verifier
@@ -47,30 +50,32 @@ class CompilerCallbacks {
 
   virtual ~CompilerCallbacks() { }
 
-  virtual void MethodVerified(verifier::MethodVerifier* verifier)
-      REQUIRES_SHARED(Locks::mutator_lock_) = 0;
+  virtual ClassLinker* CreateAotClassLinker(InternTable* intern_table) = 0;
+
+  virtual void AddUncompilableMethod(MethodReference ref) = 0;
+  virtual void AddUncompilableClass(ClassReference ref) = 0;
   virtual void ClassRejected(ClassReference ref) = 0;
 
   virtual verifier::VerifierDeps* GetVerifierDeps() const = 0;
-  virtual void SetVerifierDeps(verifier::VerifierDeps* deps ATTRIBUTE_UNUSED) {}
+  virtual void SetVerifierDeps([[maybe_unused]] verifier::VerifierDeps* deps) {}
 
   // Return the class status of a previous stage of the compilation. This can be used, for example,
   // when class unloading is enabled during multidex compilation.
-  virtual ClassStatus GetPreviousClassState(ClassReference ref ATTRIBUTE_UNUSED) {
+  virtual ClassStatus GetPreviousClassState([[maybe_unused]] ClassReference ref) {
     return ClassStatus::kNotReady;
   }
 
-  virtual void SetDoesClassUnloading(bool does_class_unloading ATTRIBUTE_UNUSED,
-                                     CompilerDriver* compiler_driver ATTRIBUTE_UNUSED) {}
+  virtual void SetDoesClassUnloading([[maybe_unused]] bool does_class_unloading,
+                                     [[maybe_unused]] CompilerDriver* compiler_driver) {}
 
   bool IsBootImage() {
     return mode_ == CallbackMode::kCompileBootImage;
   }
 
-  virtual void UpdateClassState(ClassReference ref ATTRIBUTE_UNUSED,
-                                ClassStatus state ATTRIBUTE_UNUSED) {}
+  virtual void UpdateClassState([[maybe_unused]] ClassReference ref,
+                                [[maybe_unused]] ClassStatus state) {}
 
-  virtual bool CanUseOatStatusForVerification(mirror::Class* klass ATTRIBUTE_UNUSED)
+  virtual bool CanUseOatStatusForVerification([[maybe_unused]] mirror::Class* klass)
       REQUIRES_SHARED(Locks::mutator_lock_) {
     return false;
   }

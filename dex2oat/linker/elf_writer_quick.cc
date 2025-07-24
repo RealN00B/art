@@ -18,8 +18,6 @@
 
 #include <memory>
 #include <openssl/sha.h>
-#include <unordered_map>
-#include <unordered_set>
 
 #include <android-base/logging.h>
 
@@ -27,7 +25,6 @@
 #include "base/globals.h"
 #include "base/leb128.h"
 #include "base/utils.h"
-#include "compiled_method.h"
 #include "debug/elf_debug_writer.h"
 #include "debug/method_debug_info.h"
 #include "driver/compiler_options.h"
@@ -43,21 +40,22 @@ namespace linker {
 
 class DebugInfoTask : public Task {
  public:
-  DebugInfoTask(InstructionSet isa,
+  DebugInfoTask(ThreadPool* owner,
+                InstructionSet isa,
                 const InstructionSetFeatures* features,
                 uint64_t text_section_address,
                 size_t text_section_size,
                 uint64_t dex_section_address,
                 size_t dex_section_size,
                 const debug::DebugInfo& debug_info)
-      : isa_(isa),
+      : owner_(owner),
+        isa_(isa),
         instruction_set_features_(features),
         text_section_address_(text_section_address),
         text_section_size_(text_section_size),
         dex_section_address_(dex_section_address),
         dex_section_size_(dex_section_size),
-        debug_info_(debug_info) {
-  }
+        debug_info_(debug_info) {}
 
   void Run(Thread*) override {
     result_ = debug::MakeMiniDebugInfo(isa_,
@@ -69,11 +67,13 @@ class DebugInfoTask : public Task {
                                        debug_info_);
   }
 
-  std::vector<uint8_t>* GetResult() {
+  std::vector<uint8_t>* WaitAndGetMiniDebugInfo() {
+    owner_->Wait(Thread::Current(), true, false);
     return &result_;
   }
 
  private:
+  ThreadPool* owner_;
   InstructionSet isa_;
   const InstructionSetFeatures* instruction_set_features_;
   uint64_t text_section_address_;
@@ -94,18 +94,19 @@ class ElfWriterQuick final : public ElfWriter {
   void Start() override;
   void PrepareDynamicSection(size_t rodata_size,
                              size_t text_size,
-                             size_t data_bimg_rel_ro_size,
+                             size_t data_img_rel_ro_size,
+                             size_t data_img_rel_ro_app_image_offset,
                              size_t bss_size,
                              size_t bss_methods_offset,
                              size_t bss_roots_offset,
                              size_t dex_section_size) override;
-  void PrepareDebugInfo(const debug::DebugInfo& debug_info) override;
+  std::unique_ptr<ThreadPool> PrepareDebugInfo(const debug::DebugInfo& debug_info) override;
   OutputStream* StartRoData() override;
   void EndRoData(OutputStream* rodata) override;
   OutputStream* StartText() override;
   void EndText(OutputStream* text) override;
-  OutputStream* StartDataBimgRelRo() override;
-  void EndDataBimgRelRo(OutputStream* data_bimg_rel_ro) override;
+  OutputStream* StartDataImgRelRo() override;
+  void EndDataImgRelRo(OutputStream* data_img_rel_ro) override;
   void WriteDynamicSection() override;
   void WriteDebugInfo(const debug::DebugInfo& debug_info) override;
   bool StripDebugInfo() override;
@@ -123,13 +124,12 @@ class ElfWriterQuick final : public ElfWriter {
   File* const elf_file_;
   size_t rodata_size_;
   size_t text_size_;
-  size_t data_bimg_rel_ro_size_;
+  size_t data_img_rel_ro_size_;
   size_t bss_size_;
   size_t dex_section_size_;
   std::unique_ptr<BufferedOutputStream> output_stream_;
   std::unique_ptr<ElfBuilder<ElfTypes>> builder_;
   std::unique_ptr<DebugInfoTask> debug_info_task_;
-  std::unique_ptr<ThreadPool> debug_info_thread_pool_;
 
   void ComputeFileBuildId(uint8_t (*build_id)[ElfBuilder<ElfTypes>::kBuildIdLen]);
 
@@ -152,7 +152,7 @@ ElfWriterQuick<ElfTypes>::ElfWriterQuick(const CompilerOptions& compiler_options
       elf_file_(elf_file),
       rodata_size_(0u),
       text_size_(0u),
-      data_bimg_rel_ro_size_(0u),
+      data_img_rel_ro_size_(0u),
       bss_size_(0u),
       dex_section_size_(0u),
       output_stream_(
@@ -175,7 +175,8 @@ void ElfWriterQuick<ElfTypes>::Start() {
 template <typename ElfTypes>
 void ElfWriterQuick<ElfTypes>::PrepareDynamicSection(size_t rodata_size,
                                                      size_t text_size,
-                                                     size_t data_bimg_rel_ro_size,
+                                                     size_t data_img_rel_ro_size,
+                                                     size_t data_img_rel_ro_app_image_offset,
                                                      size_t bss_size,
                                                      size_t bss_methods_offset,
                                                      size_t bss_roots_offset,
@@ -184,8 +185,8 @@ void ElfWriterQuick<ElfTypes>::PrepareDynamicSection(size_t rodata_size,
   rodata_size_ = rodata_size;
   DCHECK_EQ(text_size_, 0u);
   text_size_ = text_size;
-  DCHECK_EQ(data_bimg_rel_ro_size_, 0u);
-  data_bimg_rel_ro_size_ = data_bimg_rel_ro_size;
+  DCHECK_EQ(data_img_rel_ro_size_, 0u);
+  data_img_rel_ro_size_ = data_img_rel_ro_size;
   DCHECK_EQ(bss_size_, 0u);
   bss_size_ = bss_size;
   DCHECK_EQ(dex_section_size_, 0u);
@@ -193,7 +194,8 @@ void ElfWriterQuick<ElfTypes>::PrepareDynamicSection(size_t rodata_size,
   builder_->PrepareDynamicSection(elf_file_->GetPath(),
                                   rodata_size_,
                                   text_size_,
-                                  data_bimg_rel_ro_size_,
+                                  data_img_rel_ro_size_,
+                                  data_img_rel_ro_app_image_offset,
                                   bss_size_,
                                   bss_methods_offset,
                                   bss_roots_offset,
@@ -227,16 +229,16 @@ void ElfWriterQuick<ElfTypes>::EndText(OutputStream* text) {
 }
 
 template <typename ElfTypes>
-OutputStream* ElfWriterQuick<ElfTypes>::StartDataBimgRelRo() {
-  auto* data_bimg_rel_ro = builder_->GetDataBimgRelRo();
-  data_bimg_rel_ro->Start();
-  return data_bimg_rel_ro;
+OutputStream* ElfWriterQuick<ElfTypes>::StartDataImgRelRo() {
+  auto* data_img_rel_ro = builder_->GetDataImgRelRo();
+  data_img_rel_ro->Start();
+  return data_img_rel_ro;
 }
 
 template <typename ElfTypes>
-void ElfWriterQuick<ElfTypes>::EndDataBimgRelRo(OutputStream* data_bimg_rel_ro) {
-  CHECK_EQ(builder_->GetDataBimgRelRo(), data_bimg_rel_ro);
-  builder_->GetDataBimgRelRo()->End();
+void ElfWriterQuick<ElfTypes>::EndDataImgRelRo(OutputStream* data_img_rel_ro) {
+  CHECK_EQ(builder_->GetDataImgRelRo(), data_img_rel_ro);
+  builder_->GetDataImgRelRo()->End();
 }
 
 template <typename ElfTypes>
@@ -245,11 +247,15 @@ void ElfWriterQuick<ElfTypes>::WriteDynamicSection() {
 }
 
 template <typename ElfTypes>
-void ElfWriterQuick<ElfTypes>::PrepareDebugInfo(const debug::DebugInfo& debug_info) {
+std::unique_ptr<ThreadPool> ElfWriterQuick<ElfTypes>::PrepareDebugInfo(
+    const debug::DebugInfo& debug_info) {
+  std::unique_ptr<ThreadPool> thread_pool;
   if (compiler_options_.GetGenerateMiniDebugInfo()) {
+    thread_pool.reset(ThreadPool::Create("Mini-debug-info writer", 1));
     // Prepare the mini-debug-info in background while we do other I/O.
     Thread* self = Thread::Current();
     debug_info_task_ = std::make_unique<DebugInfoTask>(
+        thread_pool.get(),
         builder_->GetIsa(),
         compiler_options_.GetInstructionSetFeatures(),
         builder_->GetText()->GetAddress(),
@@ -257,20 +263,21 @@ void ElfWriterQuick<ElfTypes>::PrepareDebugInfo(const debug::DebugInfo& debug_in
         builder_->GetDex()->Exists() ? builder_->GetDex()->GetAddress() : 0,
         dex_section_size_,
         debug_info);
-    debug_info_thread_pool_ = std::make_unique<ThreadPool>("Mini-debug-info writer", 1);
-    debug_info_thread_pool_->AddTask(self, debug_info_task_.get());
-    debug_info_thread_pool_->StartWorkers(self);
+    thread_pool->AddTask(self, debug_info_task_.get());
+    thread_pool->StartWorkers(self);
   }
+  return thread_pool;
 }
 
 template <typename ElfTypes>
 void ElfWriterQuick<ElfTypes>::WriteDebugInfo(const debug::DebugInfo& debug_info) {
+  std::unique_ptr<ThreadPool> thread_pool;
   if (compiler_options_.GetGenerateMiniDebugInfo()) {
-    // Wait for the mini-debug-info generation to finish and write it to disk.
-    Thread* self = Thread::Current();
-    DCHECK(debug_info_thread_pool_ != nullptr);
-    debug_info_thread_pool_->Wait(self, true, false);
-    builder_->WriteSection(".gnu_debugdata", debug_info_task_->GetResult());
+    // If mini-debug-info wasn't explicitly created so far, create it now (happens in tests).
+    if (debug_info_task_ == nullptr) {
+      thread_pool = PrepareDebugInfo(debug_info);
+    }
+    builder_->WriteSection(".gnu_debugdata", debug_info_task_->WaitAndGetMiniDebugInfo());
   }
   // The Strip method expects debug info to be last (mini-debug-info is not stripped).
   if (!debug_info.Empty() && compiler_options_.GetGenerateDebugInfo()) {

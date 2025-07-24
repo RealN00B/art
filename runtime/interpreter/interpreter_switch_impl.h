@@ -24,7 +24,7 @@
 #include "jvalue.h"
 #include "obj_ptr.h"
 
-namespace art {
+namespace art HIDDEN {
 
 class ShadowFrame;
 class Thread;
@@ -40,37 +40,36 @@ struct SwitchImplContext {
   const CodeItemDataAccessor& accessor;
   ShadowFrame& shadow_frame;
   JValue& result_register;
-  bool interpret_one_instruction;
   JValue result;
 };
 
 // The actual internal implementation of the switch interpreter.
-template<bool do_access_check, bool transaction_active>
+template<bool transaction_active>
 void ExecuteSwitchImplCpp(SwitchImplContext* ctx)
   REQUIRES_SHARED(Locks::mutator_lock_);
 
 // Hand-written assembly method which wraps the C++ implementation,
 // while defining the DEX PC in the CFI so that libunwind can resolve it.
-extern "C" void ExecuteSwitchImplAsm(SwitchImplContext* ctx, void* impl, const uint16_t* dexpc)
-  REQUIRES_SHARED(Locks::mutator_lock_);
+extern "C" void ExecuteSwitchImplAsm(
+    SwitchImplContext* ctx, const void* impl, const uint16_t* dexpc)
+    REQUIRES_SHARED(Locks::mutator_lock_);
 
 // Wrapper around the switch interpreter which ensures we can unwind through it.
-template<bool do_access_check, bool transaction_active>
-ALWAYS_INLINE JValue ExecuteSwitchImpl(Thread* self, const CodeItemDataAccessor& accessor,
-                                       ShadowFrame& shadow_frame, JValue result_register,
-                                       bool interpret_one_instruction)
+ALWAYS_INLINE inline JValue ExecuteSwitchImpl(Thread* self,
+                                              const CodeItemDataAccessor& accessor,
+                                              ShadowFrame& shadow_frame,
+                                              JValue result_register,
+                                              const void* switch_impl_cpp)
   REQUIRES_SHARED(Locks::mutator_lock_) {
   SwitchImplContext ctx {
     .self = self,
     .accessor = accessor,
     .shadow_frame = shadow_frame,
     .result_register = result_register,
-    .interpret_one_instruction = interpret_one_instruction,
     .result = JValue(),
   };
-  void* impl = reinterpret_cast<void*>(&ExecuteSwitchImplCpp<do_access_check, transaction_active>);
   const uint16_t* dex_pc = ctx.accessor.Insns();
-  ExecuteSwitchImplAsm(&ctx, impl, dex_pc);
+  ExecuteSwitchImplAsm(&ctx, switch_impl_cpp, dex_pc);
   return ctx.result;
 }
 

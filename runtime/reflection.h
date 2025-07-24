@@ -18,11 +18,13 @@
 #define ART_RUNTIME_REFLECTION_H_
 
 #include "base/locks.h"
+#include "base/macros.h"
+#include "base/pointer_size.h"
 #include "dex/primitive.h"
 #include "jni.h"
 #include "obj_ptr.h"
 
-namespace art {
+namespace art HIDDEN {
 namespace mirror {
 class Class;
 class Object;
@@ -33,19 +35,17 @@ union JValue;
 class ScopedObjectAccessAlreadyRunnable;
 class ShadowFrame;
 
-ObjPtr<mirror::Object> BoxPrimitive(Primitive::Type src_class, const JValue& value)
+EXPORT ObjPtr<mirror::Object> BoxPrimitive(Primitive::Type src_class, const JValue& value)
     REQUIRES_SHARED(Locks::mutator_lock_);
 
-bool UnboxPrimitiveForField(ObjPtr<mirror::Object> o,
-                            ObjPtr<mirror::Class> dst_class,
-                            ArtField* f,
-                            JValue* unboxed_value)
-    REQUIRES_SHARED(Locks::mutator_lock_);
+EXPORT bool UnboxPrimitiveForField(ObjPtr<mirror::Object> o,
+                                   ObjPtr<mirror::Class> dst_class,
+                                   ArtField* f,
+                                   JValue* unboxed_value) REQUIRES_SHARED(Locks::mutator_lock_);
 
-bool UnboxPrimitiveForResult(ObjPtr<mirror::Object> o,
-                             ObjPtr<mirror::Class> dst_class,
-                             JValue* unboxed_value)
-    REQUIRES_SHARED(Locks::mutator_lock_);
+EXPORT bool UnboxPrimitiveForResult(ObjPtr<mirror::Object> o,
+                                    ObjPtr<mirror::Class> dst_class,
+                                    JValue* unboxed_value) REQUIRES_SHARED(Locks::mutator_lock_);
 
 ALWAYS_INLINE bool ConvertPrimitiveValueNoThrow(Primitive::Type src_class,
                                                 Primitive::Type dst_class,
@@ -97,6 +97,8 @@ JValue InvokeVirtualOrInterfaceWithVarArgs(const ScopedObjectAccessAlreadyRunnab
     REQUIRES_SHARED(Locks::mutator_lock_);
 
 // num_frames is number of frames we look up for access check.
+template<PointerSize pointer_size>
+NO_STACK_PROTECTOR
 jobject InvokeMethod(const ScopedObjectAccessAlreadyRunnable& soa,
                      jobject method,
                      jobject receiver,

@@ -19,6 +19,7 @@
 
 #include <algorithm>
 #include <iterator>
+#include <set>
 #include <sstream>
 
 #include <android-base/logging.h>
@@ -124,6 +125,11 @@ bool ContainsElement(const Container& container, const T& value, size_t start_po
   return it != container.end();
 }
 
+template <typename T>
+bool ContainsElement(const std::set<T>& container, const T& value) {
+  return container.count(value) != 0u;
+}
+
 // 32-bit FNV-1a hash function suitable for std::unordered_map.
 // It can be used with any container which works with range-based for loop.
 // See http://en.wikipedia.org/wiki/Fowler%E2%80%93Noll%E2%80%93Vo_hash_function
@@ -150,10 +156,14 @@ static inline std::vector<T*> MakeNonOwningPointerVector(const std::vector<std::
 }
 
 template <typename IterLeft, typename IterRight>
-class ZipLeftIter : public std::iterator<
-                        std::forward_iterator_tag,
-                        std::pair<typename IterLeft::value_type, typename IterRight::value_type>> {
+class ZipLeftIter {
  public:
+  using iterator_category = std::forward_iterator_tag;
+  using value_type = std::pair<typename IterLeft::value_type, typename IterRight::value_type>;
+  using difference_type = ptrdiff_t;
+  using pointer = void;
+  using reference = void;
+
   ZipLeftIter(IterLeft left, IterRight right) : left_iter_(left), right_iter_(right) {}
   ZipLeftIter<IterLeft, IterRight>& operator++() {
     ++left_iter_;
@@ -180,8 +190,14 @@ class ZipLeftIter : public std::iterator<
   IterRight right_iter_;
 };
 
-class CountIter : public std::iterator<std::forward_iterator_tag, size_t, size_t, size_t, size_t> {
+class CountIter {
  public:
+  using iterator_category = std::forward_iterator_tag;
+  using value_type = size_t;
+  using difference_type = size_t;
+  using pointer = void;
+  using reference = void;
+
   CountIter() : count_(0) {}
   explicit CountIter(size_t count) : count_(count) {}
   CountIter& operator++() {
@@ -221,6 +237,164 @@ static inline IterationRange<ZipLeftIter<IterLeft, IterRight>> ZipLeft(
     IterationRange<IterLeft> iter_left, IterationRange<IterRight> iter_right) {
   return IterationRange(ZipLeftIter(iter_left.begin(), iter_right.begin()),
                         ZipLeftIter(iter_left.end(), iter_right.end()));
+}
+
+static inline IterationRange<CountIter> Range(size_t start, size_t end) {
+  return IterationRange(CountIter(start), CountIter(end));
+}
+
+static inline IterationRange<CountIter> Range(size_t end) {
+  return Range(0, end);
+}
+
+template <typename RealIter, typename Filter>
+struct FilterIterator {
+ public:
+  using iterator_category = std::forward_iterator_tag;
+  using value_type = typename std::iterator_traits<RealIter>::value_type;
+  using difference_type = ptrdiff_t;
+  using pointer = typename std::iterator_traits<RealIter>::pointer;
+  using reference = typename std::iterator_traits<RealIter>::reference;
+
+  FilterIterator(RealIter rl,
+                 Filter cond,
+                 std::optional<RealIter> end = std::nullopt)
+      : real_iter_(rl), cond_(cond), end_(end) {
+    DCHECK(std::make_optional(rl) == end_ || cond_(*real_iter_));
+  }
+
+  FilterIterator<RealIter, Filter>& operator++() {
+    DCHECK(std::make_optional(real_iter_) != end_);
+    do {
+      if (std::make_optional(++real_iter_) == end_) {
+        break;
+      }
+    } while (!cond_(*real_iter_));
+    return *this;
+  }
+  FilterIterator<RealIter, Filter> operator++(int) {
+    FilterIterator<RealIter, Filter> ret(real_iter_, cond_, end_);
+    ++(*this);
+    return ret;
+  }
+  bool operator==(const FilterIterator<RealIter, Filter>& other) const {
+    return real_iter_ == other.real_iter_;
+  }
+  bool operator!=(const FilterIterator<RealIter, Filter>& other) const {
+    return !(*this == other);
+  }
+  typename RealIter::value_type operator*() const {
+    return *real_iter_;
+  }
+
+ private:
+  RealIter real_iter_;
+  Filter cond_;
+  std::optional<RealIter> end_;
+};
+
+template <typename BaseRange, typename FilterT>
+static inline auto Filter(BaseRange&& range, FilterT cond) {
+  auto end = range.end();
+  auto start = std::find_if(range.begin(), end, cond);
+  return MakeIterationRange(FilterIterator(start, cond, std::make_optional(end)),
+                            FilterIterator(end, cond, std::make_optional(end)));
+}
+
+template <typename Val>
+struct NonNullFilter {
+ public:
+  static_assert(std::is_pointer_v<Val>, "Must be pointer type!");
+  constexpr bool operator()(Val v) const {
+    return v != nullptr;
+  }
+};
+
+template <typename InnerIter>
+using FilterNull = FilterIterator<InnerIter, NonNullFilter<typename InnerIter::value_type>>;
+
+template <typename InnerIter>
+static inline IterationRange<FilterNull<InnerIter>> FilterOutNull(IterationRange<InnerIter> inner) {
+  return Filter(inner, NonNullFilter<typename InnerIter::value_type>());
+}
+
+template <typename Val>
+struct SafePrinter  {
+  const Val* val_;
+};
+
+template<typename Val>
+std::ostream& operator<<(std::ostream& os, const SafePrinter<Val>& v) {
+  if (v.val_ == nullptr) {
+    return os << "NULL";
+  } else {
+    return os << *v.val_;
+  }
+}
+
+template<typename Val>
+SafePrinter<Val> SafePrint(const Val* v) {
+  return SafePrinter<Val>{v};
+}
+
+// Helper struct for iterating a split-string without allocation.
+struct SplitStringIter {
+ public:
+  using iterator_category = std::forward_iterator_tag;
+  using value_type = std::string_view;
+  using difference_type = ptrdiff_t;
+  using pointer = void;
+  using reference = void;
+
+  // Direct iterator constructor. The iteration state is only the current index.
+  // We use that with the split char and the full string to get the current and
+  // next segment.
+  SplitStringIter(size_t index, char split, std::string_view sv)
+      : cur_index_(index), split_on_(split), sv_(sv) {}
+  SplitStringIter(const SplitStringIter&) = default;
+  SplitStringIter(SplitStringIter&&) = default;
+  SplitStringIter& operator=(SplitStringIter&&) = default;
+  SplitStringIter& operator=(const SplitStringIter&) = default;
+
+  SplitStringIter& operator++() {
+    size_t nxt = sv_.find(split_on_, cur_index_);
+    if (nxt == std::string_view::npos) {
+      cur_index_ = std::string_view::npos;
+    } else {
+      cur_index_ = nxt + 1;
+    }
+    return *this;
+  }
+
+  SplitStringIter operator++(int) {
+    SplitStringIter ret(cur_index_, split_on_, sv_);
+    ++(*this);
+    return ret;
+  }
+
+  bool operator==(const SplitStringIter& other) const {
+    return sv_ == other.sv_ && split_on_ == other.split_on_ && cur_index_== other.cur_index_;
+  }
+
+  bool operator!=(const SplitStringIter& other) const {
+    return !(*this == other);
+  }
+
+  typename std::string_view operator*() const {
+    return sv_.substr(cur_index_, sv_.substr(cur_index_).find(split_on_));
+  }
+
+ private:
+  size_t cur_index_;
+  char split_on_;
+  std::string_view sv_;
+};
+
+// Create an iteration range over the string 'sv' split at each 'target' occurrence.
+// Eg: SplitString(":foo::bar") -> ["", "foo", "", "bar"]
+inline IterationRange<SplitStringIter> SplitString(std::string_view sv, char target) {
+  return MakeIterationRange(SplitStringIter(0, target, sv),
+                            SplitStringIter(std::string_view::npos, target, sv));
 }
 
 }  // namespace art

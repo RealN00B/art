@@ -21,7 +21,9 @@
 #include <cstdlib>
 #include <limits>
 
-namespace art {
+#include "base/macros.h"
+
+namespace art HIDDEN {
 
 class HInstruction;
 
@@ -39,6 +41,12 @@ template <typename T> T AbsOrMin(T value) {
       ? value
       : std::abs(value);
 }
+
+// Check whether the i-th operand of instr is non-negative.
+bool HasNonNegativeInputAt(HInstruction* instr, size_t i);
+
+// Check whether the i-th operand of instr is non-negative or the minimum integer value.
+bool HasNonNegativeOrMinIntInputAt(HInstruction* instr, size_t i);
 
 }  // namespace art
 

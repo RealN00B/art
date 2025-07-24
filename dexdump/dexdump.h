@@ -47,9 +47,11 @@ struct Options {
   bool showCfg;
   bool showFileHeaders;
   bool showSectionHeaders;
+  bool showDebugInfo;
   bool verbose;
   OutputFormat outputFormat;
   const char* outputFileName;
+  bool showAllStrings;
 };
 
 /* Prototypes. */

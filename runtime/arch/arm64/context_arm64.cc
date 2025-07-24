@@ -23,13 +23,14 @@
 #include "quick/quick_method_frame_info.h"
 #include "thread-current-inl.h"
 
-#if __has_feature(hwaddress_sanitizer)
-#include <sanitizer/hwasan_interface.h>
-#else
-#define __hwasan_handle_longjmp(sp)
+
+#if defined(__aarch64__) && defined(__BIONIC__)
+#include <bionic/malloc.h>
 #endif
 
-namespace art {
+extern "C" __attribute__((weak)) void __hwasan_handle_longjmp(const void* sp_dst);
+
+namespace art HIDDEN {
 namespace arm64 {
 
 static constexpr uint64_t gZero = 0;
@@ -41,24 +42,25 @@ void Arm64Context::Reset() {
   gprs_[kPC] = &pc_;
   gprs_[X0] = &arg0_;
   // Initialize registers with easy to spot debug values.
-  sp_ = Arm64Context::kBadGprBase + SP;
-  pc_ = Arm64Context::kBadGprBase + kPC;
+  sp_ = kBadGprBase + SP;
+  pc_ = kBadGprBase + kPC;
   arg0_ = 0;
 }
 
 void Arm64Context::FillCalleeSaves(uint8_t* frame, const QuickMethodFrameInfo& frame_info) {
+  const size_t frame_size = frame_info.FrameSizeInBytes();
   int spill_pos = 0;
 
   // Core registers come first, from the highest down to the lowest.
   for (uint32_t core_reg : HighToLowBits(frame_info.CoreSpillMask())) {
-    gprs_[core_reg] = CalleeSaveAddress(frame, spill_pos, frame_info.FrameSizeInBytes());
+    gprs_[core_reg] = CalleeSaveAddress<InstructionSet::kArm64>(frame, spill_pos, frame_size);
     ++spill_pos;
   }
   DCHECK_EQ(spill_pos, POPCOUNT(frame_info.CoreSpillMask()));
 
   // FP registers come second, from the highest down to the lowest.
   for (uint32_t fp_reg : HighToLowBits(frame_info.FpSpillMask())) {
-    fprs_[fp_reg] = CalleeSaveAddress(frame, spill_pos, frame_info.FrameSizeInBytes());
+    fprs_[fp_reg] = CalleeSaveAddress<InstructionSet::kArm64>(frame, spill_pos, frame_size);
     ++spill_pos;
   }
   DCHECK_EQ(spill_pos, POPCOUNT(frame_info.CoreSpillMask()) + POPCOUNT(frame_info.FpSpillMask()));
@@ -128,27 +130,43 @@ void Arm64Context::SmashCallerSaves() {
   fprs_[D31] = nullptr;
 }
 
-extern "C" NO_RETURN void art_quick_do_long_jump(uint64_t*, uint64_t*);
+#if defined(__aarch64__) && defined(__BIONIC__) && defined(M_MEMTAG_STACK_IS_ON)
+static inline __attribute__((no_sanitize("memtag"))) void untag_memory(void* from, void* to) {
+  __asm__ __volatile__(
+      ".arch_extension mte\n"
+      "1:\n"
+      "stg %[Ptr], [%[Ptr]], #16\n"
+      "cmp %[Ptr], %[End]\n"
+      "b.lt 1b\n"
+      : [Ptr] "+&r"(from)
+      : [End] "r"(to)
+      : "memory");
+}
+#endif
 
-void Arm64Context::DoLongJump() {
-  uint64_t gprs[arraysize(gprs_)];
-  uint64_t fprs[kNumberOfDRegisters];
-
+void Arm64Context::CopyContextTo(uintptr_t* gprs, uintptr_t* fprs) {
   // The long jump routine called below expects to find the value for SP at index 31.
   DCHECK_EQ(SP, 31);
 
   for (size_t i = 0; i < arraysize(gprs_); ++i) {
-    gprs[i] = gprs_[i] != nullptr ? *gprs_[i] : Arm64Context::kBadGprBase + i;
+    gprs[i] = gprs_[i] != nullptr ? *gprs_[i] : kBadGprBase + i;
   }
   for (size_t i = 0; i < kNumberOfDRegisters; ++i) {
-    fprs[i] = fprs_[i] != nullptr ? *fprs_[i] : Arm64Context::kBadFprBase + i;
+    fprs[i] = fprs_[i] != nullptr ? *fprs_[i] : kBadFprBase + i;
   }
   // Ensure the Thread Register contains the address of the current thread.
   DCHECK_EQ(reinterpret_cast<uintptr_t>(Thread::Current()), gprs[TR]);
+#if defined(__aarch64__) && defined(__BIONIC__) && defined(M_MEMTAG_STACK_IS_ON)
+  bool memtag_stack;
+  // This works fine because versions of Android that did not support M_MEMTAG_STACK_ON did not
+  // support stack tagging either.
+  if (android_mallopt(M_MEMTAG_STACK_IS_ON, &memtag_stack, sizeof(memtag_stack)) && memtag_stack)
+    untag_memory(__builtin_frame_address(0), reinterpret_cast<void*>(gprs[SP]));
+#endif
   // Tell HWASan about the new stack top.
-  __hwasan_handle_longjmp(reinterpret_cast<void*>(gprs[SP]));
-  // The Marking Register will be updated by art_quick_do_long_jump.
-  art_quick_do_long_jump(gprs, fprs);
+  if (__hwasan_handle_longjmp != nullptr)
+    __hwasan_handle_longjmp(reinterpret_cast<void*>(gprs[SP]));
+  // The Marking Register will be updated after return by art_quick_do_long_jump.
 }
 
 }  // namespace arm64

@@ -19,6 +19,8 @@
 #include <sys/mman.h>
 
 #include <memory>
+#include <optional>
+#include <vector>
 
 #include "base/common_art_test.h"
 #include "base/mem_map.h"
@@ -29,8 +31,8 @@
 #include "dex/class_accessor-inl.h"
 #include "dex/code_item_accessors-inl.h"
 #include "dex/descriptors_names.h"
-#include "dex/dex_file.h"
 #include "dex/dex_file-inl.h"
+#include "dex/dex_file.h"
 #include "dex/dex_file_loader.h"
 
 namespace art {
@@ -57,41 +59,88 @@ TEST_F(ArtDexFileLoaderTest, Open) {
   ASSERT_TRUE(dex.get() != nullptr);
 }
 
+TEST_F(ArtDexFileLoaderTest, OpenZipMultiDex) {
+  std::string zip_file = GetTestDexFileName("MultiDex");
+  File file(zip_file, O_RDONLY, /*check_usage=*/false);
+  ASSERT_GE(file.Fd(), 0);
+  std::vector<std::unique_ptr<const DexFile>> dex_files;
+  std::string error_msg;
+  ArtDexFileLoader dex_file_loader(&file, zip_file);
+  ASSERT_TRUE(dex_file_loader.Open(/*verify=*/false,
+                                   /*verify_checksum=*/true,
+                                   /*allow_no_dex_files=*/true,
+                                   &error_msg,
+                                   &dex_files))
+      << error_msg;
+  EXPECT_GT(dex_files.size(), 1);
+}
+
+TEST_F(ArtDexFileLoaderTest, OpenZipEmpty) {
+  std::string zip_file = GetTestDexFileName("MainEmptyUncompressed");
+  File file(zip_file, O_RDONLY, /*check_usage=*/false);
+  ASSERT_GE(file.Fd(), 0);
+  std::vector<std::unique_ptr<const DexFile>> dex_files;
+  std::string error_msg;
+  ArtDexFileLoader dex_file_loader(&file, zip_file);
+  ASSERT_TRUE(dex_file_loader.Open(/*verify=*/false,
+                                   /*verify_checksum=*/true,
+                                   /*allow_no_dex_files=*/true,
+                                   &error_msg,
+                                   &dex_files))
+      << error_msg;
+  EXPECT_EQ(dex_files.size(), 0);
+}
+
 TEST_F(ArtDexFileLoaderTest, GetLocationChecksum) {
   std::unique_ptr<const DexFile> raw(OpenTestDexFile("Main"));
   EXPECT_NE(raw->GetHeader().checksum_, raw->GetLocationChecksum());
 }
 
 TEST_F(ArtDexFileLoaderTest, GetChecksum) {
-  std::vector<uint32_t> checksums;
+  std::optional<uint32_t> checksum;
   std::string error_msg;
-  const ArtDexFileLoader dex_file_loader;
-  EXPECT_TRUE(dex_file_loader.GetMultiDexChecksums(GetLibCoreDexFileNames()[0].c_str(),
-                                                    &checksums,
-                                                    &error_msg))
-      << error_msg;
-  ASSERT_EQ(1U, checksums.size());
-  EXPECT_EQ(java_lang_dex_file_->GetLocationChecksum(), checksums[0]);
+  ArtDexFileLoader dex_loader(GetLibCoreDexFileNames()[0]);
+  ASSERT_TRUE(dex_loader.GetMultiDexChecksum(&checksum, &error_msg)) << error_msg;
+  ASSERT_TRUE(checksum.has_value());
+
+  std::vector<const DexFile*> dex_files{java_lang_dex_file_};
+  uint32_t expected_checksum = DexFileLoader::GetMultiDexChecksum(dex_files);
+  EXPECT_EQ(expected_checksum, checksum.value());
 }
 
-TEST_F(ArtDexFileLoaderTest, GetMultiDexChecksums) {
+TEST_F(ArtDexFileLoaderTest, GetMultiDexChecksum) {
   std::string error_msg;
-  std::vector<uint32_t> checksums;
+  std::optional<uint32_t> checksum;
   std::string multidex_file = GetTestDexFileName("MultiDex");
-  const ArtDexFileLoader dex_file_loader;
-  EXPECT_TRUE(dex_file_loader.GetMultiDexChecksums(multidex_file.c_str(),
-                                                    &checksums,
-                                                    &error_msg)) << error_msg;
+  ArtDexFileLoader dex_loader(multidex_file);
+  EXPECT_TRUE(dex_loader.GetMultiDexChecksum(&checksum, &error_msg)) << error_msg;
 
   std::vector<std::unique_ptr<const DexFile>> dexes = OpenTestDexFiles("MultiDex");
   ASSERT_EQ(2U, dexes.size());
-  ASSERT_EQ(2U, checksums.size());
+  ASSERT_TRUE(checksum.has_value());
 
+  uint32_t expected_checksum = DexFileLoader::GetMultiDexChecksum(dexes);
   EXPECT_EQ(dexes[0]->GetLocation(), DexFileLoader::GetMultiDexLocation(0, multidex_file.c_str()));
-  EXPECT_EQ(dexes[0]->GetLocationChecksum(), checksums[0]);
-
   EXPECT_EQ(dexes[1]->GetLocation(), DexFileLoader::GetMultiDexLocation(1, multidex_file.c_str()));
-  EXPECT_EQ(dexes[1]->GetLocationChecksum(), checksums[1]);
+  EXPECT_EQ(expected_checksum, checksum.value());
+}
+
+TEST_F(ArtDexFileLoaderTest, GetMultiDexChecksumsEmptyZip) {
+  std::string error_msg;
+  std::optional<uint32_t> checksum;
+  std::string multidex_file = GetTestDexFileName("MainEmptyUncompressed");
+  ArtDexFileLoader dex_loader(multidex_file);
+  EXPECT_TRUE(dex_loader.GetMultiDexChecksum(&checksum, &error_msg)) << error_msg;
+  EXPECT_FALSE(checksum.has_value());
+}
+
+TEST_F(ArtDexFileLoaderTest, GetMultiDexChecksumsDexFile) {
+  std::string error_msg;
+  std::optional<uint32_t> checksum;
+  std::string multidex_file = GetTestDexFileName("VerifierDeps");  // This is a .dex file.
+  DexFileLoader loader(multidex_file);
+  EXPECT_TRUE(loader.GetMultiDexChecksum(&checksum, &error_msg)) << error_msg;
+  EXPECT_TRUE(checksum.has_value());
 }
 
 TEST_F(ArtDexFileLoaderTest, ClassDefs) {
@@ -126,7 +175,7 @@ TEST_F(ArtDexFileLoaderTest, GetMethodSignature) {
   {
     ASSERT_EQ(1U, accessor.NumDirectMethods());
     const dex::MethodId& method_id = raw->GetMethodId(cur_method->GetIndex());
-    const char* name = raw->StringDataByIdx(method_id.name_idx_);
+    const char* name = raw->GetStringData(method_id.name_idx_);
     ASSERT_STREQ("<init>", name);
     std::string signature(raw->GetMethodSignature(method_id).ToString());
     ASSERT_EQ("()V", signature);
@@ -201,7 +250,7 @@ TEST_F(ArtDexFileLoaderTest, GetMethodSignature) {
     ASSERT_TRUE(cur_method != methods.end());
     const dex::MethodId& method_id = raw->GetMethodId(cur_method->GetIndex());
 
-    const char* name = raw->StringDataByIdx(method_id.name_idx_);
+    const char* name = raw->GetStringData(method_id.name_idx_);
     ASSERT_STREQ(r.name, name);
 
     std::string signature(raw->GetMethodSignature(method_id).ToString());
@@ -232,7 +281,7 @@ TEST_F(ArtDexFileLoaderTest, FindStringId) {
 
 TEST_F(ArtDexFileLoaderTest, FindTypeId) {
   for (size_t i = 0; i < java_lang_dex_file_->NumTypeIds(); i++) {
-    const char* type_str = java_lang_dex_file_->StringByTypeIdx(dex::TypeIndex(i));
+    const char* type_str = java_lang_dex_file_->GetTypeDescriptor(dex::TypeIndex(i));
     const dex::StringId* type_str_id = java_lang_dex_file_->FindStringId(type_str);
     ASSERT_TRUE(type_str_id != nullptr);
     dex::StringIndex type_str_idx = java_lang_dex_file_->GetIndexForStringId(*type_str_id);
@@ -268,7 +317,7 @@ TEST_F(ArtDexFileLoaderTest, FindMethodId) {
     const dex::ProtoId& signature = java_lang_dex_file_->GetProtoId(to_find.proto_idx_);
     const dex::MethodId* found = java_lang_dex_file_->FindMethodId(klass, name, signature);
     ASSERT_TRUE(found != nullptr) << "Didn't find method " << i << ": "
-        << java_lang_dex_file_->StringByTypeIdx(to_find.class_idx_) << "."
+        << java_lang_dex_file_->GetTypeDescriptor(to_find.class_idx_) << "."
         << java_lang_dex_file_->GetStringData(name)
         << java_lang_dex_file_->GetMethodSignature(to_find);
     EXPECT_EQ(java_lang_dex_file_->GetIndexForMethodId(*found), i);
@@ -283,8 +332,8 @@ TEST_F(ArtDexFileLoaderTest, FindFieldId) {
     const dex::TypeId& type = java_lang_dex_file_->GetTypeId(to_find.type_idx_);
     const dex::FieldId* found = java_lang_dex_file_->FindFieldId(klass, name, type);
     ASSERT_TRUE(found != nullptr) << "Didn't find field " << i << ": "
-        << java_lang_dex_file_->StringByTypeIdx(to_find.type_idx_) << " "
-        << java_lang_dex_file_->StringByTypeIdx(to_find.class_idx_) << "."
+        << java_lang_dex_file_->GetTypeDescriptor(to_find.type_idx_) << " "
+        << java_lang_dex_file_->GetTypeDescriptor(to_find.class_idx_) << "."
         << java_lang_dex_file_->GetStringData(name);
     EXPECT_EQ(java_lang_dex_file_->GetIndexForFieldId(*found), i);
   }

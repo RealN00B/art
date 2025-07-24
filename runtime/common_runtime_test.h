@@ -28,16 +28,16 @@
 #include "arch/instruction_set.h"
 #include "base/common_art_test.h"
 #include "base/locks.h"
+#include "base/macros.h"
 #include "base/os.h"
 #include "base/unix_file/fd_file.h"
 #include "dex/art_dex_file_loader.h"
-#include "dex/compact_dex_level.h"
 // TODO: Add inl file and avoid including inl.
 #include "obj_ptr-inl.h"
 #include "runtime_globals.h"
 #include "scoped_thread_state_change-inl.h"
 
-namespace art {
+namespace art HIDDEN {
 
 class MethodReference;
 class TypeReference;
@@ -46,12 +46,13 @@ using LogSeverity = android::base::LogSeverity;
 using ScopedLogSeverity = android::base::ScopedLogSeverity;
 
 template<class MirrorType>
-static inline ObjPtr<MirrorType> MakeObjPtr(MirrorType* ptr) {
+static inline ObjPtr<MirrorType> MakeObjPtr(MirrorType* ptr) REQUIRES_SHARED(Locks::mutator_lock_) {
   return ptr;
 }
 
 template<class MirrorType>
-static inline ObjPtr<MirrorType> MakeObjPtr(ObjPtr<MirrorType> ptr) {
+static inline ObjPtr<MirrorType> MakeObjPtr(ObjPtr<MirrorType> ptr)
+    REQUIRES_SHARED(Locks::mutator_lock_) {
   return ptr;
 }
 
@@ -66,7 +67,7 @@ class CompilerCallbacks;
 class DexFile;
 class JavaVMExt;
 class Runtime;
-typedef std::vector<std::pair<std::string, const void*>> RuntimeOptions;
+using RuntimeOptions = std::vector<std::pair<std::string, const void*>>;
 class Thread;
 class VariableSizedHandleScope;
 
@@ -74,8 +75,6 @@ class CommonRuntimeTestImpl : public CommonArtTestImpl {
  public:
   CommonRuntimeTestImpl();
   virtual ~CommonRuntimeTestImpl();
-
-  static std::string GetAndroidTargetToolsDir(InstructionSet isa);
 
   // A helper function to fill the heap.
   static void FillHeap(Thread* self,
@@ -89,13 +88,12 @@ class CommonRuntimeTestImpl : public CommonArtTestImpl {
   bool MutateDexFile(File* output_dex, const std::string& input_jar, const Mutator& mutator) {
     std::vector<std::unique_ptr<const DexFile>> dex_files;
     std::string error_msg;
-    const ArtDexFileLoader dex_file_loader;
-    CHECK(dex_file_loader.Open(input_jar.c_str(),
-                               input_jar.c_str(),
-                               /*verify=*/ true,
-                               /*verify_checksum=*/ true,
+    ArtDexFileLoader dex_file_loader(input_jar);
+    CHECK(dex_file_loader.Open(/*verify=*/true,
+                               /*verify_checksum=*/true,
                                &error_msg,
-                               &dex_files)) << error_msg;
+                               &dex_files))
+        << error_msg;
     EXPECT_EQ(dex_files.size(), 1u) << "Only one input dex is supported";
     const std::unique_ptr<const DexFile>& dex = dex_files[0];
     CHECK(dex->EnableWrite()) << "Failed to enable write";
@@ -138,7 +136,7 @@ class CommonRuntimeTestImpl : public CommonArtTestImpl {
 
  protected:
   // Allow subclases such as CommonCompilerTest to add extra options.
-  virtual void SetUpRuntimeOptions(RuntimeOptions* options ATTRIBUTE_UNUSED) {}
+  virtual void SetUpRuntimeOptions([[maybe_unused]] RuntimeOptions* options) {}
 
   // Called before the runtime is created.
   virtual void PreRuntimeCreate() {}
@@ -154,18 +152,24 @@ class CommonRuntimeTestImpl : public CommonArtTestImpl {
   jobject LoadMultiDex(const char* first_dex_name, const char* second_dex_name)
       REQUIRES_SHARED(Locks::mutator_lock_);
 
+  // The following helper functions return global JNI references to the class loader.
   jobject LoadDexInPathClassLoader(const std::string& dex_name,
                                    jobject parent_loader,
-                                   jobject shared_libraries = nullptr);
+                                   jobject shared_libraries = nullptr,
+                                   jobject shared_libraries_after = nullptr);
   jobject LoadDexInPathClassLoader(const std::vector<std::string>& dex_names,
                                    jobject parent_loader,
-                                   jobject shared_libraries = nullptr);
+                                   jobject shared_libraries = nullptr,
+                                   jobject shared_libraries_after = nullptr);
   jobject LoadDexInDelegateLastClassLoader(const std::string& dex_name, jobject parent_loader);
   jobject LoadDexInInMemoryDexClassLoader(const std::string& dex_name, jobject parent_loader);
-  jobject LoadDexInWellKnownClassLoader(const std::vector<std::string>& dex_names,
-                                        jclass loader_class,
+  jobject LoadDexInWellKnownClassLoader(ScopedObjectAccess& soa,
+                                        const std::vector<std::string>& dex_names,
+                                        ObjPtr<mirror::Class> loader_class,
                                         jobject parent_loader,
-                                        jobject shared_libraries = nullptr);
+                                        jobject shared_libraries = nullptr,
+                                        jobject shared_libraries_after = nullptr)
+      REQUIRES_SHARED(Locks::mutator_lock_);
 
   void VisitDexes(ArrayRef<const std::string> dexes,
                   const std::function<void(MethodReference)>& method_visitor,
@@ -176,7 +180,19 @@ class CommonRuntimeTestImpl : public CommonArtTestImpl {
   void GenerateProfile(ArrayRef<const std::string> dexes,
                        File* out_file,
                        size_t method_frequency = 1u,
-                       size_t type_frequency = 1u);
+                       size_t type_frequency = 1u,
+                       bool for_boot_image = false);
+  void GenerateBootProfile(ArrayRef<const std::string> dexes,
+                           File* out_file,
+                           size_t method_frequency = 1u,
+                           size_t type_frequency = 1u) {
+    return GenerateProfile(
+        dexes, out_file, method_frequency, type_frequency, /*for_boot_image=*/ true);
+  }
+
+  ObjPtr<mirror::Class> FindClass(const char* descriptor,
+                                  Handle<mirror::ClassLoader> class_loader) const
+      REQUIRES_SHARED(Locks::mutator_lock_);
 
   std::unique_ptr<Runtime> runtime_;
 
@@ -189,14 +205,15 @@ class CommonRuntimeTestImpl : public CommonArtTestImpl {
   // Get the dex files from a PathClassLoader or DelegateLastClassLoader.
   // This only looks into the current class loader and does not recurse into the parents.
   std::vector<const DexFile*> GetDexFiles(jobject jclass_loader);
-  std::vector<const DexFile*> GetDexFiles(ScopedObjectAccess& soa,
-                                          Handle<mirror::ClassLoader> class_loader)
-    REQUIRES_SHARED(Locks::mutator_lock_);
+  std::vector<const DexFile*> GetDexFiles(Thread* self, Handle<mirror::ClassLoader> class_loader)
+      REQUIRES_SHARED(Locks::mutator_lock_);
 
   // Get the first dex file from a PathClassLoader. Will abort if it is null.
   const DexFile* GetFirstDexFile(jobject jclass_loader);
 
   std::unique_ptr<CompilerCallbacks> callbacks_;
+
+  bool use_boot_image_;
 
   virtual void SetUp();
 
@@ -206,15 +223,9 @@ class CommonRuntimeTestImpl : public CommonArtTestImpl {
   // initializers, initialize well-known classes, and creates the heap thread pool.
   virtual void FinalizeSetup();
 
-  // Returns the directory where the pre-compiled core.art can be found.
-  static std::string GetImageDirectory();
+  // Returns the directory where the pre-compiled boot.art can be found.
   static std::string GetImageLocation();
   static std::string GetSystemImageFile();
-
-  static void EnterTransactionMode();
-  static void ExitTransactionMode();
-  static void RollbackAndExitTransactionMode() REQUIRES_SHARED(Locks::mutator_lock_);
-  static bool IsTransactionAborted();
 };
 
 template <typename TestType>
@@ -258,64 +269,52 @@ class CheckJniAbortCatcher {
   DISALLOW_COPY_AND_ASSIGN(CheckJniAbortCatcher);
 };
 
-#define TEST_DISABLED() \
-  do { \
-    printf("WARNING: TEST DISABLED\n"); \
-    return; \
-  } while (false)
+#define TEST_DISABLED() GTEST_SKIP() << "WARNING: TEST DISABLED";
 
-#define TEST_DISABLED_FOR_ARM() \
+#define TEST_DISABLED_FOR_ARM()                                                        \
   if (kRuntimeISA == InstructionSet::kArm || kRuntimeISA == InstructionSet::kThumb2) { \
-    printf("WARNING: TEST DISABLED FOR ARM\n"); \
-    return; \
+    GTEST_SKIP() << "WARNING: TEST DISABLED FOR ARM";                                  \
   }
 
-#define TEST_DISABLED_FOR_ARM64() \
-  if (kRuntimeISA == InstructionSet::kArm64) { \
-    printf("WARNING: TEST DISABLED FOR ARM64\n"); \
-    return; \
+#define TEST_DISABLED_FOR_ARM64()                       \
+  if (kRuntimeISA == InstructionSet::kArm64) {          \
+    GTEST_SKIP() << "WARNING: TEST DISABLED FOR ARM64"; \
   }
 
-#define TEST_DISABLED_FOR_X86() \
-  if (kRuntimeISA == InstructionSet::kX86) { \
-    printf("WARNING: TEST DISABLED FOR X86\n"); \
-    return; \
+#define TEST_DISABLED_FOR_RISCV64()                       \
+  if (kRuntimeISA == InstructionSet::kRiscv64) {          \
+    GTEST_SKIP() << "WARNING: TEST DISABLED FOR RISCV64"; \
   }
 
-#define TEST_DISABLED_FOR_X86_64() \
-  if (kRuntimeISA == InstructionSet::kX86_64) { \
-    printf("WARNING: TEST DISABLED FOR X86_64\n"); \
-    return; \
+#define TEST_DISABLED_FOR_X86()                       \
+  if (kRuntimeISA == InstructionSet::kX86) {          \
+    GTEST_SKIP() << "WARNING: TEST DISABLED FOR X86"; \
   }
 
-#define TEST_DISABLED_FOR_STRING_COMPRESSION() \
-  if (mirror::kUseStringCompression) { \
-    printf("WARNING: TEST DISABLED FOR STRING COMPRESSION\n"); \
-    return; \
+#define TEST_DISABLED_FOR_X86_64()                       \
+  if (kRuntimeISA == InstructionSet::kX86_64) {          \
+    GTEST_SKIP() << "WARNING: TEST DISABLED FOR X86_64"; \
   }
 
-#define TEST_DISABLED_WITHOUT_BAKER_READ_BARRIERS() \
-  if (!kEmitCompilerReadBarrier || !kUseBakerReadBarrier) { \
-    printf("WARNING: TEST DISABLED FOR GC WITHOUT BAKER READ BARRIER\n"); \
-    return; \
+#define TEST_DISABLED_WITHOUT_BAKER_READ_BARRIERS()                             \
+  if (!gUseReadBarrier || !kUseBakerReadBarrier) {                              \
+    GTEST_SKIP() << "WARNING: TEST DISABLED FOR GC WITHOUT BAKER READ BARRIER"; \
   }
 
-#define TEST_DISABLED_FOR_HEAP_POISONING() \
-  if (kPoisonHeapReferences) { \
-    printf("WARNING: TEST DISABLED FOR HEAP POISONING\n"); \
-    return; \
+#define TEST_DISABLED_FOR_MEMORY_TOOL_WITH_HEAP_POISONING_WITHOUT_READ_BARRIERS()              \
+  if (kRunningOnMemoryTool && kPoisonHeapReferences && !gUseReadBarrier) {                     \
+    GTEST_SKIP()                                                                               \
+        << "WARNING: TEST DISABLED FOR MEMORY TOOL WITH HEAP POISONING WITHOUT READ BARRIERS"; \
   }
 
-#define TEST_DISABLED_FOR_MEMORY_TOOL_WITH_HEAP_POISONING_WITHOUT_READ_BARRIERS() \
-  if (kRunningOnMemoryTool && kPoisonHeapReferences && !kEmitCompilerReadBarrier) { \
-    printf("WARNING: TEST DISABLED FOR MEMORY TOOL WITH HEAP POISONING WITHOUT READ BARRIERS\n"); \
-    return; \
+#define TEST_DISABLED_FOR_KERNELS_WITH_CACHE_SEGFAULT()                                   \
+  if (CacheOperationsMaySegFault()) {                                                     \
+    GTEST_SKIP() << "WARNING: TEST DISABLED ON KERNEL THAT SEGFAULT ON CACHE OPERATIONS"; \
   }
 
-#define TEST_DISABLED_FOR_KERNELS_WITH_CACHE_SEGFAULT() \
-  if (CacheOperationsMaySegFault()) { \
-    printf("WARNING: TEST DISABLED ON KERNEL THAT SEGFAULT ON CACHE OPERATIONS\n"); \
-    return; \
+#define TEST_DISABLED_ON_VM() \
+  if (RunningOnVM()) {        \
+    GTEST_SKIP();             \
   }
 
 }  // namespace art

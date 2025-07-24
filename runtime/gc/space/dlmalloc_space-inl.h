@@ -18,10 +18,10 @@
 #define ART_RUNTIME_GC_SPACE_DLMALLOC_SPACE_INL_H_
 
 #include "dlmalloc_space.h"
-#include "gc/allocator/dlmalloc.h"
+#include "gc/allocator/art-dlmalloc.h"
 #include "thread.h"
 
-namespace art {
+namespace art HIDDEN {
 namespace gc {
 namespace space {
 

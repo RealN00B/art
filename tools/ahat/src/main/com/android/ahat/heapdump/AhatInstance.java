@@ -392,6 +392,24 @@ public abstract class AhatInstance implements Diffable<AhatInstance> {
   }
 
   /**
+   * Returns true if this instance is a bitmap instance.
+   * @return true if this instance is a bitmap instance
+   */
+  public boolean isBitmapInstance() {
+    return false;
+  }
+
+  /**
+   * Returns this as an AhatBitmapInstance if this is an AhatBitmapInstance.
+   * Returns null if this is not an AhatBitmapInstance.
+   *
+   * @return this instance as a bitmap instance
+   */
+  public AhatBitmapInstance asBitmapInstance() {
+    return null;
+  }
+
+  /**
    * Returns the <code>referent</code> associated with this instance.
    * This is only relevant for instances of java.lang.ref.Reference or its
    * subclasses. Returns null if the instance has no referent associated with
@@ -583,18 +601,6 @@ public abstract class AhatInstance implements Diffable<AhatInstance> {
     return asString(-1);
   }
 
-  /**
-   * Returns the bitmap pixel data associated with this instance.
-   * This is relevant for instances of android.graphics.Bitmap and byte[].
-   * Returns null if there is no bitmap pixel data associated with the given
-   * instance.
-   *
-   * @return the bitmap pixel data associated with this image
-   */
-  public BufferedImage asBitmap() {
-    return null;
-  }
-
   static class RegisteredNativeAllocation {
     public AhatInstance referent;
     public long size;
@@ -686,7 +692,7 @@ public abstract class AhatInstance implements Diffable<AhatInstance> {
   }
 
   /**
-   * Returns a new place holder instance corresponding to this instance.
+   * Returns a new placeholder instance corresponding to this instance.
    */
   AhatInstance newPlaceHolderInstance() {
     return new AhatPlaceHolderInstance(this);

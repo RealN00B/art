@@ -33,7 +33,7 @@
 
 #include "gtest/gtest.h"
 
-namespace art {
+namespace art HIDDEN {
 
 // Return all combinations of ISA and code generator that are executable on
 // hardware, or on simulator, and that we'd like to test.
@@ -56,7 +56,7 @@ static ::std::vector<CodegenTargetConfig> GetTargetConfigs() {
   };
 
   for (const CodegenTargetConfig& test_config : test_config_candidates) {
-    if (CanExecute(test_config.GetInstructionSet())) {
+    if (CanExecuteISA(test_config.GetInstructionSet())) {
       v.push_back(test_config);
     }
   }
@@ -64,7 +64,7 @@ static ::std::vector<CodegenTargetConfig> GetTargetConfigs() {
   return v;
 }
 
-class CodegenTest : public OptimizingUnitTest {
+class CodegenTest : public CommonCompilerTest, public OptimizingUnitTestHelper {
  protected:
   void TestCode(const std::vector<uint16_t>& data, bool has_result = false, int32_t expected = 0);
   void TestCodeLong(const std::vector<uint16_t>& data, bool has_result, int64_t expected);
@@ -73,6 +73,12 @@ class CodegenTest : public OptimizingUnitTest {
                       int64_t j,
                       DataType::Type type,
                       const CodegenTargetConfig target_config);
+  void TestPackedSwitch(const CodegenTargetConfig target_config);
+  void TestVectorComparison(IfCondition condition,
+                            int64_t lhs_value,
+                            int64_t rhs_value,
+                            DataType::Type type,
+                            CodeGenerator* codegen);
 };
 
 void CodegenTest::TestCode(const std::vector<uint16_t>& data, bool has_result, int32_t expected) {
@@ -81,8 +87,9 @@ void CodegenTest::TestCode(const std::vector<uint16_t>& data, bool has_result, i
     HGraph* graph = CreateCFG(data);
     // Remove suspend checks, they cannot be executed in this context.
     RemoveSuspendChecks(graph);
-    OverrideInstructionSetFeatures(target_config.GetInstructionSet(), "default");
-    RunCode(target_config, *compiler_options_, graph, [](HGraph*) {}, has_result, expected);
+    std::unique_ptr<CompilerOptions> compiler_options =
+        CommonCompilerTest::CreateCompilerOptions(target_config.GetInstructionSet(), "default");
+    RunCode(target_config, *compiler_options, graph, [](HGraph*) {}, has_result, expected);
   }
 }
 
@@ -93,8 +100,9 @@ void CodegenTest::TestCodeLong(const std::vector<uint16_t>& data,
     HGraph* graph = CreateCFG(data, DataType::Type::kInt64);
     // Remove suspend checks, they cannot be executed in this context.
     RemoveSuspendChecks(graph);
-    OverrideInstructionSetFeatures(target_config.GetInstructionSet(), "default");
-    RunCode(target_config, *compiler_options_, graph, [](HGraph*) {}, has_result, expected);
+    std::unique_ptr<CompilerOptions> compiler_options =
+        CommonCompilerTest::CreateCompilerOptions(target_config.GetInstructionSet(), "default");
+    RunCode(target_config, *compiler_options, graph, [](HGraph*) {}, has_result, expected);
   }
 }
 
@@ -415,16 +423,15 @@ TEST_F(CodegenTest, NonMaterializedCondition) {
     HBasicBlock* entry = new (GetAllocator()) HBasicBlock(graph);
     graph->AddBlock(entry);
     graph->SetEntryBlock(entry);
-    entry->AddInstruction(new (GetAllocator()) HGoto());
+    MakeGoto(entry);
 
     HBasicBlock* first_block = new (GetAllocator()) HBasicBlock(graph);
     graph->AddBlock(first_block);
     entry->AddSuccessor(first_block);
     HIntConstant* constant0 = graph->GetIntConstant(0);
     HIntConstant* constant1 = graph->GetIntConstant(1);
-    HEqual* equal = new (GetAllocator()) HEqual(constant0, constant0);
-    first_block->AddInstruction(equal);
-    first_block->AddInstruction(new (GetAllocator()) HIf(equal));
+    HInstruction* equal = MakeCondition(first_block, kCondEQ, constant0, constant0);
+    MakeIf(first_block, equal);
 
     HBasicBlock* then_block = new (GetAllocator()) HBasicBlock(graph);
     HBasicBlock* else_block = new (GetAllocator()) HBasicBlock(graph);
@@ -439,13 +446,15 @@ TEST_F(CodegenTest, NonMaterializedCondition) {
     then_block->AddSuccessor(exit_block);
     else_block->AddSuccessor(exit_block);
 
-    exit_block->AddInstruction(new (GetAllocator()) HExit());
-    then_block->AddInstruction(new (GetAllocator()) HReturn(constant0));
-    else_block->AddInstruction(new (GetAllocator()) HReturn(constant1));
+    MakeExit(exit_block);
+    MakeReturn(then_block, constant0);
+    MakeReturn(else_block, constant1);
 
     ASSERT_FALSE(equal->IsEmittedAtUseSite());
     graph->BuildDominatorTree();
-    PrepareForRegisterAllocation(graph, *compiler_options_).Run();
+    std::unique_ptr<CompilerOptions> compiler_options =
+        CommonCompilerTest::CreateCompilerOptions(target_config.GetInstructionSet(), "default");
+    PrepareForRegisterAllocation(graph, *compiler_options).Run();
     ASSERT_TRUE(equal->IsEmittedAtUseSite());
 
     auto hook_before_codegen = [](HGraph* graph_in) {
@@ -454,8 +463,7 @@ TEST_F(CodegenTest, NonMaterializedCondition) {
       block->InsertInstructionBefore(move, block->GetLastInstruction());
     };
 
-    OverrideInstructionSetFeatures(target_config.GetInstructionSet(), "default");
-    RunCode(target_config, *compiler_options_, graph, hook_before_codegen, true, 0);
+    RunCode(target_config, *compiler_options, graph, hook_before_codegen, true, 0);
   }
 }
 
@@ -476,12 +484,12 @@ TEST_F(CodegenTest, MaterializedCondition1) {
       HBasicBlock* entry_block = new (GetAllocator()) HBasicBlock(graph);
       graph->AddBlock(entry_block);
       graph->SetEntryBlock(entry_block);
-      entry_block->AddInstruction(new (GetAllocator()) HGoto());
+      MakeGoto(entry_block);
       HBasicBlock* code_block = new (GetAllocator()) HBasicBlock(graph);
       graph->AddBlock(code_block);
       HBasicBlock* exit_block = new (GetAllocator()) HBasicBlock(graph);
       graph->AddBlock(exit_block);
-      exit_block->AddInstruction(new (GetAllocator()) HExit());
+      MakeExit(exit_block);
 
       entry_block->AddSuccessor(code_block);
       code_block->AddSuccessor(exit_block);
@@ -489,10 +497,8 @@ TEST_F(CodegenTest, MaterializedCondition1) {
 
       HIntConstant* cst_lhs = graph->GetIntConstant(lhs[i]);
       HIntConstant* cst_rhs = graph->GetIntConstant(rhs[i]);
-      HLessThan cmp_lt(cst_lhs, cst_rhs);
-      code_block->AddInstruction(&cmp_lt);
-      HReturn ret(&cmp_lt);
-      code_block->AddInstruction(&ret);
+      HInstruction* cmp_lt = MakeCondition(code_block, kCondLT, cst_lhs, cst_rhs);
+      MakeReturn(code_block, cmp_lt);
 
       graph->BuildDominatorTree();
       auto hook_before_codegen = [](HGraph* graph_in) {
@@ -501,8 +507,9 @@ TEST_F(CodegenTest, MaterializedCondition1) {
             new (graph_in->GetAllocator()) HParallelMove(graph_in->GetAllocator());
         block->InsertInstructionBefore(move, block->GetLastInstruction());
       };
-      OverrideInstructionSetFeatures(target_config.GetInstructionSet(), "default");
-      RunCode(target_config, *compiler_options_, graph, hook_before_codegen, true, lhs[i] < rhs[i]);
+      std::unique_ptr<CompilerOptions> compiler_options =
+          CommonCompilerTest::CreateCompilerOptions(target_config.GetInstructionSet(), "default");
+      RunCode(target_config, *compiler_options, graph, hook_before_codegen, true, lhs[i] < rhs[i]);
     }
   }
 }
@@ -524,7 +531,7 @@ TEST_F(CodegenTest, MaterializedCondition2) {
       HBasicBlock* entry_block = new (GetAllocator()) HBasicBlock(graph);
       graph->AddBlock(entry_block);
       graph->SetEntryBlock(entry_block);
-      entry_block->AddInstruction(new (GetAllocator()) HGoto());
+      MakeGoto(entry_block);
 
       HBasicBlock* if_block = new (GetAllocator()) HBasicBlock(graph);
       graph->AddBlock(if_block);
@@ -534,7 +541,7 @@ TEST_F(CodegenTest, MaterializedCondition2) {
       graph->AddBlock(if_false_block);
       HBasicBlock* exit_block = new (GetAllocator()) HBasicBlock(graph);
       graph->AddBlock(exit_block);
-      exit_block->AddInstruction(new (GetAllocator()) HExit());
+      MakeExit(exit_block);
 
       graph->SetEntryBlock(entry_block);
       entry_block->AddSuccessor(if_block);
@@ -546,21 +553,18 @@ TEST_F(CodegenTest, MaterializedCondition2) {
 
       HIntConstant* cst_lhs = graph->GetIntConstant(lhs[i]);
       HIntConstant* cst_rhs = graph->GetIntConstant(rhs[i]);
-      HLessThan cmp_lt(cst_lhs, cst_rhs);
-      if_block->AddInstruction(&cmp_lt);
-      // We insert a dummy instruction to separate the HIf from the HLessThan
+      HInstruction* cmp_lt = MakeCondition(if_block, kCondLT, cst_lhs, cst_rhs);
+      // We insert a fake instruction to separate the HIf from the HLessThan
       // and force the materialization of the condition.
-      HMemoryBarrier force_materialization(MemBarrierKind::kAnyAny, 0);
-      if_block->AddInstruction(&force_materialization);
-      HIf if_lt(&cmp_lt);
-      if_block->AddInstruction(&if_lt);
+      HInstruction* force_materialization =
+          new (GetAllocator()) HMemoryBarrier(MemBarrierKind::kAnyAny, 0);
+      if_block->AddInstruction(force_materialization);
+      MakeIf(if_block, cmp_lt);
 
       HIntConstant* cst_lt = graph->GetIntConstant(1);
-      HReturn ret_lt(cst_lt);
-      if_true_block->AddInstruction(&ret_lt);
+      MakeReturn(if_true_block, cst_lt);
       HIntConstant* cst_ge = graph->GetIntConstant(0);
-      HReturn ret_ge(cst_ge);
-      if_false_block->AddInstruction(&ret_ge);
+      MakeReturn(if_false_block, cst_ge);
 
       graph->BuildDominatorTree();
       auto hook_before_codegen = [](HGraph* graph_in) {
@@ -569,8 +573,9 @@ TEST_F(CodegenTest, MaterializedCondition2) {
             new (graph_in->GetAllocator()) HParallelMove(graph_in->GetAllocator());
         block->InsertInstructionBefore(move, block->GetLastInstruction());
       };
-      OverrideInstructionSetFeatures(target_config.GetInstructionSet(), "default");
-      RunCode(target_config, *compiler_options_, graph, hook_before_codegen, true, lhs[i] < rhs[i]);
+      std::unique_ptr<CompilerOptions> compiler_options =
+          CommonCompilerTest::CreateCompilerOptions(target_config.GetInstructionSet(), "default");
+      RunCode(target_config, *compiler_options, graph, hook_before_codegen, true, lhs[i] < rhs[i]);
     }
   }
 }
@@ -594,93 +599,62 @@ TEST_F(CodegenTest, ReturnDivInt2Addr) {
   TestCode(data, true, 2);
 }
 
+static bool GetExpectedResultFromComparison(IfCondition condition, int64_t lhs, int64_t rhs) {
+  const uint64_t unsigned_lhs = lhs;
+  const uint64_t unsigned_rhs = rhs;
+  switch (condition) {
+    case kCondEQ:
+      return lhs == rhs;
+    case kCondNE:
+      return lhs != rhs;
+    case kCondLT:
+      return lhs < rhs;
+    case kCondLE:
+      return lhs <= rhs;
+    case kCondGT:
+      return lhs > rhs;
+    case kCondGE:
+      return lhs >= rhs;
+    case kCondB:
+      return unsigned_lhs < unsigned_rhs;
+    case kCondBE:
+      return unsigned_lhs <= unsigned_rhs;
+    case kCondA:
+      return unsigned_lhs > unsigned_rhs;
+    case kCondAE:
+      return unsigned_lhs >= unsigned_rhs;
+  }
+  LOG(FATAL) << "Condition '" << enum_cast<uint32_t>(condition) << "' not supported: ";
+  UNREACHABLE();
+}
+
 // Helper method.
 void CodegenTest::TestComparison(IfCondition condition,
                                  int64_t i,
                                  int64_t j,
                                  DataType::Type type,
                                  const CodegenTargetConfig target_config) {
-  HGraph* graph = CreateGraph();
-
-  HBasicBlock* entry_block = new (GetAllocator()) HBasicBlock(graph);
-  graph->AddBlock(entry_block);
-  graph->SetEntryBlock(entry_block);
-  entry_block->AddInstruction(new (GetAllocator()) HGoto());
-
-  HBasicBlock* block = new (GetAllocator()) HBasicBlock(graph);
-  graph->AddBlock(block);
-
-  HBasicBlock* exit_block = new (GetAllocator()) HBasicBlock(graph);
-  graph->AddBlock(exit_block);
-  graph->SetExitBlock(exit_block);
-  exit_block->AddInstruction(new (GetAllocator()) HExit());
-
-  entry_block->AddSuccessor(block);
-  block->AddSuccessor(exit_block);
+  HBasicBlock* block = InitEntryMainExitGraph();
 
   HInstruction* op1;
   HInstruction* op2;
   if (type == DataType::Type::kInt32) {
-    op1 = graph->GetIntConstant(i);
-    op2 = graph->GetIntConstant(j);
+    op1 = graph_->GetIntConstant(i);
+    op2 = graph_->GetIntConstant(j);
   } else {
     DCHECK_EQ(type, DataType::Type::kInt64);
-    op1 = graph->GetLongConstant(i);
-    op2 = graph->GetLongConstant(j);
+    op1 = graph_->GetLongConstant(i);
+    op2 = graph_->GetLongConstant(j);
   }
 
-  HInstruction* comparison = nullptr;
-  bool expected_result = false;
-  const uint64_t x = i;
-  const uint64_t y = j;
-  switch (condition) {
-    case kCondEQ:
-      comparison = new (GetAllocator()) HEqual(op1, op2);
-      expected_result = (i == j);
-      break;
-    case kCondNE:
-      comparison = new (GetAllocator()) HNotEqual(op1, op2);
-      expected_result = (i != j);
-      break;
-    case kCondLT:
-      comparison = new (GetAllocator()) HLessThan(op1, op2);
-      expected_result = (i < j);
-      break;
-    case kCondLE:
-      comparison = new (GetAllocator()) HLessThanOrEqual(op1, op2);
-      expected_result = (i <= j);
-      break;
-    case kCondGT:
-      comparison = new (GetAllocator()) HGreaterThan(op1, op2);
-      expected_result = (i > j);
-      break;
-    case kCondGE:
-      comparison = new (GetAllocator()) HGreaterThanOrEqual(op1, op2);
-      expected_result = (i >= j);
-      break;
-    case kCondB:
-      comparison = new (GetAllocator()) HBelow(op1, op2);
-      expected_result = (x < y);
-      break;
-    case kCondBE:
-      comparison = new (GetAllocator()) HBelowOrEqual(op1, op2);
-      expected_result = (x <= y);
-      break;
-    case kCondA:
-      comparison = new (GetAllocator()) HAbove(op1, op2);
-      expected_result = (x > y);
-      break;
-    case kCondAE:
-      comparison = new (GetAllocator()) HAboveOrEqual(op1, op2);
-      expected_result = (x >= y);
-      break;
-  }
-  block->AddInstruction(comparison);
-  block->AddInstruction(new (GetAllocator()) HReturn(comparison));
+  HInstruction* comparison = MakeCondition(block, condition, op1, op2);
+  MakeReturn(block, comparison);
 
-  graph->BuildDominatorTree();
-  OverrideInstructionSetFeatures(target_config.GetInstructionSet(), "default");
-  RunCode(target_config, *compiler_options_, graph, [](HGraph*) {}, true, expected_result);
+  graph_->BuildDominatorTree();
+  std::unique_ptr<CompilerOptions> compiler_options =
+      CommonCompilerTest::CreateCompilerOptions(target_config.GetInstructionSet(), "default");
+  bool expected_result = GetExpectedResultFromComparison(condition, i, j);
+  RunCode(target_config, *compiler_options, graph_, [](HGraph*) {}, true, expected_result);
 }
 
 TEST_F(CodegenTest, ComparisonsInt) {
@@ -709,11 +683,78 @@ TEST_F(CodegenTest, ComparisonsLong) {
   }
 }
 
+// Tests a PackedSwitch in a very large HGraph; validates that the switch jump table is in
+// range for the PC-relative load in the codegen visitor.
+void CodegenTest::TestPackedSwitch(const CodegenTargetConfig target_config) {
+  HBasicBlock* return_block = InitEntryMainExitGraph();
+  constexpr DataType::Type data_type = DataType::Type::kInt32;
+
+  // A number of entries - we are interested to test jump table implementation.
+  constexpr size_t kNumSwitchEntries = 10;
+
+  // Number of jump targets (including a 'default' case).
+  constexpr size_t kNumBB = kNumSwitchEntries + 1;
+  // Some arbitrary value to be used as input.
+  constexpr int kInputValue = kNumBB - 4;
+
+  HInstruction* input = graph_->GetIntConstant(kInputValue);
+  HIntConstant* constant_1 = graph_->GetIntConstant(1);
+
+  HBasicBlock* switch_block = AddNewBlock();
+  entry_block_->ReplaceSuccessor(return_block, switch_block);
+
+  HPackedSwitch* hswitch = new (GetAllocator()) HPackedSwitch(0, kNumSwitchEntries, input);
+  switch_block->AddInstruction(hswitch);
+
+  std::vector<HInstruction*> phi_inputs {};
+
+  // Add switch jump target blocks.
+  for (int i = 0; i < kNumBB; i++) {
+    HBasicBlock* case_block = AddNewBlock();
+    case_block->AddPredecessor(switch_block);
+    case_block->AddSuccessor(return_block);
+
+    HIntConstant* case_value = graph_->GetIntConstant(i);
+    HAdd* add = MakeBinOp<HAdd>(case_block, data_type, input, case_value);
+    phi_inputs.emplace_back(add);
+
+    MakeGoto(case_block);
+  }
+
+  HPhi* phi = MakePhi(return_block, phi_inputs);
+  HInstruction* return_val = phi;
+
+  // Emit a huge number of HAdds - to simulate a very large HGraph.
+  constexpr int kNumOfAdds = 2 * 1024 * 1024;
+  for (int i = 0; i < kNumOfAdds; i++) {
+    return_val = MakeBinOp<HAdd>(return_block, data_type, return_val, constant_1);
+  }
+
+  MakeReturn(return_block, return_val);
+
+  graph_->BuildDominatorTree();
+  EXPECT_TRUE(CheckGraph());
+
+  std::unique_ptr<CompilerOptions> compiler_options =
+      CommonCompilerTest::CreateCompilerOptions(target_config.GetInstructionSet(), "default");
+  RunCode(target_config,
+          *compiler_options,
+          graph_,
+          [](HGraph*) {}, true, kNumOfAdds + 2 * kInputValue);
+}
+
+TEST_F(CodegenTest, PackedSwitchInHugeMethod) {
+  for (CodegenTargetConfig target_config : GetTargetConfigs()) {
+    TestPackedSwitch(target_config);
+  }
+}
+
 #ifdef ART_ENABLE_CODEGEN_arm
 TEST_F(CodegenTest, ARMVIXLParallelMoveResolver) {
-  OverrideInstructionSetFeatures(InstructionSet::kThumb2, "default");
+  std::unique_ptr<CompilerOptions> compiler_options =
+      CommonCompilerTest::CreateCompilerOptions(InstructionSet::kThumb2, "default");
   HGraph* graph = CreateGraph();
-  arm::CodeGeneratorARMVIXL codegen(graph, *compiler_options_);
+  arm::CodeGeneratorARMVIXL codegen(graph, *compiler_options);
 
   codegen.Initialize();
 
@@ -726,17 +767,17 @@ TEST_F(CodegenTest, ARMVIXLParallelMoveResolver) {
   move->AddMove(Location::StackSlot(8192), Location::StackSlot(0), DataType::Type::kInt32, nullptr);
   codegen.GetMoveResolver()->EmitNativeCode(move);
 
-  InternalCodeAllocator code_allocator;
-  codegen.Finalize(&code_allocator);
+  codegen.Finalize();
 }
 #endif
 
 #ifdef ART_ENABLE_CODEGEN_arm64
 // Regression test for b/34760542.
 TEST_F(CodegenTest, ARM64ParallelMoveResolverB34760542) {
-  OverrideInstructionSetFeatures(InstructionSet::kArm64, "default");
+  std::unique_ptr<CompilerOptions> compiler_options =
+      CommonCompilerTest::CreateCompilerOptions(InstructionSet::kArm64, "default");
   HGraph* graph = CreateGraph();
-  arm64::CodeGeneratorARM64 codegen(graph, *compiler_options_);
+  arm64::CodeGeneratorARM64 codegen(graph, *compiler_options);
 
   codegen.Initialize();
 
@@ -777,19 +818,19 @@ TEST_F(CodegenTest, ARM64ParallelMoveResolverB34760542) {
                 nullptr);
   codegen.GetMoveResolver()->EmitNativeCode(move);
 
-  InternalCodeAllocator code_allocator;
-  codegen.Finalize(&code_allocator);
+  codegen.Finalize();
 }
 
 // Check that ParallelMoveResolver works fine for ARM64 for both cases when SIMD is on and off.
 TEST_F(CodegenTest, ARM64ParallelMoveResolverSIMD) {
-  OverrideInstructionSetFeatures(InstructionSet::kArm64, "default");
+  std::unique_ptr<CompilerOptions> compiler_options =
+      CommonCompilerTest::CreateCompilerOptions(InstructionSet::kArm64, "default");
   HGraph* graph = CreateGraph();
-  arm64::CodeGeneratorARM64 codegen(graph, *compiler_options_);
+  arm64::CodeGeneratorARM64 codegen(graph, *compiler_options);
 
   codegen.Initialize();
 
-  graph->SetHasSIMD(true);
+  graph->SetHasTraditionalSIMD(true);
   for (int i = 0; i < 2; i++) {
     HParallelMove* move = new (graph->GetAllocator()) HParallelMove(graph->GetAllocator());
     move->AddMove(Location::SIMDStackSlot(0),
@@ -809,18 +850,18 @@ TEST_F(CodegenTest, ARM64ParallelMoveResolverSIMD) {
                   DataType::Type::kFloat64,
                   nullptr);
     codegen.GetMoveResolver()->EmitNativeCode(move);
-    graph->SetHasSIMD(false);
+    graph->SetHasTraditionalSIMD(false);
   }
 
-  InternalCodeAllocator code_allocator;
-  codegen.Finalize(&code_allocator);
+  codegen.Finalize();
 }
 
 // Check that ART ISA Features are propagated to VIXL for arm64 (using cortex-a75 as example).
 TEST_F(CodegenTest, ARM64IsaVIXLFeaturesA75) {
-  OverrideInstructionSetFeatures(InstructionSet::kArm64, "cortex-a75");
+  std::unique_ptr<CompilerOptions> compiler_options =
+      CommonCompilerTest::CreateCompilerOptions(InstructionSet::kArm64, "cortex-a75");
   HGraph* graph = CreateGraph();
-  arm64::CodeGeneratorARM64 codegen(graph, *compiler_options_);
+  arm64::CodeGeneratorARM64 codegen(graph, *compiler_options);
   vixl::CPUFeatures* features = codegen.GetVIXLAssembler()->GetCPUFeatures();
 
   EXPECT_TRUE(features->Has(vixl::CPUFeatures::kCRC32));
@@ -832,9 +873,10 @@ TEST_F(CodegenTest, ARM64IsaVIXLFeaturesA75) {
 
 // Check that ART ISA Features are propagated to VIXL for arm64 (using cortex-a53 as example).
 TEST_F(CodegenTest, ARM64IsaVIXLFeaturesA53) {
-  OverrideInstructionSetFeatures(InstructionSet::kArm64, "cortex-a53");
+  std::unique_ptr<CompilerOptions> compiler_options =
+      CommonCompilerTest::CreateCompilerOptions(InstructionSet::kArm64, "cortex-a53");
   HGraph* graph = CreateGraph();
-  arm64::CodeGeneratorARM64 codegen(graph, *compiler_options_);
+  arm64::CodeGeneratorARM64 codegen(graph, *compiler_options);
   vixl::CPUFeatures* features = codegen.GetVIXLAssembler()->GetCPUFeatures();
 
   EXPECT_TRUE(features->Has(vixl::CPUFeatures::kCRC32));
@@ -850,12 +892,13 @@ constexpr static size_t kExpectedFPSpillSize = 8 * vixl::aarch64::kDRegSizeInByt
 // allocated on stack per callee-saved FP register to be preserved in the frame entry as
 // ABI states.
 TEST_F(CodegenTest, ARM64FrameSizeSIMD) {
-  OverrideInstructionSetFeatures(InstructionSet::kArm64, "default");
+  std::unique_ptr<CompilerOptions> compiler_options =
+      CommonCompilerTest::CreateCompilerOptions(InstructionSet::kArm64, "default");
   HGraph* graph = CreateGraph();
-  arm64::CodeGeneratorARM64 codegen(graph, *compiler_options_);
+  arm64::CodeGeneratorARM64 codegen(graph, *compiler_options);
 
   codegen.Initialize();
-  graph->SetHasSIMD(true);
+  graph->SetHasTraditionalSIMD(true);
 
   DCHECK_EQ(arm64::callee_saved_fp_registers.GetCount(), 8);
   vixl::aarch64::CPURegList reg_list = arm64::callee_saved_fp_registers;
@@ -869,12 +912,14 @@ TEST_F(CodegenTest, ARM64FrameSizeSIMD) {
 }
 
 TEST_F(CodegenTest, ARM64FrameSizeNoSIMD) {
-  OverrideInstructionSetFeatures(InstructionSet::kArm64, "default");
+  std::unique_ptr<CompilerOptions> compiler_options =
+      CommonCompilerTest::CreateCompilerOptions(InstructionSet::kArm64, "default");
   HGraph* graph = CreateGraph();
-  arm64::CodeGeneratorARM64 codegen(graph, *compiler_options_);
+  arm64::CodeGeneratorARM64 codegen(graph, *compiler_options);
 
   codegen.Initialize();
-  graph->SetHasSIMD(false);
+  graph->SetHasTraditionalSIMD(false);
+  graph->SetHasPredicatedSIMD(false);
 
   DCHECK_EQ(arm64::callee_saved_fp_registers.GetCount(), 8);
   vixl::aarch64::CPURegList reg_list = arm64::callee_saved_fp_registers;
@@ -886,6 +931,123 @@ TEST_F(CodegenTest, ARM64FrameSizeNoSIMD) {
 
   EXPECT_EQ(codegen.GetFpuSpillSize(), kExpectedFPSpillSize);
 }
+
+// This test checks that the result of the VecPredToBoolean instruction doesn't depend on
+// conditional flags that can be updated by other instructions. For example:
+//
+//   VecPredWhile p0, opa, opb
+//   Below opb, opa
+//   VecPredToBoolean p0
+//
+// where Below updates conditions flags after VecPredWhile.
+TEST_F(CodegenTest, ARM64SvePredicateToBoolean) {
+  std::unique_ptr<CompilerOptions> compiler_options =
+      CommonCompilerTest::CreateCompilerOptions(InstructionSet::kArm64, "default", "sve");
+  for (int i = 0; i < 2; i++) {
+    for (int j = 0; j < 2; j++) {
+      HBasicBlock* block = InitEntryMainExitGraph();
+      TestCodeGeneratorARM64 codegen(graph_, *compiler_options);
+      if (!codegen.SupportsPredicatedSIMD()) {
+        GTEST_SKIP() << "Predicated SIMD is not supported.";
+      }
+
+      HInstruction *opa = graph_->GetIntConstant(i);
+      HInstruction *opb = graph_->GetIntConstant(j);
+      HVecPredWhile *pred_while = MakeVecPredWhile(block,
+                                                  opa,
+                                                  opb,
+                                                  HVecPredWhile::CondKind::kLO,
+                                                  DataType::Type::kInt32);
+      // Update condition flags by using Below instruction.
+      MakeCondition(block, IfCondition::kCondB, opb, opa);
+      HVecPredToBoolean *boolean = MakeVecPredToBoolean(block,
+                                                        pred_while,
+                                                        HVecPredToBoolean::PCondKind::kNFirst,
+                                                        DataType::Type::kInt32);
+      MakeReturn(block, boolean);
+
+      graph_->SetHasPredicatedSIMD(true);
+      graph_->BuildDominatorTree();
+
+      if (CanExecute(codegen)) {
+        RunCode(&codegen, graph_, [](HGraph*) {}, true, i >= j);
+      }
+    }
+  }
+}
+
+void CodegenTest::TestVectorComparison(IfCondition condition,
+                                       int64_t lhs_value,
+                                       int64_t rhs_value,
+                                       DataType::Type type,
+                                       CodeGenerator* codegen) {
+  HBasicBlock* block = entry_block_->GetSingleSuccessor();
+
+  size_t vector_size_in_bytes = codegen->GetSIMDRegisterWidth();
+
+  HVecPredSetAll* predicate = MakeVecPredSetAll(block,
+                                                graph_->GetIntConstant(1),
+                                                type,
+                                                vector_size_in_bytes);
+  HVecReplicateScalar* op1 = MakeVecReplicateScalar(block,
+                                                    graph_->GetConstant(type, lhs_value),
+                                                    type,
+                                                    vector_size_in_bytes,
+                                                    predicate);
+  HVecReplicateScalar* op2 = MakeVecReplicateScalar(block,
+                                                    graph_->GetConstant(type, rhs_value),
+                                                    type,
+                                                    vector_size_in_bytes,
+                                                    predicate);
+  HVecCondition* comparison = MakeVecCondition(block,
+                                               condition,
+                                               op1,
+                                               op2,
+                                               type,
+                                               vector_size_in_bytes,
+                                               predicate);
+  HInstruction* boolean_return = MakeVecPredToBoolean(block,
+                                                      comparison,
+                                                      HVecPredToBoolean::PCondKind::kFirst,
+                                                      type,
+                                                      vector_size_in_bytes);
+  MakeReturn(block, boolean_return);
+
+  graph_->SetHasPredicatedSIMD(true);
+  graph_->BuildDominatorTree();
+
+  if (CanExecute(*codegen)) {
+    bool expected_result = GetExpectedResultFromComparison(condition, lhs_value, rhs_value);
+    RunCode(codegen, graph_, [](HGraph*) {}, true, expected_result);
+  }
+}
+
+// Define tests ensuring that all types of conditions can be generated correctly and return the
+// expected result.
+#define DEFINE_CONDITION_TESTS(CondType)                                                         \
+TEST_F(CodegenTest, ComparisonsVector##CondType) {                                               \
+  std::unique_ptr<CompilerOptions> compiler_options =                                            \
+      CommonCompilerTest::CreateCompilerOptions(InstructionSet::kArm64, "default", "sve");       \
+  for (int64_t i = -1; i <= 1; i++) {                                                            \
+    for (int64_t j = -1; j <= 1; j++) {                                                          \
+      for (int cond = kCondFirst; cond <= kCondLast; cond++) {                                   \
+        InitEntryMainExitGraph();                                                                \
+        TestCodeGeneratorARM64 codegen(graph_, *compiler_options);                               \
+        if (!codegen.SupportsPredicatedSIMD()) {                                                 \
+          GTEST_SKIP() << "Predicated SIMD is not supported.";                                   \
+        }                                                                                        \
+        TestVectorComparison(                                                                    \
+            static_cast<IfCondition>(cond), i, j, DataType::Type::k##CondType, &codegen);        \
+      }                                                                                          \
+    }                                                                                            \
+  }                                                                                              \
+}
+DEFINE_CONDITION_TESTS(Uint8)
+DEFINE_CONDITION_TESTS(Int8)
+DEFINE_CONDITION_TESTS(Uint16)
+DEFINE_CONDITION_TESTS(Int16)
+DEFINE_CONDITION_TESTS(Int32)
+#undef DEFINE_CONDITION_TESTS
 
 #endif
 

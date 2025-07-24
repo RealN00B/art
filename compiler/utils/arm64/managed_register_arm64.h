@@ -20,9 +20,10 @@
 #include <android-base/logging.h>
 
 #include "arch/arm64/registers_arm64.h"
+#include "base/macros.h"
 #include "utils/managed_register.h"
 
-namespace art {
+namespace art HIDDEN {
 namespace arm64 {
 
 const int kNumberOfXRegIds = kNumberOfXRegisters;
@@ -215,7 +216,7 @@ std::ostream& operator<<(std::ostream& os, const Arm64ManagedRegister& reg);
 
 }  // namespace arm64
 
-constexpr inline arm64::Arm64ManagedRegister ManagedRegister::AsArm64() const {
+constexpr arm64::Arm64ManagedRegister ManagedRegister::AsArm64() const {
   arm64::Arm64ManagedRegister reg(id_);
   CHECK(reg.IsNoRegister() || reg.IsValidManagedRegister());
   return reg;

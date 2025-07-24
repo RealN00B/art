@@ -18,12 +18,13 @@
 #define ART_RUNTIME_MIRROR_EMULATED_STACK_FRAME_H_
 
 #include "base/utils.h"
+#include "base/macros.h"
 #include "dex/dex_instruction.h"
 #include "handle.h"
 #include "object.h"
 #include "stack.h"
 
-namespace art {
+namespace art HIDDEN {
 
 struct EmulatedStackFrameOffsets;
 
@@ -34,6 +35,8 @@ class MethodType;
 // C++ mirror of dalvik.system.EmulatedStackFrame
 class MANAGED EmulatedStackFrame : public Object {
  public:
+  MIRROR_CLASS("Ldalvik/system/EmulatedStackFrame;");
+
   // Creates an emulated stack frame whose type is |frame_type| from
   // a shadow frame.
   static ObjPtr<mirror::EmulatedStackFrame> CreateFromShadowFrameAndArgs(
@@ -45,7 +48,7 @@ class MANAGED EmulatedStackFrame : public Object {
 
   // Writes the contents of this emulated stack frame to the |callee_frame|
   // whose type is |callee_type|, starting at |first_dest_reg|.
-  bool WriteToShadowFrame(
+  void WriteToShadowFrame(
       Thread* self,
       Handle<mirror::MethodType> callee_type,
       const uint32_t first_dest_reg,
@@ -66,10 +69,6 @@ class MANAGED EmulatedStackFrame : public Object {
 
   ObjPtr<mirror::ByteArray> GetStackFrame() REQUIRES_SHARED(Locks::mutator_lock_);
 
-  static MemberOffset CallsiteTypeOffset() {
-    return MemberOffset(OFFSETOF_MEMBER(EmulatedStackFrame, callsite_type_));
-  }
-
   static MemberOffset TypeOffset() {
     return MemberOffset(OFFSETOF_MEMBER(EmulatedStackFrame, type_));
   }
@@ -82,7 +81,6 @@ class MANAGED EmulatedStackFrame : public Object {
     return MemberOffset(OFFSETOF_MEMBER(EmulatedStackFrame, stack_frame_));
   }
 
-  HeapReference<mirror::MethodType> callsite_type_;
   HeapReference<mirror::ObjectArray<mirror::Object>> references_;
   HeapReference<mirror::ByteArray> stack_frame_;
   HeapReference<mirror::MethodType> type_;

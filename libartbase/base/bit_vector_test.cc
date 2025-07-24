@@ -15,17 +15,20 @@
  */
 
 #include <memory>
+#include <random>
 
 #include "allocator.h"
+#include "base/stl_util.h"
 #include "bit_vector-inl.h"
 #include "gtest/gtest.h"
+#include "transform_iterator.h"
 
 namespace art {
 
 TEST(BitVector, Test) {
   const size_t kBits = 32;
 
-  BitVector bv(kBits, false, Allocator::GetMallocAllocator());
+  BitVector bv(kBits, false, Allocator::GetCallocAllocator());
   EXPECT_EQ(1U, bv.GetStorageSize());
   EXPECT_EQ(sizeof(uint32_t), bv.GetSizeOf());
   EXPECT_FALSE(bv.IsExpandable());
@@ -63,6 +66,33 @@ TEST(BitVector, Test) {
   EXPECT_EQ(kBits - 1u, *iterator);
   ++iterator;
   EXPECT_TRUE(iterator == bv.Indexes().end());
+}
+
+struct MessyAllocator : public Allocator {
+ public:
+  MessyAllocator() : malloc_(Allocator::GetCallocAllocator()) {}
+  ~MessyAllocator() {}
+
+  void* Alloc(size_t s) override {
+    void* res = malloc_->Alloc(s);
+    memset(res, 0xfe, s);
+    return res;
+  }
+
+  void Free(void* v) override {
+    malloc_->Free(v);
+  }
+
+ private:
+  Allocator* malloc_;
+};
+
+TEST(BitVector, MessyAllocator) {
+  MessyAllocator alloc;
+  BitVector bv(32, false, &alloc);
+  bv.ClearAllBits();
+  EXPECT_EQ(bv.NumSetBits(), 0u);
+  EXPECT_EQ(bv.GetHighestBitSet(), -1);
 }
 
 TEST(BitVector, NoopAllocator) {
@@ -143,9 +173,9 @@ TEST(BitVector, SetInitialBits) {
 
 TEST(BitVector, UnionIfNotIn) {
   {
-    BitVector first(2, true, Allocator::GetMallocAllocator());
-    BitVector second(5, true, Allocator::GetMallocAllocator());
-    BitVector third(5, true, Allocator::GetMallocAllocator());
+    BitVector first(2, true, Allocator::GetCallocAllocator());
+    BitVector second(5, true, Allocator::GetCallocAllocator());
+    BitVector third(5, true, Allocator::GetCallocAllocator());
 
     second.SetBit(64);
     third.SetBit(64);
@@ -155,9 +185,9 @@ TEST(BitVector, UnionIfNotIn) {
   }
 
   {
-    BitVector first(2, true, Allocator::GetMallocAllocator());
-    BitVector second(5, true, Allocator::GetMallocAllocator());
-    BitVector third(5, true, Allocator::GetMallocAllocator());
+    BitVector first(2, true, Allocator::GetCallocAllocator());
+    BitVector second(5, true, Allocator::GetCallocAllocator());
+    BitVector third(5, true, Allocator::GetCallocAllocator());
 
     second.SetBit(64);
     bool changed = first.UnionIfNotIn(&second, &third);
@@ -169,8 +199,8 @@ TEST(BitVector, UnionIfNotIn) {
 
 TEST(BitVector, Subset) {
   {
-    BitVector first(2, true, Allocator::GetMallocAllocator());
-    BitVector second(5, true, Allocator::GetMallocAllocator());
+    BitVector first(2, true, Allocator::GetCallocAllocator());
+    BitVector second(5, true, Allocator::GetCallocAllocator());
 
     EXPECT_TRUE(first.IsSubsetOf(&second));
     second.SetBit(4);
@@ -178,8 +208,8 @@ TEST(BitVector, Subset) {
   }
 
   {
-    BitVector first(5, true, Allocator::GetMallocAllocator());
-    BitVector second(5, true, Allocator::GetMallocAllocator());
+    BitVector first(5, true, Allocator::GetCallocAllocator());
+    BitVector second(5, true, Allocator::GetCallocAllocator());
 
     first.SetBit(5);
     EXPECT_FALSE(first.IsSubsetOf(&second));
@@ -188,8 +218,8 @@ TEST(BitVector, Subset) {
   }
 
   {
-    BitVector first(5, true, Allocator::GetMallocAllocator());
-    BitVector second(5, true, Allocator::GetMallocAllocator());
+    BitVector first(5, true, Allocator::GetCallocAllocator());
+    BitVector second(5, true, Allocator::GetCallocAllocator());
 
     first.SetBit(16);
     first.SetBit(32);
@@ -214,7 +244,7 @@ TEST(BitVector, Subset) {
 TEST(BitVector, CopyTo) {
   {
     // Test copying an empty BitVector. Padding should fill `buf` with zeroes.
-    BitVector bv(0, true, Allocator::GetMallocAllocator());
+    BitVector bv(0, true, Allocator::GetCallocAllocator());
     uint32_t buf;
 
     bv.CopyTo(&buf, sizeof(buf));
@@ -224,7 +254,7 @@ TEST(BitVector, CopyTo) {
 
   {
     // Test copying when `bv.storage_` and `buf` are of equal lengths.
-    BitVector bv(0, true, Allocator::GetMallocAllocator());
+    BitVector bv(0, true, Allocator::GetCallocAllocator());
     uint32_t buf;
 
     bv.SetBit(0);
@@ -239,7 +269,7 @@ TEST(BitVector, CopyTo) {
   {
     // Test copying when the `bv.storage_` is longer than `buf`. As long as
     // `buf` is long enough to hold all set bits, copying should succeed.
-    BitVector bv(0, true, Allocator::GetMallocAllocator());
+    BitVector bv(0, true, Allocator::GetCallocAllocator());
     uint8_t buf[5];
 
     bv.SetBit(18);
@@ -256,7 +286,7 @@ TEST(BitVector, CopyTo) {
 
   {
     // Test zero padding when `bv.storage_` is shorter than `buf`.
-    BitVector bv(0, true, Allocator::GetMallocAllocator());
+    BitVector bv(0, true, Allocator::GetCallocAllocator());
     uint32_t buf[2];
 
     bv.SetBit(18);
@@ -267,6 +297,74 @@ TEST(BitVector, CopyTo) {
     EXPECT_EQ(0x80040000U, buf[0]);
     EXPECT_EQ(0x00000000U, buf[1]);
   }
+}
+
+TEST(BitVector, TransformIterator) {
+  BitVector bv(16, false, Allocator::GetCallocAllocator());
+  bv.SetBit(4);
+  bv.SetBit(8);
+
+  auto indexs = bv.Indexes();
+  for (int32_t negative :
+       MakeTransformRange(indexs, [](uint32_t idx) { return -1 * static_cast<int32_t>(idx); })) {
+    EXPECT_TRUE(negative == -4 || negative == -8);
+  }
+}
+
+class SingleAllocator : public Allocator {
+ public:
+  SingleAllocator() : alloc_count_(0), free_count_(0) {}
+  ~SingleAllocator() {
+    EXPECT_EQ(alloc_count_, 1u);
+    EXPECT_EQ(free_count_, 1u);
+  }
+
+  void* Alloc(size_t s) override {
+    EXPECT_LT(s, 1024ull);
+    EXPECT_EQ(alloc_count_, free_count_);
+    ++alloc_count_;
+    return bytes_.begin();
+  }
+
+  void Free(void*) override {
+    ++free_count_;
+  }
+
+  uint32_t AllocCount() const {
+    return alloc_count_;
+  }
+  uint32_t FreeCount() const {
+    return free_count_;
+  }
+
+ private:
+  std::array<uint8_t, 1024> bytes_;
+  uint32_t alloc_count_;
+  uint32_t free_count_;
+};
+
+TEST(BitVector, MovementFree) {
+  SingleAllocator alloc;
+  {
+    BitVector bv(16, false, &alloc);
+    bv.SetBit(13);
+    EXPECT_EQ(alloc.FreeCount(), 0u);
+    EXPECT_EQ(alloc.AllocCount(), 1u);
+    ASSERT_TRUE(bv.GetRawStorage() != nullptr);
+    EXPECT_TRUE(bv.IsBitSet(13));
+    {
+      BitVector bv2(std::move(bv));
+      // NOLINTNEXTLINE - checking underlying storage has been freed
+      ASSERT_TRUE(bv.GetRawStorage() == nullptr);
+      EXPECT_TRUE(bv2.IsBitSet(13));
+      EXPECT_EQ(alloc.FreeCount(), 0u);
+      EXPECT_EQ(alloc.AllocCount(), 1u);
+    }
+    EXPECT_EQ(alloc.FreeCount(), 1u);
+    EXPECT_EQ(alloc.AllocCount(), 1u);
+  }
+  EXPECT_EQ(alloc.FreeCount(), 1u);
+  EXPECT_EQ(alloc.AllocCount(), 1u);
 }
 
 }  // namespace art

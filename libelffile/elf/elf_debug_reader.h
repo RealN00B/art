@@ -35,10 +35,11 @@ template <typename ElfTypes>
 class ElfDebugReader {
  public:
   // Note that the input buffer might be misaligned.
-  typedef typename ElfTypes::Ehdr ALIGNED(1) Elf_Ehdr;
-  typedef typename ElfTypes::Shdr ALIGNED(1) Elf_Shdr;
-  typedef typename ElfTypes::Sym ALIGNED(1) Elf_Sym;
-  typedef typename ElfTypes::Addr ALIGNED(1) Elf_Addr;
+  using Elf_Ehdr ALIGNED(1) = typename ElfTypes::Ehdr;
+  using Elf_Phdr ALIGNED(1) = typename ElfTypes::Phdr;
+  using Elf_Shdr ALIGNED(1) = typename ElfTypes::Shdr;
+  using Elf_Sym ALIGNED(1) = typename ElfTypes::Sym;
+  using Elf_Addr ALIGNED(1) = typename ElfTypes::Addr;
 
   // Call Frame Information.
   struct CFI {
@@ -65,10 +66,11 @@ class ElfDebugReader {
     CHECK_EQ(header_->e_ident[1], ELFMAG1);
     CHECK_EQ(header_->e_ident[2], ELFMAG2);
     CHECK_EQ(header_->e_ident[3], ELFMAG3);
+    CHECK_EQ(header_->e_ident[4], sizeof(Elf_Addr) / sizeof(uint32_t));
     CHECK_EQ(header_->e_ehsize, sizeof(Elf_Ehdr));
-    CHECK_EQ(header_->e_shentsize, sizeof(Elf_Shdr));
 
     // Find all ELF sections.
+    CHECK_EQ(header_->e_shentsize, sizeof(Elf_Shdr));
     sections_ = Read<Elf_Shdr>(header_->e_shoff, header_->e_shnum);
     for (const Elf_Shdr& section : sections_) {
       const char* name = Read<char>(sections_[header_->e_shstrndx].sh_offset + section.sh_name);
@@ -84,8 +86,16 @@ class ElfDebugReader {
     }
   }
 
-  explicit ElfDebugReader(std::vector<uint8_t>& file)
+  explicit ElfDebugReader(const std::vector<uint8_t>& file)
       : ElfDebugReader(ArrayRef<const uint8_t>(file)) {
+  }
+
+  // Check that ELF signature is present at the start of the files,
+  // and that the ELF bitness matches the ElfTypes template arguments.
+  static bool IsValidElfHeader(const std::vector<uint8_t>& data) {
+    static constexpr bool kIs64Bit = sizeof(Elf_Addr) == sizeof(uint64_t);
+    static constexpr char kMagic[] = { 0x7f, 'E', 'L', 'F', kIs64Bit ? 2 : 1 };
+    return data.size() >= sizeof(kMagic) && memcmp(data.data(), kMagic, sizeof(kMagic)) == 0;
   }
 
   const Elf_Ehdr* GetHeader() { return header_; }
@@ -94,8 +104,22 @@ class ElfDebugReader {
 
   const Elf_Shdr* GetSection(const char* name) { return section_map_[name]; }
 
+  // Find the base address where the ELF file wants to be loaded.
+  // This is generally zero (therefore always requiring relocation).
+  Elf_Addr GetLoadAddress() {
+    std::optional<Elf_Addr> addr;
+    CHECK_EQ(header_->e_phentsize, sizeof(Elf_Phdr));
+    for (const Elf_Phdr& phdr : Read<Elf_Phdr>(header_->e_phoff, header_->e_phnum)) {
+      if (phdr.p_type == PT_LOAD) {
+        addr = addr.has_value() ? std::min(addr.value(), phdr.p_vaddr) : phdr.p_vaddr;
+      }
+    }
+    CHECK(addr.has_value());
+    return addr.value();
+  }
+
   template <typename VisitSym>
-  void VisitFunctionSymbols(VisitSym visit_sym) {
+  void VisitFunctionSymbols(VisitSym&& visit_sym) {
     const Elf_Shdr* symtab = GetSection(".symtab");
     const Elf_Shdr* strtab = GetSection(".strtab");
     const Elf_Shdr* text = GetSection(".text");
@@ -103,18 +127,20 @@ class ElfDebugReader {
       CHECK_EQ(symtab->sh_entsize, sizeof(Elf_Sym));
       size_t count = symtab->sh_size / sizeof(Elf_Sym);
       for (const Elf_Sym& symbol : Read<Elf_Sym>(symtab->sh_offset, count)) {
-        if (ELF_ST_TYPE(symbol.st_info) == STT_FUNC && &sections_[symbol.st_shndx] == text) {
+        if (ELF_ST_TYPE(symbol.st_info) == STT_FUNC &&
+            symbol.st_shndx < sections_.size() &&  // Ignore ABS section.
+            &sections_[symbol.st_shndx] == text) {
           visit_sym(symbol, Read<char>(strtab->sh_offset + symbol.st_name));
         }
       }
     }
     if (gnu_debugdata_reader_ != nullptr) {
-      gnu_debugdata_reader_->VisitFunctionSymbols(visit_sym);
+      gnu_debugdata_reader_->VisitFunctionSymbols(std::forward<VisitSym>(visit_sym));
     }
   }
 
   template <typename VisitSym>
-  void VisitDynamicSymbols(VisitSym visit_sym) {
+  void VisitDynamicSymbols(VisitSym&& visit_sym) {
     const Elf_Shdr* dynsym = GetSection(".dynsym");
     const Elf_Shdr* dynstr = GetSection(".dynstr");
     if (dynsym != nullptr && dynstr != nullptr) {
@@ -127,7 +153,7 @@ class ElfDebugReader {
   }
 
   template <typename VisitCIE, typename VisitFDE>
-  void VisitDebugFrame(VisitCIE visit_cie, VisitFDE visit_fde) {
+  void VisitDebugFrame(VisitCIE&& visit_cie, VisitFDE&& visit_fde) {
     const Elf_Shdr* debug_frame = GetSection(".debug_frame");
     if (debug_frame != nullptr) {
       for (size_t offset = 0; offset < debug_frame->sh_size;) {
@@ -143,7 +169,8 @@ class ElfDebugReader {
       }
     }
     if (gnu_debugdata_reader_ != nullptr) {
-      gnu_debugdata_reader_->VisitDebugFrame(visit_cie, visit_fde);
+      gnu_debugdata_reader_->VisitDebugFrame(std::forward<VisitCIE>(visit_cie),
+                                             std::forward<VisitFDE>(visit_fde));
     }
   }
 

@@ -34,14 +34,11 @@ public class Main {
     }
   }
 
-  public static boolean doThrow = false;
-
   private static int $noinline$foo(int x) {
-    if (doThrow) { throw new Error(); }
     return x;
   }
 
-  /// CHECK-START-{ARM,ARM64,X86,X86_64}: int Main.testSimple(int) builder (after)
+  /// CHECK-START-{ARM,ARM64,X86,X86_64,RISCV64}: int Main.testSimple(int) builder (after)
   /// CHECK:                InvokeStaticOrDirect method_load_kind:BssEntry
 
   /// CHECK-START-X86: int Main.testSimple(int) pc_relative_fixups_x86 (before)
@@ -56,7 +53,22 @@ public class Main {
     return $noinline$foo(x);
   }
 
-  /// CHECK-START-{ARM,ARM64,X86,X86_64}: int Main.testDiamond(boolean, int) builder (after)
+  /// CHECK-START-{ARM,ARM64,X86,X86_64,RISCV64}: int Main.testSimpleAppImage(int) builder (after)
+  /// CHECK:                InvokeStaticOrDirect method_load_kind:AppImageRelRo
+
+  /// CHECK-START-X86: int Main.testSimpleAppImage(int) pc_relative_fixups_x86 (before)
+  /// CHECK-NOT:            X86ComputeBaseMethodAddress
+
+  /// CHECK-START-X86: int Main.testSimpleAppImage(int) pc_relative_fixups_x86 (after)
+  /// CHECK:                X86ComputeBaseMethodAddress
+  /// CHECK-NOT:            X86ComputeBaseMethodAddress
+
+  public static int testSimpleAppImage(int x) {
+    // This call should use PC-relative .data.img.rel.ro array load to retrieve the target method.
+    return AppImageClass.$noinline$foo(x);
+  }
+
+  /// CHECK-START-{ARM,ARM64,X86,X86_64,RISCV64}: int Main.testDiamond(boolean, int) builder (after)
   /// CHECK:                InvokeStaticOrDirect method_load_kind:BssEntry
   /// CHECK:                InvokeStaticOrDirect method_load_kind:BssEntry
 
@@ -131,17 +143,15 @@ public class Main {
     return x;
   }
 
-  /// CHECK-START-{ARM,ARM64,X86,X86_64}: java.lang.String Main.$noinline$getBootImageString() builder (after)
+  /// CHECK-START-{ARM,ARM64,X86,X86_64,RISCV64}: java.lang.String Main.$noinline$getBootImageString() builder (after)
   /// CHECK:                LoadString load_kind:BootImageRelRo
 
   public static String $noinline$getBootImageString() {
-    // Prevent inlining to avoid the string comparison being optimized away.
-    if (doThrow) { throw new Error(); }
     // Empty string is known to be in the boot image.
     return "";
   }
 
-  /// CHECK-START-{ARM,ARM64,X86,X86_64}: java.lang.String Main.$noinline$getNonBootImageString() builder (after)
+  /// CHECK-START-{ARM,ARM64,X86,X86_64,RISCV64}: java.lang.String Main.$noinline$getNonBootImageString() builder (after)
   /// CHECK:                LoadString load_kind:BssEntry
 
   /// CHECK-START-X86: java.lang.String Main.$noinline$getNonBootImageString() pc_relative_fixups_x86 (before)
@@ -152,23 +162,19 @@ public class Main {
   /// CHECK-DAG:            LoadString load_kind:BssEntry
 
   public static String $noinline$getNonBootImageString() {
-    // Prevent inlining to avoid the string comparison being optimized away.
-    if (doThrow) { throw new Error(); }
     // This string is not in the boot image.
     return "non-boot-image-string";
   }
 
-  /// CHECK-START-{ARM,ARM64,X86,X86_64}: java.lang.Class Main.$noinline$getStringClass() builder (after)
+  /// CHECK-START-{ARM,ARM64,X86,X86_64,RISCV64}: java.lang.Class Main.$noinline$getStringClass() builder (after)
   /// CHECK:                LoadClass load_kind:BootImageRelRo class_name:java.lang.String
 
   public static Class<?> $noinline$getStringClass() {
-    // Prevent inlining to avoid the string comparison being optimized away.
-    if (doThrow) { throw new Error(); }
     // String class is known to be in the boot image.
     return String.class;
   }
 
-  /// CHECK-START-{ARM,ARM64,X86,X86_64}: java.lang.Class Main.$noinline$getOtherClass() builder (after)
+  /// CHECK-START-{ARM,ARM64,X86,X86_64,RISCV64}: java.lang.Class Main.$noinline$getOtherClass() builder (after)
   /// CHECK:                LoadClass load_kind:BssEntry class_name:Other
 
   /// CHECK-START-X86: java.lang.Class Main.$noinline$getOtherClass() pc_relative_fixups_x86 (before)
@@ -179,19 +185,32 @@ public class Main {
   /// CHECK-DAG:            LoadClass load_kind:BssEntry class_name:Other
 
   public static Class<?> $noinline$getOtherClass() {
-    // Prevent inlining to avoid the string comparison being optimized away.
-    if (doThrow) { throw new Error(); }
-    // Other class is not in the boot image.
+    // Other class is neither in the boot image nor in the app image.
     return Other.class;
   }
 
-  /// CHECK-START-{ARM,ARM64,X86,X86_64}: java.lang.String Main.$noinline$toHexString(int) builder (after)
+  /// CHECK-START-{ARM,ARM64,X86,X86_64,RISCV64}: java.lang.Class Main.$noinline$getAppImageClass() builder (after)
+  /// CHECK:                LoadClass load_kind:AppImageRelRo class_name:AppImageClass
+
+  /// CHECK-START-X86: java.lang.Class Main.$noinline$getAppImageClass() pc_relative_fixups_x86 (before)
+  /// CHECK-NOT:            X86ComputeBaseMethodAddress
+
+  /// CHECK-START-X86: java.lang.Class Main.$noinline$getAppImageClass() pc_relative_fixups_x86 (after)
+  /// CHECK-DAG:            X86ComputeBaseMethodAddress
+  /// CHECK-DAG:            LoadClass load_kind:AppImageRelRo class_name:AppImageClass
+
+  public static Class<?> $noinline$getAppImageClass() {
+    // AppImageClass class is in the app image.
+    return AppImageClass.class;
+  }
+
+  /// CHECK-START-{ARM,ARM64,X86,X86_64,RISCV64}: java.lang.String Main.$noinline$toHexString(int) builder (after)
   /// CHECK:                InvokeStaticOrDirect method_load_kind:BootImageRelRo
   public static String $noinline$toHexString(int value) {
     return Integer.toString(value, 16);
   }
 
-  /// CHECK-START-{ARM,ARM64,X86,X86_64}: java.lang.String Main.$noinline$toHexStringIndirect(int) builder (after)
+  /// CHECK-START-{ARM,ARM64,X86,X86_64,RISCV64}: java.lang.String Main.$noinline$toHexStringIndirect(int) builder (after)
   /// CHECK:                InvokeStaticOrDirect method_load_kind:BssEntry
 
   /// CHECK-START-X86: java.lang.String Main.$noinline$toHexStringIndirect(int) pc_relative_fixups_x86 (before)
@@ -206,6 +225,7 @@ public class Main {
 
   public static void main(String[] args) {
     assertIntEquals(1, testSimple(1));
+    assertIntEquals(1, testSimpleAppImage(1));
     assertIntEquals(1, testDiamond(false, 1));
     assertIntEquals(-1, testDiamond(true, 1));
     assertIntEquals(3, testLoop(new int[]{ 2 }, 1));
@@ -222,5 +242,14 @@ public class Main {
   }
 }
 
+class AppImageClass {
+  public static int $noinline$foo(int x) {
+    return x;
+  }
+}
+
 class Other {
+}
+
+class MainExtension extends Main {
 }

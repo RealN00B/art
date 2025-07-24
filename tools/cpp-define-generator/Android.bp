@@ -15,26 +15,32 @@
 //
 
 // This produces human-readable asm_defines.s with the embedded compile-time constants.
+package {
+    // See: http://go/android-license-faq
+    // A large-scale-change added 'default_applicable_licenses' to import
+    // all of the 'license_kinds' from "art_license"
+    // to get the below license kinds:
+    //   SPDX-license-identifier-Apache-2.0
+    default_applicable_licenses: ["art_license"],
+}
+
 cc_object {
     name: "asm_defines.s",
     host_supported: true,
     device_supported: true,
-    defaults: [
-        "art_debug_defaults",
-        "art_defaults",
-    ],
+    defaults: ["art_debug_defaults"],
     header_libs: [
         "art_libartbase_headers", // For base/bit_utils.h
         "jni_headers",
-        "libart_runtime_headers_ndk",
+        "libart_headers",
         "libdexfile_all_headers", // For dex/modifiers.h
     ],
     // Produce text file rather than binary.
     cflags: ["-S"],
     srcs: ["asm_defines.cc"],
     apex_available: [
+        "com.android.art",
         "com.android.art.debug",
-        "com.android.art.release",
     ],
 }
 
@@ -51,13 +57,31 @@ cc_genrule {
         darwin: {
             enabled: false,
         },
+        windows: {
+            // When the module is enabled globally in the soong_config_variables
+            // stanza above, it gets enabled on windows too. Hence we need to
+            // disable it explicitly.
+            // TODO(b/172480617): Clean up with that.
+            enabled: false,
+        },
     },
+
+    apex_available: [
+        "com.android.art",
+        "com.android.art.debug",
+    ],
 }
 
 cc_library_headers {
     name: "cpp-define-generator-definitions",
+    defaults: ["art_defaults"],
     host_supported: true,
     export_include_dirs: ["."],
+
+    apex_available: [
+        "com.android.art",
+        "com.android.art.debug",
+    ],
 }
 
 python_binary_host {

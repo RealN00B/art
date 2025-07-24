@@ -18,14 +18,15 @@
 #define ART_RUNTIME_CHECK_REFERENCE_MAP_VISITOR_H_
 
 #include "art_method-inl.h"
+#include "base/macros.h"
 #include "dex/code_item_accessors-inl.h"
 #include "dex/dex_file_types.h"
-#include "oat_quick_method_header.h"
+#include "oat/oat_quick_method_header.h"
+#include "oat/stack_map.h"
 #include "scoped_thread_state_change-inl.h"
 #include "stack.h"
-#include "stack_map.h"
 
-namespace art {
+namespace art HIDDEN {
 
 // Helper class for tests checking that the compiler keeps track of dex registers
 // holding references.
@@ -59,22 +60,39 @@ class CheckReferenceMapVisitor : public StackVisitor {
     return false;
   }
 
-  void CheckReferences(int* registers, int number_of_references, uint32_t native_pc_offset)
+  void CheckReferences(int* registers,
+                       int number_of_references,
+                       uint32_t dex_pc,
+                       uint32_t native_pc_offset,
+                       bool search_for_valid_stack_map)
       REQUIRES_SHARED(Locks::mutator_lock_) {
     CHECK(GetCurrentOatQuickMethodHeader()->IsOptimized());
-    CheckOptimizedMethod(registers, number_of_references, native_pc_offset);
+    CheckOptimizedMethod(
+        registers, number_of_references, dex_pc, native_pc_offset, search_for_valid_stack_map);
   }
 
  private:
-  void CheckOptimizedMethod(int* registers, int number_of_references, uint32_t native_pc_offset)
+  void CheckOptimizedMethod(int* registers,
+                            int number_of_references,
+                            uint32_t dex_pc,
+                            uint32_t native_pc_offset,
+                            bool search_for_valid_stack_map)
       REQUIRES_SHARED(Locks::mutator_lock_) {
     ArtMethod* m = GetMethod();
     CodeInfo code_info(GetCurrentOatQuickMethodHeader());
     StackMap stack_map = code_info.GetStackMapForNativePcOffset(native_pc_offset);
+    if (search_for_valid_stack_map && !code_info.GetStackMaskOf(stack_map).IsValid()) {
+      for (StackMap map : code_info.GetStackMaps()) {
+        if (map.GetDexPc() == dex_pc && code_info.GetStackMaskOf(map).IsValid()) {
+          stack_map = map;
+          break;
+        }
+      }
+    }
     CodeItemDataAccessor accessor(m->DexInstructionData());
     uint16_t number_of_dex_registers = accessor.RegistersSize();
 
-    if (!Runtime::Current()->IsAsyncDeoptimizeable(GetCurrentQuickFramePc())) {
+    if (!Runtime::Current()->IsAsyncDeoptimizeable(GetOuterMethod(), GetCurrentQuickFramePc())) {
       // We can only guarantee dex register info presence for debuggable methods.
       return;
     }
@@ -93,6 +111,7 @@ class CheckReferenceMapVisitor : public StackVisitor {
           CHECK(false);
           break;
         case DexRegisterLocation::Kind::kInStack:
+          CHECK(stack_mask.IsValid());
           DCHECK_EQ(location.GetValue() % kFrameSlotSize, 0);
           CHECK(stack_mask.LoadBit(location.GetValue() / kFrameSlotSize));
           break;

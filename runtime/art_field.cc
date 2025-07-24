@@ -29,7 +29,7 @@
 #include "scoped_thread_state_change-inl.h"
 #include "well_known_classes.h"
 
-namespace art {
+namespace art HIDDEN {
 
 void ArtField::SetOffset(MemberOffset num_bytes) {
   DCHECK(GetDeclaringClass()->IsLoaded() || GetDeclaringClass()->IsErroneous());
@@ -39,7 +39,7 @@ void ArtField::SetOffset(MemberOffset num_bytes) {
   offset_ = num_bytes.Uint32Value();
 }
 
-ObjPtr<mirror::Class> ArtField::ProxyFindSystemClass(const char* descriptor) {
+ObjPtr<mirror::Class> ArtField::ProxyFindSystemClass(std::string_view descriptor) {
   DCHECK(IsProxyField());
   ObjPtr<mirror::Class> klass = Runtime::Current()->GetClassLinker()->LookupClass(
       Thread::Current(), descriptor, /* class_loader= */ nullptr);
@@ -60,19 +60,12 @@ std::string ArtField::PrettyField(bool with_type) {
     result += PrettyDescriptor(GetTypeDescriptor());
     result += ' ';
   }
+  // Note: `GetDeclaringClassDescriptor()` does not support proxy classes.
   std::string temp;
   result += PrettyDescriptor(GetDeclaringClass()->GetDescriptor(&temp));
   result += '.';
   result += GetName();
   return result;
-}
-
-void ArtField::GetAccessFlagsDCheck() {
-  CHECK(GetDeclaringClass()->IsLoaded() || GetDeclaringClass()->IsErroneous());
-}
-
-void ArtField::GetOffsetDCheck() {
-  CHECK(GetDeclaringClass()->IsResolved());
 }
 
 }  // namespace art

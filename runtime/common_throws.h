@@ -20,9 +20,10 @@
 #include <string_view>
 
 #include "base/locks.h"
+#include "base/macros.h"
 #include "obj_ptr.h"
 
-namespace art {
+namespace art HIDDEN {
 namespace mirror {
 class Class;
 class Object;
@@ -33,6 +34,10 @@ class ArtMethod;
 class DexFile;
 enum InvokeType : uint32_t;
 class Signature;
+enum class StackType;
+
+// The descriptor of the transaction abort exception.
+constexpr const char kTransactionAbortErrorDescriptor[] = "Ldalvik/system/TransactionAbortError;";
 
 // AbstractMethodError
 
@@ -44,7 +49,7 @@ void ThrowAbstractMethodError(uint32_t method_idx, const DexFile& dex_file)
 
 // ArithmeticException
 
-void ThrowArithmeticExceptionDivideByZero() REQUIRES_SHARED(Locks::mutator_lock_) COLD_ATTR;
+EXPORT void ThrowArithmeticExceptionDivideByZero() REQUIRES_SHARED(Locks::mutator_lock_) COLD_ATTR;
 
 // ArrayIndexOutOfBoundsException
 
@@ -75,7 +80,7 @@ void ThrowClassCircularityError(ObjPtr<mirror::Class> c, const char* fmt, ...)
 
 // ClassCastException
 
-void ThrowClassCastException(ObjPtr<mirror::Class> dest_type, ObjPtr<mirror::Class> src_type)
+EXPORT void ThrowClassCastException(ObjPtr<mirror::Class> dest_type, ObjPtr<mirror::Class> src_type)
     REQUIRES_SHARED(Locks::mutator_lock_) COLD_ATTR;
 
 void ThrowClassCastException(const char* msg)
@@ -83,13 +88,13 @@ void ThrowClassCastException(const char* msg)
 
 // ClassFormatError
 
-void ThrowClassFormatError(ObjPtr<mirror::Class> referrer, const char* fmt, ...)
-    __attribute__((__format__(__printf__, 2, 3)))
-    REQUIRES_SHARED(Locks::mutator_lock_) COLD_ATTR;
+EXPORT void ThrowClassFormatError(ObjPtr<mirror::Class> referrer, const char* fmt, ...)
+    __attribute__((__format__(__printf__, 2, 3))) REQUIRES_SHARED(Locks::mutator_lock_) COLD_ATTR;
 
 // IllegalAccessError
 
-void ThrowIllegalAccessErrorClass(ObjPtr<mirror::Class> referrer, ObjPtr<mirror::Class> accessed)
+EXPORT void ThrowIllegalAccessErrorClass(ObjPtr<mirror::Class> referrer,
+                                         ObjPtr<mirror::Class> accessed)
     REQUIRES_SHARED(Locks::mutator_lock_) COLD_ATTR;
 
 void ThrowIllegalAccessErrorClassForMethodDispatch(ObjPtr<mirror::Class> referrer,
@@ -101,14 +106,19 @@ void ThrowIllegalAccessErrorClassForMethodDispatch(ObjPtr<mirror::Class> referre
 void ThrowIllegalAccessErrorMethod(ObjPtr<mirror::Class> referrer, ArtMethod* accessed)
     REQUIRES_SHARED(Locks::mutator_lock_) COLD_ATTR;
 
-void ThrowIllegalAccessErrorField(ObjPtr<mirror::Class> referrer, ArtField* accessed)
+EXPORT void ThrowIllegalAccessErrorField(ObjPtr<mirror::Class> referrer, ArtField* accessed)
     REQUIRES_SHARED(Locks::mutator_lock_) COLD_ATTR;
 
-void ThrowIllegalAccessErrorFinalField(ArtMethod* referrer, ArtField* accessed)
+EXPORT void ThrowIllegalAccessErrorFinalField(ArtMethod* referrer, ArtField* accessed)
     REQUIRES_SHARED(Locks::mutator_lock_) COLD_ATTR;
 
-void ThrowIllegalAccessError(ObjPtr<mirror::Class> referrer, const char* fmt, ...)
+EXPORT void ThrowIllegalAccessError(ObjPtr<mirror::Class> referrer, const char* fmt, ...)
     __attribute__((__format__(__printf__, 2, 3)))
+    REQUIRES_SHARED(Locks::mutator_lock_) COLD_ATTR;
+
+void ThrowIllegalAccessErrorForImplementingMethod(ObjPtr<mirror::Class> klass,
+                                                  ArtMethod* implementation_method,
+                                                  ArtMethod* interface_method)
     REQUIRES_SHARED(Locks::mutator_lock_) COLD_ATTR;
 
 // IllegalAccessException
@@ -123,7 +133,7 @@ void ThrowIllegalArgumentException(const char* msg)
 
 // IllegalAccessException
 
-void ThrowIllegalStateException(const char* msg)
+EXPORT void ThrowIllegalStateException(const char* msg)
     REQUIRES_SHARED(Locks::mutator_lock_) COLD_ATTR;
 
 // IncompatibleClassChangeError
@@ -134,20 +144,12 @@ void ThrowIncompatibleClassChangeError(InvokeType expected_type,
                                        ArtMethod* referrer)
     REQUIRES_SHARED(Locks::mutator_lock_) COLD_ATTR;
 
-void ThrowIncompatibleClassChangeErrorClassForInterfaceSuper(ArtMethod* method,
-                                                             ObjPtr<mirror::Class> target_class,
-                                                             ObjPtr<mirror::Object> this_object,
-                                                             ArtMethod* referrer)
+EXPORT void ThrowIncompatibleClassChangeErrorClassForInterfaceDispatch(
+    ArtMethod* interface_method, ObjPtr<mirror::Object> this_object, ArtMethod* referrer)
     REQUIRES_SHARED(Locks::mutator_lock_) COLD_ATTR;
 
-void ThrowIncompatibleClassChangeErrorClassForInterfaceDispatch(ArtMethod* interface_method,
-                                                                ObjPtr<mirror::Object> this_object,
-                                                                ArtMethod* referrer)
-    REQUIRES_SHARED(Locks::mutator_lock_) COLD_ATTR;
-
-void ThrowIncompatibleClassChangeErrorField(ArtField* resolved_field,
-                                            bool is_static,
-                                            ArtMethod* referrer)
+EXPORT void ThrowIncompatibleClassChangeErrorField(
+    ArtField* resolved_field, bool is_static, ArtMethod* referrer)
     REQUIRES_SHARED(Locks::mutator_lock_) COLD_ATTR;
 
 void ThrowIncompatibleClassChangeError(ObjPtr<mirror::Class> referrer, const char* fmt, ...)
@@ -188,7 +190,7 @@ void ThrowWrappedLinkageError(ObjPtr<mirror::Class> referrer, const char* fmt, .
 
 // NegativeArraySizeException
 
-void ThrowNegativeArraySizeException(int size)
+EXPORT void ThrowNegativeArraySizeException(int size)
     REQUIRES_SHARED(Locks::mutator_lock_) COLD_ATTR;
 
 void ThrowNegativeArraySizeException(const char* msg)
@@ -197,10 +199,10 @@ void ThrowNegativeArraySizeException(const char* msg)
 
 // NoSuchFieldError
 
-void ThrowNoSuchFieldError(std::string_view scope,
-                           ObjPtr<mirror::Class> c,
-                           std::string_view type,
-                           std::string_view name)
+EXPORT void ThrowNoSuchFieldError(std::string_view scope,
+                                  ObjPtr<mirror::Class> c,
+                                  std::string_view type,
+                                  std::string_view name)
     REQUIRES_SHARED(Locks::mutator_lock_) COLD_ATTR;
 
 void ThrowNoSuchFieldException(ObjPtr<mirror::Class> c, std::string_view name)
@@ -214,27 +216,29 @@ void ThrowNoSuchMethodError(InvokeType type,
                             const Signature& signature)
     REQUIRES_SHARED(Locks::mutator_lock_) COLD_ATTR;
 
+void ThrowNoSuchMethodError(ObjPtr<mirror::Class> c,
+                            std::string_view name,
+                            const Signature& signature)
+    REQUIRES_SHARED(Locks::mutator_lock_) COLD_ATTR;
+
 // NullPointerException
-
-void ThrowNullPointerExceptionForFieldAccess(ArtField* field,
-                                             bool is_read)
+EXPORT
+void ThrowNullPointerExceptionForFieldAccess(ArtField* field, ArtMethod* method, bool is_read)
     REQUIRES_SHARED(Locks::mutator_lock_) COLD_ATTR;
 
-void ThrowNullPointerExceptionForMethodAccess(uint32_t method_idx,
-                                              InvokeType type)
+EXPORT void ThrowNullPointerExceptionForMethodAccess(uint32_t method_idx, InvokeType type)
     REQUIRES_SHARED(Locks::mutator_lock_) COLD_ATTR;
 
-void ThrowNullPointerExceptionForMethodAccess(ArtMethod* method,
-                                              InvokeType type)
+void ThrowNullPointerExceptionForMethodAccess(ArtMethod* method, InvokeType type)
     REQUIRES_SHARED(Locks::mutator_lock_) COLD_ATTR;
 
 void ThrowNullPointerExceptionFromDexPC(bool check_address = false, uintptr_t addr = 0)
     REQUIRES_SHARED(Locks::mutator_lock_) COLD_ATTR;
 
-void ThrowNullPointerException(const char* msg)
+EXPORT void ThrowNullPointerException(const char* msg)
     REQUIRES_SHARED(Locks::mutator_lock_) COLD_ATTR;
 
-void ThrowNullPointerException()
+EXPORT void ThrowNullPointerException()
     REQUIRES_SHARED(Locks::mutator_lock_) COLD_ATTR;
 
 // ReadOnlyBufferException
@@ -255,6 +259,7 @@ void ThrowSecurityException(const char* fmt, ...)
 
 // Stack overflow.
 
+template <StackType stack_type>
 void ThrowStackOverflowError(Thread* self) REQUIRES_SHARED(Locks::mutator_lock_) COLD_ATTR;
 
 // StringIndexOutOfBoundsException

@@ -20,7 +20,7 @@
 #include "base/bit_utils_iterator.h"
 #include "quick/quick_method_frame_info.h"
 
-namespace art {
+namespace art HIDDEN {
 namespace x86_64 {
 
 static constexpr uintptr_t gZero = 0;
@@ -31,12 +31,13 @@ void X86_64Context::Reset() {
   gprs_[RSP] = &rsp_;
   gprs_[RDI] = &arg0_;
   // Initialize registers with easy to spot debug values.
-  rsp_ = X86_64Context::kBadGprBase + RSP;
-  rip_ = X86_64Context::kBadGprBase + kNumberOfCpuRegisters;
+  rsp_ = kBadGprBase + RSP;
+  rip_ = kBadGprBase + kNumberOfCpuRegisters;
   arg0_ = 0;
 }
 
 void X86_64Context::FillCalleeSaves(uint8_t* frame, const QuickMethodFrameInfo& frame_info) {
+  const size_t frame_size = frame_info.FrameSizeInBytes();
   int spill_pos = 0;
 
   // Core registers come first, from the highest down to the lowest.
@@ -44,7 +45,7 @@ void X86_64Context::FillCalleeSaves(uint8_t* frame, const QuickMethodFrameInfo& 
       frame_info.CoreSpillMask() & ~(static_cast<uint32_t>(-1) << kNumberOfCpuRegisters);
   DCHECK_EQ(1, POPCOUNT(frame_info.CoreSpillMask() & ~core_regs));  // Return address spill.
   for (uint32_t core_reg : HighToLowBits(core_regs)) {
-    gprs_[core_reg] = CalleeSaveAddress(frame, spill_pos, frame_info.FrameSizeInBytes());
+    gprs_[core_reg] = CalleeSaveAddress<InstructionSet::kX86_64>(frame, spill_pos, frame_size);
     ++spill_pos;
   }
   DCHECK_EQ(spill_pos, POPCOUNT(frame_info.CoreSpillMask()) - 1);
@@ -54,7 +55,7 @@ void X86_64Context::FillCalleeSaves(uint8_t* frame, const QuickMethodFrameInfo& 
   DCHECK_EQ(0u, fp_regs & (static_cast<uint32_t>(-1) << kNumberOfFloatRegisters));
   for (uint32_t fp_reg : HighToLowBits(fp_regs)) {
     fprs_[fp_reg] = reinterpret_cast<uint64_t*>(
-        CalleeSaveAddress(frame, spill_pos, frame_info.FrameSizeInBytes()));
+        CalleeSaveAddress<InstructionSet::kX86_64>(frame, spill_pos, frame_size));
     ++spill_pos;
   }
   DCHECK_EQ(spill_pos,
@@ -100,26 +101,19 @@ void X86_64Context::SetFPR(uint32_t reg, uintptr_t value) {
   *fprs_[reg] = value;
 }
 
-extern "C" NO_RETURN void art_quick_do_long_jump(uintptr_t*, uintptr_t*);
-
-void X86_64Context::DoLongJump() {
+void X86_64Context::CopyContextTo(uintptr_t* gprs, uintptr_t* fprs) {
 #if defined(__x86_64__)
-  uintptr_t gprs[kNumberOfCpuRegisters + 1];
-  uintptr_t fprs[kNumberOfFloatRegisters];
-
   for (size_t i = 0; i < kNumberOfCpuRegisters; ++i) {
-    gprs[kNumberOfCpuRegisters - i - 1] = gprs_[i] != nullptr ? *gprs_[i] : X86_64Context::kBadGprBase + i;
+    gprs[kNumberOfCpuRegisters - i - 1] = gprs_[i] != nullptr ? *gprs_[i] : kBadGprBase + i;
   }
   for (size_t i = 0; i < kNumberOfFloatRegisters; ++i) {
-    fprs[i] = fprs_[i] != nullptr ? *fprs_[i] : X86_64Context::kBadFprBase + i;
+    fprs[i] = fprs_[i] != nullptr ? *fprs_[i] : kBadFprBase + i;
   }
 
   // We want to load the stack pointer one slot below so that the ret will pop eip.
   uintptr_t rsp = gprs[kNumberOfCpuRegisters - RSP - 1] - sizeof(intptr_t);
   gprs[kNumberOfCpuRegisters] = rsp;
   *(reinterpret_cast<uintptr_t*>(rsp)) = rip_;
-
-  art_quick_do_long_jump(gprs, fprs);
 #else
   UNIMPLEMENTED(FATAL);
   UNREACHABLE();

@@ -38,10 +38,14 @@ public class Main {
     boolean baseline = args.length > 1 && args[1].equals("--base");
 
     // Enable allocation tracking so we get stack traces in the heap dump.
-    DdmVmInternal.enableRecentAllocations(true);
+    DdmVmInternal.setRecentAllocationsTrackingEnabled(true);
 
     // Allocate the instance of DumpedStuff.
     stuff = new DumpedStuff(baseline);
+
+    // Preemptively garbage collect to avoid an inopportune GC triggering
+    // after this.
+    Runtime.getRuntime().gc();
 
     // Create a bunch of unreachable objects pointing to basicString for the
     // reverseReferencesAreNotUnreachable test

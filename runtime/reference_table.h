@@ -24,10 +24,14 @@
 
 #include "base/allocator.h"
 #include "base/locks.h"
+#include "base/macros.h"
 #include "gc_root.h"
 #include "obj_ptr.h"
 
-namespace art {
+namespace art HIDDEN {
+namespace jni {
+class LocalReferenceTable;
+}  // namespace jni
 namespace mirror {
 class Object;
 }  // namespace mirror
@@ -51,16 +55,17 @@ class ReferenceTable {
       REQUIRES_SHARED(Locks::mutator_lock_)
       REQUIRES(!Locks::alloc_tracker_lock_);
 
-  void VisitRoots(RootVisitor* visitor, const RootInfo& root_info)
+  EXPORT void VisitRoots(RootVisitor* visitor, const RootInfo& root_info)
       REQUIRES_SHARED(Locks::mutator_lock_);
 
  private:
-  typedef std::vector<GcRoot<mirror::Object>,
-                      TrackingAllocator<GcRoot<mirror::Object>, kAllocatorTagReferenceTable>> Table;
+  using Table = std::vector<GcRoot<mirror::Object>,
+                            TrackingAllocator<GcRoot<mirror::Object>, kAllocatorTagReferenceTable>>;
   static void Dump(std::ostream& os, Table& entries)
       REQUIRES_SHARED(Locks::mutator_lock_)
       REQUIRES(!Locks::alloc_tracker_lock_);
   friend class IndirectReferenceTable;  // For Dump.
+  friend class jni::LocalReferenceTable;  // For Dump.
 
   std::string name_;
   Table entries_;

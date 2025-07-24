@@ -29,25 +29,24 @@
  * questions.
  */
 
-#include <android-base/thread_annotations.h>
+#include "events.h"
 
-#include "alloc_manager.h"
-#include "base/locks.h"
-#include "base/mutex.h"
-#include "events-inl.h"
+#include <sys/time.h>
 
 #include <array>
 #include <functional>
-#include <sys/time.h>
 
+#include "alloc_manager.h"
+#include "android-base/thread_annotations.h"
 #include "arch/context.h"
 #include "art_field-inl.h"
 #include "art_jvmti.h"
 #include "art_method-inl.h"
+#include "base/locks.h"
 #include "base/mutex.h"
 #include "deopt_manager.h"
 #include "dex/dex_file_types.h"
-#include "events.h"
+#include "events-inl.h"
 #include "gc/allocation_listener.h"
 #include "gc/gc_pause_listener.h"
 #include "gc/heap.h"
@@ -71,8 +70,8 @@
 #include "scoped_thread_state_change-inl.h"
 #include "scoped_thread_state_change.h"
 #include "stack.h"
-#include "thread.h"
 #include "thread-inl.h"
+#include "thread.h"
 #include "thread_list.h"
 #include "ti_phase.h"
 #include "ti_thread.h"
@@ -300,7 +299,6 @@ class JvmtiDdmChunkListener : public art::DdmCallback {
       art::Thread* self = art::Thread::Current();
       handler_->DispatchEvent<ArtJvmtiEvent::kDdmPublishChunk>(
           self,
-          static_cast<JNIEnv*>(self->GetJniEnv()),
           static_cast<jint>(type),
           static_cast<jint>(data.size()),
           reinterpret_cast<const jbyte*>(data.data()));
@@ -448,9 +446,8 @@ class JvmtiParkListener : public art::ParkCallback {
     if (handler_->IsEventEnabledAnywhere(ArtJvmtiEvent::kMonitorWait)) {
       art::Thread* self = art::Thread::Current();
       art::JNIEnvExt* jnienv = self->GetJniEnv();
-      art::ArtField* parkBlockerField = art::jni::DecodeArtField(
-          art::WellKnownClasses::java_lang_Thread_parkBlocker);
-      art::ObjPtr<art::mirror::Object> blocker_obj = parkBlockerField->GetObj(self->GetPeer());
+      art::ObjPtr<art::mirror::Object> blocker_obj =
+          art::WellKnownClasses::java_lang_Thread_parkBlocker->GetObj(self->GetPeer());
       if (blocker_obj.IsNull()) {
         blocker_obj = self->GetPeer();
       }
@@ -506,9 +503,8 @@ class JvmtiParkListener : public art::ParkCallback {
     if (handler_->IsEventEnabledAnywhere(ArtJvmtiEvent::kMonitorWaited)) {
       art::Thread* self = art::Thread::Current();
       art::JNIEnvExt* jnienv = self->GetJniEnv();
-      art::ArtField* parkBlockerField = art::jni::DecodeArtField(
-          art::WellKnownClasses::java_lang_Thread_parkBlocker);
-      art::ObjPtr<art::mirror::Object> blocker_obj = parkBlockerField->GetObj(self->GetPeer());
+      art::ObjPtr<art::mirror::Object> blocker_obj =
+          art::WellKnownClasses::java_lang_Thread_parkBlocker->GetObj(self->GetPeer());
       if (blocker_obj.IsNull()) {
         blocker_obj = self->GetPeer();
       }
@@ -625,10 +621,7 @@ class JvmtiMethodTraceListener final : public art::instrumentation::Instrumentat
   }
 
   // Call-back for when a method is entered.
-  void MethodEntered(art::Thread* self,
-                     art::Handle<art::mirror::Object> this_object ATTRIBUTE_UNUSED,
-                     art::ArtMethod* method,
-                     uint32_t dex_pc ATTRIBUTE_UNUSED)
+  void MethodEntered(art::Thread* self, art::ArtMethod* method)
       REQUIRES_SHARED(art::Locks::mutator_lock_) override {
     if (!method->IsRuntimeMethod() &&
         event_handler_->IsEventEnabledAnywhere(ArtJvmtiEvent::kMethodEntry)) {
@@ -643,9 +636,7 @@ class JvmtiMethodTraceListener final : public art::instrumentation::Instrumentat
   // TODO Maybe try to combine this with below using templates?
   // Callback for when a method is exited with a reference return value.
   void MethodExited(art::Thread* self,
-                    art::Handle<art::mirror::Object> this_object ATTRIBUTE_UNUSED,
                     art::ArtMethod* method,
-                    uint32_t dex_pc ATTRIBUTE_UNUSED,
                     art::instrumentation::OptionalFrame frame,
                     art::MutableHandle<art::mirror::Object>& return_value)
       REQUIRES_SHARED(art::Locks::mutator_lock_) override {
@@ -698,9 +689,7 @@ class JvmtiMethodTraceListener final : public art::instrumentation::Instrumentat
 
   // Call-back for when a method is exited.
   void MethodExited(art::Thread* self,
-                    art::Handle<art::mirror::Object> this_object ATTRIBUTE_UNUSED,
                     art::ArtMethod* method,
-                    uint32_t dex_pc ATTRIBUTE_UNUSED,
                     art::instrumentation::OptionalFrame frame,
                     art::JValue& return_value) REQUIRES_SHARED(art::Locks::mutator_lock_) override {
     if (frame.has_value() &&
@@ -748,10 +737,7 @@ class JvmtiMethodTraceListener final : public art::instrumentation::Instrumentat
 
   // Call-back for when a method is popped due to an exception throw. A method will either cause a
   // MethodExited call-back or a MethodUnwind call-back when its activation is removed.
-  void MethodUnwind(art::Thread* self,
-                    art::Handle<art::mirror::Object> this_object ATTRIBUTE_UNUSED,
-                    art::ArtMethod* method,
-                    uint32_t dex_pc ATTRIBUTE_UNUSED)
+  void MethodUnwind(art::Thread* self, art::ArtMethod* method, [[maybe_unused]] uint32_t dex_pc)
       REQUIRES_SHARED(art::Locks::mutator_lock_) override {
     if (!method->IsRuntimeMethod() &&
         event_handler_->IsEventEnabledAnywhere(ArtJvmtiEvent::kMethodExit)) {
@@ -779,10 +765,9 @@ class JvmtiMethodTraceListener final : public art::instrumentation::Instrumentat
 
   // Call-back for when the dex pc moves in a method.
   void DexPcMoved(art::Thread* self,
-                  art::Handle<art::mirror::Object> this_object ATTRIBUTE_UNUSED,
+                  [[maybe_unused]] art::Handle<art::mirror::Object> this_object,
                   art::ArtMethod* method,
-                  uint32_t new_dex_pc)
-      REQUIRES_SHARED(art::Locks::mutator_lock_) override {
+                  uint32_t new_dex_pc) REQUIRES_SHARED(art::Locks::mutator_lock_) override {
     DCHECK(!method->IsRuntimeMethod());
     // Default methods might be copied to multiple classes. We need to get the canonical version of
     // this method so that we can check for breakpoints correctly.
@@ -1046,10 +1031,10 @@ class JvmtiMethodTraceListener final : public art::instrumentation::Instrumentat
   }
 
   // Call-back for when we execute a branch.
-  void Branch(art::Thread* self ATTRIBUTE_UNUSED,
-              art::ArtMethod* method ATTRIBUTE_UNUSED,
-              uint32_t dex_pc ATTRIBUTE_UNUSED,
-              int32_t dex_pc_offset ATTRIBUTE_UNUSED)
+  void Branch([[maybe_unused]] art::Thread* self,
+              [[maybe_unused]] art::ArtMethod* method,
+              [[maybe_unused]] uint32_t dex_pc,
+              [[maybe_unused]] int32_t dex_pc_offset)
       REQUIRES_SHARED(art::Locks::mutator_lock_) override {
     return;
   }
@@ -1141,13 +1126,11 @@ static DeoptRequirement GetDeoptRequirement(ArtJvmtiEvent event, jthread thread)
   switch (event) {
     case ArtJvmtiEvent::kBreakpoint:
     case ArtJvmtiEvent::kException:
-      return DeoptRequirement::kLimited;
-    // TODO MethodEntry is needed due to inconsistencies between the interpreter and the trampoline
-    // in how to handle exceptions.
     case ArtJvmtiEvent::kMethodEntry:
+    case ArtJvmtiEvent::kMethodExit:
+      return DeoptRequirement::kLimited;
     case ArtJvmtiEvent::kExceptionCatch:
       return DeoptRequirement::kFull;
-    case ArtJvmtiEvent::kMethodExit:
     case ArtJvmtiEvent::kFieldModification:
     case ArtJvmtiEvent::kFieldAccess:
     case ArtJvmtiEvent::kSingleStep:
@@ -1264,11 +1247,11 @@ void EventHandler::HandleLocalAccessCapabilityAdded() {
       }
       for (auto& m : klass->GetMethods(art::kRuntimePointerSize)) {
         const void* code = m.GetEntryPointFromQuickCompiledCode();
-        if (m.IsNative() || m.IsProxyMethod()) {
+        if (m.IsNative() || m.IsProxyMethod() || !m.IsInvokable()) {
           continue;
         } else if (!runtime_->GetClassLinker()->IsQuickToInterpreterBridge(code) &&
-                   !runtime_->IsAsyncDeoptimizeable(reinterpret_cast<uintptr_t>(code))) {
-          runtime_->GetInstrumentation()->UpdateMethodsCodeToInterpreterEntryPoint(&m);
+                   !runtime_->IsAsyncDeoptimizeable(&m, reinterpret_cast<uintptr_t>(code))) {
+          runtime_->GetInstrumentation()->InitializeMethodsCode(&m, /*aot_code=*/ nullptr);
         }
       }
       return true;

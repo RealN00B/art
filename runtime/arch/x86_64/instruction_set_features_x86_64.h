@@ -18,8 +18,9 @@
 #define ART_RUNTIME_ARCH_X86_64_INSTRUCTION_SET_FEATURES_X86_64_H_
 
 #include "arch/x86/instruction_set_features_x86.h"
+#include "base/macros.h"
 
-namespace art {
+namespace art HIDDEN {
 
 class X86_64InstructionSetFeatures;
 using X86_64FeaturesUniquePtr = std::unique_ptr<const X86_64InstructionSetFeatures>;
@@ -57,6 +58,11 @@ class X86_64InstructionSetFeatures final : public X86InstructionSetFeatures {
   // InstructionSetFeatures. This works around kernel bugs in AT_HWCAP and /proc/cpuinfo.
   static X86_64FeaturesUniquePtr FromAssembly() {
     return Convert(X86InstructionSetFeatures::FromAssembly(true));
+  }
+
+  // Use external cpu_features library.
+  static X86_64FeaturesUniquePtr FromCpuFeatures() {
+    return Convert(X86InstructionSetFeatures::FromCpuFeatures(true));
   }
 
   InstructionSet GetInstructionSet() const override {

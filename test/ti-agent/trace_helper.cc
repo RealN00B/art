@@ -303,7 +303,7 @@ static void methodEntryCB(jvmtiEnv* jvmti,
 
 static void classPrepareCB(jvmtiEnv* jvmti,
                            JNIEnv* jnienv,
-                           jthread thr ATTRIBUTE_UNUSED,
+                           [[maybe_unused]] jthread thr,
                            jclass klass) {
   TraceData* data = nullptr;
   if (JvmtiErrorToException(jnienv, jvmti,
@@ -441,7 +441,7 @@ static bool GetFieldAndClass(JNIEnv* env,
 
 extern "C" JNIEXPORT void JNICALL Java_art_Trace_watchFieldModification(
     JNIEnv* env,
-    jclass trace ATTRIBUTE_UNUSED,
+    [[maybe_unused]] jclass trace,
     jobject field_obj) {
   jfieldID field;
   jclass klass;
@@ -455,7 +455,7 @@ extern "C" JNIEXPORT void JNICALL Java_art_Trace_watchFieldModification(
 
 extern "C" JNIEXPORT void JNICALL Java_art_Trace_watchFieldAccess(
     JNIEnv* env,
-    jclass trace ATTRIBUTE_UNUSED,
+    [[maybe_unused]] jclass trace,
     jobject field_obj) {
   jfieldID field;
   jclass klass;
@@ -466,9 +466,18 @@ extern "C" JNIEXPORT void JNICALL Java_art_Trace_watchFieldAccess(
   env->DeleteLocalRef(klass);
 }
 
+extern "C" JNIEXPORT void JNICALL Java_art_Trace_nativeEnableFramePopEvents(JNIEnv* env) {
+  jvmtiCapabilities caps;
+  memset(&caps, 0, sizeof(caps));
+  caps.can_pop_frame = 1;
+  if (JvmtiErrorToException(env, jvmti_env, jvmti_env->AddCapabilities(&caps))) {
+    return;
+  }
+}
+
 extern "C" JNIEXPORT void JNICALL Java_art_Trace_enableTracing2(
     JNIEnv* env,
-    jclass trace ATTRIBUTE_UNUSED,
+    [[maybe_unused]] jclass trace,
     jclass klass,
     jobject enter,
     jobject exit,
@@ -610,7 +619,7 @@ extern "C" JNIEXPORT void JNICALL Java_art_Trace_enableTracing(
 }
 
 extern "C" JNIEXPORT void JNICALL Java_art_Trace_disableTracing(
-    JNIEnv* env, jclass klass ATTRIBUTE_UNUSED, jthread thr) {
+    JNIEnv* env, [[maybe_unused]] jclass klass, jthread thr) {
   TraceData* data = nullptr;
   if (JvmtiErrorToException(
       env, jvmti_env, jvmti_env->GetEnvironmentLocalStorage(reinterpret_cast<void**>(&data)))) {

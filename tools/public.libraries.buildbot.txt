@@ -1,4 +1,3 @@
-libbacktrace.so
 libc.so
 libc++.so
 libdl.so

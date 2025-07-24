@@ -17,15 +17,16 @@
 #ifndef ART_LIBARTBASE_BASE_COMMON_ART_TEST_H_
 #define ART_LIBARTBASE_BASE_COMMON_ART_TEST_H_
 
-#include <gtest/gtest.h>
+#include <sys/types.h>
+#include <sys/wait.h>
 
 #include <functional>
 #include <string>
+#include <vector>
 
-#include <sys/wait.h>
-
-#include <android-base/logging.h>
-
+#include "android-base/logging.h"
+#include "android-base/properties.h"
+#include "android-base/scopeguard.h"
 #include "base/file_utils.h"
 #include "base/globals.h"
 #include "base/memory_tool.h"
@@ -33,8 +34,8 @@
 #include "base/os.h"
 #include "base/unix_file/fd_file.h"
 #include "dex/art_dex_file_loader.h"
-#include "dex/compact_dex_level.h"
 #include "dex/compact_dex_file.h"
+#include "gtest/gtest.h"
 
 namespace art {
 
@@ -45,7 +46,7 @@ class DexFile;
 
 class ScratchDir {
  public:
-  ScratchDir();
+  explicit ScratchDir(bool keep_files = false);
 
   ~ScratchDir();
 
@@ -55,6 +56,7 @@ class ScratchDir {
 
  private:
   std::string path_;
+  bool keep_files_;  // Useful for debugging.
 
   DISALLOW_COPY_AND_ASSIGN(ScratchDir);
 };
@@ -93,70 +95,39 @@ class ScratchFile {
   std::unique_ptr<File> file_;
 };
 
-// Close to store a fake dex file and its underlying data.
-class FakeDex {
+// Helper class that removes an environment variable whilst in scope.
+class ScopedUnsetEnvironmentVariable {
  public:
-  static std::unique_ptr<FakeDex> Create(
-      const std::string& location,
-      uint32_t checksum,
-      uint32_t num_method_ids) {
-    FakeDex* fake_dex = new FakeDex();
-    fake_dex->dex = CreateFakeDex(location, checksum, num_method_ids, &fake_dex->storage);
-    return std::unique_ptr<FakeDex>(fake_dex);
+  explicit ScopedUnsetEnvironmentVariable(const char* variable)
+      : variable_{variable}, old_value_{GetOldValue(variable)} {
+    unsetenv(variable);
   }
 
-  static std::unique_ptr<const DexFile> CreateFakeDex(
-      const std::string& location,
-      uint32_t checksum,
-      uint32_t num_method_ids,
-      std::vector<uint8_t>* storage) {
-    storage->resize(kPageSize);
-    CompactDexFile::Header* header =
-        const_cast<CompactDexFile::Header*>(CompactDexFile::Header::At(storage->data()));
-    CompactDexFile::WriteMagic(header->magic_);
-    CompactDexFile::WriteCurrentVersion(header->magic_);
-    header->data_off_ = 0;
-    header->data_size_ = storage->size();
-    header->method_ids_size_ = num_method_ids;
-
-    const DexFileLoader dex_file_loader;
-    std::string error_msg;
-    std::unique_ptr<const DexFile> dex(dex_file_loader.Open(storage->data(),
-                                                            storage->size(),
-                                                            location,
-                                                            checksum,
-                                                            /*oat_dex_file=*/nullptr,
-                                                            /*verify=*/false,
-                                                            /*verify_checksum=*/false,
-                                                            &error_msg));
-    CHECK(dex != nullptr) << error_msg;
-    return dex;
-  }
-
-  std::unique_ptr<const DexFile>& Dex() {
-    return dex;
+  ~ScopedUnsetEnvironmentVariable() {
+    if (old_value_.has_value()) {
+      static constexpr int kReplace = 1;  // tidy-issue: replace argument has libc dependent name.
+      setenv(variable_, old_value_.value().c_str(), kReplace);
+    } else {
+      unsetenv(variable_);
+    }
   }
 
  private:
-  std::vector<uint8_t> storage;
-  std::unique_ptr<const DexFile> dex;
-};
-
-// Convenience class to store multiple fake dex files in order to make
-// allocation/de-allocation easier in tests.
-class FakeDexStorage {
- public:
-  const DexFile* AddFakeDex(
-      const std::string& location,
-      uint32_t checksum,
-      uint32_t num_method_ids) {
-    fake_dex_files.push_back(FakeDex::Create(location, checksum, num_method_ids));
-    return fake_dex_files.back()->Dex().get();
+  static std::optional<std::string> GetOldValue(const char* variable) {
+    const char* value = getenv(variable);
+    return value != nullptr ? std::optional<std::string>{value} : std::nullopt;
   }
 
- private:
-  std::vector<std::unique_ptr<FakeDex>> fake_dex_files;
+  const char* variable_;
+  std::optional<std::string> old_value_;
+  DISALLOW_COPY_AND_ASSIGN(ScopedUnsetEnvironmentVariable);
 };
+
+// Temporarily drops all root capabilities when the test is run as root. This is a noop otherwise.
+android::base::ScopeGuard<std::function<void()>> ScopedUnroot();
+
+// Temporarily drops all permissions on a file/directory.
+android::base::ScopeGuard<std::function<void()>> ScopedInaccessible(const std::string& path);
 
 class CommonArtTestImpl {
  public:
@@ -175,6 +146,8 @@ class CommonArtTestImpl {
 
   static void TearDownAndroidDataDir(const std::string& android_data, bool fail_on_error);
 
+  static void ClearDirectory(const char* dirpath, bool recursive = true);
+
   // Get the names of the libcore modules.
   virtual std::vector<std::string> GetLibCoreModuleNames() const;
 
@@ -184,17 +157,14 @@ class CommonArtTestImpl {
   // Gets the paths of the libcore dex files.
   std::vector<std::string> GetLibCoreDexFileNames() const;
 
-  // Gets the locations of the libcore dex files for given modules.
+  // Gets the on-host or on-device locations of the libcore dex files for given modules.
   std::vector<std::string> GetLibCoreDexLocations(const std::vector<std::string>& modules) const;
 
-  // Gets the locations of the libcore dex files.
+  // Gets the on-host or on-device locations of the libcore dex files.
   std::vector<std::string> GetLibCoreDexLocations() const;
 
   static std::string GetClassPathOption(const char* option,
                                         const std::vector<std::string>& class_path);
-
-  // Returns bin directory which contains host's prebuild tools.
-  static std::string GetAndroidHostToolsDir();
 
   // Retuerns the filename for a test dex (i.e. XandY or ManyMethods).
   std::string GetTestDexFileName(const char* name) const;
@@ -203,20 +173,25 @@ class CommonArtTestImpl {
   bool MutateDexFile(File* output_dex, const std::string& input_jar, const Mutator& mutator) {
     std::vector<std::unique_ptr<const DexFile>> dex_files;
     std::string error_msg;
-    const ArtDexFileLoader dex_file_loader;
-    CHECK(dex_file_loader.Open(input_jar.c_str(),
-                               input_jar.c_str(),
-                               /*verify*/ true,
+    ArtDexFileLoader dex_file_loader(input_jar);
+    CHECK(dex_file_loader.Open(/*verify*/ true,
                                /*verify_checksum*/ true,
                                &error_msg,
-                               &dex_files)) << error_msg;
+                               &dex_files))
+        << error_msg;
     EXPECT_EQ(dex_files.size(), 1u) << "Only one input dex is supported";
     const std::unique_ptr<const DexFile>& dex = dex_files[0];
     CHECK(dex->EnableWrite()) << "Failed to enable write";
     DexFile* dex_file = const_cast<DexFile*>(dex.get());
+    size_t original_size = dex_file->Size();
     mutator(dex_file);
-    const_cast<DexFile::Header&>(dex_file->GetHeader()).checksum_ = dex_file->CalculateChecksum();
-    if (!output_dex->WriteFully(dex->Begin(), dex->Size())) {
+    // NB: mutation might have changed the DEX size in the header.
+    std::vector<uint8_t> copy(dex_file->Begin(), dex_file->Begin() + original_size);
+    copy.resize(dex_file->Size());  // Shrink/expand to new size.
+    uint32_t checksum = DexFile::CalculateChecksum(copy.data(), copy.size());
+    CHECK_GE(copy.size(), sizeof(DexFile::Header));
+    reinterpret_cast<DexFile::Header*>(copy.data())->checksum_ = checksum;
+    if (!output_dex->WriteFully(copy.data(), copy.size())) {
       return false;
     }
     if (output_dex->Flush() != 0) {
@@ -248,6 +223,9 @@ class CommonArtTestImpl {
                                        const PostForkFn& post_fork,
                                        std::string* output);
 
+  // Helper - find prebuilt tool (e.g. objdump).
+  static std::string GetAndroidTool(const char* name, InstructionSet isa = InstructionSet::kX86_64);
+
  protected:
   static bool IsHost() {
     return !kIsTargetBuild;
@@ -256,21 +234,22 @@ class CommonArtTestImpl {
   // Returns ${ANDROID_BUILD_TOP}. Ensure it has tailing /.
   static std::string GetAndroidBuildTop();
 
-  // Helper - find directory with the following format:
-  // ${ANDROID_BUILD_TOP}/${subdir1}/${subdir2}-${version}/${subdir3}/bin/
-  static std::string GetAndroidToolsDir(const std::string& subdir1,
-                                        const std::string& subdir2,
-                                        const std::string& subdir3);
+  // Returns ${ANDROID_HOST_OUT}.
+  static std::string GetAndroidHostOut();
 
-  // File location to core.art, e.g. $ANDROID_HOST_OUT/system/framework/core.art
+  // Returns the path where boot classpath and boot image files are installed
+  // for host tests (by the art_common mk module, typically built through "m
+  // art-host-tests"). Different in CI where they are unpacked from the
+  // art-host-tests.zip file.
+  static std::string GetHostBootClasspathInstallRoot();
+
+  // File location to boot.art, e.g. /apex/com.android.art/javalib/boot.art
   static std::string GetCoreArtLocation();
 
-  // File location to core.oat, e.g. $ANDROID_HOST_OUT/system/framework/core.oat
+  // File location to boot.oat, e.g. /apex/com.android.art/javalib/boot.oat
   static std::string GetCoreOatLocation();
 
   std::unique_ptr<const DexFile> LoadExpectSingleDexFile(const char* location);
-
-  void ClearDirectory(const char* dirpath, bool recursive = true);
 
   // Open a file (allows reading of framework jars).
   std::vector<std::unique_ptr<const DexFile>> OpenDexFiles(const char* filename);
@@ -283,8 +262,8 @@ class CommonArtTestImpl {
 
   std::unique_ptr<const DexFile> OpenTestDexFile(const char* name);
 
-
   std::string android_data_;
+  std::string android_system_ext_;
   std::string dalvik_cache_;
 
   virtual void SetUp();
@@ -299,6 +278,7 @@ class CommonArtTestImpl {
   std::string CreateClassPathWithChecksums(
       const std::vector<std::unique_ptr<const DexFile>>& dex_files);
 
+  static std::string GetImageDirectory();
   static std::string GetCoreFileLocation(const char* suffix);
 
   std::vector<std::unique_ptr<const DexFile>> loaded_dex_files_;
@@ -325,35 +305,50 @@ using CommonArtTest = CommonArtTestBase<testing::Test>;
 template <typename Param>
 using CommonArtTestWithParam = CommonArtTestBase<testing::TestWithParam<Param>>;
 
-#define TEST_DISABLED_FOR_TARGET() \
-  if (kIsTargetBuild) { \
-    printf("WARNING: TEST DISABLED FOR TARGET\n"); \
-    return; \
+// Returns a list of PIDs of the processes whose process name (the first commandline argument) fully
+// matches the given name.
+std::vector<pid_t> GetPidByName(const std::string& process_name);
+
+#define TEST_DISABLED_FOR_TARGET()                       \
+  if (kIsTargetBuild) {                                  \
+    GTEST_SKIP() << "WARNING: TEST DISABLED FOR TARGET"; \
   }
 
-#define TEST_DISABLED_FOR_NON_STATIC_HOST_BUILDS() \
-  if (!kHostStaticBuildEnabled) { \
-    printf("WARNING: TEST DISABLED FOR NON-STATIC HOST BUILDS\n"); \
-    return; \
+#define TEST_DISABLED_FOR_HOST()                       \
+  if (!kIsTargetBuild) {                               \
+    GTEST_SKIP() << "WARNING: TEST DISABLED FOR HOST"; \
   }
 
-#define TEST_DISABLED_FOR_MEMORY_TOOL() \
-  if (kRunningOnMemoryTool) { \
-    printf("WARNING: TEST DISABLED FOR MEMORY TOOL\n"); \
-    return; \
+#define TEST_DISABLED_FOR_NON_STATIC_HOST_BUILDS()                       \
+  if (!kHostStaticBuildEnabled) {                                        \
+    GTEST_SKIP() << "WARNING: TEST DISABLED FOR NON-STATIC HOST BUILDS"; \
   }
 
-#define TEST_DISABLED_FOR_HEAP_POISONING() \
-  if (kPoisonHeapReferences) { \
-    printf("WARNING: TEST DISABLED FOR HEAP POISONING\n"); \
-    return; \
+#define TEST_DISABLED_FOR_DEBUG_BUILD()                       \
+  if (kIsDebugBuild) {                                        \
+    GTEST_SKIP() << "WARNING: TEST DISABLED FOR DEBUG BUILD"; \
+  }
+
+#define TEST_DISABLED_FOR_MEMORY_TOOL()                       \
+  if (kRunningOnMemoryTool) {                                 \
+    GTEST_SKIP() << "WARNING: TEST DISABLED FOR MEMORY TOOL"; \
+  }
+
+#define TEST_DISABLED_FOR_HEAP_POISONING()                       \
+  if (kPoisonHeapReferences) {                                   \
+    GTEST_SKIP() << "WARNING: TEST DISABLED FOR HEAP POISONING"; \
   }
 }  // namespace art
 
-#define TEST_DISABLED_FOR_MEMORY_TOOL_WITH_HEAP_POISONING() \
-  if (kRunningOnMemoryTool && kPoisonHeapReferences) { \
-    printf("WARNING: TEST DISABLED FOR MEMORY TOOL WITH HEAP POISONING\n"); \
-    return; \
+#define TEST_DISABLED_FOR_MEMORY_TOOL_WITH_HEAP_POISONING()                       \
+  if (kRunningOnMemoryTool && kPoisonHeapReferences) {                            \
+    GTEST_SKIP() << "WARNING: TEST DISABLED FOR MEMORY TOOL WITH HEAP POISONING"; \
+  }
+
+#define TEST_DISABLED_FOR_USER_BUILD()                                          \
+  if (std::string build_type = android::base::GetProperty("ro.build.type", ""); \
+      kIsTargetBuild && build_type != "userdebug" && build_type != "eng") {     \
+    GTEST_SKIP() << "WARNING: TEST DISABLED FOR USER BUILD";                    \
   }
 
 #endif  // ART_LIBARTBASE_BASE_COMMON_ART_TEST_H_

@@ -90,7 +90,7 @@ static void AgentMain(jvmtiEnv* jenv, JNIEnv* env, void* arg) {
 }
 
 extern "C" JNIEXPORT void JNICALL Java_art_Test931_testAgentThread(
-    JNIEnv* env, jclass Main_klass ATTRIBUTE_UNUSED) {
+    JNIEnv* env, [[maybe_unused]] jclass Main_klass) {
   // Create a Thread object.
   ScopedLocalRef<jobject> thread_name(env, env->NewStringUTF("Agent Thread"));
   if (thread_name.get() == nullptr) {
@@ -120,19 +120,13 @@ extern "C" JNIEXPORT void JNICALL Java_art_Test931_testAgentThread(
     env->DeleteLocalRef(cur_thread_info.context_class_loader);
   }
 
-  jmethodID initID = env->GetMethodID(thread_klass.get(),
-                                      "<init>",
-                                      "(Ljava/lang/ThreadGroup;Ljava/lang/String;IZ)V");
+  jmethodID initID = env->GetMethodID(
+      thread_klass.get(), "<init>", "(Ljava/lang/ThreadGroup;Ljava/lang/String;)V");
   if (initID == nullptr) {
     return;
   }
-  env->CallNonvirtualVoidMethod(thread.get(),
-                                thread_klass.get(),
-                                initID,
-                                thread_group.get(),
-                                thread_name.get(),
-                                0,
-                                JNI_FALSE);
+  env->CallNonvirtualVoidMethod(
+      thread.get(), thread_klass.get(), initID, thread_group.get(), thread_name.get());
   if (env->ExceptionCheck()) {
     return;
   }

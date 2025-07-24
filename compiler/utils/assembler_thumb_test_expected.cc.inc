@@ -1,267 +1,259 @@
-const char* const VixlJniHelpersResults[] = {
-  "   0:	e92d 4de0 	stmdb	sp!, {r5, r6, r7, r8, sl, fp, lr}\n",
-  "   4:	ed2d 8a10 	vpush	{s16-s31}\n",
-  "   8:	b089      	sub	sp, #36	; 0x24\n",
-  "   a:	9000      	str	r0, [sp, #0]\n",
-  "   c:	9121      	str	r1, [sp, #132]	; 0x84\n",
-  "   e:	ed8d 0a22 	vstr	s0, [sp, #136]	; 0x88\n",
-  "  12:	9223      	str	r2, [sp, #140]	; 0x8c\n",
-  "  14:	9324      	str	r3, [sp, #144]	; 0x90\n",
-  "  16:	b088      	sub	sp, #32\n",
-  "  18:	f5ad 5d80 	sub.w	sp, sp, #4096	; 0x1000\n",
-  "  1c:	9808      	ldr	r0, [sp, #32]\n",
-  "  1e:	981f      	ldr	r0, [sp, #124]	; 0x7c\n",
-  "  20:	9821      	ldr	r0, [sp, #132]	; 0x84\n",
-  "  22:	98ff      	ldr	r0, [sp, #1020]	; 0x3fc\n",
-  "  24:	f8dd 0400 	ldr.w	r0, [sp, #1024]	; 0x400\n",
-  "  28:	f8dd cffc 	ldr.w	ip, [sp, #4092]	; 0xffc\n",
-  "  2c:	f50d 5c80 	add.w	ip, sp, #4096	; 0x1000\n",
-  "  30:	f8dc c000 	ldr.w	ip, [ip]\n",
-  "  34:	f8d9 c200 	ldr.w	ip, [r9, #512]	; 0x200\n",
-  "  38:	f8dc 0080 	ldr.w	r0, [ip, #128]	; 0x80\n",
-  "  3c:	9008      	str	r0, [sp, #32]\n",
-  "  3e:	901f      	str	r0, [sp, #124]	; 0x7c\n",
-  "  40:	9021      	str	r0, [sp, #132]	; 0x84\n",
-  "  42:	90ff      	str	r0, [sp, #1020]	; 0x3fc\n",
-  "  44:	f8cd 0400 	str.w	r0, [sp, #1024]	; 0x400\n",
-  "  48:	f8cd cffc 	str.w	ip, [sp, #4092]	; 0xffc\n",
-  "  4c:	f84d 5d04 	str.w	r5, [sp, #-4]!\n",
-  "  50:	f50d 5580 	add.w	r5, sp, #4096	; 0x1000\n",
-  "  54:	f8c5 c004 	str.w	ip, [r5, #4]\n",
-  "  58:	f85d 5b04 	ldr.w	r5, [sp], #4\n",
-  "  5c:	f04f 0cff 	mov.w	ip, #255	; 0xff\n",
-  "  60:	f8cd c030 	str.w	ip, [sp, #48]	; 0x30\n",
-  "  64:	f06f 4c7f 	mvn.w	ip, #4278190080	; 0xff000000\n",
-  "  68:	f8cd c030 	str.w	ip, [sp, #48]	; 0x30\n",
-  "  6c:	f8cd c030 	str.w	ip, [sp, #48]	; 0x30\n",
-  "  70:	f8cd c030 	str.w	ip, [sp, #48]	; 0x30\n",
-  "  74:	900c      	str	r0, [sp, #48]	; 0x30\n",
-  "  76:	f8dd c030 	ldr.w	ip, [sp, #48]	; 0x30\n",
-  "  7a:	f8cd c034 	str.w	ip, [sp, #52]	; 0x34\n",
-  "  7e:	f50d 5c80 	add.w	ip, sp, #4096	; 0x1000\n",
-  "  82:	f8c9 c200 	str.w	ip, [r9, #512]	; 0x200\n",
-  "  86:	f8c9 d200 	str.w	sp, [r9, #512]	; 0x200\n",
-  "  8a:	f8d0 e030 	ldr.w	lr, [r0, #48]	; 0x30\n",
-  "  8e:	47f0      	blx	lr\n",
-  "  90:	f8dd c02c 	ldr.w	ip, [sp, #44]	; 0x2c\n",
-  "  94:	f8cd c030 	str.w	ip, [sp, #48]	; 0x30\n",
-  "  98:	f8d9 c200 	ldr.w	ip, [r9, #512]	; 0x200\n",
-  "  9c:	f8cd c02c 	str.w	ip, [sp, #44]	; 0x2c\n",
-  "  a0:	f8dd c02c 	ldr.w	ip, [sp, #44]	; 0x2c\n",
-  "  a4:	f8cd c030 	str.w	ip, [sp, #48]	; 0x30\n",
-  "  a8:	4648      	mov	r0, r9\n",
-  "  aa:	f8cd 9030 	str.w	r9, [sp, #48]	; 0x30\n",
-  "  ae:	4604      	mov	r4, r0\n",
-  "  b0:	f1bc 0f00 	cmp.w	ip, #0\n",
-  "  b4:	bf18      	it	ne\n",
-  "  b6:	f10d 0c30 	addne.w	ip, sp, #48	; 0x30\n",
-  "  ba:	f10d 0c30 	add.w	ip, sp, #48	; 0x30\n",
-  "  be:	f1bc 0f00 	cmp.w	ip, #0\n",
-  "  c2:	bf0c      	ite	eq\n",
-  "  c4:	2000      	moveq	r0, #0\n",
-  "  c6:	a80c      	addne	r0, sp, #48	; 0x30\n",
-  "  c8:	f8dd c040 	ldr.w	ip, [sp, #64]	; 0x40\n",
-  "  cc:	f1bc 0f00 	cmp.w	ip, #0\n",
-  "  d0:	bf18      	it	ne\n",
-  "  d2:	f10d 0c40 	addne.w	ip, sp, #64	; 0x40\n",
-  "  d6:	f8cd c030 	str.w	ip, [sp, #48]	; 0x30\n",
-  "  da:	f1bc 0f00 	cmp.w	ip, #0\n",
-  "  de:	bf0c      	ite	eq\n",
-  "  e0:	2000      	moveq	r0, #0\n",
-  "  e2:	4668      	movne	r0, sp\n",
-  "  e4:	f1bc 0f00 	cmp.w	ip, #0\n",
-  "  e8:	bf0c      	ite	eq\n",
-  "  ea:	2000      	moveq	r0, #0\n",
-  "  ec:	f20d 4001 	addwne	r0, sp, #1025	; 0x401\n",
-  "  f0:	f1bc 0f00 	cmp.w	ip, #0\n",
-  "  f4:	bf18      	it	ne\n",
-  "  f6:	f20d 4c01 	addwne	ip, sp, #1025	; 0x401\n",
-  "  fa:	f8d9 c0a4 	ldr.w	ip, [r9, #164]	; 0xa4\n",
-  "  fe:	f1bc 0f00 	cmp.w	ip, #0\n",
-  " 102:	d171      	bne.n	1e8 <VixlJniHelpers+0x1e8>\n",
-  " 104:	f8cd c7ff 	str.w	ip, [sp, #2047]	; 0x7ff\n",
-  " 108:	f8cd c7ff 	str.w	ip, [sp, #2047]	; 0x7ff\n",
-  " 10c:	f8cd c7ff 	str.w	ip, [sp, #2047]	; 0x7ff\n",
-  " 110:	f8cd c7ff 	str.w	ip, [sp, #2047]	; 0x7ff\n",
-  " 114:	f8cd c7ff 	str.w	ip, [sp, #2047]	; 0x7ff\n",
-  " 118:	f8cd c7ff 	str.w	ip, [sp, #2047]	; 0x7ff\n",
-  " 11c:	f8cd c7ff 	str.w	ip, [sp, #2047]	; 0x7ff\n",
-  " 120:	f8cd c7ff 	str.w	ip, [sp, #2047]	; 0x7ff\n",
-  " 124:	f8cd c7ff 	str.w	ip, [sp, #2047]	; 0x7ff\n",
-  " 128:	f8cd c7ff 	str.w	ip, [sp, #2047]	; 0x7ff\n",
-  " 12c:	f8cd c7ff 	str.w	ip, [sp, #2047]	; 0x7ff\n",
-  " 130:	f8cd c7ff 	str.w	ip, [sp, #2047]	; 0x7ff\n",
-  " 134:	f8cd c7ff 	str.w	ip, [sp, #2047]	; 0x7ff\n",
-  " 138:	f8cd c7ff 	str.w	ip, [sp, #2047]	; 0x7ff\n",
-  " 13c:	f8cd c7ff 	str.w	ip, [sp, #2047]	; 0x7ff\n",
-  " 140:	f8cd c7ff 	str.w	ip, [sp, #2047]	; 0x7ff\n",
-  " 144:	f8cd c7ff 	str.w	ip, [sp, #2047]	; 0x7ff\n",
-  " 148:	f8cd c7ff 	str.w	ip, [sp, #2047]	; 0x7ff\n",
-  " 14c:	f8cd c7ff 	str.w	ip, [sp, #2047]	; 0x7ff\n",
-  " 150:	f8cd c7ff 	str.w	ip, [sp, #2047]	; 0x7ff\n",
-  " 154:	f8cd c7ff 	str.w	ip, [sp, #2047]	; 0x7ff\n",
-  " 158:	f8cd c7ff 	str.w	ip, [sp, #2047]	; 0x7ff\n",
-  " 15c:	f8cd c7ff 	str.w	ip, [sp, #2047]	; 0x7ff\n",
-  " 160:	f8cd c7ff 	str.w	ip, [sp, #2047]	; 0x7ff\n",
-  " 164:	f8cd c7ff 	str.w	ip, [sp, #2047]	; 0x7ff\n",
-  " 168:	f8cd c7ff 	str.w	ip, [sp, #2047]	; 0x7ff\n",
-  " 16c:	f8cd c7ff 	str.w	ip, [sp, #2047]	; 0x7ff\n",
-  " 170:	f8cd c7ff 	str.w	ip, [sp, #2047]	; 0x7ff\n",
-  " 174:	f8cd c7ff 	str.w	ip, [sp, #2047]	; 0x7ff\n",
-  " 178:	f8cd c7ff 	str.w	ip, [sp, #2047]	; 0x7ff\n",
-  " 17c:	f8cd c7ff 	str.w	ip, [sp, #2047]	; 0x7ff\n",
-  " 180:	f8cd c7ff 	str.w	ip, [sp, #2047]	; 0x7ff\n",
-  " 184:	f8cd c7ff 	str.w	ip, [sp, #2047]	; 0x7ff\n",
-  " 188:	f8cd c7ff 	str.w	ip, [sp, #2047]	; 0x7ff\n",
-  " 18c:	f8cd c7ff 	str.w	ip, [sp, #2047]	; 0x7ff\n",
-  " 190:	f8cd c7ff 	str.w	ip, [sp, #2047]	; 0x7ff\n",
-  " 194:	f8cd c7ff 	str.w	ip, [sp, #2047]	; 0x7ff\n",
-  " 198:	f8cd c7ff 	str.w	ip, [sp, #2047]	; 0x7ff\n",
-  " 19c:	f8cd c7ff 	str.w	ip, [sp, #2047]	; 0x7ff\n",
-  " 1a0:	f8cd c7ff 	str.w	ip, [sp, #2047]	; 0x7ff\n",
-  " 1a4:	f8cd c7ff 	str.w	ip, [sp, #2047]	; 0x7ff\n",
-  " 1a8:	f8cd c7ff 	str.w	ip, [sp, #2047]	; 0x7ff\n",
-  " 1ac:	f8cd c7ff 	str.w	ip, [sp, #2047]	; 0x7ff\n",
-  " 1b0:	f8cd c7ff 	str.w	ip, [sp, #2047]	; 0x7ff\n",
-  " 1b4:	f8cd c7ff 	str.w	ip, [sp, #2047]	; 0x7ff\n",
-  " 1b8:	f8cd c7ff 	str.w	ip, [sp, #2047]	; 0x7ff\n",
-  " 1bc:	f8cd c7ff 	str.w	ip, [sp, #2047]	; 0x7ff\n",
-  " 1c0:	f8cd c7ff 	str.w	ip, [sp, #2047]	; 0x7ff\n",
-  " 1c4:	f8cd c7ff 	str.w	ip, [sp, #2047]	; 0x7ff\n",
-  " 1c8:	f8cd c7ff 	str.w	ip, [sp, #2047]	; 0x7ff\n",
-  " 1cc:	f8cd c7ff 	str.w	ip, [sp, #2047]	; 0x7ff\n",
-  " 1d0:	f8cd c7ff 	str.w	ip, [sp, #2047]	; 0x7ff\n",
-  " 1d4:	f8cd c7ff 	str.w	ip, [sp, #2047]	; 0x7ff\n",
-  " 1d8:	f8cd c7ff 	str.w	ip, [sp, #2047]	; 0x7ff\n",
-  " 1dc:	f8cd c7ff 	str.w	ip, [sp, #2047]	; 0x7ff\n",
-  " 1e0:	f8cd c7ff 	str.w	ip, [sp, #2047]	; 0x7ff\n",
-  " 1e4:	f000 b802 	b.w	1ec <VixlJniHelpers+0x1ec>\n",
-  " 1e8:	f000 b81b 	b.w	222 <VixlJniHelpers+0x222>\n",
-  " 1ec:	f8cd c7ff 	str.w	ip, [sp, #2047]	; 0x7ff\n",
-  " 1f0:	f8cd c7ff 	str.w	ip, [sp, #2047]	; 0x7ff\n",
-  " 1f4:	f8cd c7ff 	str.w	ip, [sp, #2047]	; 0x7ff\n",
-  " 1f8:	f8cd c7ff 	str.w	ip, [sp, #2047]	; 0x7ff\n",
-  " 1fc:	f8cd c7ff 	str.w	ip, [sp, #2047]	; 0x7ff\n",
-  " 200:	f8cd c7ff 	str.w	ip, [sp, #2047]	; 0x7ff\n",
-  " 204:	f8cd c7ff 	str.w	ip, [sp, #2047]	; 0x7ff\n",
-  " 208:	f8cd c7ff 	str.w	ip, [sp, #2047]	; 0x7ff\n",
-  " 20c:	f50d 5d80 	add.w	sp, sp, #4096	; 0x1000\n",
-  " 210:	b008      	add	sp, #32\n",
-  " 212:	b009      	add	sp, #36	; 0x24\n",
-  " 214:	ecbd 8a10 	vpop	{s16-s31}\n",
-  " 218:	e8bd 4de0 	ldmia.w	sp!, {r5, r6, r7, r8, sl, fp, lr}\n",
-  " 21c:	f8d9 8034 	ldr.w	r8, [r9, #52]	; 0x34\n",
-  " 220:	4770      	bx	lr\n",
-  " 222:	4660      	mov	r0, ip\n",
-  " 224:	f8d9 e2e8 	ldr.w	lr, [r9, #744]	; 0x2e8\n",
-  " 228:	47f0      	blx	lr\n",
-  nullptr
+const char* const VixlJniHelpersResults = {
+  "       0: e92d 4de0     push.w {r5, r6, r7, r8, r10, r11, lr}\n"
+  "       4: ed2d 8a10     vpush {s16, s17, s18, s19, s20, s21, s22, s23, s24, s25, s26, s27, s28, s29, s30, s31}\n"
+  "       8: b081          sub sp, #4\n"
+  "       a: 9000          str r0, [sp]\n"
+  "       c: 9119          str r1, [sp, #100]\n"
+  "       e: ed8d 0a1a     vstr s0, [sp, #104]\n"
+  "      12: 921b          str r2, [sp, #108]\n"
+  "      14: 931c          str r3, [sp, #112]\n"
+  "      16: b088          sub sp, #32\n"
+  "      18: f5ad 5d80     sub.w sp, sp, #4096\n"
+  "      1c: 9808          ldr r0, [sp, #32]\n"
+  "      1e: 981f          ldr r0, [sp, #124]\n"
+  "      20: 9821          ldr r0, [sp, #132]\n"
+  "      22: 98ff          ldr r0, [sp, #1020]\n"
+  "      24: f8dd 0400     ldr.w r0, [sp, #1024]\n"
+  "      28: f8dd cffc     ldr.w r12, [sp, #4092]\n"
+  "      2c: f50d 5c80     add.w r12, sp, #4096\n"
+  "      30: f8dc c000     ldr.w r12, [r12]\n"
+  "      34: f8d9 c200     ldr.w r12, [r9, #512]\n"
+  "      38: 9008          str r0, [sp, #32]\n"
+  "      3a: 901f          str r0, [sp, #124]\n"
+  "      3c: 9021          str r0, [sp, #132]\n"
+  "      3e: 90ff          str r0, [sp, #1020]\n"
+  "      40: f8cd 0400     str.w r0, [sp, #1024]\n"
+  "      44: f8cd cffc     str.w r12, [sp, #4092]\n"
+  "      48: f84d 5d04     str r5, [sp, #-4]!\n"
+  "      4c: f50d 5580     add.w r5, sp, #4096\n"
+  "      50: f8c5 c004     str.w r12, [r5, #4]\n"
+  "      54: f85d 5b04     ldr r5, [sp], #4\n"
+  "      58: f8cd c030     str.w r12, [sp, #48]\n"
+  "      5c: f8c9 d200     str.w sp, [r9, #512]\n"
+  "      60: f04d 0c02     orr r12, sp, #2\n"
+  "      64: f8c9 c200     str.w r12, [r9, #512]\n"
+  "      68: a909          add r1, sp, #36\n"
+  "      6a: e9cd 2300     strd r2, r3, [sp]\n"
+  "      6e: e9dd 020c     ldrd r0, r2, [sp, #48]\n"
+  "      72: e9cd 0202     strd r0, r2, [sp, #8]\n"
+  "      76: e9dd 020e     ldrd r0, r2, [sp, #56]\n"
+  "      7a: 2a00          cmp r2, #0\n"
+  "      7c: bf18          it ne\n"
+  "      7e: aa0f          addne r2, sp, #60\n"
+  "      80: e9cd 0204     strd r0, r2, [sp, #16]\n"
+  "      84: 460a          mov r2, r1\n"
+  "      86: e9dd 0108     ldrd r0, r1, [sp, #32]\n"
+  "      8a: e9cd 0100     strd r0, r1, [sp]\n"
+  "      8e: f8dd c028     ldr.w r12, [sp, #40]\n"
+  "      92: f8cd c008     str.w r12, [sp, #8]\n"
+  "      96: 4610          mov r0, r2\n"
+  "      98: 4619          mov r1, r3\n"
+  "      9a: 9a07          ldr r2, [sp, #28]\n"
+  "      9c: 9b08          ldr r3, [sp, #32]\n"
+  "      9e: f8d0 e030     ldr.w lr, [r0, #48]\n"
+  "      a2: 47f0          blx lr\n"
+  "      a4: f8dd c02c     ldr.w r12, [sp, #44]\n"
+  "      a8: f8cd c030     str.w r12, [sp, #48]\n"
+  "      ac: 4648          mov r0, r9\n"
+  "      ae: f8cd 9030     str.w r9, [sp, #48]\n"
+  "      b2: 4604          mov r4, r0\n"
+  "      b4: f10d 0c30     add.w r12, sp, #48\n"
+  "      b8: f1bb 0f00     cmp.w r11, #0\n"
+  "      bc: bf18          it ne\n"
+  "      be: 46e3          movne r11, r12\n"
+  "      c0: f10d 0b30     add.w r11, sp, #48\n"
+  "      c4: ea5f 000b     movs.w r0, r11\n"
+  "      c8: bf18          it ne\n"
+  "      ca: a80c          addne r0, sp, #48\n"
+  "      cc: ea5f 000b     movs.w r0, r11\n"
+  "      d0: bf18          it ne\n"
+  "      d2: a800          addne r0, sp, #0\n"
+  "      d4: f20d 4004     addw r0, sp, #1028\n"
+  "      d8: f1bb 0f00     cmp.w r11, #0\n"
+  "      dc: bf08          it eq\n"
+  "      de: 4658          moveq r0, r11\n"
+  "      e0: f20d 4c04     addw r12, sp, #1028\n"
+  "      e4: f1bb 0f00     cmp.w r11, #0\n"
+  "      e8: bf18          it ne\n"
+  "      ea: 46e3          movne r11, r12\n"
+  "      ec: f8d9 c094     ldr.w r12, [r9, #148]\n"
+  "      f0: f1bc 0f00     cmp.w r12, #0\n"
+  "      f4: d16f          bne 0x1d6     @ imm = #222\n"
+  "      f6: f8cd c7ff     str.w r12, [sp, #2047]\n"
+  "      fa: f8cd c7ff     str.w r12, [sp, #2047]\n"
+  "      fe: f8cd c7ff     str.w r12, [sp, #2047]\n"
+  "     102: f8cd c7ff     str.w r12, [sp, #2047]\n"
+  "     106: f8cd c7ff     str.w r12, [sp, #2047]\n"
+  "     10a: f8cd c7ff     str.w r12, [sp, #2047]\n"
+  "     10e: f8cd c7ff     str.w r12, [sp, #2047]\n"
+  "     112: f8cd c7ff     str.w r12, [sp, #2047]\n"
+  "     116: f8cd c7ff     str.w r12, [sp, #2047]\n"
+  "     11a: f8cd c7ff     str.w r12, [sp, #2047]\n"
+  "     11e: f8cd c7ff     str.w r12, [sp, #2047]\n"
+  "     122: f8cd c7ff     str.w r12, [sp, #2047]\n"
+  "     126: f8cd c7ff     str.w r12, [sp, #2047]\n"
+  "     12a: f8cd c7ff     str.w r12, [sp, #2047]\n"
+  "     12e: f8cd c7ff     str.w r12, [sp, #2047]\n"
+  "     132: f8cd c7ff     str.w r12, [sp, #2047]\n"
+  "     136: f8cd c7ff     str.w r12, [sp, #2047]\n"
+  "     13a: f8cd c7ff     str.w r12, [sp, #2047]\n"
+  "     13e: f8cd c7ff     str.w r12, [sp, #2047]\n"
+  "     142: f8cd c7ff     str.w r12, [sp, #2047]\n"
+  "     146: f8cd c7ff     str.w r12, [sp, #2047]\n"
+  "     14a: f8cd c7ff     str.w r12, [sp, #2047]\n"
+  "     14e: f8cd c7ff     str.w r12, [sp, #2047]\n"
+  "     152: f8cd c7ff     str.w r12, [sp, #2047]\n"
+  "     156: f8cd c7ff     str.w r12, [sp, #2047]\n"
+  "     15a: f8cd c7ff     str.w r12, [sp, #2047]\n"
+  "     15e: f8cd c7ff     str.w r12, [sp, #2047]\n"
+  "     162: f8cd c7ff     str.w r12, [sp, #2047]\n"
+  "     166: f8cd c7ff     str.w r12, [sp, #2047]\n"
+  "     16a: f8cd c7ff     str.w r12, [sp, #2047]\n"
+  "     16e: f8cd c7ff     str.w r12, [sp, #2047]\n"
+  "     172: f8cd c7ff     str.w r12, [sp, #2047]\n"
+  "     176: f8cd c7ff     str.w r12, [sp, #2047]\n"
+  "     17a: f8cd c7ff     str.w r12, [sp, #2047]\n"
+  "     17e: f8cd c7ff     str.w r12, [sp, #2047]\n"
+  "     182: f8cd c7ff     str.w r12, [sp, #2047]\n"
+  "     186: f8cd c7ff     str.w r12, [sp, #2047]\n"
+  "     18a: f8cd c7ff     str.w r12, [sp, #2047]\n"
+  "     18e: f8cd c7ff     str.w r12, [sp, #2047]\n"
+  "     192: f8cd c7ff     str.w r12, [sp, #2047]\n"
+  "     196: f8cd c7ff     str.w r12, [sp, #2047]\n"
+  "     19a: f8cd c7ff     str.w r12, [sp, #2047]\n"
+  "     19e: f8cd c7ff     str.w r12, [sp, #2047]\n"
+  "     1a2: f8cd c7ff     str.w r12, [sp, #2047]\n"
+  "     1a6: f8cd c7ff     str.w r12, [sp, #2047]\n"
+  "     1aa: f8cd c7ff     str.w r12, [sp, #2047]\n"
+  "     1ae: f8cd c7ff     str.w r12, [sp, #2047]\n"
+  "     1b2: f8cd c7ff     str.w r12, [sp, #2047]\n"
+  "     1b6: f8cd c7ff     str.w r12, [sp, #2047]\n"
+  "     1ba: f8cd c7ff     str.w r12, [sp, #2047]\n"
+  "     1be: f8cd c7ff     str.w r12, [sp, #2047]\n"
+  "     1c2: f8cd c7ff     str.w r12, [sp, #2047]\n"
+  "     1c6: f8cd c7ff     str.w r12, [sp, #2047]\n"
+  "     1ca: f8cd c7ff     str.w r12, [sp, #2047]\n"
+  "     1ce: f8cd c7ff     str.w r12, [sp, #2047]\n"
+  "     1d2: f000 b803     b.w 0x1dc     @ imm = #6\n"
+  "     1d6: f000 b81e     b.w 0x216     @ imm = #60\n"
+  "     1da: 0000          movs r0, r0\n"
+  "     1dc: f8cd c7ff     str.w r12, [sp, #2047]\n"
+  "     1e0: f8cd c7ff     str.w r12, [sp, #2047]\n"
+  "     1e4: f8cd c7ff     str.w r12, [sp, #2047]\n"
+  "     1e8: f8cd c7ff     str.w r12, [sp, #2047]\n"
+  "     1ec: f8cd c7ff     str.w r12, [sp, #2047]\n"
+  "     1f0: f8cd c7ff     str.w r12, [sp, #2047]\n"
+  "     1f4: f8cd c7ff     str.w r12, [sp, #2047]\n"
+  "     1f8: f8cd c7ff     str.w r12, [sp, #2047]\n"
+  "     1fc: f8cd c7ff     str.w r12, [sp, #2047]\n"
+  "     200: f50d 5d80     add.w sp, sp, #4096\n"
+  "     204: b008          add sp, #32\n"
+  "     206: b001          add sp, #4\n"
+  "     208: ecbd 8a10     vpop {s16, s17, s18, s19, s20, s21, s22, s23, s24, s25, s26, s27, s28, s29, s30, s31}\n"
+  "     20c: e8bd 4de0     pop.w {r5, r6, r7, r8, r10, r11, lr}\n"
+  "     210: f8d9 8020     ldr.w r8, [r9, #32]\n"
+  "     214: 4770          bx lr\n"
+  "     216: f8d9 0094     ldr.w r0, [r9, #148]\n"
+  "     21a: f8d9 e2c0     ldr.w lr, [r9, #704]\n"
+  "     21e: 47f0          blx lr\n"
 };
 
-const char* const VixlLoadFromOffsetResults[] = {
-  "   0:  68e2        ldr r2, [r4, #12]\n",
-  "   2:  f8d4 2fff   ldr.w r2, [r4, #4095] ; 0xfff\n",
-  "   6:  f504 5280   add.w r2, r4, #4096 ; 0x1000\n",
-  "   a:  6812        ldr r2, [r2, #0]\n",
-  "   c:  f504 1280   add.w r2, r4, #1048576  ; 0x100000\n",
-  "  10:  f8d2 20a4   ldr.w r2, [r2, #164]  ; 0xa4\n",
-  "  14:  f44f 5280   mov.w r2, #4096 ; 0x1000\n",
-  "  18:  f2c0 0210   movt  r2, #16\n",
-  "  1c:  4422        add r2, r4\n",
-  "  1e:  6812        ldr r2, [r2, #0]\n",
-  "  20:  f44f 5c80   mov.w ip, #4096 ; 0x1000\n",
-  "  24:  f2c0 0c10   movt  ip, #16\n",
-  "  28:  4464        add r4, ip\n",
-  "  2a:  6824        ldr r4, [r4, #0]\n",
-  "  2c:  89a2        ldrh  r2, [r4, #12]\n",
-  "  2e:  f8b4 2fff   ldrh.w  r2, [r4, #4095] ; 0xfff\n",
-  "  32:  f504 5280   add.w r2, r4, #4096 ; 0x1000\n",
-  "  36:  8812        ldrh  r2, [r2, #0]\n",
-  "  38:  f504 1280   add.w r2, r4, #1048576  ; 0x100000\n",
-  "  3c:  f8b2 20a4   ldrh.w  r2, [r2, #164]  ; 0xa4\n",
-  "  40:  f44f 5280   mov.w r2, #4096 ; 0x1000\n",
-  "  44:  f2c0 0210   movt  r2, #16\n",
-  "  48:  4422        add r2, r4\n",
-  "  4a:  8812        ldrh  r2, [r2, #0]\n",
-  "  4c:  f44f 5c80   mov.w ip, #4096 ; 0x1000\n",
-  "  50:  f2c0 0c10   movt  ip, #16\n",
-  "  54:  4464        add r4, ip\n",
-  "  56:  8824        ldrh  r4, [r4, #0]\n",
-  "  58:  e9d4 2303   ldrd  r2, r3, [r4, #12]\n",
-  "  5c:  e9d4 23ff   ldrd  r2, r3, [r4, #1020] ; 0x3fc\n",
-  "  60:  f504 6280   add.w r2, r4, #1024 ; 0x400\n",
-  "  64:  e9d2 2300   ldrd  r2, r3, [r2]\n",
-  "  68:  f504 2280   add.w r2, r4, #262144 ; 0x40000\n",
-  "  6c:  e9d2 2329   ldrd  r2, r3, [r2, #164]  ; 0xa4\n",
-  "  70:  f44f 6280   mov.w r2, #1024 ; 0x400\n",
-  "  74:  f2c0 0204   movt  r2, #4\n",
-  "  78:  4422        add r2, r4\n",
-  "  7a:  e9d2 2300   ldrd  r2, r3, [r2]\n",
-  "  7e:  f44f 6c80   mov.w ip, #1024 ; 0x400\n",
-  "  82:  f2c0 0c04   movt  ip, #4\n",
-  "  86:  4464        add r4, ip\n",
-  "  88:  e9d4 4500   ldrd  r4, r5, [r4]\n",
-  "  8c:  f8dc 000c   ldr.w r0, [ip, #12]\n",
-  "  90:  f5a4 1280   sub.w r2, r4, #1048576  ; 0x100000\n",
-  "  94:  f8d2 20a4   ldr.w r2, [r2, #164]  ; 0xa4\n",
-  "  98:  f994 200c   ldrsb.w r2, [r4, #12]\n",
-  "  9c:  7b22        ldrb  r2, [r4, #12]\n",
-  "  9e:  f9b4 200c   ldrsh.w r2, [r4, #12]\n",
-  nullptr
-};
-const char* const VixlStoreToOffsetResults[] = {
-  "   0:  60e2        str r2, [r4, #12]\n",
-  "   2:  f8c4 2fff   str.w r2, [r4, #4095] ; 0xfff\n",
-  "   6:  f504 5c80   add.w ip, r4, #4096 ; 0x1000\n",
-  "   a:  f8cc 2000   str.w r2, [ip]\n",
-  "   e:  f504 1c80   add.w ip, r4, #1048576  ; 0x100000\n",
-  "  12:  f8cc 20a4   str.w r2, [ip, #164]  ; 0xa4\n",
-  "  16:  f44f 5c80   mov.w ip, #4096 ; 0x1000\n",
-  "  1a:  f2c0 0c10   movt  ip, #16\n",
-  "  1e:  44a4        add ip, r4\n",
-  "  20:  f8cc 2000   str.w r2, [ip]\n",
-  "  24:  f44f 5c80   mov.w ip, #4096 ; 0x1000\n",
-  "  28:  f2c0 0c10   movt  ip, #16\n",
-  "  2c:  44a4        add ip, r4\n",
-  "  2e:  f8cc 4000   str.w r4, [ip]\n",
-  "  32:  81a2        strh  r2, [r4, #12]\n",
-  "  34:  f8a4 2fff   strh.w  r2, [r4, #4095] ; 0xfff\n",
-  "  38:  f504 5c80   add.w ip, r4, #4096 ; 0x1000\n",
-  "  3c:  f8ac 2000   strh.w  r2, [ip]\n",
-  "  40:  f504 1c80   add.w ip, r4, #1048576  ; 0x100000\n",
-  "  44:  f8ac 20a4   strh.w  r2, [ip, #164]  ; 0xa4\n",
-  "  48:  f44f 5c80   mov.w ip, #4096 ; 0x1000\n",
-  "  4c:  f2c0 0c10   movt  ip, #16\n",
-  "  50:  44a4        add ip, r4\n",
-  "  52:  f8ac 2000   strh.w  r2, [ip]\n",
-  "  56:  f44f 5c80   mov.w ip, #4096 ; 0x1000\n",
-  "  5a:  f2c0 0c10   movt  ip, #16\n",
-  "  5e:  44a4        add ip, r4\n",
-  "  60:  f8ac 4000   strh.w  r4, [ip]\n",
-  "  64:  e9c4 2303   strd  r2, r3, [r4, #12]\n",
-  "  68:  e9c4 23ff   strd  r2, r3, [r4, #1020] ; 0x3fc\n",
-  "  6c:  f504 6c80   add.w ip, r4, #1024 ; 0x400\n",
-  "  70:  e9cc 2300   strd  r2, r3, [ip]\n",
-  "  74:  f504 2c80   add.w ip, r4, #262144 ; 0x40000\n",
-  "  78:  e9cc 2329   strd  r2, r3, [ip, #164]  ; 0xa4\n",
-  "  7c:  f44f 6c80   mov.w ip, #1024 ; 0x400\n",
-  "  80:  f2c0 0c04   movt  ip, #4\n",
-  "  84:  44a4        add ip, r4\n",
-  "  86:  e9cc 2300   strd  r2, r3, [ip]\n",
-  "  8a:  f44f 6c80   mov.w ip, #1024 ; 0x400\n",
-  "  8e:  f2c0 0c04   movt  ip, #4\n",
-  "  92:  44a4        add ip, r4\n",
-  "  94:  e9cc 4500   strd  r4, r5, [ip]\n",
-  "  98:  f8cc 000c   str.w r0, [ip, #12]\n",
-  "  9c:  f5a4 1c80   sub.w ip, r4, #1048576  ; 0x100000\n",
-  "  a0:  f8cc 20a4   str.w r2, [ip, #164]  ; 0xa4\n",
-  "  a4:  7322        strb  r2, [r4, #12]\n",
-  nullptr
+const char* const VixlLoadFromOffsetResults = {
+  "       0: 68e2          ldr r2, [r4, #12]\n"
+  "       2: f8d4 2fff     ldr.w r2, [r4, #4095]\n"
+  "       6: f504 5280     add.w r2, r4, #4096\n"
+  "       a: 6812          ldr r2, [r2]\n"
+  "       c: f504 1280     add.w r2, r4, #1048576\n"
+  "      10: f8d2 20a4     ldr.w r2, [r2, #164]\n"
+  "      14: f44f 5280     mov.w r2, #4096\n"
+  "      18: f2c0 0210     movt r2, #16\n"
+  "      1c: 4422          add r2, r4\n"
+  "      1e: 6812          ldr r2, [r2]\n"
+  "      20: f44f 5c80     mov.w r12, #4096\n"
+  "      24: f2c0 0c10     movt r12, #16\n"
+  "      28: 4464          add r4, r12\n"
+  "      2a: 6824          ldr r4, [r4]\n"
+  "      2c: 89a2          ldrh r2, [r4, #12]\n"
+  "      2e: f8b4 2fff     ldrh.w r2, [r4, #4095]\n"
+  "      32: f504 5280     add.w r2, r4, #4096\n"
+  "      36: 8812          ldrh r2, [r2]\n"
+  "      38: f504 1280     add.w r2, r4, #1048576\n"
+  "      3c: f8b2 20a4     ldrh.w r2, [r2, #164]\n"
+  "      40: f44f 5280     mov.w r2, #4096\n"
+  "      44: f2c0 0210     movt r2, #16\n"
+  "      48: 4422          add r2, r4\n"
+  "      4a: 8812          ldrh r2, [r2]\n"
+  "      4c: f44f 5c80     mov.w r12, #4096\n"
+  "      50: f2c0 0c10     movt r12, #16\n"
+  "      54: 4464          add r4, r12\n"
+  "      56: 8824          ldrh r4, [r4]\n"
+  "      58: e9d4 2303     ldrd r2, r3, [r4, #12]\n"
+  "      5c: e9d4 23ff     ldrd r2, r3, [r4, #1020]\n"
+  "      60: f504 6280     add.w r2, r4, #1024\n"
+  "      64: e9d2 2300     ldrd r2, r3, [r2]\n"
+  "      68: f504 2280     add.w r2, r4, #262144\n"
+  "      6c: e9d2 2329     ldrd r2, r3, [r2, #164]\n"
+  "      70: f44f 6280     mov.w r2, #1024\n"
+  "      74: f2c0 0204     movt r2, #4\n"
+  "      78: 4422          add r2, r4\n"
+  "      7a: e9d2 2300     ldrd r2, r3, [r2]\n"
+  "      7e: f44f 6c80     mov.w r12, #1024\n"
+  "      82: f2c0 0c04     movt r12, #4\n"
+  "      86: 4464          add r4, r12\n"
+  "      88: e9d4 4500     ldrd r4, r5, [r4]\n"
+  "      8c: f8dc 000c     ldr.w r0, [r12, #12]\n"
+  "      90: f5a4 1280     sub.w r2, r4, #1048576\n"
+  "      94: f8d2 20a4     ldr.w r2, [r2, #164]\n"
+  "      98: f994 200c     ldrsb.w r2, [r4, #12]\n"
+  "      9c: 7b22          ldrb r2, [r4, #12]\n"
+  "      9e: f9b4 200c     ldrsh.w r2, [r4, #12]\n"
 };
 
-std::map<std::string, const char* const*> test_results;
-void setup_results() {
-    test_results["VixlJniHelpers"] = VixlJniHelpersResults;
-    test_results["VixlStoreToOffset"] = VixlStoreToOffsetResults;
-    test_results["VixlLoadFromOffset"] = VixlLoadFromOffsetResults;
-}
+const char* const VixlStoreToOffsetResults = {
+  "       0: 60e2          str r2, [r4, #12]\n"
+  "       2: f8c4 2fff     str.w r2, [r4, #4095]\n"
+  "       6: f504 5c80     add.w r12, r4, #4096\n"
+  "       a: f8cc 2000     str.w r2, [r12]\n"
+  "       e: f504 1c80     add.w r12, r4, #1048576\n"
+  "      12: f8cc 20a4     str.w r2, [r12, #164]\n"
+  "      16: f44f 5c80     mov.w r12, #4096\n"
+  "      1a: f2c0 0c10     movt r12, #16\n"
+  "      1e: 44a4          add r12, r4\n"
+  "      20: f8cc 2000     str.w r2, [r12]\n"
+  "      24: f44f 5c80     mov.w r12, #4096\n"
+  "      28: f2c0 0c10     movt r12, #16\n"
+  "      2c: 44a4          add r12, r4\n"
+  "      2e: f8cc 4000     str.w r4, [r12]\n"
+  "      32: 81a2          strh r2, [r4, #12]\n"
+  "      34: f8a4 2fff     strh.w r2, [r4, #4095]\n"
+  "      38: f504 5c80     add.w r12, r4, #4096\n"
+  "      3c: f8ac 2000     strh.w r2, [r12]\n"
+  "      40: f504 1c80     add.w r12, r4, #1048576\n"
+  "      44: f8ac 20a4     strh.w r2, [r12, #164]\n"
+  "      48: f44f 5c80     mov.w r12, #4096\n"
+  "      4c: f2c0 0c10     movt r12, #16\n"
+  "      50: 44a4          add r12, r4\n"
+  "      52: f8ac 2000     strh.w r2, [r12]\n"
+  "      56: f44f 5c80     mov.w r12, #4096\n"
+  "      5a: f2c0 0c10     movt r12, #16\n"
+  "      5e: 44a4          add r12, r4\n"
+  "      60: f8ac 4000     strh.w r4, [r12]\n"
+  "      64: e9c4 2303     strd r2, r3, [r4, #12]\n"
+  "      68: e9c4 23ff     strd r2, r3, [r4, #1020]\n"
+  "      6c: f504 6c80     add.w r12, r4, #1024\n"
+  "      70: e9cc 2300     strd r2, r3, [r12]\n"
+  "      74: f504 2c80     add.w r12, r4, #262144\n"
+  "      78: e9cc 2329     strd r2, r3, [r12, #164]\n"
+  "      7c: f44f 6c80     mov.w r12, #1024\n"
+  "      80: f2c0 0c04     movt r12, #4\n"
+  "      84: 44a4          add r12, r4\n"
+  "      86: e9cc 2300     strd r2, r3, [r12]\n"
+  "      8a: f44f 6c80     mov.w r12, #1024\n"
+  "      8e: f2c0 0c04     movt r12, #4\n"
+  "      92: 44a4          add r12, r4\n"
+  "      94: e9cc 4500     strd r4, r5, [r12]\n"
+  "      98: f8cc 000c     str.w r0, [r12, #12]\n"
+  "      9c: f5a4 1c80     sub.w r12, r4, #1048576\n"
+  "      a0: f8cc 20a4     str.w r2, [r12, #164]\n"
+  "      a4: 7322          strb r2, [r4, #12]\n"
+};

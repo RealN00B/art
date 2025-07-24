@@ -19,7 +19,7 @@
 
 #include "object.h"
 
-namespace art {
+namespace art HIDDEN {
 
 class RootVisitor;
 struct ThrowableOffsets;
@@ -31,16 +31,19 @@ class String;
 // C++ mirror of java.lang.Throwable
 class MANAGED Throwable : public Object {
  public:
+  MIRROR_CLASS("Ljava/lang/Throwable;");
+
   void SetDetailMessage(ObjPtr<String> new_detail_message) REQUIRES_SHARED(Locks::mutator_lock_);
 
   ObjPtr<String> GetDetailMessage() REQUIRES_SHARED(Locks::mutator_lock_);
 
-  std::string Dump() REQUIRES_SHARED(Locks::mutator_lock_);
+  EXPORT std::string Dump() REQUIRES_SHARED(Locks::mutator_lock_);
 
   // This is a runtime version of initCause, you shouldn't use it if initCause may have been
   // overridden. Also it asserts rather than throwing exceptions. Currently this is only used
   // in cases like the verifier where the checks cannot fail and initCause isn't overridden.
   void SetCause(ObjPtr<Throwable> cause) REQUIRES_SHARED(Locks::mutator_lock_);
+  ObjPtr<Throwable> GetCause() REQUIRES_SHARED(Locks::mutator_lock_);
   void SetStackState(ObjPtr<Object> state) REQUIRES_SHARED(Locks::mutator_lock_);
   bool IsCheckedException() REQUIRES_SHARED(Locks::mutator_lock_);
   bool IsError() REQUIRES_SHARED(Locks::mutator_lock_);

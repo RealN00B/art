@@ -18,14 +18,17 @@
 #define ART_COMPILER_OPTIMIZING_CODE_GENERATOR_X86_64_H_
 
 #include "arch/x86_64/instruction_set_features_x86_64.h"
+#include "base/macros.h"
 #include "code_generator.h"
 #include "driver/compiler_options.h"
 #include "nodes.h"
 #include "parallel_move_resolver.h"
 #include "utils/x86_64/assembler_x86_64.h"
 
-namespace art {
+namespace art HIDDEN {
 namespace x86_64 {
+
+static constexpr Register kMethodRegisterArgument = RDI;
 
 // Use a local definition to prevent copying mistakes.
 static constexpr size_t kX86_64WordSize = static_cast<size_t>(kX86_64PointerSize);
@@ -51,6 +54,50 @@ static constexpr size_t kRuntimeParameterFpuRegistersLength =
 // If the ART ABI changes, this list must be updated.  It is used to ensure that
 // these are not clobbered by any direct call to native code (such as math intrinsics).
 static constexpr FloatRegister non_volatile_xmm_regs[] = { XMM12, XMM13, XMM14, XMM15 };
+
+#define UNIMPLEMENTED_INTRINSIC_LIST_X86_64(V) \
+  V(MathSignumFloat)                           \
+  V(MathSignumDouble)                          \
+  V(MathCopySignFloat)                         \
+  V(MathCopySignDouble)                        \
+  V(CRC32Update)                               \
+  V(CRC32UpdateBytes)                          \
+  V(CRC32UpdateByteBuffer)                     \
+  V(FP16ToFloat)                               \
+  V(FP16ToHalf)                                \
+  V(FP16Floor)                                 \
+  V(FP16Ceil)                                  \
+  V(FP16Rint)                                  \
+  V(FP16Greater)                               \
+  V(FP16GreaterEquals)                         \
+  V(FP16Less)                                  \
+  V(FP16LessEquals)                            \
+  V(FP16Compare)                               \
+  V(FP16Min)                                   \
+  V(FP16Max)                                   \
+  V(IntegerRemainderUnsigned)                  \
+  V(LongRemainderUnsigned)                     \
+  V(StringStringIndexOf)                       \
+  V(StringStringIndexOfAfter)                  \
+  V(StringBufferAppend)                        \
+  V(StringBufferLength)                        \
+  V(StringBufferToString)                      \
+  V(StringBuilderAppendObject)                 \
+  V(StringBuilderAppendString)                 \
+  V(StringBuilderAppendCharSequence)           \
+  V(StringBuilderAppendCharArray)              \
+  V(StringBuilderAppendBoolean)                \
+  V(StringBuilderAppendChar)                   \
+  V(StringBuilderAppendInt)                    \
+  V(StringBuilderAppendLong)                   \
+  V(StringBuilderAppendFloat)                  \
+  V(StringBuilderAppendDouble)                 \
+  V(StringBuilderLength)                       \
+  V(StringBuilderToString)                     \
+  V(UnsafeArrayBaseOffset)                     \
+  /* 1.8 */                                    \
+  V(JdkUnsafeArrayBaseOffset)                  \
+  V(MethodHandleInvoke)                        \
 
 
 class InvokeRuntimeCallingConvention : public CallingConvention<Register, FloatRegister> {
@@ -79,6 +126,31 @@ class InvokeDexCallingConvention : public CallingConvention<Register, FloatRegis
   DISALLOW_COPY_AND_ASSIGN(InvokeDexCallingConvention);
 };
 
+class CriticalNativeCallingConventionVisitorX86_64 : public InvokeDexCallingConventionVisitor {
+ public:
+  explicit CriticalNativeCallingConventionVisitorX86_64(bool for_register_allocation)
+      : for_register_allocation_(for_register_allocation) {}
+
+  virtual ~CriticalNativeCallingConventionVisitorX86_64() {}
+
+  Location GetNextLocation(DataType::Type type) override;
+  Location GetReturnLocation(DataType::Type type) const override;
+  Location GetMethodLocation() const override;
+
+  size_t GetStackOffset() const { return stack_offset_; }
+
+ private:
+  // Register allocator does not support adjusting frame size, so we cannot provide final locations
+  // of stack arguments for register allocation. We ask the register allocator for any location and
+  // move these arguments to the right place after adjusting the SP when generating the call.
+  const bool for_register_allocation_;
+  size_t gpr_index_ = 0u;
+  size_t fpr_index_ = 0u;
+  size_t stack_offset_ = 0u;
+
+  DISALLOW_COPY_AND_ASSIGN(CriticalNativeCallingConventionVisitorX86_64);
+};
+
 class FieldAccessCallingConventionX86_64 : public FieldAccessCallingConvention {
  public:
   FieldAccessCallingConventionX86_64() {}
@@ -89,16 +161,16 @@ class FieldAccessCallingConventionX86_64 : public FieldAccessCallingConvention {
   Location GetFieldIndexLocation() const override {
     return Location::RegisterLocation(RDI);
   }
-  Location GetReturnLocation(DataType::Type type ATTRIBUTE_UNUSED) const override {
+  Location GetReturnLocation([[maybe_unused]] DataType::Type type) const override {
     return Location::RegisterLocation(RAX);
   }
-  Location GetSetValueLocation(DataType::Type type ATTRIBUTE_UNUSED, bool is_instance)
-      const override {
+  Location GetSetValueLocation([[maybe_unused]] DataType::Type type,
+                               bool is_instance) const override {
     return is_instance
         ? Location::RegisterLocation(RDX)
         : Location::RegisterLocation(RSI);
   }
-  Location GetFpuLocation(DataType::Type type ATTRIBUTE_UNUSED) const override {
+  Location GetFpuLocation([[maybe_unused]] DataType::Type type) const override {
     return Location::FpuRegisterLocation(XMM0);
   }
 
@@ -175,7 +247,10 @@ class LocationsBuilderX86_64 : public HGraphVisitor {
   void HandleBitwiseOperation(HBinaryOperation* operation);
   void HandleCondition(HCondition* condition);
   void HandleShift(HBinaryOperation* operation);
-  void HandleFieldSet(HInstruction* instruction, const FieldInfo& field_info);
+  void HandleRotate(HBinaryOperation* rotate);
+  void HandleFieldSet(HInstruction* instruction,
+                      const FieldInfo& field_info,
+                      WriteBarrierKind write_barrier_kind);
   void HandleFieldGet(HInstruction* instruction);
   bool CpuHasAvxFeatureFlag();
   bool CpuHasAvx2FeatureFlag();
@@ -206,6 +281,30 @@ class InstructionCodeGeneratorX86_64 : public InstructionCodeGenerator {
 
   X86_64Assembler* GetAssembler() const { return assembler_; }
 
+  // Generate a GC root reference load:
+  //
+  //   root <- *address
+  //
+  // while honoring read barriers based on read_barrier_option.
+  void GenerateGcRootFieldLoad(HInstruction* instruction,
+                               Location root,
+                               const Address& address,
+                               Label* fixup_label,
+                               ReadBarrierOption read_barrier_option);
+  void HandleFieldSet(HInstruction* instruction,
+                      uint32_t value_index,
+                      uint32_t extra_temp_index,
+                      DataType::Type field_type,
+                      Address field_addr,
+                      CpuRegister base,
+                      bool is_volatile,
+                      bool is_atomic,
+                      bool value_can_be_null,
+                      bool byte_swap,
+                      WriteBarrierKind write_barrier_kind);
+
+  void Bswap(Location value, DataType::Type type, CpuRegister* temp = nullptr);
+
  private:
   // Generate code for the given suspend check. If not null, `successor`
   // is the block to branch to if the suspend check is not needed, and after
@@ -222,15 +321,18 @@ class InstructionCodeGeneratorX86_64 : public InstructionCodeGenerator {
   void GenerateDivRemIntegral(HBinaryOperation* instruction);
   void HandleCondition(HCondition* condition);
   void HandleShift(HBinaryOperation* operation);
+  void HandleRotate(HBinaryOperation* rotate);
 
   void HandleFieldSet(HInstruction* instruction,
                       const FieldInfo& field_info,
-                      bool value_can_be_null);
+                      bool value_can_be_null,
+                      WriteBarrierKind write_barrier_kind);
   void HandleFieldGet(HInstruction* instruction, const FieldInfo& field_info);
 
   void GenerateMinMaxInt(LocationSummary* locations, bool is_min, DataType::Type type);
   void GenerateMinMaxFP(LocationSummary* locations, bool is_min, DataType::Type type);
   void GenerateMinMax(HBinaryOperation* minmax, bool is_min);
+  void GenerateMethodEntryExitHook(HInstruction* instruction);
 
   // Generate a heap reference load using one register `out`:
   //
@@ -261,16 +363,6 @@ class InstructionCodeGeneratorX86_64 : public InstructionCodeGenerator {
                                          Location obj,
                                          uint32_t offset,
                                          ReadBarrierOption read_barrier_option);
-  // Generate a GC root reference load:
-  //
-  //   root <- *address
-  //
-  // while honoring read barriers based on read_barrier_option.
-  void GenerateGcRootFieldLoad(HInstruction* instruction,
-                               Location root,
-                               const Address& address,
-                               Label* fixup_label,
-                               ReadBarrierOption read_barrier_option);
 
   void PushOntoFPStack(Location source, uint32_t temp_offset,
                        uint32_t stack_adjustment, bool is_float);
@@ -379,25 +471,41 @@ class CodeGeneratorX86_64 : public CodeGenerator {
   void SetupBlockedRegisters() const override;
   void DumpCoreRegister(std::ostream& stream, int reg) const override;
   void DumpFloatingPointRegister(std::ostream& stream, int reg) const override;
-  void Finalize(CodeAllocator* allocator) override;
+  void Finalize() override;
 
   InstructionSet GetInstructionSet() const override {
     return InstructionSet::kX86_64;
   }
 
+  InstructionCodeGeneratorX86_64* GetInstructionCodegen() {
+    return down_cast<InstructionCodeGeneratorX86_64*>(GetInstructionVisitor());
+  }
+
   const X86_64InstructionSetFeatures& GetInstructionSetFeatures() const;
 
-  // Emit a write barrier.
-  void MarkGCCard(CpuRegister temp,
-                  CpuRegister card,
-                  CpuRegister object,
-                  CpuRegister value,
-                  bool value_can_be_null);
+  // Emit a write barrier if:
+  // A) emit_null_check is false
+  // B) emit_null_check is true, and value is not null.
+  void MaybeMarkGCCard(CpuRegister temp,
+                       CpuRegister card,
+                       CpuRegister object,
+                       CpuRegister value,
+                       bool emit_null_check);
+
+  // Emit a write barrier unconditionally.
+  void MarkGCCard(CpuRegister temp, CpuRegister card, CpuRegister object);
+
+  // Crash if the card table is not valid. This check is only emitted for the CC GC. We assert
+  // `(!clean || !self->is_gc_marking)`, since the card table should not be set to clean when the CC
+  // GC is marking for eliminated write barriers.
+  void CheckGCCardIsValid(CpuRegister temp, CpuRegister card, CpuRegister object);
 
   void GenerateMemoryBarrier(MemBarrierKind kind);
 
   // Helper method to move a value between two locations.
   void Move(Location destination, Location source);
+  // Helper method to load a value of non-reference type from memory.
+  void LoadFromMemoryNoReference(DataType::Type type, Location dst, Address src);
 
   Label* GetLabelOf(HBasicBlock* block) const {
     return CommonGetLabelOf<Label>(block_labels_, block);
@@ -407,9 +515,7 @@ class CodeGeneratorX86_64 : public CodeGenerator {
     block_labels_ = CommonInitializeLabels<Label>();
   }
 
-  bool NeedsTwoRegisters(DataType::Type type ATTRIBUTE_UNUSED) const override {
-    return false;
-  }
+  bool NeedsTwoRegisters([[maybe_unused]] DataType::Type type) const override { return false; }
 
   // Check if the desired_string_load_kind is supported. If it is, return it,
   // otherwise return a fall-back kind that should be used instead.
@@ -427,6 +533,7 @@ class CodeGeneratorX86_64 : public CodeGenerator {
       const HInvokeStaticOrDirect::DispatchInfo& desired_dispatch_info,
       ArtMethod* method) override;
 
+  void LoadMethod(MethodLoadKind load_kind, Location temp, HInvoke* invoke);
   void GenerateStaticOrDirectCall(
       HInvokeStaticOrDirect* invoke, Location temp, SlowPathCode* slow_path = nullptr) override;
   void GenerateVirtualCall(
@@ -434,21 +541,29 @@ class CodeGeneratorX86_64 : public CodeGenerator {
 
   void RecordBootImageIntrinsicPatch(uint32_t intrinsic_data);
   void RecordBootImageRelRoPatch(uint32_t boot_image_offset);
-  void RecordBootImageMethodPatch(HInvokeStaticOrDirect* invoke);
-  void RecordMethodBssEntryPatch(HInvokeStaticOrDirect* invoke);
-  void RecordBootImageTypePatch(HLoadClass* load_class);
+  void RecordBootImageMethodPatch(HInvoke* invoke);
+  void RecordAppImageMethodPatch(HInvoke* invoke);
+  void RecordMethodBssEntryPatch(HInvoke* invoke);
+  void RecordBootImageTypePatch(const DexFile& dex_file, dex::TypeIndex type_index);
+  void RecordAppImageTypePatch(const DexFile& dex_file, dex::TypeIndex type_index);
   Label* NewTypeBssEntryPatch(HLoadClass* load_class);
   void RecordBootImageStringPatch(HLoadString* load_string);
   Label* NewStringBssEntryPatch(HLoadString* load_string);
+  Label* NewMethodTypeBssEntryPatch(HLoadMethodType* load_method_type);
+  void RecordBootImageJniEntrypointPatch(HInvokeStaticOrDirect* invoke);
   Label* NewJitRootStringPatch(const DexFile& dex_file,
                                dex::StringIndex string_index,
                                Handle<mirror::String> handle);
   Label* NewJitRootClassPatch(const DexFile& dex_file,
                               dex::TypeIndex type_index,
                               Handle<mirror::Class> handle);
+  Label* NewJitRootMethodTypePatch(const DexFile& dex_file,
+                                   dex::ProtoIndex proto_index,
+                                   Handle<mirror::MethodType> method_type);
 
   void LoadBootImageAddress(CpuRegister reg, uint32_t boot_image_reference);
-  void AllocateInstanceForIntrinsic(HInvokeStaticOrDirect* invoke, uint32_t boot_image_offset);
+  void LoadIntrinsicDeclaringClass(CpuRegister reg, HInvoke* invoke);
+  void LoadClassRootForIntrinsic(CpuRegister reg, ClassRoot class_root);
 
   void EmitLinkerPatches(ArenaVector<linker::LinkerPatch>* linker_patches) override;
 
@@ -601,17 +716,21 @@ class CodeGeneratorX86_64 : public CodeGenerator {
     }
   }
 
+  void IncreaseFrame(size_t adjustment) override;
+  void DecreaseFrame(size_t adjustment) override;
+
   void GenerateNop() override;
   void GenerateImplicitNullCheck(HNullCheck* instruction) override;
   void GenerateExplicitNullCheck(HNullCheck* instruction) override;
   void MaybeGenerateInlineCacheCheck(HInstruction* instruction, CpuRegister cls);
 
+  void MaybeIncrementHotness(HSuspendCheck* suspend_check, bool is_frame_entry);
 
-  void MaybeIncrementHotness(bool is_frame_entry);
+  static void BlockNonVolatileXmmRegisters(LocationSummary* locations);
 
-  // When we don't know the proper offset for the value, we use kDummy32BitOffset.
+  // When we don't know the proper offset for the value, we use kPlaceholder32BitOffset.
   // We will fix this up in the linker later to have the right value.
-  static constexpr int32_t kDummy32BitOffset = 256;
+  static constexpr int32_t kPlaceholder32BitOffset = 256;
 
  private:
   template <linker::LinkerPatch (*Factory)(size_t, const DexFile*, uint32_t, uint32_t)>
@@ -632,16 +751,28 @@ class CodeGeneratorX86_64 : public CodeGenerator {
 
   // PC-relative method patch info for kBootImageLinkTimePcRelative.
   ArenaDeque<PatchInfo<Label>> boot_image_method_patches_;
+  // PC-relative method patch info for kAppImageRelRo.
+  ArenaDeque<PatchInfo<Label>> app_image_method_patches_;
   // PC-relative method patch info for kBssEntry.
   ArenaDeque<PatchInfo<Label>> method_bss_entry_patches_;
   // PC-relative type patch info for kBootImageLinkTimePcRelative.
   ArenaDeque<PatchInfo<Label>> boot_image_type_patches_;
+  // PC-relative type patch info for kAppImageRelRo.
+  ArenaDeque<PatchInfo<Label>> app_image_type_patches_;
   // PC-relative type patch info for kBssEntry.
   ArenaDeque<PatchInfo<Label>> type_bss_entry_patches_;
+  // PC-relative public type patch info for kBssEntryPublic.
+  ArenaDeque<PatchInfo<Label>> public_type_bss_entry_patches_;
+  // PC-relative package type patch info for kBssEntryPackage.
+  ArenaDeque<PatchInfo<Label>> package_type_bss_entry_patches_;
   // PC-relative String patch info for kBootImageLinkTimePcRelative.
   ArenaDeque<PatchInfo<Label>> boot_image_string_patches_;
   // PC-relative String patch info for kBssEntry.
   ArenaDeque<PatchInfo<Label>> string_bss_entry_patches_;
+  // PC-relative MethodType patch info for kBssEntry.
+  ArenaDeque<PatchInfo<Label>> method_type_bss_entry_patches_;
+  // PC-relative method patch info for kBootImageLinkTimePcRelative+kCallCriticalNative.
+  ArenaDeque<PatchInfo<Label>> boot_image_jni_entrypoint_patches_;
   // PC-relative patch info for IntrinsicObjects for the boot image,
   // and for method/type/string patches for kBootImageRelRo otherwise.
   ArenaDeque<PatchInfo<Label>> boot_image_other_patches_;
@@ -650,6 +781,8 @@ class CodeGeneratorX86_64 : public CodeGenerator {
   ArenaDeque<PatchInfo<Label>> jit_string_patches_;
   // Patches for class literals in JIT compiled code.
   ArenaDeque<PatchInfo<Label>> jit_class_patches_;
+  // Patches for method type in JIT compiled code.
+  ArenaDeque<PatchInfo<Label>> jit_method_type_patches_;
 
   // Fixups for jump tables need to be handled specially.
   ArenaVector<JumpTableRIPFixup*> fixups_to_jump_tables_;

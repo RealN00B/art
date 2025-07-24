@@ -18,6 +18,7 @@
 #define ART_LIBARTBASE_BASE_ARENA_CONTAINERS_H_
 
 #include <deque>
+#include <forward_list>
 #include <queue>
 #include <set>
 #include <stack>
@@ -48,6 +49,9 @@ class ArenaAllocatorAdapter;
 
 template <typename T>
 using ArenaDeque = std::deque<T, ArenaAllocatorAdapter<T>>;
+
+template <typename T>
+using ArenaForwardList = std::forward_list<T, ArenaAllocatorAdapter<T>>;
 
 template <typename T>
 using ArenaQueue = std::queue<T, ArenaDeque<T>>;
@@ -89,7 +93,7 @@ using ArenaHashMap = HashMap<Key,
 template <typename Key,
           typename Value,
           typename Hash = std::hash<Key>,
-          typename Pred = std::equal_to<Value>>
+          typename Pred = std::equal_to<Key>>
 using ArenaUnorderedMap = std::unordered_map<Key,
                                              Value,
                                              Hash,
@@ -105,7 +109,7 @@ template <>
 class ArenaAllocatorAdapterKindImpl<false> {
  public:
   // Not tracking allocations, ignore the supplied kind and arbitrarily provide kArenaAllocSTL.
-  explicit ArenaAllocatorAdapterKindImpl(ArenaAllocKind kind ATTRIBUTE_UNUSED) {}
+  explicit ArenaAllocatorAdapterKindImpl([[maybe_unused]] ArenaAllocKind kind) {}
   ArenaAllocatorAdapterKindImpl(const ArenaAllocatorAdapterKindImpl&) = default;
   ArenaAllocatorAdapterKindImpl& operator=(const ArenaAllocatorAdapterKindImpl&) = default;
   ArenaAllocKind Kind() { return kArenaAllocSTL; }
@@ -123,18 +127,18 @@ class ArenaAllocatorAdapterKindImpl {
   ArenaAllocKind kind_;
 };
 
-typedef ArenaAllocatorAdapterKindImpl<kArenaAllocatorCountAllocations> ArenaAllocatorAdapterKind;
+using ArenaAllocatorAdapterKind = ArenaAllocatorAdapterKindImpl<kArenaAllocatorCountAllocations>;
 
 template <>
 class ArenaAllocatorAdapter<void> : private ArenaAllocatorAdapterKind {
  public:
-  typedef void value_type;
-  typedef void* pointer;
-  typedef const void* const_pointer;
+  using value_type    = void;
+  using pointer       = void*;
+  using const_pointer = const void*;
 
   template <typename U>
   struct rebind {
-    typedef ArenaAllocatorAdapter<U> other;
+    using other = ArenaAllocatorAdapter<U>;
   };
 
   explicit ArenaAllocatorAdapter(ArenaAllocator* allocator,
@@ -161,17 +165,17 @@ class ArenaAllocatorAdapter<void> : private ArenaAllocatorAdapterKind {
 template <typename T>
 class ArenaAllocatorAdapter : private ArenaAllocatorAdapterKind {
  public:
-  typedef T value_type;
-  typedef T* pointer;
-  typedef T& reference;
-  typedef const T* const_pointer;
-  typedef const T& const_reference;
-  typedef size_t size_type;
-  typedef ptrdiff_t difference_type;
+  using value_type      = T;
+  using pointer         = T*;
+  using reference       = T&;
+  using const_pointer   = const T*;
+  using const_reference = const T&;
+  using size_type       = size_t;
+  using difference_type = ptrdiff_t;
 
   template <typename U>
   struct rebind {
-    typedef ArenaAllocatorAdapter<U> other;
+    using other = ArenaAllocatorAdapter<U>;
   };
 
   ArenaAllocatorAdapter(ArenaAllocator* allocator, ArenaAllocKind kind)
@@ -195,7 +199,7 @@ class ArenaAllocatorAdapter : private ArenaAllocatorAdapterKind {
   const_pointer address(const_reference x) const { return &x; }
 
   pointer allocate(size_type n,
-                   ArenaAllocatorAdapter<void>::pointer hint ATTRIBUTE_UNUSED = nullptr) {
+                   [[maybe_unused]] ArenaAllocatorAdapter<void>::pointer hint = nullptr) {
     DCHECK_LE(n, max_size());
     return allocator_->AllocArray<T>(n, ArenaAllocatorAdapterKind::Kind());
   }
@@ -238,6 +242,51 @@ inline bool operator!=(const ArenaAllocatorAdapter<T>& lhs,
 inline ArenaAllocatorAdapter<void> ArenaAllocator::Adapter(ArenaAllocKind kind) {
   return ArenaAllocatorAdapter<void>(this, kind);
 }
+
+// Special deleter that only calls the destructor. Also checks for double free errors.
+template <typename T>
+class ArenaDelete {
+  static constexpr uint8_t kMagicFill = 0xCE;
+
+ protected:
+  // Used for variable sized objects such as RegisterLine.
+  ALWAYS_INLINE void ProtectMemory(T* ptr, size_t size) const {
+    if (kRunningOnMemoryTool) {
+      memset(ptr, kMagicFill, size);
+      MEMORY_TOOL_MAKE_NOACCESS(ptr, size);
+    } else if (kIsDebugBuild) {
+      // Write a magic value to try and catch use after free errors.
+      memset(ptr, kMagicFill, size);
+    }
+  }
+
+ public:
+  void operator()(T* ptr) const {
+    if (ptr != nullptr) {
+      ptr->~T();
+      ProtectMemory(ptr, sizeof(T));
+    }
+  }
+};
+
+// In general we lack support for arrays. We would need to call the destructor on each element,
+// which requires access to the array size. Support for that is future work.
+//
+// However, we can support trivially destructible component types, as then a destructor doesn't
+// need to be called.
+template <typename T>
+class ArenaDelete<T[]> {
+ public:
+  void operator()([[maybe_unused]] T* ptr) const {
+    static_assert(std::is_trivially_destructible_v<T>,
+                  "ArenaUniquePtr does not support non-trivially-destructible arrays.");
+    // TODO: Implement debug checks, and MEMORY_TOOL support.
+  }
+};
+
+// Arena unique ptr that only calls the destructor of the element.
+template <typename T>
+using ArenaUniquePtr = std::unique_ptr<T, ArenaDelete<T>>;
 
 }  // namespace art
 

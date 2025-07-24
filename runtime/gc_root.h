@@ -22,7 +22,7 @@
 #include "mirror/object_reference.h"
 #include "read_barrier_option.h"
 
-namespace art {
+namespace art HIDDEN {
 class ArtField;
 class ArtMethod;
 template<class MirrorType> class ObjPtr;
@@ -54,7 +54,7 @@ enum RootType {
   kRootVMInternal,
   kRootJNIMonitor,
 };
-std::ostream& operator<<(std::ostream& os, const RootType& root_type);
+EXPORT std::ostream& operator<<(std::ostream& os, RootType root_type);
 
 // Only used by hprof. thread_id_ and type_ are only used by hprof.
 class RootInfo {
@@ -183,6 +183,10 @@ class GcRootSource {
   DISALLOW_COPY_AND_ASSIGN(GcRootSource);
 };
 
+// A small CompressedReference wrapper class that makes it harder to forget about read barriers.
+// Used for references that are roots for an object graph, whether or not they are actually traced
+// from. Requires an explicit VisitRoots call for tracing. See also Handle (implicitly traced by a
+// GC) and StackReference (traced explicitly, but not as the result of a read barrier).
 template<class MirrorType>
 class GcRoot {
  public:
@@ -190,6 +194,10 @@ class GcRoot {
   ALWAYS_INLINE MirrorType* Read(GcRootSource* gc_root_source = nullptr) const
       REQUIRES_SHARED(Locks::mutator_lock_);
 
+  // TODO: This is often called repeatedly from functions to process an explicit array of roots.
+  // And it calls a function that takes an array of roots. By processing a single root at a time
+  // here and turning it into a 1-element array, do we lose performance? Or does the compiler
+  // eliminate the extra work?
   void VisitRoot(RootVisitor* visitor, const RootInfo& info) const
       REQUIRES_SHARED(Locks::mutator_lock_) {
     DCHECK(!IsNull());
@@ -214,7 +222,12 @@ class GcRoot {
     return root_.IsNull();
   }
 
-  ALWAYS_INLINE GcRoot() {}
+  ALWAYS_INLINE GcRoot() : GcRoot(nullptr) {}
+  ALWAYS_INLINE GcRoot(std::nullptr_t) : root_() {
+    DCHECK(IsNull());
+  }
+  explicit ALWAYS_INLINE GcRoot(mirror::CompressedReference<mirror::Object> ref)
+      REQUIRES_SHARED(Locks::mutator_lock_);
   explicit ALWAYS_INLINE GcRoot(MirrorType* ref)
       REQUIRES_SHARED(Locks::mutator_lock_);
   explicit ALWAYS_INLINE GcRoot(ObjPtr<MirrorType> ref)

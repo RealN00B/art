@@ -14,22 +14,69 @@
  * limitations under the License.
  */
 
+#include "arch/context.h"
 #include "callee_save_frame.h"
 #include "jit/jit.h"
 #include "runtime.h"
 #include "thread-inl.h"
 
-namespace art {
+namespace art HIDDEN {
 
-extern "C" void artTestSuspendFromCode(Thread* self) REQUIRES_SHARED(Locks::mutator_lock_) {
-  // Called when suspend count check value is 0 and thread->suspend_count_ != 0
+extern "C" Context* artDeoptimizeIfNeeded(Thread* self, uintptr_t result, bool is_ref)
+    REQUIRES_SHARED(Locks::mutator_lock_) {
+  ScopedQuickEntrypointChecks sqec(self);
+  instrumentation::Instrumentation* instr = Runtime::Current()->GetInstrumentation();
+  DCHECK(!self->IsExceptionPending());
+
+  ArtMethod** sp = self->GetManagedStack()->GetTopQuickFrame();
+  DCHECK(sp != nullptr && (*sp)->IsRuntimeMethod());
+
+  DeoptimizationMethodType type = instr->GetDeoptimizationMethodType(*sp);
+  JValue jvalue;
+  jvalue.SetJ(result);
+  std::unique_ptr<Context> context = instr->DeoptimizeIfNeeded(self, sp, type, jvalue, is_ref);
+  return context.release();
+}
+
+extern "C" Context* artTestSuspendFromCode(Thread* self) REQUIRES_SHARED(Locks::mutator_lock_) {
+  // Called when there is a pending checkpoint or suspend request.
   ScopedQuickEntrypointChecks sqec(self);
   self->CheckSuspend();
+
+  // We could have other dex instructions at the same dex pc as suspend and we need to execute
+  // those instructions. So we should start executing from the current dex pc.
+  ArtMethod** sp = self->GetManagedStack()->GetTopQuickFrame();
+  JValue result;
+  result.SetJ(0);
+  std::unique_ptr<Context> context = Runtime::Current()->GetInstrumentation()->DeoptimizeIfNeeded(
+      self, sp, DeoptimizationMethodType::kKeepDexPc, result, /* is_ref= */ false);
+  return context.release();
+}
+
+extern "C" Context* artImplicitSuspendFromCode(Thread* self) REQUIRES_SHARED(Locks::mutator_lock_) {
+  // Called when there is a pending checkpoint or suspend request.
+  ScopedQuickEntrypointChecks sqec(self);
+  self->CheckSuspend(/*implicit=*/ true);
+
+  // We could have other dex instructions at the same dex pc as suspend and we need to execute
+  // those instructions. So we should start executing from the current dex pc.
+  ArtMethod** sp = self->GetManagedStack()->GetTopQuickFrame();
+  JValue result;
+  result.SetJ(0);
+  std::unique_ptr<Context> context = Runtime::Current()->GetInstrumentation()->DeoptimizeIfNeeded(
+      self, sp, DeoptimizationMethodType::kKeepDexPc, result, /* is_ref= */ false);
+  return context.release();
 }
 
 extern "C" void artCompileOptimized(ArtMethod* method, Thread* self)
     REQUIRES_SHARED(Locks::mutator_lock_) {
   ScopedQuickEntrypointChecks sqec(self);
+  // It is important this method is not suspended due to:
+  // * It is called on entry, and object parameters are in locations that are
+  //   not marked in the stack map.
+  // * Async deoptimization does not expect runtime methods other than the
+  //   suspend entrypoint before executing the first instruction of a Java
+  //   method.
   ScopedAssertNoThreadSuspension sants("Enqueuing optimized compilation");
   Runtime::Current()->GetJit()->EnqueueOptimizedCompilation(method, self);
 }

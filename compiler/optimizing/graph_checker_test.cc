@@ -14,12 +14,13 @@
  * limitations under the License.
  */
 
+#include "base/macros.h"
 #include "graph_checker.h"
 #include "optimizing_unit_test.h"
 
-namespace art {
+namespace art HIDDEN {
 
-class GraphCheckerTest : public OptimizingUnitTest {
+class GraphCheckerTest : public CommonCompilerTest, public OptimizingUnitTestHelper {
  protected:
   HGraph* CreateSimpleCFG();
   void TestCode(const std::vector<uint16_t>& data);
@@ -36,11 +37,11 @@ class GraphCheckerTest : public OptimizingUnitTest {
 HGraph* GraphCheckerTest::CreateSimpleCFG() {
   HGraph* graph = CreateGraph();
   HBasicBlock* entry_block = new (GetAllocator()) HBasicBlock(graph);
-  entry_block->AddInstruction(new (GetAllocator()) HReturnVoid());
+  MakeReturnVoid(entry_block);
   graph->AddBlock(entry_block);
   graph->SetEntryBlock(entry_block);
   HBasicBlock* exit_block = new (GetAllocator()) HBasicBlock(graph);
-  exit_block->AddInstruction(new (GetAllocator()) HExit());
+  MakeExit(exit_block);
   graph->AddBlock(exit_block);
   graph->SetExitBlock(exit_block);
   entry_block->AddSuccessor(exit_block);

@@ -22,14 +22,17 @@
 #include "arch/context.h"
 #include "art_method-inl.h"
 #include "base/callee_save_type.h"
-#include "base/enums.h"
 #include "base/hex_dump.h"
+#include "base/indenter.h"
+#include "base/pointer_size.h"
+#include "base/utils.h"
 #include "dex/dex_file_types.h"
 #include "entrypoints/entrypoint_utils-inl.h"
 #include "entrypoints/quick/callee_save_frame.h"
 #include "entrypoints/runtime_asm_entrypoints.h"
 #include "gc/space/image_space.h"
 #include "gc/space/space-inl.h"
+#include "interpreter/mterp/nterp.h"
 #include "interpreter/shadow_frame-inl.h"
 #include "jit/jit.h"
 #include "jit/jit_code_cache.h"
@@ -39,14 +42,14 @@
 #include "mirror/object-inl.h"
 #include "mirror/object_array-inl.h"
 #include "nterp_helpers.h"
-#include "oat_quick_method_header.h"
+#include "oat/oat_quick_method_header.h"
 #include "obj_ptr-inl.h"
 #include "quick/quick_method_frame_info.h"
 #include "runtime.h"
 #include "thread.h"
 #include "thread_list.h"
 
-namespace art {
+namespace art HIDDEN {
 
 using android::base::StringPrintf;
 
@@ -76,7 +79,7 @@ StackVisitor::StackVisitor(Thread* thread,
       context_(context),
       check_suspended_(check_suspended) {
   if (check_suspended_) {
-    DCHECK(thread == Thread::Current() || thread->IsSuspended()) << *thread;
+    DCHECK(thread == Thread::Current() || thread->GetState() != ThreadState::kRunnable) << *thread;
   }
 }
 
@@ -128,7 +131,19 @@ uint32_t StackVisitor::GetDexPc(bool abort_on_failure) const {
           GetCurrentQuickFrame(), cur_quick_frame_pc_, abort_on_failure);
     } else if (cur_oat_quick_method_header_->IsOptimized()) {
       StackMap* stack_map = GetCurrentStackMap();
-      DCHECK(stack_map->IsValid());
+      if (!stack_map->IsValid()) {
+        // Debugging code for b/361916648.
+        CodeInfo code_info(cur_oat_quick_method_header_);
+        std::stringstream os;
+        VariableIndentationOutputStream vios(&os);
+        code_info.Dump(&vios, /* code_offset= */ 0u, /* verbose= */ true, kRuntimeQuickCodeISA);
+        LOG(FATAL) << os.str() << '\n'
+                   << "StackMap not found for "
+                   << std::hex << cur_quick_frame_pc_ << " in "
+                   << GetMethod()->PrettyMethod()
+                   << " @" << std::hex
+                   << reinterpret_cast<uintptr_t>(cur_oat_quick_method_header_->GetCode());
+      }
       return stack_map->GetDexPc();
     } else {
       DCHECK(cur_oat_quick_method_header_->IsNterpMethodHeader());
@@ -137,6 +152,29 @@ uint32_t StackVisitor::GetDexPc(bool abort_on_failure) const {
   } else {
     return 0;
   }
+}
+
+std::vector<uint32_t> StackVisitor::ComputeDexPcList(uint32_t handler_dex_pc) const {
+  std::vector<uint32_t> result;
+  if (cur_shadow_frame_ == nullptr && cur_quick_frame_ != nullptr && IsInInlinedFrame()) {
+    const BitTableRange<InlineInfo>& infos = current_inline_frames_;
+    DCHECK_NE(infos.size(), 0u);
+
+    // Outermost dex_pc.
+    result.push_back(GetCurrentStackMap()->GetDexPc());
+
+    // The mid dex_pcs. Note that we skip the last one since we want to change that for
+    // `handler_dex_pc`.
+    for (size_t index = 0; index < infos.size() - 1; ++index) {
+      result.push_back(infos[index].GetDexPc());
+    }
+  }
+
+  // The innermost dex_pc has to be the handler dex_pc. In the case of no inline frames, it will be
+  // just the one dex_pc. In the case of inlining we will be replacing the innermost InlineInfo's
+  // dex_pc with this one.
+  result.push_back(handler_dex_pc);
+  return result;
 }
 
 extern "C" mirror::Object* artQuickGetProxyThisObject(ArtMethod** sp)
@@ -149,19 +187,11 @@ ObjPtr<mirror::Object> StackVisitor::GetThisObject() const {
     return nullptr;
   } else if (m->IsNative()) {
     if (cur_quick_frame_ != nullptr) {
-      HandleScope* hs;
-      if (cur_oat_quick_method_header_ != nullptr) {
-        hs = reinterpret_cast<HandleScope*>(
-            reinterpret_cast<char*>(cur_quick_frame_) + sizeof(ArtMethod*));
-      } else {
-        // GenericJNI frames have the HandleScope under the managed frame.
-        uint32_t shorty_len;
-        const char* shorty = m->GetShorty(&shorty_len);
-        const size_t num_handle_scope_references =
-            /* this */ 1u + std::count(shorty + 1, shorty + shorty_len, 'L');
-        hs = GetGenericJniHandleScope(cur_quick_frame_, num_handle_scope_references);
-      }
-      return hs->GetReference(0);
+      // The `this` reference is stored in the first out vreg in the caller's frame.
+      const size_t frame_size = GetCurrentQuickFrameInfo().FrameSizeInBytes();
+      auto* stack_ref = reinterpret_cast<StackReference<mirror::Object>*>(
+          reinterpret_cast<uint8_t*>(cur_quick_frame_) + frame_size + sizeof(ArtMethod*));
+      return stack_ref->AsMirrorPtr();
     } else {
       return cur_shadow_frame_->GetVRegReference(0);
     }
@@ -220,7 +250,8 @@ bool StackVisitor::GetVReg(ArtMethod* m,
                            uint16_t vreg,
                            VRegKind kind,
                            uint32_t* val,
-                           std::optional<DexRegisterLocation> location) const {
+                           std::optional<DexRegisterLocation> location,
+                           bool need_full_register_list) const {
   if (cur_quick_frame_ != nullptr) {
     DCHECK(context_ != nullptr);  // You can't reliably read registers without a context.
     DCHECK(m == GetMethod());
@@ -240,12 +271,12 @@ bool StackVisitor::GetVReg(ArtMethod* m,
         uint32_t val2 = *val;
         // The caller already known the register location, so we can use the faster overload
         // which does not decode the stack maps.
-        result = GetVRegFromOptimizedCode(location.value(), kind, val);
+        result = GetVRegFromOptimizedCode(location.value(), val);
         // Compare to the slower overload.
-        DCHECK_EQ(result, GetVRegFromOptimizedCode(m, vreg, kind, &val2));
+        DCHECK_EQ(result, GetVRegFromOptimizedCode(m, vreg, kind, &val2, need_full_register_list));
         DCHECK_EQ(*val, val2);
       } else {
-        result = GetVRegFromOptimizedCode(m, vreg, kind, val);
+        result = GetVRegFromOptimizedCode(m, vreg, kind, val, need_full_register_list);
       }
     }
     if (kind == kReferenceVReg) {
@@ -268,14 +299,20 @@ bool StackVisitor::GetVReg(ArtMethod* m,
   }
 }
 
-bool StackVisitor::GetVRegFromOptimizedCode(ArtMethod* m, uint16_t vreg, VRegKind kind,
-                                            uint32_t* val) const {
+size_t StackVisitor::GetNumberOfRegisters(CodeInfo* code_info, int depth) const {
+  return depth == 0
+    ? code_info->GetNumberOfDexRegisters()
+    : current_inline_frames_[depth - 1].GetNumberOfDexRegisters();
+}
+
+bool StackVisitor::GetVRegFromOptimizedCode(ArtMethod* m,
+                                            uint16_t vreg,
+                                            VRegKind kind,
+                                            uint32_t* val,
+                                            bool need_full_register_list) const {
   DCHECK_EQ(m, GetMethod());
   // Can't be null or how would we compile its instructions?
   DCHECK(m->GetCodeItem() != nullptr) << m->PrettyMethod();
-  CodeItemDataAccessor accessor(m->DexInstructionData());
-  uint16_t number_of_dex_registers = accessor.RegistersSize();
-  DCHECK_LT(vreg, number_of_dex_registers);
   const OatQuickMethodHeader* method_header = GetCurrentOatQuickMethodHeader();
   CodeInfo code_info(method_header);
 
@@ -283,13 +320,18 @@ bool StackVisitor::GetVRegFromOptimizedCode(ArtMethod* m, uint16_t vreg, VRegKin
   StackMap stack_map = code_info.GetStackMapForNativePcOffset(native_pc_offset);
   DCHECK(stack_map.IsValid());
 
-  DexRegisterMap dex_register_map = IsInInlinedFrame()
-      ? code_info.GetInlineDexRegisterMapOf(stack_map, current_inline_frames_.back())
-      : code_info.GetDexRegisterMapOf(stack_map);
+  DexRegisterMap dex_register_map = (IsInInlinedFrame() && !need_full_register_list)
+    ? code_info.GetInlineDexRegisterMapOf(stack_map, current_inline_frames_.back())
+    : code_info.GetDexRegisterMapOf(stack_map,
+                                    /* first= */ 0,
+                                    GetNumberOfRegisters(&code_info, InlineDepth()));
+
   if (dex_register_map.empty()) {
     return false;
   }
-  DCHECK_EQ(dex_register_map.size(), number_of_dex_registers);
+
+  const size_t number_of_dex_registers = dex_register_map.size();
+  DCHECK_LT(vreg, number_of_dex_registers);
   DexRegisterLocation::Kind location_kind = dex_register_map[vreg].GetKind();
   switch (location_kind) {
     case DexRegisterLocation::Kind::kInStack: {
@@ -308,7 +350,7 @@ bool StackVisitor::GetVRegFromOptimizedCode(ArtMethod* m, uint16_t vreg, VRegKin
       if (kind == kReferenceVReg && !(register_mask & (1 << reg))) {
         return false;
       }
-      return GetRegisterIfAccessible(reg, kind, val);
+      return GetRegisterIfAccessible(reg, location_kind, val);
     }
     case DexRegisterLocation::Kind::kInRegisterHigh:
     case DexRegisterLocation::Kind::kInFpuRegister:
@@ -317,7 +359,7 @@ bool StackVisitor::GetVRegFromOptimizedCode(ArtMethod* m, uint16_t vreg, VRegKin
         return false;
       }
       uint32_t reg = dex_register_map[vreg].GetMachineRegister();
-      return GetRegisterIfAccessible(reg, kind, val);
+      return GetRegisterIfAccessible(reg, location_kind, val);
     }
     case DexRegisterLocation::Kind::kConstant: {
       uint32_t result = dex_register_map[vreg].GetConstant();
@@ -335,9 +377,7 @@ bool StackVisitor::GetVRegFromOptimizedCode(ArtMethod* m, uint16_t vreg, VRegKin
   }
 }
 
-bool StackVisitor::GetVRegFromOptimizedCode(DexRegisterLocation location,
-                                            VRegKind kind,
-                                            uint32_t* val) const {
+bool StackVisitor::GetVRegFromOptimizedCode(DexRegisterLocation location, uint32_t* val) const {
   switch (location.GetKind()) {
     case DexRegisterLocation::Kind::kInvalid:
       break;
@@ -350,7 +390,7 @@ bool StackVisitor::GetVRegFromOptimizedCode(DexRegisterLocation location,
     case DexRegisterLocation::Kind::kInRegisterHigh:
     case DexRegisterLocation::Kind::kInFpuRegister:
     case DexRegisterLocation::Kind::kInFpuRegisterHigh:
-      return GetRegisterIfAccessible(location.GetMachineRegister(), kind, val);
+      return GetRegisterIfAccessible(location.GetMachineRegister(), location.GetKind(), val);
     case DexRegisterLocation::Kind::kConstant:
       *val = location.GetConstant();
       return true;
@@ -361,29 +401,30 @@ bool StackVisitor::GetVRegFromOptimizedCode(DexRegisterLocation location,
   UNREACHABLE();
 }
 
-bool StackVisitor::GetRegisterIfAccessible(uint32_t reg, VRegKind kind, uint32_t* val) const {
-  const bool is_float = (kind == kFloatVReg) || (kind == kDoubleLoVReg) || (kind == kDoubleHiVReg);
+bool StackVisitor::GetRegisterIfAccessible(uint32_t reg,
+                                           DexRegisterLocation::Kind location_kind,
+                                           uint32_t* val) const {
+  const bool is_float = (location_kind == DexRegisterLocation::Kind::kInFpuRegister) ||
+                        (location_kind == DexRegisterLocation::Kind::kInFpuRegisterHigh);
 
-  if (kRuntimeISA == InstructionSet::kX86 && is_float) {
+  if (kRuntimeQuickCodeISA == InstructionSet::kX86 && is_float) {
     // X86 float registers are 64-bit and each XMM register is provided as two separate
     // 32-bit registers by the context.
-    reg = (kind == kDoubleHiVReg) ? (2 * reg + 1) : (2 * reg);
+    reg = (location_kind == DexRegisterLocation::Kind::kInFpuRegisterHigh)
+        ? (2 * reg + 1)
+        : (2 * reg);
   }
 
   if (!IsAccessibleRegister(reg, is_float)) {
     return false;
   }
   uintptr_t ptr_val = GetRegister(reg, is_float);
-  const bool target64 = Is64BitInstructionSet(kRuntimeISA);
+  const bool target64 = Is64BitInstructionSet(kRuntimeQuickCodeISA);
   if (target64) {
-    const bool wide_lo = (kind == kLongLoVReg) || (kind == kDoubleLoVReg);
-    const bool wide_hi = (kind == kLongHiVReg) || (kind == kDoubleHiVReg);
+    const bool is_high = (location_kind == DexRegisterLocation::Kind::kInRegisterHigh) ||
+                         (location_kind == DexRegisterLocation::Kind::kInFpuRegisterHigh);
     int64_t value_long = static_cast<int64_t>(ptr_val);
-    if (wide_lo) {
-      ptr_val = static_cast<uintptr_t>(Low32Bits(value_long));
-    } else if (wide_hi) {
-      ptr_val = static_cast<uintptr_t>(High32Bits(value_long));
-    }
+    ptr_val = static_cast<uintptr_t>(is_high ? High32Bits(value_long) : Low32Bits(value_long));
   }
   *val = ptr_val;
   return true;
@@ -446,25 +487,6 @@ bool StackVisitor::GetVRegPairFromOptimizedCode(ArtMethod* m, uint16_t vreg,
     *val = (static_cast<uint64_t>(high_32bits) << 32) | static_cast<uint64_t>(low_32bits);
   }
   return success;
-}
-
-bool StackVisitor::GetRegisterPairIfAccessible(uint32_t reg_lo, uint32_t reg_hi,
-                                               VRegKind kind_lo, uint64_t* val) const {
-  const bool is_float = (kind_lo == kDoubleLoVReg);
-  if (!IsAccessibleRegister(reg_lo, is_float) || !IsAccessibleRegister(reg_hi, is_float)) {
-    return false;
-  }
-  uintptr_t ptr_val_lo = GetRegister(reg_lo, is_float);
-  uintptr_t ptr_val_hi = GetRegister(reg_hi, is_float);
-  bool target64 = Is64BitInstructionSet(kRuntimeISA);
-  if (target64) {
-    int64_t value_long_lo = static_cast<int64_t>(ptr_val_lo);
-    int64_t value_long_hi = static_cast<int64_t>(ptr_val_hi);
-    ptr_val_lo = static_cast<uintptr_t>(Low32Bits(value_long_lo));
-    ptr_val_hi = static_cast<uintptr_t>(High32Bits(value_long_hi));
-  }
-  *val = (static_cast<uint64_t>(ptr_val_hi) << 32) | static_cast<uint32_t>(ptr_val_lo);
-  return true;
 }
 
 ShadowFrame* StackVisitor::PrepareSetVReg(ArtMethod* m, uint16_t vreg, bool wide) {
@@ -672,105 +694,65 @@ void StackVisitor::SetMethod(ArtMethod* method) {
   }
 }
 
-static void AssertPcIsWithinQuickCode(ArtMethod* method, uintptr_t pc)
-    REQUIRES_SHARED(Locks::mutator_lock_) {
-  if (method->IsNative() || method->IsRuntimeMethod() || method->IsProxyMethod()) {
+void StackVisitor::ValidateFrame() const {
+  if (!kIsDebugBuild) {
     return;
   }
-
-  if (pc == reinterpret_cast<uintptr_t>(GetQuickInstrumentationExitPc())) {
-    return;
+  ArtMethod* method = GetMethod();
+  ObjPtr<mirror::Class> declaring_class = method->GetDeclaringClass();
+  // Runtime methods have null declaring class.
+  if (!method->IsRuntimeMethod()) {
+    CHECK(declaring_class != nullptr);
+    CHECK_EQ(declaring_class->GetClass(), declaring_class->GetClass()->GetClass())
+        << declaring_class;
+  } else {
+    CHECK(declaring_class == nullptr);
   }
-
-  Runtime* runtime = Runtime::Current();
-  if (runtime->UseJitCompilation() &&
-      runtime->GetJit()->GetCodeCache()->ContainsPc(reinterpret_cast<const void*>(pc))) {
-    return;
-  }
-
-  const void* code = method->GetEntryPointFromQuickCompiledCode();
-  if (code == GetQuickInstrumentationEntryPoint() || code == GetInvokeObsoleteMethodStub()) {
-    return;
-  }
-
-  ClassLinker* class_linker = Runtime::Current()->GetClassLinker();
-  if (class_linker->IsQuickToInterpreterBridge(code) ||
-      class_linker->IsQuickResolutionStub(code)) {
-    return;
-  }
-
-  if (runtime->UseJitCompilation() && runtime->GetJit()->GetCodeCache()->ContainsPc(code)) {
-    return;
-  }
-
-  uint32_t code_size = OatQuickMethodHeader::FromEntryPoint(code)->GetCodeSize();
-  uintptr_t code_start = reinterpret_cast<uintptr_t>(code);
-  CHECK(code_start <= pc && pc <= (code_start + code_size))
-      << method->PrettyMethod()
-      << " pc=" << std::hex << pc
-      << " code_start=" << code_start
-      << " code_size=" << code_size;
-}
-
-void StackVisitor::SanityCheckFrame() const {
-  if (kIsDebugBuild) {
-    ArtMethod* method = GetMethod();
-    ObjPtr<mirror::Class> declaring_class = method->GetDeclaringClass();
-    // Runtime methods have null declaring class.
-    if (!method->IsRuntimeMethod()) {
-      CHECK(declaring_class != nullptr);
-      CHECK_EQ(declaring_class->GetClass(), declaring_class->GetClass()->GetClass())
-          << declaring_class;
-    } else {
-      CHECK(declaring_class == nullptr);
-    }
-    Runtime* const runtime = Runtime::Current();
-    LinearAlloc* const linear_alloc = runtime->GetLinearAlloc();
-    if (!linear_alloc->Contains(method)) {
-      // Check class linker linear allocs.
-      // We get the canonical method as copied methods may have their declaring
-      // class from another class loader.
-      const PointerSize ptrSize = runtime->GetClassLinker()->GetImagePointerSize();
-      ArtMethod* canonical = method->GetCanonicalMethod(ptrSize);
-      ObjPtr<mirror::Class> klass = canonical->GetDeclaringClass();
-      LinearAlloc* const class_linear_alloc = (klass != nullptr)
-          ? runtime->GetClassLinker()->GetAllocatorForClassLoader(klass->GetClassLoader())
-          : linear_alloc;
-      if (!class_linear_alloc->Contains(canonical)) {
-        // Check image space.
-        bool in_image = false;
-        for (auto& space : runtime->GetHeap()->GetContinuousSpaces()) {
-          if (space->IsImageSpace()) {
-            auto* image_space = space->AsImageSpace();
-            const auto& header = image_space->GetImageHeader();
-            const ImageSection& methods = header.GetMethodsSection();
-            const ImageSection& runtime_methods = header.GetRuntimeMethodsSection();
-            const size_t offset =  reinterpret_cast<const uint8_t*>(canonical) - image_space->Begin();
-            if (methods.Contains(offset) || runtime_methods.Contains(offset)) {
-              in_image = true;
-              break;
-            }
+  Runtime* const runtime = Runtime::Current();
+  LinearAlloc* const linear_alloc = runtime->GetLinearAlloc();
+  if (!linear_alloc->Contains(method)) {
+    // Check class linker linear allocs.
+    // We get the canonical method as copied methods may have been allocated
+    // by a different class loader.
+    const PointerSize ptrSize = runtime->GetClassLinker()->GetImagePointerSize();
+    ArtMethod* canonical = method->GetCanonicalMethod(ptrSize);
+    ObjPtr<mirror::Class> klass = canonical->GetDeclaringClass();
+    LinearAlloc* const class_linear_alloc = (klass != nullptr)
+        ? runtime->GetClassLinker()->GetAllocatorForClassLoader(klass->GetClassLoader())
+        : linear_alloc;
+    if (!class_linear_alloc->Contains(canonical)) {
+      // Check image space.
+      bool in_image = false;
+      for (auto& space : runtime->GetHeap()->GetContinuousSpaces()) {
+        if (space->IsImageSpace()) {
+          auto* image_space = space->AsImageSpace();
+          const auto& header = image_space->GetImageHeader();
+          const ImageSection& methods = header.GetMethodsSection();
+          const ImageSection& runtime_methods = header.GetRuntimeMethodsSection();
+          const size_t offset =  reinterpret_cast<const uint8_t*>(canonical) - image_space->Begin();
+          if (methods.Contains(offset) || runtime_methods.Contains(offset)) {
+            in_image = true;
+            break;
           }
         }
-        CHECK(in_image) << canonical->PrettyMethod() << " not in linear alloc or image";
       }
+      CHECK(in_image) << canonical->PrettyMethod() << " not in linear alloc or image";
     }
-    if (cur_quick_frame_ != nullptr) {
-      AssertPcIsWithinQuickCode(method, cur_quick_frame_pc_);
-      // Frame sanity.
-      size_t frame_size = GetCurrentQuickFrameInfo().FrameSizeInBytes();
-      CHECK_NE(frame_size, 0u);
-      // For compiled code, we could try to have a rough guess at an upper size we expect
-      // to see for a frame:
-      // 256 registers
-      // 2 words HandleScope overhead
-      // 3+3 register spills
-      // const size_t kMaxExpectedFrameSize = (256 + 2 + 3 + 3) * sizeof(word);
-      const size_t kMaxExpectedFrameSize = interpreter::kMaxNterpFrame;
-      CHECK_LE(frame_size, kMaxExpectedFrameSize) << method->PrettyMethod();
-      size_t return_pc_offset = GetCurrentQuickFrameInfo().GetReturnPcOffset();
-      CHECK_LT(return_pc_offset, frame_size);
-    }
+  }
+  if (cur_quick_frame_ != nullptr) {
+    // Frame consistency checks.
+    size_t frame_size = GetCurrentQuickFrameInfo().FrameSizeInBytes();
+    CHECK_NE(frame_size, 0u);
+    // For compiled code, we could try to have a rough guess at an upper size we expect
+    // to see for a frame:
+    // 256 registers
+    // 2 words HandleScope overhead
+    // 3+3 register spills
+    // const size_t kMaxExpectedFrameSize = (256 + 2 + 3 + 3) * sizeof(word);
+    const size_t kMaxExpectedFrameSize = interpreter::kNterpMaxFrame;
+    CHECK_LE(frame_size, kMaxExpectedFrameSize) << method->PrettyMethod();
+    size_t return_pc_offset = GetCurrentQuickFrameInfo().GetReturnPcOffset();
+    CHECK_LT(return_pc_offset, frame_size);
   }
 }
 
@@ -810,28 +792,32 @@ QuickMethodFrameInfo StackVisitor::GetCurrentQuickFrameInfo() const {
   //     (resolution, instrumentation) trampoline; or
   //   - fake a Generic JNI frame in art_jni_dlsym_lookup_critical_stub.
   DCHECK(method->IsNative());
-  if (kIsDebugBuild && !method->IsCriticalNative()) {
-    ClassLinker* class_linker = runtime->GetClassLinker();
-    const void* entry_point = runtime->GetInstrumentation()->GetQuickCodeFor(method,
-                                                                             kRuntimePointerSize);
-    CHECK(class_linker->IsQuickGenericJniStub(entry_point) ||
-          // The current entrypoint (after filtering out trampolines) may have changed
-          // from GenericJNI to JIT-compiled stub since we have entered this frame.
-          (runtime->GetJit() != nullptr &&
-           runtime->GetJit()->GetCodeCache()->ContainsPc(entry_point))) << method->PrettyMethod();
-  }
   // Generic JNI frame is just like the SaveRefsAndArgs frame.
   // Note that HandleScope, if any, is below the frame.
   return RuntimeCalleeSaveFrame::GetMethodFrameInfo(CalleeSaveType::kSaveRefsAndArgs);
 }
 
+uint8_t* StackVisitor::GetShouldDeoptimizeFlagAddr() const REQUIRES_SHARED(Locks::mutator_lock_) {
+  DCHECK(GetCurrentOatQuickMethodHeader()->HasShouldDeoptimizeFlag());
+  QuickMethodFrameInfo frame_info = GetCurrentQuickFrameInfo();
+  size_t frame_size = frame_info.FrameSizeInBytes();
+  uint8_t* sp = reinterpret_cast<uint8_t*>(GetCurrentQuickFrame());
+  size_t core_spill_size =
+      POPCOUNT(frame_info.CoreSpillMask()) * GetBytesPerGprSpillLocation(kRuntimeQuickCodeISA);
+  size_t fpu_spill_size =
+      POPCOUNT(frame_info.FpSpillMask()) * GetBytesPerFprSpillLocation(kRuntimeQuickCodeISA);
+  size_t offset = frame_size - core_spill_size - fpu_spill_size - kShouldDeoptimizeFlagSize;
+  uint8_t* should_deoptimize_addr = sp + offset;
+  DCHECK_EQ(*should_deoptimize_addr & ~static_cast<uint8_t>(DeoptimizeFlagValue::kAll), 0);
+  return should_deoptimize_addr;
+}
+
 template <StackVisitor::CountTransitions kCount>
 void StackVisitor::WalkStack(bool include_transitions) {
   if (check_suspended_) {
-    DCHECK(thread_ == Thread::Current() || thread_->IsSuspended());
+    DCHECK(thread_ == Thread::Current() || thread_->GetState() != ThreadState::kRunnable);
   }
   CHECK_EQ(cur_depth_, 0U);
-  size_t inlined_frames_count = 0;
 
   for (const ManagedStack* current_fragment = thread_->GetManagedStack();
        current_fragment != nullptr; current_fragment = current_fragment->GetLink()) {
@@ -839,6 +825,12 @@ void StackVisitor::WalkStack(bool include_transitions) {
     cur_quick_frame_ = current_fragment->GetTopQuickFrame();
     cur_quick_frame_pc_ = 0;
     DCHECK(cur_oat_quick_method_header_ == nullptr);
+
+    if (kDebugStackWalk) {
+      LOG(INFO) << "Tid=" << thread_-> GetThreadId()
+          << ", ManagedStack fragement: " << current_fragment;
+    }
+
     if (cur_quick_frame_ != nullptr) {  // Handle quick stack frames.
       // Can't be both a shadow and a quick fragment.
       DCHECK(current_fragment->GetTopShadowFrame() == nullptr);
@@ -851,18 +843,26 @@ void StackVisitor::WalkStack(bool include_transitions) {
         // between GenericJNI frame and JIT-compiled JNI stub; the entrypoint may have
         // changed since the frame was entered. The top quick frame tag indicates
         // GenericJNI here, otherwise it's either AOT-compiled or JNI-compiled JNI stub.
-        if (UNLIKELY(current_fragment->GetTopQuickFrameTag())) {
+        if (UNLIKELY(current_fragment->GetTopQuickFrameGenericJniTag())) {
           // The generic JNI does not have any method header.
           cur_oat_quick_method_header_ = nullptr;
+        } else if (UNLIKELY(current_fragment->GetTopQuickFrameJitJniTag())) {
+          // Should be JITed code.
+          Runtime* runtime = Runtime::Current();
+          const void* code = runtime->GetJit()->GetCodeCache()->GetJniStubCode(method);
+          CHECK(code != nullptr) << method->PrettyMethod();
+          cur_oat_quick_method_header_ = OatQuickMethodHeader::FromCodePointer(code);
         } else {
+          // We are sure we are not running GenericJni here. Though the entry point could still be
+          // GenericJnistub. The entry point is usually JITed or AOT code. It could be also a
+          // resolution stub if the class isn't visibly initialized yet.
           const void* existing_entry_point = method->GetEntryPointFromQuickCompiledCode();
           CHECK(existing_entry_point != nullptr);
           Runtime* runtime = Runtime::Current();
           ClassLinker* class_linker = runtime->GetClassLinker();
           // Check whether we can quickly get the header from the current entrypoint.
           if (!class_linker->IsQuickGenericJniStub(existing_entry_point) &&
-              !class_linker->IsQuickResolutionStub(existing_entry_point) &&
-              existing_entry_point != GetQuickInstrumentationEntryPoint()) {
+              !class_linker->IsQuickResolutionStub(existing_entry_point)) {
             cur_oat_quick_method_header_ =
                 OatQuickMethodHeader::FromEntryPoint(existing_entry_point);
           } else {
@@ -870,9 +870,24 @@ void StackVisitor::WalkStack(bool include_transitions) {
             if (code != nullptr) {
               cur_oat_quick_method_header_ = OatQuickMethodHeader::FromEntryPoint(code);
             } else {
-              // This must be a JITted JNI stub frame.
-              CHECK(runtime->GetJit() != nullptr);
-              code = runtime->GetJit()->GetCodeCache()->GetJniStubCode(method);
+              // For non-debuggable runtimes, the JNI stub can be JIT-compiled or AOT-compiled, and
+              // can also reuse the stub in boot images. Since we checked for AOT code earlier, we
+              // must be running JITed code or boot JNI stub.
+              // For debuggable runtimes, we won't be here as we never use AOT code in debuggable.
+              // And the JIT situation is handled earlier as its SP will be tagged. But there is a
+              // special case where we change runtime state from non-debuggable to debuggable in
+              // the JNI implementation and do deopt inside, which could be treated as
+              // a case of non-debuggable as well.
+              if (runtime->GetJit() != nullptr) {
+                code = runtime->GetJit()->GetCodeCache()->GetJniStubCode(method);
+              }
+              if (code == nullptr) {
+                // Check if current method uses the boot JNI stub.
+                const void* boot_jni_stub = class_linker->FindBootJniStub(method);
+                if (boot_jni_stub != nullptr) {
+                  code = EntryPointToCodePointer(boot_jni_stub);
+                }
+              }
               CHECK(code != nullptr) << method->PrettyMethod();
               cur_oat_quick_method_header_ = OatQuickMethodHeader::FromCodePointer(code);
             }
@@ -885,8 +900,12 @@ void StackVisitor::WalkStack(bool include_transitions) {
           cur_oat_quick_method_header_ = method->GetOatQuickMethodHeader(cur_quick_frame_pc_);
         }
         header_retrieved = false;  // Force header retrieval in next iteration.
-        SanityCheckFrame();
 
+        if (kDebugStackWalk) {
+          LOG(INFO) << "Early print: Tid=" << thread_-> GetThreadId() << ", method: "
+              << ArtMethod::PrettyMethod(method) << "@" << method;
+        }
+        ValidateFrame();
         if ((walk_kind_ == StackWalkKind::kIncludeInlinedFrames)
             && (cur_oat_quick_method_header_ != nullptr)
             && cur_oat_quick_method_header_->IsOptimized()
@@ -905,7 +924,6 @@ void StackVisitor::WalkStack(bool include_transitions) {
                 return;
               }
               cur_depth_++;
-              inlined_frames_count++;
             }
           }
         }
@@ -922,44 +940,14 @@ void StackVisitor::WalkStack(bool include_transitions) {
         // Compute PC for next stack frame from return PC.
         size_t frame_size = frame_info.FrameSizeInBytes();
         uintptr_t return_pc_addr = GetReturnPcAddr();
-        uintptr_t return_pc = *reinterpret_cast<uintptr_t*>(return_pc_addr);
 
-        if (UNLIKELY(reinterpret_cast<uintptr_t>(GetQuickInstrumentationExitPc()) == return_pc)) {
-          // While profiling, the return pc is restored from the side stack, except when walking
-          // the stack for an exception where the side stack will be unwound in VisitFrame.
-          const std::map<uintptr_t, instrumentation::InstrumentationStackFrame>&
-              instrumentation_stack = *thread_->GetInstrumentationStack();
-          auto it = instrumentation_stack.find(return_pc_addr);
-          CHECK(it != instrumentation_stack.end());
-          const instrumentation::InstrumentationStackFrame& instrumentation_frame = it->second;
-          if (GetMethod() ==
-              Runtime::Current()->GetCalleeSaveMethod(CalleeSaveType::kSaveAllCalleeSaves)) {
-            // Skip runtime save all callee frames which are used to deliver exceptions.
-          } else if (instrumentation_frame.interpreter_entry_) {
-            ArtMethod* callee =
-                Runtime::Current()->GetCalleeSaveMethod(CalleeSaveType::kSaveRefsAndArgs);
-            CHECK_EQ(GetMethod(), callee) << "Expected: " << ArtMethod::PrettyMethod(callee)
-                                          << " Found: " << ArtMethod::PrettyMethod(GetMethod());
-          } else if (!instrumentation_frame.method_->IsRuntimeMethod()) {
-            // Trampolines get replaced with their actual method in the stack,
-            // so don't do the check below for runtime methods.
-            // Instrumentation generally doesn't distinguish between a method's obsolete and
-            // non-obsolete version.
-            CHECK_EQ(instrumentation_frame.method_->GetNonObsoleteMethod(),
-                     GetMethod()->GetNonObsoleteMethod())
-                << "Expected: "
-                << ArtMethod::PrettyMethod(instrumentation_frame.method_->GetNonObsoleteMethod())
-                << " Found: " << ArtMethod::PrettyMethod(GetMethod()->GetNonObsoleteMethod());
-          }
-          return_pc = instrumentation_frame.return_pc_;
-        }
-
-        cur_quick_frame_pc_ = return_pc;
+        cur_quick_frame_pc_ = *reinterpret_cast<uintptr_t*>(return_pc_addr);
         uint8_t* next_frame = reinterpret_cast<uint8_t*>(cur_quick_frame_) + frame_size;
         cur_quick_frame_ = reinterpret_cast<ArtMethod**>(next_frame);
 
         if (kDebugStackWalk) {
-          LOG(INFO) << ArtMethod::PrettyMethod(method) << "@" << method << " size=" << frame_size
+          LOG(INFO) << "Tid=" << thread_-> GetThreadId() << ", method: "
+              << ArtMethod::PrettyMethod(method) << "@" << method << " size=" << frame_size
               << std::boolalpha
               << " optimized=" << (cur_oat_quick_method_header_ != nullptr &&
                                    cur_oat_quick_method_header_->IsOptimized())
@@ -979,7 +967,13 @@ void StackVisitor::WalkStack(bool include_transitions) {
       cur_oat_quick_method_header_ = nullptr;
     } else if (cur_shadow_frame_ != nullptr) {
       do {
-        SanityCheckFrame();
+        if (kDebugStackWalk) {
+          ArtMethod* method = cur_shadow_frame_->GetMethod();
+          LOG(INFO) << "Tid=" << thread_-> GetThreadId() << ", method: "
+              << ArtMethod::PrettyMethod(method) << "@" << method
+              << ", ShadowFrame";
+        }
+        ValidateFrame();
         bool should_continue = VisitFrame();
         if (UNLIKELY(!should_continue)) {
           return;

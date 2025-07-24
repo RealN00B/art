@@ -23,21 +23,22 @@
 
 #include "art_field-inl.h"
 #include "art_method-inl.h"
+#include "art_method.h"
 #include "class_linker-inl.h"
 #include "debug_print.h"
 #include "dex/dex_file-inl.h"
 #include "dex/dex_instruction-inl.h"
 #include "dex/invoke_type.h"
-#include "mirror/class-inl.h"
+#include "mirror/class-alloc-inl.h"
 #include "mirror/method_type.h"
 #include "mirror/object-inl.h"
 #include "mirror/object_array-inl.h"
 #include "nativehelper/scoped_local_ref.h"
 #include "obj_ptr-inl.h"
 #include "thread.h"
-#include "well_known_classes.h"
+#include "well_known_classes-inl.h"
 
-namespace art {
+namespace art HIDDEN {
 
 using android::base::StringAppendV;
 using android::base::StringPrintf;
@@ -151,7 +152,6 @@ void ThrowWrappedBootstrapMethodError(const char* fmt, ...) {
 // ClassCastException
 
 void ThrowClassCastException(ObjPtr<mirror::Class> dest_type, ObjPtr<mirror::Class> src_type) {
-  DumpB77342775DebugData(dest_type, src_type);
   ThrowException("Ljava/lang/ClassCastException;", nullptr,
                  StringPrintf("%s cannot be cast to %s",
                               mirror::Class::PrettyDescriptor(src_type).c_str(),
@@ -237,6 +237,21 @@ void ThrowIllegalAccessError(ObjPtr<mirror::Class> referrer, const char* fmt, ..
   va_end(args);
 }
 
+void ThrowIllegalAccessErrorForImplementingMethod(ObjPtr<mirror::Class> klass,
+                                                  ArtMethod* implementation_method,
+                                                  ArtMethod* interface_method)
+    REQUIRES_SHARED(Locks::mutator_lock_) {
+  // Note: For a non-public abstract implementing method, both `AbstractMethodError` and
+  // `IllegalAccessError` are reasonable. We now follow the RI behaviour and throw the latter,
+  // so we do not assert here that the implementation method is concrete as we did in the past.
+  DCHECK(!implementation_method->IsPublic());
+  ThrowIllegalAccessError(
+      klass,
+      "Method '%s' implementing interface method '%s' is not public",
+      implementation_method->PrettyMethod().c_str(),
+      interface_method->PrettyMethod().c_str());
+}
+
 // IllegalAccessException
 
 void ThrowIllegalAccessException(const char* msg) {
@@ -257,29 +272,13 @@ void ThrowIllegalStateException(const char* msg) {
 
 // IncompatibleClassChangeError
 
-void ThrowIncompatibleClassChangeError(InvokeType expected_type, InvokeType found_type,
-                                       ArtMethod* method, ArtMethod* referrer) {
+void ThrowIncompatibleClassChangeError(InvokeType expected_type,
+                                       InvokeType found_type,
+                                       ArtMethod* method,
+                                       ArtMethod* referrer) {
   std::ostringstream msg;
   msg << "The method '" << ArtMethod::PrettyMethod(method) << "' was expected to be of type "
       << expected_type << " but instead was found to be of type " << found_type;
-  ThrowException("Ljava/lang/IncompatibleClassChangeError;",
-                 referrer != nullptr ? referrer->GetDeclaringClass() : nullptr,
-                 msg.str().c_str());
-}
-
-void ThrowIncompatibleClassChangeErrorClassForInterfaceSuper(ArtMethod* method,
-                                                             ObjPtr<mirror::Class> target_class,
-                                                             ObjPtr<mirror::Object> this_object,
-                                                             ArtMethod* referrer) {
-  // Referrer is calling interface_method on this_object, however, the interface_method isn't
-  // implemented by this_object.
-  CHECK(this_object != nullptr);
-  std::ostringstream msg;
-  msg << "Class '" << mirror::Class::PrettyDescriptor(this_object->GetClass())
-      << "' does not implement interface '" << mirror::Class::PrettyDescriptor(target_class)
-      << "' in call to '"
-      << ArtMethod::PrettyMethod(method) << "'";
-  DumpB77342775DebugData(target_class, this_object->GetClass());
   ThrowException("Ljava/lang/IncompatibleClassChangeError;",
                  referrer != nullptr ? referrer->GetDeclaringClass() : nullptr,
                  msg.str().c_str());
@@ -296,13 +295,13 @@ void ThrowIncompatibleClassChangeErrorClassForInterfaceDispatch(ArtMethod* inter
       << "' does not implement interface '"
       << mirror::Class::PrettyDescriptor(interface_method->GetDeclaringClass())
       << "' in call to '" << ArtMethod::PrettyMethod(interface_method) << "'";
-  DumpB77342775DebugData(interface_method->GetDeclaringClass(), this_object->GetClass());
   ThrowException("Ljava/lang/IncompatibleClassChangeError;",
                  referrer != nullptr ? referrer->GetDeclaringClass() : nullptr,
                  msg.str().c_str());
 }
 
-void ThrowIncompatibleClassChangeErrorField(ArtField* resolved_field, bool is_static,
+void ThrowIncompatibleClassChangeErrorField(ArtField* resolved_field,
+                                            bool is_static,
                                             ArtMethod* referrer) {
   std::ostringstream msg;
   msg << "Expected '" << ArtField::PrettyField(resolved_field) << "' to be a "
@@ -419,12 +418,23 @@ void ThrowNoSuchMethodError(InvokeType type,
   ThrowException("Ljava/lang/NoSuchMethodError;", c, msg.str().c_str());
 }
 
+void ThrowNoSuchMethodError(ObjPtr<mirror::Class> c,
+                            std::string_view name,
+                            const Signature& signature) {
+  std::ostringstream msg;
+  std::string temp;
+  msg << "No method " << name << signature
+      << " in class " << c->GetDescriptor(&temp) << " or its super classes";
+  ThrowException("Ljava/lang/NoSuchMethodError;", c, msg.str().c_str());
+}
+
 // NullPointerException
 
-void ThrowNullPointerExceptionForFieldAccess(ArtField* field, bool is_read) {
+void ThrowNullPointerExceptionForFieldAccess(ArtField* field, ArtMethod* method, bool is_read) {
   std::ostringstream msg;
-  msg << "Attempt to " << (is_read ? "read from" : "write to")
-      << " field '" << ArtField::PrettyField(field, true) << "' on a null object reference";
+  msg << "Attempt to " << (is_read ? "read from" : "write to") << " field '"
+      << ArtField::PrettyField(field) << "' on a null object reference in method '"
+      << ArtMethod::PrettyMethod(method) << "'";
   ThrowException("Ljava/lang/NullPointerException;", nullptr, msg.str().c_str());
 }
 
@@ -450,7 +460,7 @@ void ThrowNullPointerExceptionForMethodAccess(ArtMethod* method, InvokeType type
 }
 
 static bool IsValidReadBarrierImplicitCheck(uintptr_t addr) {
-  DCHECK(kEmitCompilerReadBarrier);
+  DCHECK(gUseReadBarrier);
   uint32_t monitor_offset = mirror::Object::MonitorOffset().Uint32Value();
   if (kUseBakerReadBarrier &&
       (kRuntimeISA == InstructionSet::kX86 || kRuntimeISA == InstructionSet::kX86_64)) {
@@ -476,9 +486,7 @@ static bool IsValidImplicitCheck(uintptr_t addr, const Instruction& instr)
     case Instruction::INVOKE_POLYMORPHIC:
     case Instruction::INVOKE_POLYMORPHIC_RANGE:
     case Instruction::INVOKE_SUPER:
-    case Instruction::INVOKE_SUPER_RANGE:
-    case Instruction::INVOKE_VIRTUAL_QUICK:
-    case Instruction::INVOKE_VIRTUAL_RANGE_QUICK: {
+    case Instruction::INVOKE_SUPER_RANGE: {
       // Without inlining, we could just check that the offset is the class offset.
       // However, when inlining, the compiler can (validly) merge the null check with a field access
       // on the same object. Note that the stack map at the NPE will reflect the invoke's location,
@@ -487,7 +495,7 @@ static bool IsValidImplicitCheck(uintptr_t addr, const Instruction& instr)
     }
 
     case Instruction::IGET_OBJECT:
-      if (kEmitCompilerReadBarrier && IsValidReadBarrierImplicitCheck(addr)) {
+      if (gUseReadBarrier && IsValidReadBarrierImplicitCheck(addr)) {
         return true;
       }
       FALLTHROUGH_INTENDED;
@@ -510,32 +518,8 @@ static bool IsValidImplicitCheck(uintptr_t addr, const Instruction& instr)
       return true;
     }
 
-    case Instruction::IGET_OBJECT_QUICK:
-      if (kEmitCompilerReadBarrier && IsValidReadBarrierImplicitCheck(addr)) {
-        return true;
-      }
-      FALLTHROUGH_INTENDED;
-    case Instruction::IGET_QUICK:
-    case Instruction::IGET_BOOLEAN_QUICK:
-    case Instruction::IGET_BYTE_QUICK:
-    case Instruction::IGET_CHAR_QUICK:
-    case Instruction::IGET_SHORT_QUICK:
-    case Instruction::IGET_WIDE_QUICK:
-    case Instruction::IPUT_QUICK:
-    case Instruction::IPUT_BOOLEAN_QUICK:
-    case Instruction::IPUT_BYTE_QUICK:
-    case Instruction::IPUT_CHAR_QUICK:
-    case Instruction::IPUT_SHORT_QUICK:
-    case Instruction::IPUT_WIDE_QUICK:
-    case Instruction::IPUT_OBJECT_QUICK: {
-      // We might be doing an implicit null check with an offset that doesn't correspond
-      // to the instruction, for example with two field accesses and the first one being
-      // eliminated or re-ordered.
-      return true;
-    }
-
     case Instruction::AGET_OBJECT:
-      if (kEmitCompilerReadBarrier && IsValidReadBarrierImplicitCheck(addr)) {
+      if (gUseReadBarrier && IsValidReadBarrierImplicitCheck(addr)) {
         return true;
       }
       FALLTHROUGH_INTENDED;
@@ -616,18 +600,6 @@ void ThrowNullPointerExceptionFromDexPC(bool check_address, uintptr_t addr) {
     case Instruction::INVOKE_POLYMORPHIC_RANGE:
       ThrowNullPointerExceptionForMethodAccess(instr.VRegB_4rcc(), kVirtual);
       break;
-    case Instruction::INVOKE_VIRTUAL_QUICK:
-    case Instruction::INVOKE_VIRTUAL_RANGE_QUICK: {
-      uint16_t method_idx = method->GetIndexFromQuickening(throw_dex_pc);
-      if (method_idx != DexFile::kDexNoIndex16) {
-        // NPE with precise message.
-        ThrowNullPointerExceptionForMethodAccess(method_idx, kVirtual);
-      } else {
-        // NPE with imprecise message.
-        ThrowNullPointerException("Attempt to invoke a virtual method on a null object reference");
-      }
-      break;
-    }
     case Instruction::IGET:
     case Instruction::IGET_WIDE:
     case Instruction::IGET_OBJECT:
@@ -638,23 +610,7 @@ void ThrowNullPointerExceptionFromDexPC(bool check_address, uintptr_t addr) {
       ArtField* field =
           Runtime::Current()->GetClassLinker()->ResolveField(instr.VRegC_22c(), method, false);
       Thread::Current()->ClearException();  // Resolution may fail, ignore.
-      ThrowNullPointerExceptionForFieldAccess(field, /* is_read= */ true);
-      break;
-    }
-    case Instruction::IGET_QUICK:
-    case Instruction::IGET_BOOLEAN_QUICK:
-    case Instruction::IGET_BYTE_QUICK:
-    case Instruction::IGET_CHAR_QUICK:
-    case Instruction::IGET_SHORT_QUICK:
-    case Instruction::IGET_WIDE_QUICK:
-    case Instruction::IGET_OBJECT_QUICK: {
-      uint16_t field_idx = method->GetIndexFromQuickening(throw_dex_pc);
-      ArtField* field = nullptr;
-      CHECK_NE(field_idx, DexFile::kDexNoIndex16);
-      field = Runtime::Current()->GetClassLinker()->ResolveField(
-          field_idx, method, /* is_static= */ false);
-      Thread::Current()->ClearException();  // Resolution may fail, ignore.
-      ThrowNullPointerExceptionForFieldAccess(field, /* is_read= */ true);
+      ThrowNullPointerExceptionForFieldAccess(field, method, /* is_read= */ true);
       break;
     }
     case Instruction::IPUT:
@@ -667,23 +623,7 @@ void ThrowNullPointerExceptionFromDexPC(bool check_address, uintptr_t addr) {
       ArtField* field = Runtime::Current()->GetClassLinker()->ResolveField(
           instr.VRegC_22c(), method, /* is_static= */ false);
       Thread::Current()->ClearException();  // Resolution may fail, ignore.
-      ThrowNullPointerExceptionForFieldAccess(field, /* is_read= */ false);
-      break;
-    }
-    case Instruction::IPUT_QUICK:
-    case Instruction::IPUT_BOOLEAN_QUICK:
-    case Instruction::IPUT_BYTE_QUICK:
-    case Instruction::IPUT_CHAR_QUICK:
-    case Instruction::IPUT_SHORT_QUICK:
-    case Instruction::IPUT_WIDE_QUICK:
-    case Instruction::IPUT_OBJECT_QUICK: {
-      uint16_t field_idx = method->GetIndexFromQuickening(throw_dex_pc);
-      ArtField* field = nullptr;
-      CHECK_NE(field_idx, DexFile::kDexNoIndex16);
-      field = Runtime::Current()->GetClassLinker()->ResolveField(
-          field_idx, method, /* is_static= */ false);
-      Thread::Current()->ClearException();  // Resolution may fail, ignore.
-      ThrowNullPointerExceptionForFieldAccess(field, /* is_read= */ false);
+      ThrowNullPointerExceptionForFieldAccess(field, method, /* is_read= */ false);
       break;
     }
     case Instruction::AGET:
@@ -766,27 +706,42 @@ void ThrowSecurityException(const char* fmt, ...) {
 
 // Stack overflow.
 
+template <StackType stack_type>
 void ThrowStackOverflowError(Thread* self) {
-  if (self->IsHandlingStackOverflow()) {
+  if (self->IsHandlingStackOverflow<stack_type>()) {
     LOG(ERROR) << "Recursive stack overflow.";
     // We don't fail here because SetStackEndForStackOverflow will print better diagnostics.
   }
 
-  self->SetStackEndForStackOverflow();  // Allow space on the stack for constructor to execute.
-  JNIEnvExt* env = self->GetJniEnv();
-  std::string msg("stack size ");
-  msg += PrettySize(self->GetStackSize());
+  // Allow space on the stack for constructor to execute.
+  self->SetStackEndForStackOverflow<stack_type>();
+
+  // Remove the stack overflow protection if it is set up.
+  bool implicit_stack_check = Runtime::Current()->GetImplicitStackOverflowChecks();
+  if (implicit_stack_check) {
+    if (!self->UnprotectStack<stack_type>()) {
+      LOG(ERROR) << "Unable to remove stack protection for stack overflow";
+    }
+  }
 
   // Avoid running Java code for exception initialization.
   // TODO: Checks to make this a bit less brittle.
   //
-  // Note: this lambda ensures that the destruction of the ScopedLocalRefs will run in the extended
-  //       stack, which is important for modes with larger stack sizes (e.g., ASAN). Using a lambda
-  //       instead of a block simplifies the control flow.
-  auto create_and_throw = [&]() REQUIRES_SHARED(Locks::mutator_lock_) {
+  // Note: This lambda is used to make sure the `StackOverflowError` intitialization code
+  //       does not increase the frame size of `ThrowStackOverflowError()` itself. It runs
+  //       with its own frame in the extended stack, which is especially important for modes
+  //       with larger stack sizes (e.g., ASAN).
+  auto create_and_throw = [self]() REQUIRES_SHARED(Locks::mutator_lock_) NO_INLINE {
+    std::string msg("stack size ");
+    msg += PrettySize(self->GetUsableStackSize<stack_type>());
+
+    ScopedObjectAccessUnchecked soa(self);
+    StackHandleScope<1u> hs(self);
+
     // Allocate an uninitialized object.
-    ScopedLocalRef<jobject> exc(env,
-                                env->AllocObject(WellKnownClasses::java_lang_StackOverflowError));
+    DCHECK(WellKnownClasses::java_lang_StackOverflowError->IsInitialized());
+    Handle<mirror::Object> exc = hs.NewHandle(
+        WellKnownClasses::java_lang_StackOverflowError->AllocObject(self));
     if (exc == nullptr) {
       LOG(WARNING) << "Could not allocate StackOverflowError object.";
       return;
@@ -805,65 +760,67 @@ void ThrowStackOverflowError(Thread* self) {
     //   fillInStackTrace();
 
     // detailMessage.
-    // TODO: Use String::FromModifiedUTF...?
-    ScopedLocalRef<jstring> s(env, env->NewStringUTF(msg.c_str()));
-    if (s == nullptr) {
-      LOG(WARNING) << "Could not throw new StackOverflowError because JNI NewStringUTF failed.";
-      return;
+    {
+      ObjPtr<mirror::String> s = mirror::String::AllocFromModifiedUtf8(self, msg.c_str());
+      if (s == nullptr) {
+        LOG(WARNING) << "Could not throw new StackOverflowError because message allocation failed.";
+        return;
+      }
+      WellKnownClasses::java_lang_Throwable_detailMessage
+          ->SetObject</*kTransactionActive=*/ false>(exc.Get(), s);
     }
 
-    env->SetObjectField(exc.get(), WellKnownClasses::java_lang_Throwable_detailMessage, s.get());
-
     // cause.
-    env->SetObjectField(exc.get(), WellKnownClasses::java_lang_Throwable_cause, exc.get());
+    WellKnownClasses::java_lang_Throwable_cause
+        ->SetObject</*kTransactionActive=*/ false>(exc.Get(), exc.Get());
 
     // suppressedExceptions.
-    ScopedLocalRef<jobject> emptylist(env, env->GetStaticObjectField(
-        WellKnownClasses::java_util_Collections,
-        WellKnownClasses::java_util_Collections_EMPTY_LIST));
-    CHECK(emptylist != nullptr);
-    env->SetObjectField(exc.get(),
-                        WellKnownClasses::java_lang_Throwable_suppressedExceptions,
-                        emptylist.get());
+    {
+      ObjPtr<mirror::Class> j_u_c = WellKnownClasses::java_util_Collections.Get();
+      DCHECK(j_u_c->IsInitialized());
+      ObjPtr<mirror::Object> empty_list =
+          WellKnownClasses::java_util_Collections_EMPTY_LIST->GetObject(j_u_c);
+      CHECK(empty_list != nullptr);
+      WellKnownClasses::java_lang_Throwable_suppressedExceptions
+          ->SetObject</*kTransactionActive=*/ false>(exc.Get(), empty_list);
+    }
 
     // stackState is set as result of fillInStackTrace. fillInStackTrace calls
     // nativeFillInStackTrace.
-    ScopedLocalRef<jobject> stack_state_val(env, nullptr);
-    {
-      ScopedObjectAccessUnchecked soa(env);  // TODO: Is this necessary?
-      stack_state_val.reset(soa.Self()->CreateInternalStackTrace<false>(soa));
-    }
+    ObjPtr<mirror::Object> stack_state_val = self->CreateInternalStackTrace(soa);
     if (stack_state_val != nullptr) {
-      env->SetObjectField(exc.get(),
-                          WellKnownClasses::java_lang_Throwable_stackState,
-                          stack_state_val.get());
+      WellKnownClasses::java_lang_Throwable_stackState
+          ->SetObject</*kTransactionActive=*/ false>(exc.Get(), stack_state_val);
 
       // stackTrace.
-      ScopedLocalRef<jobject> stack_trace_elem(env, env->GetStaticObjectField(
-          WellKnownClasses::libcore_util_EmptyArray,
-          WellKnownClasses::libcore_util_EmptyArray_STACK_TRACE_ELEMENT));
-      env->SetObjectField(exc.get(),
-                          WellKnownClasses::java_lang_Throwable_stackTrace,
-                          stack_trace_elem.get());
+      ObjPtr<mirror::Class> l_u_ea = WellKnownClasses::libcore_util_EmptyArray.Get();
+      DCHECK(l_u_ea->IsInitialized());
+      ObjPtr<mirror::Object> empty_ste =
+          WellKnownClasses::libcore_util_EmptyArray_STACK_TRACE_ELEMENT->GetObject(l_u_ea);
+      CHECK(empty_ste != nullptr);
+      WellKnownClasses::java_lang_Throwable_stackTrace
+          ->SetObject</*kTransactionActive=*/ false>(exc.Get(), empty_ste);
     } else {
       LOG(WARNING) << "Could not create stack trace.";
       // Note: we'll create an exception without stack state, which is valid.
     }
 
     // Throw the exception.
-    self->SetException(self->DecodeJObject(exc.get())->AsThrowable());
+    self->SetException(exc->AsThrowable());
   };
   create_and_throw();
   CHECK(self->IsExceptionPending());
 
-  bool explicit_overflow_check = Runtime::Current()->ExplicitStackOverflowChecks();
-  self->ResetDefaultStackEnd();  // Return to default stack size.
+  self->ResetDefaultStackEnd<stack_type>();  // Return to default stack size.
 
   // And restore protection if implicit checks are on.
-  if (!explicit_overflow_check) {
-    self->ProtectStack();
+  if (implicit_stack_check) {
+    self->ProtectStack<stack_type>();
   }
 }
+
+// Explicit instantiations to keep this definition separate to the declaration.
+template void ThrowStackOverflowError<StackType::kHardware>(Thread* self);
 
 // StringIndexOutOfBoundsException
 

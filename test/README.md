@@ -39,9 +39,10 @@ is actually implemented in the "JAR runner" (`test/etc/run-test-jar`), invoked
 by `test/etc/default-run`.
 
 After the execution of a run-test, the check step's default behavior
-(implemented in `test/etc/default-check`) is to compare its standard output with
-the contents of the `expected.txt` file contained in the test's directory; any
-mismatch triggers a test failure.
+(implemented in `test/etc/default-check`) is to respectively compare its
+standard output and standard error with the contents of the
+`expected-stdout.txt` and `expected-stderr.txt` files contained in the test's
+directory; any mismatch triggers a test failure.
 
 The `test/run-test` script handles the execution of a single run-test in a given
 configuration. The Python script `test/testrunner/testrunner.py` is a convenient
@@ -56,6 +57,20 @@ art/test/run-test --help
 ```sh
 art/test/testrunner/testrunner.py --help
 ```
+
+### Checker tests
+
+Some ART run-tests, known as "Checker tests", perform additional checks on ART's
+compiler. They are identified by their name, which match the
+`^[0-9]+-checker-.*` regular expression (e.g. `004-checker-UnsafeTest18`).
+
+Checker assertions are annotations in a run-test's (Java and Smali) source files
+verifying the behavior of the ART compiler when compiling the corresponding Dex
+code. They are checked by the `checker` tool (see [directory
+`art/tools/checker`](https://cs.android.com/android/platform/superproject/+/master:art/tools/checker/))
+against a c1visualizer-style (`.cfg`) file emitted by `dex2oat`, containing
+control-flow graphs (CFGs) for compiled methods at each step (pass) in the
+compiler's pipeline, as well as the emitted assembly code.
 
 ## ART gtests
 
@@ -92,16 +107,42 @@ To see command flags run:
 $ art/test.py -h
 ```
 
+## Building tests
+
+In general all tests require some dependencies to be built before they can be run.
+In general you can pass the `--build-dependencies` flag (also available as short
+option -b) to `art/test.py` program to automatically build required dependencies.
+One can also directly use the various `test-art-...-dependencies` targets listed
+below.
+
 ## Running all tests on the build host
 
 ```sh
+$ # Build test files
+$ m test-art-host-run-test-dependencies
+$ # Run the tests
 $ art/test.py --host
+```
+
+Or:
+
+```
+$ art/test.py -b --host
 ```
 
 ## Running all tests on the target device
 
 ```sh
+$ # Build test files
+$ m test-art-target-run-test-dependencies
+$ # Run the tests
 $ art/test.py --target
+```
+
+Or:
+
+```
+$ art/test.py -b --target
 ```
 
 ## Running all gtests on the build host
@@ -119,7 +160,15 @@ $ art/test.py --target -g
 ## Running all run-tests on the build host
 
 ```sh
+$ # Build test files
+$ m test-art-host-run-test-dependencies
 $ art/test.py --host -r
+```
+
+Or:
+
+```
+$ art/test.py -b --host -r
 ```
 
 ## Running all run-tests on the target device
@@ -128,18 +177,52 @@ $ art/test.py --host -r
 $ art/test.py --target -r
 ```
 
-## Running one run-test on the build host
+## Building and running one run-test on the build host
 
 ```sh
+$ # Build test files
+$ m test-art-host-run-test-dependencies
+$ # Run the tests
 $ art/test.py --host -r -t 001-HelloWorld
 ```
 
-## Running one run-test on the target device
+Or:
 
-```sh
-$ art/test.py --target -r -t 001-HelloWorld
+```
+$ art/test.py -b --host -r -t 001-HelloWorld
 ```
 
+## Building and running one run-test on the target device
+
+```sh
+$ art/test.py --target -b -r -t 001-HelloWorld
+```
+
+The `-b` option (re)builds the shard for the given test(s) and pushes it to
+device. However the push may not include all necessary dependencies, e.g. test
+`.so` libraries like `libarttest.so`.
+
+## Running one gtest on the build host
+
+```sh
+$ m test-art-host-gtest-art_runtime_tests
+```
+
+Note: Although this is a build command, it actually builds the test with
+dependencies and runs the test.
+
+If you want to run the test with more options, use the following commands
+instead. Note that you need to run the test with the command above at least once
+before you run the commands below.
+
+```sh
+$ find out/host/ -type f -name art_runtime_tests  # Find the path of the test.
+$ out/host/linux-x86/nativetest/art_runtime_tests/art_runtime_tests
+```
+
+Add "--no_isolate" to run the tests one by one in single process (disable forking).
+Add "--gtest_filter=..." to select specific sub-test(s) to run.
+Prefix by "gdb --args " to run the test in gdb.
 
 # ART Continuous Integration
 

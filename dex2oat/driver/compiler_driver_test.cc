@@ -25,6 +25,7 @@
 #include "base/casts.h"
 #include "class_linker-inl.h"
 #include "common_compiler_driver_test.h"
+#include "compiled_method-inl.h"
 #include "compiler_callbacks.h"
 #include "dex/dex_file.h"
 #include "dex/dex_file_types.h"
@@ -80,14 +81,19 @@ class CompilerDriverTest : public CommonCompilerDriverTest {
   void MakeExecutable(ArtMethod* method) REQUIRES_SHARED(Locks::mutator_lock_) {
     CHECK(method != nullptr);
 
-    const CompiledMethod* compiled_method = nullptr;
+    const void* method_code = nullptr;
     if (!method->IsAbstract()) {
-      const DexFile& dex_file = *method->GetDexFile();
-      compiled_method =
-          compiler_driver_->GetCompiledMethod(MethodReference(&dex_file,
-                                                              method->GetDexMethodIndex()));
+      MethodReference method_ref(method->GetDexFile(), method->GetDexMethodIndex());
+      const CompiledMethod* compiled_method = compiler_driver_->GetCompiledMethod(method_ref);
+      // If the code size is 0 it means the method was skipped due to profile guided compilation.
+      if (compiled_method != nullptr && compiled_method->GetQuickCode().size() != 0u) {
+        method_code = CommonCompilerTest::MakeExecutable(compiled_method->GetQuickCode(),
+                                                         compiled_method->GetVmapTable(),
+                                                         compiled_method->GetInstructionSet());
+        LOG(INFO) << "MakeExecutable " << method->PrettyMethod() << " code=" << method_code;
+      }
     }
-    CommonCompilerTest::MakeExecutable(method, compiled_method);
+    runtime_->GetInstrumentation()->InitializeMethodsCode(method, /*aot_code=*/ method_code);
   }
 
   void MakeDexFileExecutable(jobject class_loader, const DexFile& dex_file) {
@@ -99,7 +105,7 @@ class CompilerDriverTest : public CommonCompilerDriverTest {
       StackHandleScope<1> hs(soa.Self());
       Handle<mirror::ClassLoader> loader(
           hs.NewHandle(soa.Decode<mirror::ClassLoader>(class_loader)));
-      ObjPtr<mirror::Class> c = class_linker->FindClass(soa.Self(), descriptor, loader);
+      ObjPtr<mirror::Class> c = FindClass(descriptor, loader);
       CHECK(c != nullptr);
       const auto pointer_size = class_linker->GetImagePointerSize();
       for (auto& m : c->GetMethods(pointer_size)) {
@@ -124,24 +130,18 @@ TEST_F(CompilerDriverTest, DISABLED_LARGE_CompileDexLibCore) {
   ASSERT_TRUE(java_lang_dex_file_ != nullptr);
   const DexFile& dex = *java_lang_dex_file_;
   ObjPtr<mirror::DexCache> dex_cache = class_linker_->FindDexCache(soa.Self(), dex);
-  EXPECT_EQ(dex.NumStringIds(), dex_cache->NumStrings());
   for (size_t i = 0; i < dex_cache->NumStrings(); i++) {
     const ObjPtr<mirror::String> string = dex_cache->GetResolvedString(dex::StringIndex(i));
     EXPECT_TRUE(string != nullptr) << "string_idx=" << i;
   }
-  EXPECT_EQ(dex.NumTypeIds(), dex_cache->NumResolvedTypes());
   for (size_t i = 0; i < dex_cache->NumResolvedTypes(); i++) {
     const ObjPtr<mirror::Class> type = dex_cache->GetResolvedType(dex::TypeIndex(i));
     EXPECT_TRUE(type != nullptr)
         << "type_idx=" << i << " " << dex.GetTypeDescriptor(dex.GetTypeId(dex::TypeIndex(i)));
   }
-  EXPECT_TRUE(dex_cache->StaticMethodSize() == dex_cache->NumResolvedMethods()
-      || dex.NumMethodIds() ==  dex_cache->NumResolvedMethods());
-  auto* cl = Runtime::Current()->GetClassLinker();
-  auto pointer_size = cl->GetImagePointerSize();
   for (size_t i = 0; i < dex_cache->NumResolvedMethods(); i++) {
     // FIXME: This is outdated for hash-based method array.
-    ArtMethod* method = dex_cache->GetResolvedMethod(i, pointer_size);
+    ArtMethod* method = dex_cache->GetResolvedMethod(i);
     EXPECT_TRUE(method != nullptr) << "method_idx=" << i
                                 << " " << dex.GetMethodDeclaringClassDescriptor(dex.GetMethodId(i))
                                 << " " << dex.GetMethodName(dex.GetMethodId(i));
@@ -149,11 +149,9 @@ TEST_F(CompilerDriverTest, DISABLED_LARGE_CompileDexLibCore) {
         << " " << dex.GetMethodDeclaringClassDescriptor(dex.GetMethodId(i)) << " "
         << dex.GetMethodName(dex.GetMethodId(i));
   }
-  EXPECT_TRUE(dex_cache->StaticArtFieldSize() == dex_cache->NumResolvedFields()
-      || dex.NumFieldIds() ==  dex_cache->NumResolvedFields());
   for (size_t i = 0; i < dex_cache->NumResolvedFields(); i++) {
     // FIXME: This is outdated for hash-based field array.
-    ArtField* field = dex_cache->GetResolvedField(i, cl->GetImagePointerSize());
+    ArtField* field = dex_cache->GetResolvedField(i);
     EXPECT_TRUE(field != nullptr) << "field_idx=" << i
                                << " " << dex.GetFieldDeclaringClassDescriptor(dex.GetFieldId(i))
                                << " " << dex.GetFieldName(dex.GetFieldId(i));
@@ -239,7 +237,7 @@ class CompilerDriverProfileTest : public CompilerDriverTest {
     StackHandleScope<1> hs(self);
     Handle<mirror::ClassLoader> h_loader(
         hs.NewHandle(soa.Decode<mirror::ClassLoader>(class_loader)));
-    ObjPtr<mirror::Class> klass = class_linker->FindClass(self, clazz.c_str(), h_loader);
+    ObjPtr<mirror::Class> klass = FindClass(clazz.c_str(), h_loader);
     ASSERT_NE(klass, nullptr);
 
     const auto pointer_size = class_linker->GetImagePointerSize();
@@ -300,7 +298,7 @@ class CompilerDriverVerifyTest : public CompilerDriverTest {
     StackHandleScope<1> hs(self);
     Handle<mirror::ClassLoader> h_loader(
         hs.NewHandle(soa.Decode<mirror::ClassLoader>(class_loader)));
-    ObjPtr<mirror::Class> klass = class_linker->FindClass(self, clazz.c_str(), h_loader);
+    ObjPtr<mirror::Class> klass = FindClass(clazz.c_str(), h_loader);
     ASSERT_NE(klass, nullptr);
     EXPECT_TRUE(klass->IsVerified());
 
@@ -353,8 +351,7 @@ TEST_F(CompilerDriverVerifyTest, RetryVerifcationStatusCheckVerified) {
        ++i) {
     const ClassStatus expected_status = enum_cast<ClassStatus>(i);
     // Skip unsupported status that are not supposed to be ever recorded.
-    if (expected_status == ClassStatus::kVerifyingAtRuntime ||
-        expected_status == ClassStatus::kInitializing ||
+    if (expected_status == ClassStatus::kInitializing ||
         expected_status == ClassStatus::kInitialized) {
       continue;
     }

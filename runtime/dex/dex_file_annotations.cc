@@ -18,14 +18,15 @@
 
 #include <stdlib.h>
 
+#include "android-base/macros.h"
 #include "android-base/stringprintf.h"
-
 #include "art_field-inl.h"
-#include "art_method-inl.h"
+#include "art_method-alloc-inl.h"
 #include "base/sdk_version.h"
 #include "class_linker-inl.h"
-#include "class_root.h"
+#include "class_root-inl.h"
 #include "dex/dex_file-inl.h"
+#include "dex/dex_file_types.h"
 #include "dex/dex_instruction-inl.h"
 #include "jni/jni_internal.h"
 #include "jvalue-inl.h"
@@ -35,14 +36,13 @@
 #include "mirror/method.h"
 #include "mirror/object_array-alloc-inl.h"
 #include "mirror/object_array-inl.h"
-#include "oat_file.h"
+#include "oat/oat_file.h"
 #include "obj_ptr-inl.h"
-#include "quicken_info.h"
 #include "reflection.h"
 #include "thread.h"
 #include "well_known_classes.h"
 
-namespace art {
+namespace art HIDDEN {
 
 using android::base::StringPrintf;
 
@@ -194,12 +194,16 @@ const AnnotationItem* SearchAnnotationSet(const DexFile& dex_file,
     const uint8_t* annotation = annotation_item->annotation_;
     uint32_t type_index = DecodeUnsignedLeb128(&annotation);
 
-    if (strcmp(descriptor, dex_file.StringByTypeIdx(dex::TypeIndex(type_index))) == 0) {
+    if (strcmp(descriptor, dex_file.GetTypeDescriptor(dex::TypeIndex(type_index))) == 0) {
       result = annotation_item;
       break;
     }
   }
   return result;
+}
+
+inline static void SkipEncodedValueHeaderByte(const uint8_t** annotation_ptr) {
+  (*annotation_ptr)++;
 }
 
 bool SkipAnnotationValue(const DexFile& dex_file, const uint8_t** annotation_ptr)
@@ -218,6 +222,8 @@ bool SkipAnnotationValue(const DexFile& dex_file, const uint8_t** annotation_ptr
     case DexFile::kDexAnnotationLong:
     case DexFile::kDexAnnotationFloat:
     case DexFile::kDexAnnotationDouble:
+    case DexFile::kDexAnnotationMethodType:
+    case DexFile::kDexAnnotationMethodHandle:
     case DexFile::kDexAnnotationString:
     case DexFile::kDexAnnotationType:
     case DexFile::kDexAnnotationMethod:
@@ -356,7 +362,6 @@ ObjPtr<mirror::Object> ProcessEncodedAnnotation(const ClassData& klass, const ui
   uint32_t size = DecodeUnsignedLeb128(annotation);
 
   Thread* self = Thread::Current();
-  ScopedObjectAccessUnchecked soa(self);
   StackHandleScope<4> hs(self);
   ClassLinker* class_linker = Runtime::Current()->GetClassLinker();
   Handle<mirror::Class> annotation_class(hs.NewHandle(
@@ -371,10 +376,8 @@ ObjPtr<mirror::Object> ProcessEncodedAnnotation(const ClassData& klass, const ui
     return nullptr;
   }
 
-  ObjPtr<mirror::Class> annotation_member_class =
-      soa.Decode<mirror::Class>(WellKnownClasses::libcore_reflect_AnnotationMember);
   ObjPtr<mirror::Class> annotation_member_array_class =
-      class_linker->FindArrayClass(self, annotation_member_class);
+      WellKnownClasses::ToClass(WellKnownClasses::libcore_reflect_AnnotationMember__array);
   if (annotation_member_array_class == nullptr) {
     return nullptr;
   }
@@ -397,18 +400,16 @@ ObjPtr<mirror::Object> ProcessEncodedAnnotation(const ClassData& klass, const ui
     h_element_array->SetWithoutChecks<false>(i, new_member);
   }
 
-  JValue result;
   ArtMethod* create_annotation_method =
-      jni::DecodeArtMethod(WellKnownClasses::libcore_reflect_AnnotationFactory_createAnnotation);
-  uint32_t args[2] = { static_cast<uint32_t>(reinterpret_cast<uintptr_t>(annotation_class.Get())),
-                       static_cast<uint32_t>(reinterpret_cast<uintptr_t>(h_element_array.Get())) };
-  create_annotation_method->Invoke(self, args, sizeof(args), &result, "LLL");
+      WellKnownClasses::libcore_reflect_AnnotationFactory_createAnnotation;
+  ObjPtr<mirror::Object> result = create_annotation_method->InvokeStatic<'L', 'L', 'L'>(
+      self, annotation_class.Get(), h_element_array.Get());
   if (self->IsExceptionPending()) {
     LOG(INFO) << "Exception in AnnotationFactory.createAnnotation";
     return nullptr;
   }
 
-  return result.GetL();
+  return result;
 }
 
 template <bool kTransactionActive>
@@ -467,6 +468,11 @@ bool ProcessAnnotationValue(const ClassData& klass,
       primitive_type = Primitive::kPrimBoolean;
       width = 0;
       break;
+    case DexFile::kDexAnnotationMethodType:
+    case DexFile::kDexAnnotationMethodHandle:
+      // These annotations are unexpected here. Don't process them.
+      LOG(WARNING) << StringPrintf("Unexpected annotation of type 0x%02x", value_type);
+      return false;
     case DexFile::kDexAnnotationString: {
       uint32_t index = DexFile::ReadUnsignedInt(annotation, value_arg, false);
       if (result_style == DexFile::kAllRaw) {
@@ -497,7 +503,7 @@ bool ProcessAnnotationValue(const ClassData& klass,
         if (element_object == nullptr) {
           CHECK(self->IsExceptionPending());
           if (result_style == DexFile::kAllObjects) {
-            const char* msg = dex_file.StringByTypeIdx(type_index);
+            const char* msg = dex_file.GetTypeDescriptor(type_index);
             self->ThrowNewWrappedException("Ljava/lang/TypeNotPresentException;", msg);
             element_object = self->GetException();
             self->ClearException();
@@ -515,7 +521,7 @@ bool ProcessAnnotationValue(const ClassData& klass,
       } else {
         ClassLinker* class_linker = Runtime::Current()->GetClassLinker();
         StackHandleScope<2> hs(self);
-        ArtMethod* method = class_linker->ResolveMethodWithoutInvokeType(
+        ArtMethod* method = class_linker->ResolveMethodId(
             index,
             hs.NewHandle(klass.GetDexCache()),
             hs.NewHandle(klass.GetClassLoader()));
@@ -525,21 +531,13 @@ bool ProcessAnnotationValue(const ClassData& klass,
         PointerSize pointer_size = class_linker->GetImagePointerSize();
         set_object = true;
         if (method->IsConstructor()) {
-          if (pointer_size == PointerSize::k64) {
-            element_object = mirror::Constructor::CreateFromArtMethod<PointerSize::k64,
-                kTransactionActive>(self, method);
-          } else {
-            element_object = mirror::Constructor::CreateFromArtMethod<PointerSize::k32,
-                kTransactionActive>(self, method);
-          }
+          element_object = (pointer_size == PointerSize::k64)
+              ? mirror::Constructor::CreateFromArtMethod<PointerSize::k64>(self, method)
+              : mirror::Constructor::CreateFromArtMethod<PointerSize::k32>(self, method);
         } else {
-          if (pointer_size == PointerSize::k64) {
-            element_object = mirror::Method::CreateFromArtMethod<PointerSize::k64,
-                kTransactionActive>(self, method);
-          } else {
-            element_object = mirror::Method::CreateFromArtMethod<PointerSize::k32,
-                kTransactionActive>(self, method);
-          }
+          element_object = (pointer_size == PointerSize::k64)
+              ? mirror::Method::CreateFromArtMethod<PointerSize::k64>(self, method)
+              : mirror::Method::CreateFromArtMethod<PointerSize::k32>(self, method);
         }
         if (element_object == nullptr) {
           return false;
@@ -561,14 +559,7 @@ bool ProcessAnnotationValue(const ClassData& klass,
           return false;
         }
         set_object = true;
-        PointerSize pointer_size = Runtime::Current()->GetClassLinker()->GetImagePointerSize();
-        if (pointer_size == PointerSize::k64) {
-          element_object = mirror::Field::CreateFromArtField<PointerSize::k64,
-              kTransactionActive>(self, field, true);
-        } else {
-          element_object = mirror::Field::CreateFromArtField<PointerSize::k32,
-              kTransactionActive>(self, field, true);
-        }
+        element_object = mirror::Field::CreateFromArtField(self, field, true);
         if (element_object == nullptr) {
           return false;
         }
@@ -718,9 +709,7 @@ ObjPtr<mirror::Object> CreateAnnotationMember(const ClassData& klass,
   ScopedObjectAccessUnchecked soa(self);
   StackHandleScope<5> hs(self);
   uint32_t element_name_index = DecodeUnsignedLeb128(annotation);
-  const char* name = dex_file.StringDataByIdx(dex::StringIndex(element_name_index));
-  Handle<mirror::String> string_name(
-      hs.NewHandle(mirror::String::AllocFromModifiedUtf8(self, name)));
+  const char* name = dex_file.GetStringData(dex::StringIndex(element_name_index));
 
   PointerSize pointer_size = Runtime::Current()->GetClassLinker()->GetImagePointerSize();
   ArtMethod* annotation_method =
@@ -728,7 +717,19 @@ ObjPtr<mirror::Object> CreateAnnotationMember(const ClassData& klass,
   if (annotation_method == nullptr) {
     return nullptr;
   }
-  Handle<mirror::Class> method_return(hs.NewHandle(annotation_method->ResolveReturnType()));
+
+  Handle<mirror::String> string_name =
+      hs.NewHandle(mirror::String::AllocFromModifiedUtf8(self, name));
+  if (UNLIKELY(string_name == nullptr)) {
+    LOG(ERROR) << "Failed to allocate name for annotation member";
+    return nullptr;
+  }
+
+  Handle<mirror::Class> method_return = hs.NewHandle(annotation_method->ResolveReturnType());
+  if (UNLIKELY(method_return == nullptr)) {
+    LOG(ERROR) << "Failed to resolve method return type for annotation member";
+    return nullptr;
+  }
 
   DexFile::AnnotationValue annotation_value;
   if (!ProcessAnnotationValue<false>(klass,
@@ -736,43 +737,26 @@ ObjPtr<mirror::Object> CreateAnnotationMember(const ClassData& klass,
                                      &annotation_value,
                                      method_return,
                                      DexFile::kAllObjects)) {
+    // TODO: Logging the error breaks run-test 005-annotations.
+    // LOG(ERROR) << "Failed to process annotation value for annotation member";
     return nullptr;
   }
-  Handle<mirror::Object> value_object(hs.NewHandle(annotation_value.value_.GetL()));
+  Handle<mirror::Object> value_object = hs.NewHandle(annotation_value.value_.GetL());
 
-  ObjPtr<mirror::Class> annotation_member_class =
-      WellKnownClasses::ToClass(WellKnownClasses::libcore_reflect_AnnotationMember);
-  Handle<mirror::Object> new_member(hs.NewHandle(annotation_member_class->AllocObject(self)));
-  ObjPtr<mirror::Method> method_obj_ptr;
-  DCHECK(!Runtime::Current()->IsActiveTransaction());
-  if (pointer_size == PointerSize::k64) {
-    method_obj_ptr = mirror::Method::CreateFromArtMethod<PointerSize::k64, false>(
-        self, annotation_method);
-  } else {
-    method_obj_ptr = mirror::Method::CreateFromArtMethod<PointerSize::k32, false>(
-        self, annotation_method);
-  }
-  Handle<mirror::Method> method_object(hs.NewHandle(method_obj_ptr));
-
-  if (new_member == nullptr || string_name == nullptr ||
-      method_object == nullptr || method_return == nullptr) {
-    LOG(ERROR) << StringPrintf("Failed creating annotation element (m=%p n=%p a=%p r=%p",
-        new_member.Get(), string_name.Get(), method_object.Get(), method_return.Get());
+  Handle<mirror::Method> method_object = hs.NewHandle((pointer_size == PointerSize::k64)
+      ? mirror::Method::CreateFromArtMethod<PointerSize::k64>(self, annotation_method)
+      : mirror::Method::CreateFromArtMethod<PointerSize::k32>(self, annotation_method));
+  if (UNLIKELY(method_object == nullptr)) {
+    LOG(ERROR) << "Failed to create method object for annotation member";
     return nullptr;
   }
 
-  JValue result;
-  ArtMethod* annotation_member_init =
-      jni::DecodeArtMethod(WellKnownClasses::libcore_reflect_AnnotationMember_init);
-  uint32_t args[5] = { static_cast<uint32_t>(reinterpret_cast<uintptr_t>(new_member.Get())),
-                       static_cast<uint32_t>(reinterpret_cast<uintptr_t>(string_name.Get())),
-                       static_cast<uint32_t>(reinterpret_cast<uintptr_t>(value_object.Get())),
-                       static_cast<uint32_t>(reinterpret_cast<uintptr_t>(method_return.Get())),
-                       static_cast<uint32_t>(reinterpret_cast<uintptr_t>(method_object.Get()))
-  };
-  annotation_member_init->Invoke(self, args, sizeof(args), &result, "VLLLL");
-  if (self->IsExceptionPending()) {
-    LOG(INFO) << "Exception in AnnotationMember.<init>";
+  Handle<mirror::Object> new_member =
+      WellKnownClasses::libcore_reflect_AnnotationMember_init->NewObject<'L', 'L', 'L', 'L'>(
+          hs, self, string_name, value_object, method_return, method_object);
+  if (new_member == nullptr) {
+    DCHECK(self->IsExceptionPending());
+    LOG(ERROR) << "Failed to create annotation member";
     return nullptr;
   }
 
@@ -862,6 +846,38 @@ ObjPtr<mirror::Object> GetAnnotationValue(const ClassData& klass,
   return annotation_value.value_.GetL();
 }
 
+template<typename T>
+static inline ObjPtr<mirror::ObjectArray<T>> GetAnnotationArrayValue(
+                                     Handle<mirror::Class> klass,
+                                     const char* annotation_name,
+                                     const char* value_name)
+            REQUIRES_SHARED(Locks::mutator_lock_) {
+  ClassData data(klass);
+  const AnnotationSetItem* annotation_set = FindAnnotationSetForClass(data);
+  if (annotation_set == nullptr) {
+    return nullptr;
+  }
+  const AnnotationItem* annotation_item =
+      SearchAnnotationSet(data.GetDexFile(), annotation_set, annotation_name,
+                          DexFile::kDexVisibilitySystem);
+  if (annotation_item == nullptr) {
+    return nullptr;
+  }
+  StackHandleScope<1> hs(Thread::Current());
+  Handle<mirror::Class> class_array_class =
+      hs.NewHandle(GetClassRoot<mirror::ObjectArray<T>>());
+  DCHECK(class_array_class != nullptr);
+  ObjPtr<mirror::Object> obj = GetAnnotationValue(data,
+                                                  annotation_item,
+                                                  value_name,
+                                                  class_array_class,
+                                                  DexFile::kDexAnnotationArray);
+  if (obj == nullptr) {
+    return nullptr;
+  }
+  return obj->AsObjectArray<T>();
+}
+
 static ObjPtr<mirror::ObjectArray<mirror::String>> GetSignatureValue(
     const ClassData& klass,
     const AnnotationSetItem* annotation_set)
@@ -916,10 +932,9 @@ ObjPtr<mirror::ObjectArray<mirror::Object>> ProcessAnnotationSet(
     REQUIRES_SHARED(Locks::mutator_lock_) {
   const DexFile& dex_file = klass.GetDexFile();
   Thread* self = Thread::Current();
-  ScopedObjectAccessUnchecked soa(self);
   StackHandleScope<2> hs(self);
   Handle<mirror::Class> annotation_array_class(hs.NewHandle(
-      soa.Decode<mirror::Class>(WellKnownClasses::java_lang_annotation_Annotation__array)));
+      WellKnownClasses::ToClass(WellKnownClasses::java_lang_annotation_Annotation__array)));
   if (annotation_set == nullptr) {
     return mirror::ObjectArray<mirror::Object>::Alloc(self, annotation_array_class.Get(), 0);
   }
@@ -974,10 +989,9 @@ ObjPtr<mirror::ObjectArray<mirror::Object>> ProcessAnnotationSetRefList(
     REQUIRES_SHARED(Locks::mutator_lock_) {
   const DexFile& dex_file = klass.GetDexFile();
   Thread* self = Thread::Current();
-  ScopedObjectAccessUnchecked soa(self);
   StackHandleScope<1> hs(self);
   ObjPtr<mirror::Class> annotation_array_class =
-      soa.Decode<mirror::Class>(WellKnownClasses::java_lang_annotation_Annotation__array);
+      WellKnownClasses::ToClass(WellKnownClasses::java_lang_annotation_Annotation__array);
   ObjPtr<mirror::Class> annotation_array_array_class =
       Runtime::Current()->GetClassLinker()->FindArrayClass(self, annotation_array_class);
   if (annotation_array_array_class == nullptr) {
@@ -1280,13 +1294,34 @@ static bool IsMethodBuildAnnotationPresent(const DexFile& dex_file,
     }
     const uint8_t* annotation = annotation_item->annotation_;
     uint32_t type_index = DecodeUnsignedLeb128(&annotation);
-    const char* descriptor = dex_file.StringByTypeIdx(dex::TypeIndex(type_index));
+    const char* descriptor = dex_file.GetTypeDescriptor(dex::TypeIndex(type_index));
     if (strcmp(descriptor, annotation_descriptor) == 0) {
       DCheckNativeAnnotation(descriptor, annotation_class);
       return true;
     }
   }
   return false;
+}
+
+static uint32_t GetNativeMethodAnnotationAccessFlags(const DexFile& dex_file,
+                                                     const dex::AnnotationSetItem& annotation_set) {
+  uint32_t access_flags = 0u;
+  if (IsMethodBuildAnnotationPresent(
+          dex_file,
+          annotation_set,
+          "Ldalvik/annotation/optimization/FastNative;",
+          WellKnownClasses::dalvik_annotation_optimization_FastNative)) {
+    access_flags |= kAccFastNative;
+  }
+  if (IsMethodBuildAnnotationPresent(
+          dex_file,
+          annotation_set,
+          "Ldalvik/annotation/optimization/CriticalNative;",
+          WellKnownClasses::dalvik_annotation_optimization_CriticalNative)) {
+    access_flags |= kAccCriticalNative;
+  }
+  CHECK_NE(access_flags, kAccFastNative | kAccCriticalNative);
+  return access_flags;
 }
 
 uint32_t GetNativeMethodAnnotationAccessFlags(const DexFile& dex_file,
@@ -1297,23 +1332,53 @@ uint32_t GetNativeMethodAnnotationAccessFlags(const DexFile& dex_file,
   if (annotation_set == nullptr) {
     return 0u;
   }
-  uint32_t access_flags = 0u;
-  if (IsMethodBuildAnnotationPresent(
-          dex_file,
-          *annotation_set,
-          "Ldalvik/annotation/optimization/FastNative;",
-          WellKnownClasses::dalvik_annotation_optimization_FastNative)) {
-    access_flags |= kAccFastNative;
+  return GetNativeMethodAnnotationAccessFlags(dex_file, *annotation_set);
+}
+
+uint32_t GetNativeMethodAnnotationAccessFlags(const DexFile& dex_file,
+                                              const dex::MethodAnnotationsItem& method_annotations) {
+  return GetNativeMethodAnnotationAccessFlags(
+      dex_file, *dex_file.GetMethodAnnotationSetItem(method_annotations));
+}
+
+static bool MethodIsNeverCompile(const DexFile& dex_file,
+                                 const dex::AnnotationSetItem& annotation_set) {
+  return IsMethodBuildAnnotationPresent(
+      dex_file,
+      annotation_set,
+      "Ldalvik/annotation/optimization/NeverCompile;",
+      WellKnownClasses::dalvik_annotation_optimization_NeverCompile);
+}
+
+bool MethodIsNeverCompile(const DexFile& dex_file,
+                          const dex::ClassDef& class_def,
+                          uint32_t method_index) {
+  const dex::AnnotationSetItem* annotation_set =
+      FindAnnotationSetForMethod(dex_file, class_def, method_index);
+  if (annotation_set == nullptr) {
+    return false;
   }
-  if (IsMethodBuildAnnotationPresent(
-          dex_file,
-          *annotation_set,
-          "Ldalvik/annotation/optimization/CriticalNative;",
-          WellKnownClasses::dalvik_annotation_optimization_CriticalNative)) {
-    access_flags |= kAccCriticalNative;
+  return MethodIsNeverCompile(dex_file, *annotation_set);
+}
+
+bool MethodIsNeverCompile(const DexFile& dex_file,
+                          const dex::MethodAnnotationsItem& method_annotations) {
+  return MethodIsNeverCompile(dex_file, *dex_file.GetMethodAnnotationSetItem(method_annotations));
+}
+
+bool MethodIsNeverInline(const DexFile& dex_file,
+                         const dex::ClassDef& class_def,
+                         uint32_t method_index) {
+  const dex::AnnotationSetItem* annotation_set =
+      FindAnnotationSetForMethod(dex_file, class_def, method_index);
+  if (annotation_set == nullptr) {
+    return false;
   }
-  CHECK_NE(access_flags, kAccFastNative | kAccCriticalNative);
-  return access_flags;
+  return IsMethodBuildAnnotationPresent(
+      dex_file,
+      *annotation_set,
+      "Ldalvik/annotation/optimization/NeverInline;",
+      WellKnownClasses::dalvik_annotation_optimization_NeverInline);
 }
 
 bool FieldIsReachabilitySensitive(const DexFile& dex_file,
@@ -1370,50 +1435,24 @@ bool MethodContainsRSensitiveAccess(const DexFile& dex_file,
   if (!accessor.HasCodeItem()) {
     return false;
   }
-  ArrayRef<const uint8_t> quicken_data;
-  const OatDexFile* oat_dex_file = dex_file.GetOatDexFile();
-  if (oat_dex_file != nullptr) {
-    quicken_data = oat_dex_file->GetQuickenedInfoOf(dex_file, method_index);
-  }
-  const QuickenInfoTable quicken_info(quicken_data);
-  uint32_t quicken_index = 0;
   for (DexInstructionIterator iter = accessor.begin(); iter != accessor.end(); ++iter) {
     switch (iter->Opcode()) {
       case Instruction::IGET:
-      case Instruction::IGET_QUICK:
       case Instruction::IGET_WIDE:
-      case Instruction::IGET_WIDE_QUICK:
       case Instruction::IGET_OBJECT:
-      case Instruction::IGET_OBJECT_QUICK:
       case Instruction::IGET_BOOLEAN:
-      case Instruction::IGET_BOOLEAN_QUICK:
       case Instruction::IGET_BYTE:
-      case Instruction::IGET_BYTE_QUICK:
       case Instruction::IGET_CHAR:
-      case Instruction::IGET_CHAR_QUICK:
       case Instruction::IGET_SHORT:
-      case Instruction::IGET_SHORT_QUICK:
       case Instruction::IPUT:
-      case Instruction::IPUT_QUICK:
       case Instruction::IPUT_WIDE:
-      case Instruction::IPUT_WIDE_QUICK:
       case Instruction::IPUT_OBJECT:
-      case Instruction::IPUT_OBJECT_QUICK:
       case Instruction::IPUT_BOOLEAN:
-      case Instruction::IPUT_BOOLEAN_QUICK:
       case Instruction::IPUT_BYTE:
-      case Instruction::IPUT_BYTE_QUICK:
       case Instruction::IPUT_CHAR:
-      case Instruction::IPUT_CHAR_QUICK:
       case Instruction::IPUT_SHORT:
-      case Instruction::IPUT_SHORT_QUICK:
         {
-          uint32_t field_index;
-          if (iter->IsQuickened()) {
-            field_index = quicken_info.GetData(quicken_index);
-          } else {
-            field_index = iter->VRegC_22c();
-          }
+          uint32_t field_index = iter->VRegC_22c();
           DCHECK(field_index < dex_file.NumFieldIds());
           // We only guarantee to pay attention to the annotation if it's in the same class,
           // or a containing class, but it's OK to do so in other cases.
@@ -1455,15 +1494,6 @@ bool MethodContainsRSensitiveAccess(const DexFile& dex_file,
           }
         }
         break;
-      case Instruction::INVOKE_VIRTUAL_QUICK:
-      case Instruction::INVOKE_VIRTUAL_RANGE_QUICK:
-        {
-          uint32_t called_method_index = quicken_info.GetData(quicken_index);
-          if (MethodIsReachabilitySensitive(dex_file, called_method_index)) {
-            return true;
-          }
-        }
-        break;
         // We explicitly do not handle indirect ReachabilitySensitive accesses through VarHandles,
         // etc. Thus we ignore INVOKE_CUSTOM / INVOKE_CUSTOM_RANGE / INVOKE_POLYMORPHIC /
         // INVOKE_POLYMORPHIC_RANGE.
@@ -1474,9 +1504,6 @@ bool MethodContainsRSensitiveAccess(const DexFile& dex_file,
         // on the call stack. We allow ReachabilitySensitive annotations on static methods and
         // fields, but they can be safely ignored.
         break;
-    }
-    if (QuickenInfoTable::NeedsIndexForInstruction(&iter.Inst())) {
-      ++quicken_index;
     }
   }
   return false;
@@ -1521,28 +1548,9 @@ ObjPtr<mirror::ObjectArray<mirror::Object>> GetAnnotationsForClass(Handle<mirror
 }
 
 ObjPtr<mirror::ObjectArray<mirror::Class>> GetDeclaredClasses(Handle<mirror::Class> klass) {
-  ClassData data(klass);
-  const AnnotationSetItem* annotation_set = FindAnnotationSetForClass(data);
-  if (annotation_set == nullptr) {
-    return nullptr;
-  }
-  const AnnotationItem* annotation_item =
-      SearchAnnotationSet(data.GetDexFile(), annotation_set, "Ldalvik/annotation/MemberClasses;",
-                          DexFile::kDexVisibilitySystem);
-  if (annotation_item == nullptr) {
-    return nullptr;
-  }
-  StackHandleScope<1> hs(Thread::Current());
-  Handle<mirror::Class> class_array_class =
-      hs.NewHandle(GetClassRoot<mirror::ObjectArray<mirror::Class>>());
-  DCHECK(class_array_class != nullptr);
-  ObjPtr<mirror::Object> obj =
-      GetAnnotationValue(data, annotation_item, "value", class_array_class,
-                         DexFile::kDexAnnotationArray);
-  if (obj == nullptr) {
-    return nullptr;
-  }
-  return obj->AsObjectArray<mirror::Class>();
+  return GetAnnotationArrayValue<mirror::Class>(klass,
+                                                "Ldalvik/annotation/MemberClasses;",
+                                                "value");
 }
 
 ObjPtr<mirror::Class> GetDeclaringClass(Handle<mirror::Class> klass) {
@@ -1565,12 +1573,17 @@ ObjPtr<mirror::Class> GetDeclaringClass(Handle<mirror::Class> klass) {
   if (obj == nullptr) {
     return nullptr;
   }
+  if (!obj->IsClass()) {
+    // TypeNotPresentException, throw the NoClassDefFoundError.
+    Thread::Current()->SetException(obj->AsThrowable()->GetCause());
+    return nullptr;
+  }
   return obj->AsClass();
 }
 
 ObjPtr<mirror::Class> GetEnclosingClass(Handle<mirror::Class> klass) {
   ObjPtr<mirror::Class> declaring_class = GetDeclaringClass(klass);
-  if (declaring_class != nullptr) {
+  if (declaring_class != nullptr || Thread::Current()->IsExceptionPending()) {
     return declaring_class;
   }
   ClassData data(klass);
@@ -1603,7 +1616,7 @@ ObjPtr<mirror::Class> GetEnclosingClass(Handle<mirror::Class> klass) {
     return nullptr;
   }
   StackHandleScope<2> hs(Thread::Current());
-  ArtMethod* method = Runtime::Current()->GetClassLinker()->ResolveMethodWithoutInvokeType(
+  ArtMethod* method = Runtime::Current()->GetClassLinker()->ResolveMethodId(
       annotation_value.value_.GetI(),
       hs.NewHandle(data.GetDexCache()),
       hs.NewHandle(data.GetClassLoader()));
@@ -1749,7 +1762,84 @@ const char* GetSourceDebugExtension(Handle<mirror::Class> klass) {
     return nullptr;
   }
   dex::StringIndex index(static_cast<uint32_t>(annotation_value.value_.GetI()));
-  return data.GetDexFile().StringDataByIdx(index);
+  return data.GetDexFile().GetStringData(index);
+}
+
+ObjPtr<mirror::Class> GetNestHost(Handle<mirror::Class> klass) {
+  ClassData data(klass);
+  const AnnotationSetItem* annotation_set = FindAnnotationSetForClass(data);
+  if (annotation_set == nullptr) {
+    return nullptr;
+  }
+  const AnnotationItem* annotation_item =
+      SearchAnnotationSet(data.GetDexFile(), annotation_set, "Ldalvik/annotation/NestHost;",
+                          DexFile::kDexVisibilitySystem);
+  if (annotation_item == nullptr) {
+    return nullptr;
+  }
+  ObjPtr<mirror::Object> obj = GetAnnotationValue(data,
+                                                  annotation_item,
+                                                  "host",
+                                                  ScopedNullHandle<mirror::Class>(),
+                                                  DexFile::kDexAnnotationType);
+  if (obj == nullptr) {
+    return nullptr;
+  }
+  if (!obj->IsClass()) {
+    // TypeNotPresentException, throw the NoClassDefFoundError.
+    Thread::Current()->SetException(obj->AsThrowable()->GetCause());
+    return nullptr;
+  }
+  return obj->AsClass();
+}
+
+ObjPtr<mirror::ObjectArray<mirror::Class>> GetNestMembers(Handle<mirror::Class> klass) {
+  return GetAnnotationArrayValue<mirror::Class>(klass,
+                                                "Ldalvik/annotation/NestMembers;",
+                                                "classes");
+}
+
+ObjPtr<mirror::ObjectArray<mirror::Class>> GetPermittedSubclasses(Handle<mirror::Class> klass) {
+  return GetAnnotationArrayValue<mirror::Class>(klass,
+                                                "Ldalvik/annotation/PermittedSubclasses;",
+                                                "value");
+}
+
+ObjPtr<mirror::Object> getRecordAnnotationElement(Handle<mirror::Class> klass,
+                                                  Handle<mirror::Class> array_class,
+                                                  const char* element_name) {
+  ClassData data(klass);
+  const DexFile& dex_file = klass->GetDexFile();
+  const AnnotationSetItem* annotation_set = FindAnnotationSetForClass(data);
+  if (annotation_set == nullptr) {
+    return nullptr;
+  }
+  const AnnotationItem* annotation_item = SearchAnnotationSet(
+      dex_file, annotation_set, "Ldalvik/annotation/Record;", DexFile::kDexVisibilitySystem);
+  if (annotation_item == nullptr) {
+    return nullptr;
+  }
+  const uint8_t* annotation =
+      SearchEncodedAnnotation(dex_file, annotation_item->annotation_, element_name);
+  if (annotation == nullptr) {
+    return nullptr;
+  }
+  DexFile::AnnotationValue annotation_value;
+  bool result = Runtime::Current()->IsActiveTransaction()
+      ? ProcessAnnotationValue<true>(data,
+                                     &annotation,
+                                     &annotation_value,
+                                     array_class,
+                                     DexFile::kPrimitivesOrObjects)
+      : ProcessAnnotationValue<false>(data,
+                                      &annotation,
+                                      &annotation_value,
+                                      array_class,
+                                      DexFile::kPrimitivesOrObjects);
+  if (!result) {
+    return nullptr;
+  }
+  return annotation_value.value_.GetL();
 }
 
 bool IsClassAnnotationPresent(Handle<mirror::Class> klass, Handle<mirror::Class> annotation_class) {
@@ -1766,7 +1856,7 @@ bool IsClassAnnotationPresent(Handle<mirror::Class> klass, Handle<mirror::Class>
 int32_t GetLineNumFromPC(const DexFile* dex_file, ArtMethod* method, uint32_t rel_pc) {
   // For native method, lineno should be -2 to indicate it is native. Note that
   // "line number == -2" is how libcore tells from StackTraceElement.
-  if (method->GetCodeItemOffset() == 0) {
+  if (!method->HasCodeItem()) {
     return -2;
   }
 
@@ -1813,6 +1903,156 @@ template
 void RuntimeEncodedStaticFieldValueIterator::ReadValueToField<true>(ArtField* field) const;
 template
 void RuntimeEncodedStaticFieldValueIterator::ReadValueToField<false>(ArtField* field) const;
+
+inline static VisitorStatus VisitElement(AnnotationVisitor* visitor,
+                                         const char* element_name,
+                                         uint8_t depth,
+                                         uint32_t element_index,
+                                         const DexFile::AnnotationValue& annotation_value)
+    REQUIRES_SHARED(Locks::mutator_lock_) {
+  if (depth == 0) {
+    return visitor->VisitAnnotationElement(
+        element_name, annotation_value.type_, annotation_value.value_);
+  } else {
+    return visitor->VisitArrayElement(
+        depth - 1, element_index, annotation_value.type_, annotation_value.value_);
+  }
+}
+
+static VisitorStatus VisitEncodedValue(const ClassData& klass,
+                                       const DexFile& dex_file,
+                                       const uint8_t** annotation_ptr,
+                                       AnnotationVisitor* visitor,
+                                       const char* element_name,
+                                       uint8_t depth,
+                                       uint32_t element_index)
+    REQUIRES_SHARED(Locks::mutator_lock_) {
+  DexFile::AnnotationValue annotation_value;
+  // kTransactionActive is safe because the result_style is kAllRaw.
+  bool is_consumed = ProcessAnnotationValue<false>(klass,
+                                                   annotation_ptr,
+                                                   &annotation_value,
+                                                   ScopedNullHandle<mirror::Class>(),
+                                                   DexFile::kAllRaw);
+
+  VisitorStatus status =
+      VisitElement(visitor, element_name, depth, element_index, annotation_value);
+  if (UNLIKELY(visitor->HasError())) {
+    // Stop visiting since we won't verify the class anyway.
+    return annotations::VisitorStatus::kVisitBreak;
+  }
+
+  switch (annotation_value.type_) {
+    case DexFile::kDexAnnotationArray: {
+      DCHECK(!is_consumed) << " unexpected consumption of array-typed element '" << element_name
+                           << "' annotating the class " << klass.GetRealClass()->PrettyClass();
+      SkipEncodedValueHeaderByte(annotation_ptr);
+      uint32_t array_size = DecodeUnsignedLeb128(annotation_ptr);
+      uint8_t next_depth = depth + 1;
+      VisitorStatus element_status = (status == VisitorStatus::kVisitInner) ?
+                                         VisitorStatus::kVisitNext :
+                                         VisitorStatus::kVisitBreak;
+      uint32_t i = 0;
+      for (; i < array_size && element_status != VisitorStatus::kVisitBreak; ++i) {
+        element_status = VisitEncodedValue(
+            klass, dex_file, annotation_ptr, visitor, element_name, next_depth, i);
+        if (UNLIKELY(visitor->HasError())) {
+          // Stop visiting since we won't verify the class anyway.
+          return annotations::VisitorStatus::kVisitBreak;
+        }
+      }
+      for (; i < array_size; ++i) {
+        SkipAnnotationValue(dex_file, annotation_ptr);
+      }
+      break;
+    }
+    case DexFile::kDexAnnotationAnnotation: {
+      DCHECK(!is_consumed) << " unexpected consumption of annotation-typed element '"
+                           << element_name << "' annotating the class "
+                           << klass.GetRealClass()->PrettyClass();
+      SkipEncodedValueHeaderByte(annotation_ptr);
+      DecodeUnsignedLeb128(annotation_ptr);  // unused type_index
+      uint32_t size = DecodeUnsignedLeb128(annotation_ptr);
+      for (; size != 0u; --size) {
+        DecodeUnsignedLeb128(annotation_ptr);  // unused element_name_index
+        SkipAnnotationValue(dex_file, annotation_ptr);
+      }
+      break;
+    }
+    case DexFile::kDexAnnotationMethodType:
+    case DexFile::kDexAnnotationMethodHandle:
+      // kDexAnnotationMethodType and kDexAnnotationMethodHandle return false in order to not
+      // crash the process but they are unexpected here.
+      visitor->SetErrorMsg(StringPrintf(
+          "Encountered unexpected annotation element type 0x%02x of %s for the class %s",
+          annotation_value.type_,
+          element_name,
+          klass.GetRealClass()->PrettyClass().c_str()));
+      // Stop visiting since we won't verify the class anyway.
+      return annotations::VisitorStatus::kVisitBreak;
+    default: {
+      // kDexAnnotationArray and kDexAnnotationAnnotation are the only 2 known value_types causing
+      // ProcessAnnotationValue return false. For other value_types, we shouldn't need to iterate
+      // over annotation_ptr and skip the value here.
+      DCHECK(is_consumed) << StringPrintf(
+          "consumed annotation element type 0x%02x of %s for the class %s",
+          annotation_value.type_,
+          element_name,
+          klass.GetRealClass()->PrettyClass().c_str());
+      if (UNLIKELY(!is_consumed)) {
+        SkipAnnotationValue(dex_file, annotation_ptr);
+      }
+      break;
+    }
+  }
+
+  return status;
+}
+
+void VisitClassAnnotations(Handle<mirror::Class> klass, AnnotationVisitor* visitor) {
+  ClassData data(klass);
+  const AnnotationSetItem* annotation_set = FindAnnotationSetForClass(data);
+  if (annotation_set == nullptr) {
+    return;
+  }
+
+  const DexFile& dex_file = data.GetDexFile();
+  for (uint32_t i = 0; i < annotation_set->size_; ++i) {
+    const AnnotationItem* annotation_item = dex_file.GetAnnotationItem(annotation_set, i);
+    uint8_t visibility = annotation_item->visibility_;
+    const uint8_t* annotation = annotation_item->annotation_;
+    uint32_t type_index = DecodeUnsignedLeb128(&annotation);
+    const char* annotation_descriptor = dex_file.GetTypeDescriptor(dex::TypeIndex(type_index));
+    VisitorStatus status = visitor->VisitAnnotation(annotation_descriptor, visibility);
+    switch (status) {
+      case VisitorStatus::kVisitBreak:
+        return;
+      case VisitorStatus::kVisitNext:
+        continue;
+      case VisitorStatus::kVisitInner:
+        // Visit the annotation elements
+        break;
+    }
+
+    uint32_t size = DecodeUnsignedLeb128(&annotation);
+    while (size != 0) {
+      uint32_t element_name_index = DecodeUnsignedLeb128(&annotation);
+      const char* element_name =
+          dex_file.GetStringData(dex_file.GetStringId(dex::StringIndex(element_name_index)));
+
+      status = VisitEncodedValue(
+          data, dex_file, &annotation, visitor, element_name, /*depth=*/0, /*ignored*/ 0);
+      if (UNLIKELY(visitor->HasError())) {
+        // Encountered an error, bail out since we won't verify the class anyway.
+        return;
+      }
+      if (status == VisitorStatus::kVisitBreak) {
+        break;
+      }
+      size--;
+    }
+  }
+}
 
 }  // namespace annotations
 

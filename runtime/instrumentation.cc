@@ -34,6 +34,7 @@
 #include "dex/dex_instruction-inl.h"
 #include "entrypoints/quick/quick_alloc_entrypoints.h"
 #include "entrypoints/quick/quick_entrypoints.h"
+#include "entrypoints/quick/runtime_entrypoints_list.h"
 #include "entrypoints/runtime_asm_entrypoints.h"
 #include "gc_root-inl.h"
 #include "interpreter/interpreter.h"
@@ -46,22 +47,23 @@
 #include "mirror/dex_cache.h"
 #include "mirror/object-inl.h"
 #include "mirror/object_array-inl.h"
+#include "nterp_helpers.h"
 #include "nth_caller_visitor.h"
-#include "oat_quick_method_header.h"
+#include "oat/oat_file_manager.h"
+#include "oat/oat_quick_method_header.h"
 #include "runtime-inl.h"
 #include "thread.h"
 #include "thread_list.h"
 
-namespace art {
+namespace art HIDDEN {
+
 namespace instrumentation {
 
 constexpr bool kVerboseInstrumentation = false;
 
 void InstrumentationListener::MethodExited(
     Thread* thread,
-    Handle<mirror::Object> this_object,
     ArtMethod* method,
-    uint32_t dex_pc,
     OptionalFrame frame,
     MutableHandle<mirror::Object>& return_value) {
   DCHECK_EQ(method->GetInterfaceMethodIfProxy(kRuntimePointerSize)->GetReturnTypePrimitive(),
@@ -69,7 +71,7 @@ void InstrumentationListener::MethodExited(
   const void* original_ret = return_value.Get();
   JValue v;
   v.SetL(return_value.Get());
-  MethodExited(thread, this_object, method, dex_pc, frame, v);
+  MethodExited(thread, method, frame, v);
   DCHECK(original_ret == v.GetL()) << "Return value changed";
 }
 
@@ -104,78 +106,12 @@ class InstallStubsClassVisitor : public ClassVisitor {
   Instrumentation* const instrumentation_;
 };
 
-InstrumentationStackPopper::InstrumentationStackPopper(Thread* self)
-      : self_(self),
-        instrumentation_(Runtime::Current()->GetInstrumentation()),
-        pop_until_(0u) {}
-
-InstrumentationStackPopper::~InstrumentationStackPopper() {
-  std::map<uintptr_t, instrumentation::InstrumentationStackFrame>* stack =
-      self_->GetInstrumentationStack();
-  for (auto i = stack->begin(); i != stack->end() && i->first <= pop_until_;) {
-    i = stack->erase(i);
-  }
-}
-
-bool InstrumentationStackPopper::PopFramesTo(uintptr_t stack_pointer,
-                                             MutableHandle<mirror::Throwable>& exception) {
-  std::map<uintptr_t, instrumentation::InstrumentationStackFrame>* stack =
-      self_->GetInstrumentationStack();
-  DCHECK(!self_->IsExceptionPending());
-  if (!instrumentation_->HasMethodUnwindListeners()) {
-    pop_until_ = stack_pointer;
-    return true;
-  }
-  if (kVerboseInstrumentation) {
-    LOG(INFO) << "Popping frames for exception " << exception->Dump();
-  }
-  // The instrumentation events expect the exception to be set.
-  self_->SetException(exception.Get());
-  bool new_exception_thrown = false;
-  auto i = stack->upper_bound(pop_until_);
-
-  // Now pop all frames until reaching stack_pointer, or a new exception is
-  // thrown. Note that `stack_pointer` doesn't need to be a return PC address
-  // (in fact the exception handling code passes the start of the frame where
-  // the catch handler is).
-  for (; i != stack->end() && i->first <= stack_pointer; i++) {
-    const InstrumentationStackFrame& frame = i->second;
-    ArtMethod* method = frame.method_;
-    // Notify listeners of method unwind.
-    // TODO: improve the dex_pc information here.
-    uint32_t dex_pc = dex::kDexNoIndex;
-    if (kVerboseInstrumentation) {
-      LOG(INFO) << "Popping for unwind " << method->PrettyMethod();
-    }
-    if (!method->IsRuntimeMethod() && !frame.interpreter_entry_) {
-      instrumentation_->MethodUnwindEvent(self_, frame.this_object_, method, dex_pc);
-      new_exception_thrown = self_->GetException() != exception.Get();
-      if (new_exception_thrown) {
-        pop_until_ = i->first;
-        break;
-      }
-    }
-  }
-  if (!new_exception_thrown) {
-    pop_until_ = stack_pointer;
-  }
-  exception.Assign(self_->GetException());
-  self_->ClearException();
-  if (kVerboseInstrumentation && new_exception_thrown) {
-    LOG(INFO) << "Did partial pop of frames due to new exception";
-  }
-  return !new_exception_thrown;
-}
-
 Instrumentation::Instrumentation()
-    : current_force_deopt_id_(0),
-      instrumentation_stubs_installed_(false),
-      entry_exit_stubs_installed_(false),
-      interpreter_stubs_installed_(false),
-      interpret_only_(false),
+    : run_exit_hooks_(false),
+      instrumentation_level_(InstrumentationLevel::kInstrumentNothing),
       forced_interpret_only_(false),
-      have_method_entry_listeners_(false),
-      have_method_exit_listeners_(false),
+      have_method_entry_listeners_(0),
+      have_method_exit_listeners_(0),
       have_method_unwind_listeners_(false),
       have_dex_pc_listeners_(false),
       have_field_read_listeners_(false),
@@ -184,13 +120,51 @@ Instrumentation::Instrumentation()
       have_watched_frame_pop_listeners_(false),
       have_branch_listeners_(false),
       have_exception_handled_listeners_(false),
-      deoptimized_methods_lock_(new ReaderWriterMutex("deoptimized methods lock",
-                                                      kGenericBottomLock)),
-      deoptimization_enabled_(false),
-      interpreter_handler_table_(kMainHandlerTable),
       quick_alloc_entry_points_instrumentation_counter_(0),
-      alloc_entrypoints_instrumented_(false),
-      can_use_instrumentation_trampolines_(true) {
+      alloc_entrypoints_instrumented_(false) {}
+
+bool Instrumentation::ProcessMethodUnwindCallbacks(Thread* self,
+                                                   std::queue<ArtMethod*>& methods,
+                                                   MutableHandle<mirror::Throwable>& exception) {
+  DCHECK(!self->IsExceptionPending());
+  if (!HasMethodUnwindListeners()) {
+    return true;
+  }
+  if (kVerboseInstrumentation) {
+    LOG(INFO) << "Popping frames for exception " << exception->Dump();
+  }
+  // The instrumentation events expect the exception to be set.
+  self->SetException(exception.Get());
+  bool new_exception_thrown = false;
+
+  // Process callbacks for all methods that would be unwound until a new exception is thrown.
+  while (!methods.empty()) {
+    ArtMethod* method = methods.front();
+    methods.pop();
+    if (kVerboseInstrumentation) {
+      LOG(INFO) << "Popping for unwind " << method->PrettyMethod();
+    }
+
+    if (method->IsRuntimeMethod()) {
+      continue;
+    }
+
+    // Notify listeners of method unwind.
+    // TODO: improve the dex_pc information here.
+    uint32_t dex_pc = dex::kDexNoIndex;
+    MethodUnwindEvent(self, method, dex_pc);
+    new_exception_thrown = self->GetException() != exception.Get();
+    if (new_exception_thrown) {
+      break;
+    }
+  }
+
+  exception.Assign(self->GetException());
+  self->ClearException();
+  if (kVerboseInstrumentation && new_exception_thrown) {
+    LOG(INFO) << "Did partial pop of frames due to new exception";
+  }
+  return !new_exception_thrown;
 }
 
 void Instrumentation::InstallStubsForClass(ObjPtr<mirror::Class> klass) {
@@ -206,29 +180,261 @@ void Instrumentation::InstallStubsForClass(ObjPtr<mirror::Class> klass) {
   }
 }
 
-static void UpdateEntrypoints(ArtMethod* method, const void* quick_code)
-    REQUIRES_SHARED(Locks::mutator_lock_) {
-  if (kIsDebugBuild) {
-    jit::Jit* jit = Runtime::Current()->GetJit();
-    if (jit != nullptr && jit->GetCodeCache()->ContainsPc(quick_code)) {
-      // Ensure we always have the thumb entrypoint for JIT on arm32.
-      if (kRuntimeISA == InstructionSet::kArm) {
-        CHECK_EQ(reinterpret_cast<uintptr_t>(quick_code) & 1, 1u);
-      }
-    }
-  }
-  method->SetEntryPointFromQuickCompiledCode(quick_code);
+static bool CanHandleInitializationCheck(const void* code) {
+  ClassLinker* class_linker = Runtime::Current()->GetClassLinker();
+  return class_linker->IsQuickResolutionStub(code) ||
+         class_linker->IsQuickToInterpreterBridge(code) ||
+         class_linker->IsQuickGenericJniStub(code) ||
+         (code == interpreter::GetNterpWithClinitEntryPoint());
 }
 
-bool Instrumentation::NeedDebugVersionFor(ArtMethod* method) const
+static bool IsProxyInit(ArtMethod* method) REQUIRES_SHARED(Locks::mutator_lock_) {
+  // Annoyingly this can be called before we have actually initialized WellKnownClasses so therefore
+  // we also need to check this based on the declaring-class descriptor. The check is valid because
+  // Proxy only has a single constructor.
+  ArtMethod* well_known_proxy_init = WellKnownClasses::java_lang_reflect_Proxy_init;
+  if (well_known_proxy_init == method) {
+    return true;
+  }
+
+  if (well_known_proxy_init != nullptr) {
+    return false;
+  }
+
+  return method->IsConstructor() && !method->IsStatic() &&
+      method->GetDeclaringClass()->DescriptorEquals("Ljava/lang/reflect/Proxy;");
+}
+
+// Returns true if we need entry exit stub to call entry hooks. JITed code
+// directly call entry / exit hooks and don't need the stub.
+static bool CodeSupportsEntryExitHooks(const void* entry_point, ArtMethod* method)
     REQUIRES_SHARED(Locks::mutator_lock_) {
-  art::Runtime* runtime = Runtime::Current();
-  // If anything says we need the debug version or we are debuggable we will need the debug version
-  // of the method.
-  return (runtime->GetRuntimeCallbacks()->MethodNeedsDebugVersion(method) ||
-          runtime->IsJavaDebuggable()) &&
-         !method->IsNative() &&
-         !method->IsProxyMethod();
+  // Proxy.init should always run with the switch interpreter where entry / exit hooks are
+  // supported.
+  if (IsProxyInit(method)) {
+    return true;
+  }
+
+  // In some tests runtime isn't setup fully and hence the entry points could be nullptr.
+  // just be conservative and return false here.
+  if (entry_point == nullptr) {
+    return false;
+  }
+
+  ClassLinker* linker = Runtime::Current()->GetClassLinker();
+  // Interpreter supports entry / exit hooks. Resolution stubs fetch code that supports entry / exit
+  // hooks when required. So return true for both cases.
+  if (linker->IsQuickToInterpreterBridge(entry_point) ||
+      linker->IsQuickResolutionStub(entry_point)) {
+    return true;
+  }
+
+  // When jiting code for debuggable runtimes / instrumentation is active  we generate the code to
+  // call method entry / exit hooks when required.
+  jit::Jit* jit = Runtime::Current()->GetJit();
+  if (jit != nullptr && jit->GetCodeCache()->ContainsPc(entry_point)) {
+    // If JITed code was compiled with instrumentation support we support entry / exit hooks.
+    OatQuickMethodHeader* header = OatQuickMethodHeader::FromEntryPoint(entry_point);
+    return CodeInfo::IsDebuggable(header->GetOptimizedCodeInfoPtr());
+  }
+
+  // GenericJni trampoline can handle entry / exit hooks.
+  if (linker->IsQuickGenericJniStub(entry_point)) {
+    return true;
+  }
+
+  // The remaining cases are nterp / oat code / JIT code that isn't compiled with instrumentation
+  // support.
+  return false;
+}
+
+template <typename T>
+bool CompareExchange(uintptr_t ptr, uintptr_t old_value, uintptr_t new_value) {
+  std::atomic<T>* atomic_addr = reinterpret_cast<std::atomic<T>*>(ptr);
+  T cast_old_value = dchecked_integral_cast<T>(old_value);
+  return atomic_addr->compare_exchange_strong(cast_old_value,
+                                              dchecked_integral_cast<T>(new_value),
+                                              std::memory_order_relaxed);
+}
+
+static void UpdateEntryPoints(ArtMethod* method, const void* new_code)
+    REQUIRES_SHARED(Locks::mutator_lock_) {
+  if (kIsDebugBuild) {
+    if (method->StillNeedsClinitCheckMayBeDead()) {
+      CHECK(CanHandleInitializationCheck(new_code));
+    }
+    jit::Jit* jit = Runtime::Current()->GetJit();
+    if (jit != nullptr && jit->GetCodeCache()->ContainsPc(new_code)) {
+      // Ensure we always have the thumb entrypoint for JIT on arm32.
+      if (kRuntimeQuickCodeISA == InstructionSet::kArm) {
+        CHECK_EQ(reinterpret_cast<uintptr_t>(new_code) & 1, 1u);
+      }
+    }
+    const Instrumentation* instr = Runtime::Current()->GetInstrumentation();
+    if (instr->EntryExitStubsInstalled()) {
+      CHECK(CodeSupportsEntryExitHooks(new_code, method));
+    }
+    if (instr->InterpreterStubsInstalled() && !method->IsNative()) {
+      CHECK_EQ(new_code, GetQuickToInterpreterBridge());
+    }
+  }
+  const void* current_entry_point = method->GetEntryPointFromQuickCompiledCode();
+  if (current_entry_point == new_code) {
+    // If the method is from a boot image, don't dirty it if the entrypoint
+    // doesn't change.
+    return;
+  }
+
+  // Do an atomic exchange to avoid potentially unregistering JIT code twice.
+  MemberOffset offset = ArtMethod::EntryPointFromQuickCompiledCodeOffset(kRuntimePointerSize);
+  uintptr_t old_value = reinterpret_cast<uintptr_t>(current_entry_point);
+  uintptr_t new_value = reinterpret_cast<uintptr_t>(new_code);
+  uintptr_t ptr = reinterpret_cast<uintptr_t>(method) + offset.Uint32Value();
+  bool success = (kRuntimePointerSize == PointerSize::k32)
+      ? CompareExchange<uint32_t>(ptr, old_value, new_value)
+      : CompareExchange<uint64_t>(ptr, old_value, new_value);
+
+  // If we successfully updated the entrypoint and the old entrypoint is JITted
+  // code, register the old entrypoint as zombie.
+  jit::Jit* jit = Runtime::Current()->GetJit();
+  if (success &&
+      jit != nullptr &&
+      jit->GetCodeCache()->ContainsPc(current_entry_point)) {
+    jit->GetCodeCache()->AddZombieCode(method, current_entry_point);
+  }
+}
+
+bool Instrumentation::NeedsDexPcEvents(ArtMethod* method, Thread* thread) {
+  return (InterpretOnly(method) || thread->IsForceInterpreter()) && HasDexPcListeners();
+}
+
+bool Instrumentation::InterpretOnly(ArtMethod* method) REQUIRES_SHARED(Locks::mutator_lock_) {
+  if (method->IsNative()) {
+    return false;
+  }
+  return InterpretOnly() || IsDeoptimized(method);
+}
+
+static bool CanUseAotCode(const void* quick_code)
+    REQUIRES_SHARED(Locks::mutator_lock_) {
+  if (quick_code == nullptr) {
+    return false;
+  }
+  Runtime* runtime = Runtime::Current();
+  // For simplicity, we never use AOT code for debuggable.
+  if (runtime->IsJavaDebuggable()) {
+    return false;
+  }
+
+  if (runtime->IsNativeDebuggable()) {
+    DCHECK(runtime->UseJitCompilation() && runtime->GetJit()->JitAtFirstUse());
+    // If we are doing native debugging, ignore application's AOT code,
+    // since we want to JIT it (at first use) with extra stackmaps for native
+    // debugging. We keep however all AOT code from the boot image,
+    // since the JIT-at-first-use is blocking and would result in non-negligible
+    // startup performance impact.
+    return runtime->GetHeap()->IsInBootImageOatFile(quick_code);
+  }
+
+  return true;
+}
+
+static bool CanUseNterp(ArtMethod* method) REQUIRES_SHARED(Locks::mutator_lock_) {
+  return interpreter::CanRuntimeUseNterp() &&
+      CanMethodUseNterp(method) &&
+      method->IsDeclaringClassVerifiedMayBeDead();
+}
+
+static const void* GetOptimizedCodeFor(ArtMethod* method) REQUIRES_SHARED(Locks::mutator_lock_) {
+  DCHECK(!Runtime::Current()->GetInstrumentation()->InterpretOnly(method));
+  CHECK(method->IsInvokable()) << method->PrettyMethod();
+  if (method->IsProxyMethod()) {
+    return GetQuickProxyInvokeHandler();
+  }
+
+  // In debuggable mode, we can only use AOT code for native methods.
+  ClassLinker* class_linker = Runtime::Current()->GetClassLinker();
+  const void* aot_code = method->GetOatMethodQuickCode(class_linker->GetImagePointerSize());
+  if (CanUseAotCode(aot_code)) {
+    return aot_code;
+  }
+
+  // If the method has been precompiled, there can be a JIT version.
+  jit::Jit* jit = Runtime::Current()->GetJit();
+  if (jit != nullptr) {
+    const void* code = jit->GetCodeCache()->GetSavedEntryPointOfPreCompiledMethod(method);
+    if (code != nullptr) {
+      return code;
+    }
+  }
+
+  // We need to check if the class has been verified for setting up nterp, as
+  // the verifier could punt the method to the switch interpreter in case we
+  // need to do lock counting.
+  if (CanUseNterp(method)) {
+    return interpreter::GetNterpEntryPoint();
+  }
+
+  return method->IsNative() ? GetQuickGenericJniStub() : GetQuickToInterpreterBridge();
+}
+
+void Instrumentation::InitializeMethodsCode(ArtMethod* method, const void* aot_code)
+    REQUIRES_SHARED(Locks::mutator_lock_) {
+  if (!method->IsInvokable()) {
+    DCHECK(method->GetEntryPointFromQuickCompiledCode() == nullptr ||
+           Runtime::Current()->GetClassLinker()->IsQuickToInterpreterBridge(
+               method->GetEntryPointFromQuickCompiledCode()));
+    UpdateEntryPoints(method, GetQuickToInterpreterBridge());
+    return;
+  }
+
+  // Use instrumentation entrypoints if instrumentation is installed.
+  if (UNLIKELY(EntryExitStubsInstalled() || IsForcedInterpretOnly() || IsDeoptimized(method))) {
+    UpdateEntryPoints(
+        method, method->IsNative() ? GetQuickGenericJniStub() : GetQuickToInterpreterBridge());
+    return;
+  }
+
+  // Special case if we need an initialization check.
+  // The method and its declaring class may be dead when starting JIT GC during managed heap GC.
+  if (method->StillNeedsClinitCheckMayBeDead()) {
+    // If we have code but the method needs a class initialization check before calling
+    // that code, install the resolution stub that will perform the check.
+    // It will be replaced by the proper entry point by ClassLinker::FixupStaticTrampolines
+    // after initializing class (see ClassLinker::InitializeClass method).
+    // Note: this mimics the logic in image_writer.cc that installs the resolution
+    // stub only if we have compiled code or we can execute nterp, and the method needs a class
+    // initialization check.
+    if (aot_code != nullptr || method->IsNative() || CanUseNterp(method)) {
+      if (kIsDebugBuild && CanUseNterp(method)) {
+        // Adds some test coverage for the nterp clinit entrypoint.
+        UpdateEntryPoints(method, interpreter::GetNterpWithClinitEntryPoint());
+      } else {
+        UpdateEntryPoints(method, GetQuickResolutionStub());
+      }
+    } else {
+      UpdateEntryPoints(method, GetQuickToInterpreterBridge());
+    }
+    return;
+  }
+
+  // Use the provided AOT code if possible.
+  if (CanUseAotCode(aot_code)) {
+    UpdateEntryPoints(method, aot_code);
+    return;
+  }
+
+  // We check if the class is verified as we need the slow interpreter for lock verification.
+  // If the class is not verified, This will be updated in
+  // ClassLinker::UpdateClassAfterVerification.
+  if (CanUseNterp(method)) {
+    UpdateEntryPoints(method, interpreter::GetNterpEntryPoint());
+    return;
+  }
+
+  // Use default entrypoints.
+  UpdateEntryPoints(
+      method, method->IsNative() ? GetQuickGenericJniStub() : GetQuickToInterpreterBridge());
 }
 
 void Instrumentation::InstallStubsForMethod(ArtMethod* method) {
@@ -239,180 +445,134 @@ void Instrumentation::InstallStubsForMethod(ArtMethod* method) {
   // Don't stub Proxy.<init>. Note that the Proxy class itself is not a proxy class.
   // TODO We should remove the need for this since it means we cannot always correctly detect calls
   // to Proxy.<init>
-  // Annoyingly this can be called before we have actually initialized WellKnownClasses so therefore
-  // we also need to check this based on the declaring-class descriptor. The check is valid because
-  // Proxy only has a single constructor.
-  ArtMethod* well_known_proxy_init = jni::DecodeArtMethod(
-      WellKnownClasses::java_lang_reflect_Proxy_init);
-  if ((LIKELY(well_known_proxy_init != nullptr) && UNLIKELY(method == well_known_proxy_init)) ||
-      UNLIKELY(method->IsConstructor() &&
-               method->GetDeclaringClass()->DescriptorEquals("Ljava/lang/reflect/Proxy;"))) {
+  if (IsProxyInit(method)) {
     return;
   }
-  const void* new_quick_code;
-  bool uninstall = !entry_exit_stubs_installed_ && !interpreter_stubs_installed_;
-  Runtime* const runtime = Runtime::Current();
-  ClassLinker* const class_linker = runtime->GetClassLinker();
-  bool is_class_initialized = method->GetDeclaringClass()->IsInitialized();
-  if (uninstall) {
-    if ((forced_interpret_only_ || IsDeoptimized(method)) && !method->IsNative()) {
-      new_quick_code = GetQuickToInterpreterBridge();
-    } else if (is_class_initialized || !method->IsStatic() || method->IsConstructor()) {
-      new_quick_code = GetCodeForInvoke(method);
-    } else {
-      new_quick_code = GetQuickResolutionStub();
-    }
-  } else {  // !uninstall
-    if ((interpreter_stubs_installed_ || forced_interpret_only_ || IsDeoptimized(method)) &&
-        !method->IsNative()) {
-      new_quick_code = GetQuickToInterpreterBridge();
-    } else {
-      // Do not overwrite resolution trampoline. When the trampoline initializes the method's
-      // class, all its static methods code will be set to the instrumentation entry point.
-      // For more details, see ClassLinker::FixupStaticTrampolines.
-      if (is_class_initialized || !method->IsStatic() || method->IsConstructor()) {
-        if (entry_exit_stubs_installed_) {
-          // This needs to be checked first since the instrumentation entrypoint will be able to
-          // find the actual JIT compiled code that corresponds to this method.
-          new_quick_code = GetQuickInstrumentationEntryPoint();
-        } else if (NeedDebugVersionFor(method)) {
-          // It would be great to search the JIT for its implementation here but we cannot due to
-          // the locks we hold. Instead just set to the interpreter bridge and that code will search
-          // the JIT when it gets called and replace the entrypoint then.
-          new_quick_code = GetQuickToInterpreterBridge();
-        } else {
-          new_quick_code = class_linker->GetQuickOatCodeFor(method);
-        }
-      } else {
-        new_quick_code = GetQuickResolutionStub();
-      }
-    }
+
+  // If the instrumentation needs to go through the interpreter, just update the
+  // entrypoint to interpreter.
+  if (InterpretOnly(method)) {
+    UpdateEntryPoints(method, GetQuickToInterpreterBridge());
+    return;
   }
-  UpdateEntrypoints(method, new_quick_code);
+
+  if (EntryExitStubsInstalled()) {
+    // Install interpreter bridge / GenericJni stub if the existing code doesn't support
+    // entry / exit hooks.
+    if (!CodeSupportsEntryExitHooks(method->GetEntryPointFromQuickCompiledCode(), method)) {
+      UpdateEntryPoints(
+          method, method->IsNative() ? GetQuickGenericJniStub() : GetQuickToInterpreterBridge());
+    }
+    return;
+  }
+
+  // We're being asked to restore the entrypoints after instrumentation.
+  CHECK_EQ(instrumentation_level_, InstrumentationLevel::kInstrumentNothing);
+  // We need to have the resolution stub still if the class is not initialized.
+  if (method->StillNeedsClinitCheck()) {
+    UpdateEntryPoints(method, GetQuickResolutionStub());
+    return;
+  }
+  UpdateEntryPoints(method, GetOptimizedCodeFor(method));
 }
 
-// Places the instrumentation exit pc as the return PC for every quick frame. This also allows
-// deoptimization of quick frames to interpreter frames.
-// Since we may already have done this previously, we need to push new instrumentation frame before
-// existing instrumentation frames.
-void InstrumentationInstallStack(Thread* thread, void* arg)
+void Instrumentation::UpdateEntrypointsForDebuggable() {
+  Runtime* runtime = Runtime::Current();
+  // If we are transitioning from non-debuggable to debuggable, we patch
+  // entry points of methods to remove any aot / JITed entry points.
+  InstallStubsClassVisitor visitor(this);
+  runtime->GetClassLinker()->VisitClasses(&visitor);
+}
+
+bool Instrumentation::MethodSupportsExitEvents(ArtMethod* method,
+                                               const OatQuickMethodHeader* header) {
+  if (header == nullptr) {
+    // Header can be a nullptr for runtime / proxy methods that doesn't support method exit hooks
+    // or for native methods that use generic jni stubs. Generic jni stubs support method exit
+    // hooks.
+    return method->IsNative();
+  }
+
+  if (header->IsNterpMethodHeader()) {
+    // Nterp doesn't support method exit events
+    return false;
+  }
+
+  DCHECK(header->IsOptimized());
+  if (CodeInfo::IsDebuggable(header->GetOptimizedCodeInfoPtr())) {
+    // For optimized code, we only support method entry / exit hooks if they are compiled as
+    // debuggable.
+    return true;
+  }
+
+  return false;
+}
+
+// Updates on stack frames to support any changes related to instrumentation.
+// For JITed frames, DeoptimizeFlag is updated to enable deoptimization of
+// methods when necessary. Shadow frames are updated if dex pc event
+// notification has changed. When force_deopt is true then DeoptimizationFlag is
+// updated to force a deoptimization.
+void InstrumentationInstallStack(Thread* thread, bool deopt_all_frames)
     REQUIRES(Locks::mutator_lock_) {
   Locks::mutator_lock_->AssertExclusiveHeld(Thread::Current());
   struct InstallStackVisitor final : public StackVisitor {
     InstallStackVisitor(Thread* thread_in,
                         Context* context,
-                        uintptr_t instrumentation_exit_pc,
-                        uint64_t force_deopt_id)
+                        bool deopt_all_frames)
         : StackVisitor(thread_in, context, kInstrumentationStackWalk),
-          instrumentation_stack_(thread_in->GetInstrumentationStack()),
-          instrumentation_exit_pc_(instrumentation_exit_pc),
-          reached_existing_instrumentation_frames_(false),
-          last_return_pc_(0),
-          force_deopt_id_(force_deopt_id) {}
+          deopt_all_frames_(deopt_all_frames),
+          runtime_methods_need_deopt_check_(false) {}
 
     bool VisitFrame() override REQUIRES_SHARED(Locks::mutator_lock_) {
       ArtMethod* m = GetMethod();
-      if (m == nullptr) {
+      if (m == nullptr || m->IsRuntimeMethod()) {
         if (kVerboseInstrumentation) {
-          LOG(INFO) << "  Skipping upcall. Frame " << GetFrameId();
+          LOG(INFO) << "  Skipping upcall / runtime method. Frame " << GetFrameId();
         }
-        last_return_pc_ = 0;
-        return true;  // Ignore upcalls.
+        return true;  // Ignore upcalls and runtime methods.
       }
-      if (GetCurrentQuickFrame() == nullptr) {
-        bool interpreter_frame = true;
-        InstrumentationStackFrame instrumentation_frame(GetThisObject().Ptr(),
-                                                        m,
-                                                        /*return_pc=*/ 0,
-                                                        GetFrameId(),
-                                                        interpreter_frame,
-                                                        force_deopt_id_);
-        if (kVerboseInstrumentation) {
-          LOG(INFO) << "Pushing shadow frame " << instrumentation_frame.Dump();
-        }
-        shadow_stack_.push_back(instrumentation_frame);
+
+      bool is_shadow_frame = GetCurrentQuickFrame() == nullptr;
+      if (kVerboseInstrumentation) {
+        LOG(INFO) << "Processing frame: method: " << m->PrettyMethod()
+                  << " is_shadow_frame: " << is_shadow_frame;
+      }
+
+      // Handle interpreter frame.
+      if (is_shadow_frame) {
+        // Since we are updating the instrumentation related information we have to recalculate
+        // NeedsDexPcEvents. For example, when a new method or thread is deoptimized / interpreter
+        // stubs are installed the NeedsDexPcEvents could change for the shadow frames on the stack.
+        // If we don't update it here we would miss reporting dex pc events which is incorrect.
+        ShadowFrame* shadow_frame = GetCurrentShadowFrame();
+        DCHECK(shadow_frame != nullptr);
+        shadow_frame->SetNotifyDexPcMoveEvents(
+            Runtime::Current()->GetInstrumentation()->NeedsDexPcEvents(GetMethod(), GetThread()));
         return true;  // Continue.
       }
-      uintptr_t return_pc = GetReturnPc();
-      if (kVerboseInstrumentation) {
-        LOG(INFO) << "  Installing exit stub in " << DescribeLocation();
-      }
-      if (return_pc == instrumentation_exit_pc_) {
-        auto it = instrumentation_stack_->find(GetReturnPcAddr());
-        CHECK(it != instrumentation_stack_->end());
-        const InstrumentationStackFrame& frame = it->second;
-        if (m->IsRuntimeMethod()) {
-          if (frame.interpreter_entry_) {
-            // This instrumentation frame is for an interpreter bridge and is
-            // pushed when executing the instrumented interpreter bridge. So method
-            // enter event must have been reported. However we need to push a DEX pc
-            // into the dex_pcs_ list to match size of instrumentation stack.
-            uint32_t dex_pc = dex::kDexNoIndex;
-            dex_pcs_.push_back(dex_pc);
-            last_return_pc_ = frame.return_pc_;
-            return true;
-          }
-        }
 
-        // We've reached a frame which has already been installed with instrumentation exit stub.
-        // We should have already installed instrumentation or be interpreter on previous frames.
-        reached_existing_instrumentation_frames_ = true;
-
-        CHECK_EQ(m->GetNonObsoleteMethod(), frame.method_->GetNonObsoleteMethod())
-            << "Expected " << ArtMethod::PrettyMethod(m)
-            << ", Found " << ArtMethod::PrettyMethod(frame.method_);
-        return_pc = frame.return_pc_;
-        if (kVerboseInstrumentation) {
-          LOG(INFO) << "Ignoring already instrumented " << frame.Dump();
+      DCHECK(!m->IsRuntimeMethod());
+      const OatQuickMethodHeader* method_header = GetCurrentOatQuickMethodHeader();
+      // If it is a JITed frame then just set the deopt bit if required otherwise continue.
+      // We need kForceDeoptForRedefinition to ensure we don't use any JITed code after a
+      // redefinition. We support redefinition only if the runtime has started off as a
+      // debuggable runtime which makes sure we don't use any AOT or Nterp code.
+      // The CheckCallerForDeopt is an optimization which we only do for non-native JITed code for
+      // now. We can extend it to native methods but that needs reserving an additional stack slot.
+      // We don't do it currently since that wasn't important for debugger performance.
+      if (method_header != nullptr && method_header->HasShouldDeoptimizeFlag()) {
+        if (deopt_all_frames_) {
+          runtime_methods_need_deopt_check_ = true;
+          SetShouldDeoptimizeFlag(DeoptimizeFlagValue::kForceDeoptForRedefinition);
         }
-      } else {
-        CHECK_NE(return_pc, 0U);
-        if (UNLIKELY(reached_existing_instrumentation_frames_ && !m->IsRuntimeMethod())) {
-          // We already saw an existing instrumentation frame so this should be a runtime-method
-          // inserted by the interpreter or runtime.
-          std::string thread_name;
-          GetThread()->GetThreadName(thread_name);
-          uint32_t dex_pc = dex::kDexNoIndex;
-          if (last_return_pc_ != 0 && GetCurrentOatQuickMethodHeader() != nullptr) {
-            dex_pc = GetCurrentOatQuickMethodHeader()->ToDexPc(
-                GetCurrentQuickFrame(), last_return_pc_);
-          }
-          LOG(FATAL) << "While walking " << thread_name << " found unexpected non-runtime method"
-                     << " without instrumentation exit return or interpreter frame."
-                     << " method is " << GetMethod()->PrettyMethod()
-                     << " return_pc is " << std::hex << return_pc
-                     << " dex pc: " << dex_pc;
-          UNREACHABLE();
-        }
-        InstrumentationStackFrame instrumentation_frame(
-            m->IsRuntimeMethod() ? nullptr : GetThisObject().Ptr(),
-            m,
-            return_pc,
-            GetFrameId(),    // A runtime method still gets a frame id.
-            false,
-            force_deopt_id_);
-        if (kVerboseInstrumentation) {
-          LOG(INFO) << "Pushing frame " << instrumentation_frame.Dump();
-        }
-
-        instrumentation_stack_->insert({GetReturnPcAddr(), instrumentation_frame});
-        SetReturnPc(instrumentation_exit_pc_);
+        SetShouldDeoptimizeFlag(DeoptimizeFlagValue::kCheckCallerForDeopt);
       }
-      uint32_t dex_pc = dex::kDexNoIndex;
-      if (last_return_pc_ != 0 && GetCurrentOatQuickMethodHeader() != nullptr) {
-        dex_pc = GetCurrentOatQuickMethodHeader()->ToDexPc(GetCurrentQuickFrame(), last_return_pc_);
-      }
-      dex_pcs_.push_back(dex_pc);
-      last_return_pc_ = return_pc;
+
       return true;  // Continue.
     }
-    std::map<uintptr_t, InstrumentationStackFrame>* const instrumentation_stack_;
-    std::vector<InstrumentationStackFrame> shadow_stack_;
-    std::vector<uint32_t> dex_pcs_;
-    const uintptr_t instrumentation_exit_pc_;
-    bool reached_existing_instrumentation_frames_;
-    uintptr_t last_return_pc_;
-    uint64_t force_deopt_id_;
+    bool deopt_all_frames_;
+    bool runtime_methods_need_deopt_check_;
   };
   if (kVerboseInstrumentation) {
     std::string thread_name;
@@ -420,154 +580,191 @@ void InstrumentationInstallStack(Thread* thread, void* arg)
     LOG(INFO) << "Installing exit stubs in " << thread_name;
   }
 
-  Instrumentation* instrumentation = reinterpret_cast<Instrumentation*>(arg);
   std::unique_ptr<Context> context(Context::Create());
-  uintptr_t instrumentation_exit_pc = reinterpret_cast<uintptr_t>(GetQuickInstrumentationExitPc());
-  InstallStackVisitor visitor(
-      thread, context.get(), instrumentation_exit_pc, instrumentation->current_force_deopt_id_);
+  InstallStackVisitor visitor(thread,
+                              context.get(),
+                              deopt_all_frames);
   visitor.WalkStack(true);
-  CHECK_EQ(visitor.dex_pcs_.size(), thread->GetInstrumentationStack()->size());
 
-  if (instrumentation->ShouldNotifyMethodEnterExitEvents()) {
-    // Create method enter events for all methods currently on the thread's stack. We only do this
-    // if no debugger is attached to prevent from posting events twice.
-    // TODO: This is the only place we make use of frame_id_. We should create a
-    // std::vector instead and populate it as we walk the stack.
-    auto ssi = visitor.shadow_stack_.rbegin();
-    for (auto isi = thread->GetInstrumentationStack()->rbegin(),
-        end = thread->GetInstrumentationStack()->rend(); isi != end; ++isi) {
-      while (ssi != visitor.shadow_stack_.rend() && (*ssi).frame_id_ < isi->second.frame_id_) {
-        instrumentation->MethodEnterEvent(thread, (*ssi).this_object_, (*ssi).method_, 0);
-        ++ssi;
-      }
-      uint32_t dex_pc = visitor.dex_pcs_.back();
-      visitor.dex_pcs_.pop_back();
-      if (!isi->second.interpreter_entry_ && !isi->second.method_->IsRuntimeMethod()) {
-        instrumentation->MethodEnterEvent(
-            thread, isi->second.this_object_, isi->second.method_, dex_pc);
-      }
-    }
+  if (visitor.runtime_methods_need_deopt_check_) {
+    thread->SetDeoptCheckRequired(true);
   }
+
   thread->VerifyStack();
 }
 
-void Instrumentation::InstrumentThreadStack(Thread* thread) {
-  instrumentation_stubs_installed_ = true;
-  InstrumentationInstallStack(thread, this);
+void UpdateNeedsDexPcEventsOnStack(Thread* thread) REQUIRES(Locks::mutator_lock_) {
+  Locks::mutator_lock_->AssertExclusiveHeld(Thread::Current());
+
+  struct InstallStackVisitor final : public StackVisitor {
+    InstallStackVisitor(Thread* thread_in, Context* context)
+        : StackVisitor(thread_in, context, kInstrumentationStackWalk) {}
+
+    bool VisitFrame() override REQUIRES_SHARED(Locks::mutator_lock_) {
+      ShadowFrame* shadow_frame = GetCurrentShadowFrame();
+      if (shadow_frame != nullptr) {
+        shadow_frame->SetNotifyDexPcMoveEvents(
+            Runtime::Current()->GetInstrumentation()->NeedsDexPcEvents(GetMethod(), GetThread()));
+      }
+      return true;
+    }
+  };
+
+  std::unique_ptr<Context> context(Context::Create());
+  InstallStackVisitor visitor(thread, context.get());
+  visitor.WalkStack(true);
 }
 
-// Removes the instrumentation exit pc as the return PC for every quick frame.
-static void InstrumentationRestoreStack(Thread* thread, void* arg)
+void ReportMethodEntryForOnStackMethods(InstrumentationListener* listener, Thread* thread)
     REQUIRES(Locks::mutator_lock_) {
   Locks::mutator_lock_->AssertExclusiveHeld(Thread::Current());
 
-  struct RestoreStackVisitor final : public StackVisitor {
-    RestoreStackVisitor(Thread* thread_in, uintptr_t instrumentation_exit_pc,
-                        Instrumentation* instrumentation)
-        : StackVisitor(thread_in, nullptr, kInstrumentationStackWalk),
-          thread_(thread_in),
-          instrumentation_exit_pc_(instrumentation_exit_pc),
-          instrumentation_(instrumentation),
-          instrumentation_stack_(thread_in->GetInstrumentationStack()),
-          frames_removed_(0) {}
+  struct InstallStackVisitor final : public StackVisitor {
+    InstallStackVisitor(Thread* thread_in, Context* context)
+        : StackVisitor(thread_in, context, kInstrumentationStackWalk) {}
 
     bool VisitFrame() override REQUIRES_SHARED(Locks::mutator_lock_) {
-      if (instrumentation_stack_->size() == 0) {
-        return false;  // Stop.
-      }
       ArtMethod* m = GetMethod();
-      if (GetCurrentQuickFrame() == nullptr) {
-        if (kVerboseInstrumentation) {
-          LOG(INFO) << "  Ignoring a shadow frame. Frame " << GetFrameId()
-              << " Method=" << ArtMethod::PrettyMethod(m);
-        }
-        return true;  // Ignore shadow frames.
+      if (m == nullptr || m->IsRuntimeMethod()) {
+        // Skip upcall / runtime methods
+        return true;
       }
-      if (m == nullptr) {
-        if (kVerboseInstrumentation) {
-          LOG(INFO) << "  Skipping upcall. Frame " << GetFrameId();
-        }
-        return true;  // Ignore upcalls.
-      }
-      auto it = instrumentation_stack_->find(GetReturnPcAddr());
-      if (it != instrumentation_stack_->end()) {
-        const InstrumentationStackFrame& instrumentation_frame = it->second;
-        if (kVerboseInstrumentation) {
-          LOG(INFO) << "  Removing exit stub in " << DescribeLocation();
-        }
-        if (instrumentation_frame.interpreter_entry_) {
-          CHECK(m == Runtime::Current()->GetCalleeSaveMethod(CalleeSaveType::kSaveRefsAndArgs));
-        } else {
-          CHECK_EQ(m->GetNonObsoleteMethod(),
-                   instrumentation_frame.method_->GetNonObsoleteMethod())
-              << ArtMethod::PrettyMethod(m)
-              << " and " << instrumentation_frame.method_->GetNonObsoleteMethod()->PrettyMethod();
-        }
-        SetReturnPc(instrumentation_frame.return_pc_);
-        if (instrumentation_->ShouldNotifyMethodEnterExitEvents() &&
-            !m->IsRuntimeMethod()) {
-          // Create the method exit events. As the methods didn't really exit the result is 0.
-          // We only do this if no debugger is attached to prevent from posting events twice.
-          JValue val;
-          instrumentation_->MethodExitEvent(thread_, instrumentation_frame.this_object_, m,
-                                            GetDexPc(), OptionalFrame{}, val);
-        }
-        frames_removed_++;
+
+      if (GetCurrentShadowFrame() != nullptr) {
+        stack_methods_.push_back(m);
       } else {
-        if (kVerboseInstrumentation) {
-          LOG(INFO) << "  No exit stub in " << DescribeLocation();
+        const OatQuickMethodHeader* method_header = GetCurrentOatQuickMethodHeader();
+        if (Runtime::Current()->GetInstrumentation()->MethodSupportsExitEvents(m, method_header)) {
+          // It is unexpected to see a method enter event but not a method exit event so record
+          // stack methods only for frames that support method exit events. Even if we deoptimize we
+          // make sure that we only call method exit event if the frame supported it in the first
+          // place. For ex: deoptimizing from JITed code with debug support calls a method exit hook
+          // but deoptimizing from nterp doesn't.
+          stack_methods_.push_back(m);
+        }
+      }
+      return true;
+    }
+
+    std::vector<ArtMethod*> stack_methods_;
+  };
+
+  if (kVerboseInstrumentation) {
+    std::string thread_name;
+    thread->GetThreadName(thread_name);
+    LOG(INFO) << "Updating DexPcMoveEvents on shadow frames on stack  " << thread_name;
+  }
+
+  std::unique_ptr<Context> context(Context::Create());
+  InstallStackVisitor visitor(thread, context.get());
+  visitor.WalkStack(true);
+
+  // Create method enter events for all methods currently on the thread's stack.
+  for (auto smi = visitor.stack_methods_.rbegin(); smi != visitor.stack_methods_.rend(); smi++) {
+    listener->MethodEntered(thread, *smi);
+  }
+}
+
+void Instrumentation::InstrumentThreadStack(Thread* thread, bool force_deopt) {
+  run_exit_hooks_ = true;
+  InstrumentationInstallStack(thread, force_deopt);
+}
+
+void Instrumentation::InstrumentAllThreadStacks(bool force_deopt) {
+  run_exit_hooks_ = true;
+  MutexLock mu(Thread::Current(), *Locks::thread_list_lock_);
+  for (Thread* thread : Runtime::Current()->GetThreadList()->GetList()) {
+    InstrumentThreadStack(thread, force_deopt);
+  }
+}
+
+static void InstrumentationRestoreStack(Thread* thread) REQUIRES(Locks::mutator_lock_) {
+  Locks::mutator_lock_->AssertExclusiveHeld(Thread::Current());
+
+  struct RestoreStackVisitor final : public StackVisitor {
+    RestoreStackVisitor(Thread* thread)
+        : StackVisitor(thread, nullptr, kInstrumentationStackWalk), thread_(thread) {}
+
+    bool VisitFrame() override REQUIRES_SHARED(Locks::mutator_lock_) {
+      if (GetCurrentQuickFrame() == nullptr) {
+        return true;
+      }
+
+      const OatQuickMethodHeader* method_header = GetCurrentOatQuickMethodHeader();
+      if (method_header != nullptr && method_header->HasShouldDeoptimizeFlag()) {
+        // We shouldn't restore stack if any of the frames need a force deopt
+        DCHECK(!ShouldForceDeoptForRedefinition());
+        UnsetShouldDeoptimizeFlag(DeoptimizeFlagValue::kCheckCallerForDeopt);
+      }
+      return true;  // Continue.
+    }
+    Thread* const thread_;
+  };
+
+  if (kVerboseInstrumentation) {
+    std::string thread_name;
+    thread->GetThreadName(thread_name);
+    LOG(INFO) << "Restoring stack for " << thread_name;
+  }
+  DCHECK(!thread->IsDeoptCheckRequired());
+  RestoreStackVisitor visitor(thread);
+  visitor.WalkStack(true);
+}
+
+static bool HasFramesNeedingForceDeopt(Thread* thread) REQUIRES(Locks::mutator_lock_) {
+  Locks::mutator_lock_->AssertExclusiveHeld(Thread::Current());
+
+  struct CheckForForceDeoptStackVisitor final : public StackVisitor {
+    CheckForForceDeoptStackVisitor(Thread* thread)
+        : StackVisitor(thread, nullptr, kInstrumentationStackWalk),
+          thread_(thread),
+          force_deopt_check_needed_(false) {}
+
+    bool VisitFrame() override REQUIRES_SHARED(Locks::mutator_lock_) {
+      if (GetCurrentQuickFrame() == nullptr) {
+        return true;
+      }
+
+      const OatQuickMethodHeader* method_header = GetCurrentOatQuickMethodHeader();
+      if (method_header != nullptr && method_header->HasShouldDeoptimizeFlag()) {
+        if (ShouldForceDeoptForRedefinition()) {
+          force_deopt_check_needed_ = true;
+          return false;
         }
       }
       return true;  // Continue.
     }
     Thread* const thread_;
-    const uintptr_t instrumentation_exit_pc_;
-    Instrumentation* const instrumentation_;
-    std::map<uintptr_t, instrumentation::InstrumentationStackFrame>* const instrumentation_stack_;
-    size_t frames_removed_;
+    bool force_deopt_check_needed_;
   };
-  if (kVerboseInstrumentation) {
-    std::string thread_name;
-    thread->GetThreadName(thread_name);
-    LOG(INFO) << "Removing exit stubs in " << thread_name;
-  }
-  std::map<uintptr_t, instrumentation::InstrumentationStackFrame>* stack =
-      thread->GetInstrumentationStack();
-  if (stack->size() > 0) {
-    Instrumentation* instrumentation = reinterpret_cast<Instrumentation*>(arg);
-    uintptr_t instrumentation_exit_pc =
-        reinterpret_cast<uintptr_t>(GetQuickInstrumentationExitPc());
-    RestoreStackVisitor visitor(thread, instrumentation_exit_pc, instrumentation);
-    visitor.WalkStack(true);
-    CHECK_EQ(visitor.frames_removed_, stack->size());
-    stack->clear();
-  }
+
+  CheckForForceDeoptStackVisitor visitor(thread);
+  visitor.WalkStack(true);
+  // If there is a frame that requires a force deopt we should have set the IsDeoptCheckRequired
+  // bit. We don't check if the bit needs to be reset on every method exit / deoptimization. We
+  // only check when we no longer need instrumentation support. So it is possible that the bit is
+  // set but we don't find any frames that need a force deopt on the stack so reverse implication
+  // doesn't hold.
+  DCHECK_IMPLIES(visitor.force_deopt_check_needed_, thread->IsDeoptCheckRequired());
+  return visitor.force_deopt_check_needed_;
 }
 
 void Instrumentation::DeoptimizeAllThreadFrames() {
-  Thread* self = Thread::Current();
-  MutexLock mu(self, *Locks::thread_list_lock_);
-  ThreadList* tl = Runtime::Current()->GetThreadList();
-  tl->ForEach([&](Thread* t) {
-    Locks::mutator_lock_->AssertExclusiveHeld(self);
-    InstrumentThreadStack(t);
-  });
-  current_force_deopt_id_++;
+  InstrumentAllThreadStacks(/* force_deopt= */ true);
 }
 
 static bool HasEvent(Instrumentation::InstrumentationEvent expected, uint32_t events) {
   return (events & expected) != 0;
 }
 
-static void PotentiallyAddListenerTo(Instrumentation::InstrumentationEvent event,
+static bool PotentiallyAddListenerTo(Instrumentation::InstrumentationEvent event,
                                      uint32_t events,
                                      std::list<InstrumentationListener*>& list,
-                                     InstrumentationListener* listener,
-                                     bool* has_listener)
+                                     InstrumentationListener* listener)
     REQUIRES(Locks::mutator_lock_, !Locks::thread_list_lock_, !Locks::classlinker_classes_lock_) {
   Locks::mutator_lock_->AssertExclusiveHeld(Thread::Current());
   if (!HasEvent(event, events)) {
-    return;
+    return false;
   }
   // If there is a free slot in the list, we insert the listener in that slot.
   // Otherwise we add it to the end of the list.
@@ -577,21 +774,66 @@ static void PotentiallyAddListenerTo(Instrumentation::InstrumentationEvent event
   } else {
     list.push_back(listener);
   }
-  Runtime::DoAndMaybeSwitchInterpreter([=](){ *has_listener = true; });
+  return true;
 }
 
-void Instrumentation::AddListener(InstrumentationListener* listener, uint32_t events) {
+static void PotentiallyAddListenerTo(Instrumentation::InstrumentationEvent event,
+                                     uint32_t events,
+                                     std::list<InstrumentationListener*>& list,
+                                     InstrumentationListener* listener,
+                                     bool* has_listener)
+    REQUIRES(Locks::mutator_lock_, !Locks::thread_list_lock_, !Locks::classlinker_classes_lock_) {
+  if (PotentiallyAddListenerTo(event, events, list, listener)) {
+    *has_listener = true;
+  }
+}
+
+static void PotentiallyAddListenerTo(Instrumentation::InstrumentationEvent event,
+                                     uint32_t events,
+                                     std::list<InstrumentationListener*>& list,
+                                     InstrumentationListener* listener,
+                                     uint8_t* has_listener,
+                                     uint8_t flag)
+    REQUIRES(Locks::mutator_lock_, !Locks::thread_list_lock_, !Locks::classlinker_classes_lock_) {
+  if (PotentiallyAddListenerTo(event, events, list, listener)) {
+    *has_listener = *has_listener | flag;
+  }
+}
+
+void Instrumentation::AddListener(InstrumentationListener* listener,
+                                  uint32_t events,
+                                  bool is_trace_listener) {
   Locks::mutator_lock_->AssertExclusiveHeld(Thread::Current());
-  PotentiallyAddListenerTo(kMethodEntered,
-                           events,
-                           method_entry_listeners_,
-                           listener,
-                           &have_method_entry_listeners_);
-  PotentiallyAddListenerTo(kMethodExited,
-                           events,
-                           method_exit_listeners_,
-                           listener,
-                           &have_method_exit_listeners_);
+  if (is_trace_listener) {
+    PotentiallyAddListenerTo(kMethodEntered,
+                             events,
+                             method_entry_fast_trace_listeners_,
+                             listener,
+                             &have_method_entry_listeners_,
+                             kFastTraceListeners);
+  } else {
+    PotentiallyAddListenerTo(kMethodEntered,
+                             events,
+                             method_entry_slow_listeners_,
+                             listener,
+                             &have_method_entry_listeners_,
+                             kSlowMethodEntryExitListeners);
+  }
+  if (is_trace_listener) {
+    PotentiallyAddListenerTo(kMethodExited,
+                             events,
+                             method_exit_fast_trace_listeners_,
+                             listener,
+                             &have_method_exit_listeners_,
+                             kFastTraceListeners);
+  } else {
+    PotentiallyAddListenerTo(kMethodExited,
+                             events,
+                             method_exit_slow_listeners_,
+                             listener,
+                             &have_method_exit_listeners_,
+                             kSlowMethodEntryExitListeners);
+  }
   PotentiallyAddListenerTo(kMethodUnwind,
                            events,
                            method_unwind_listeners_,
@@ -632,18 +874,22 @@ void Instrumentation::AddListener(InstrumentationListener* listener, uint32_t ev
                            exception_handled_listeners_,
                            listener,
                            &have_exception_handled_listeners_);
-  UpdateInterpreterHandlerTable();
+  if (HasEvent(kDexPcMoved, events)) {
+    MutexLock mu(Thread::Current(), *Locks::thread_list_lock_);
+    for (Thread* thread : Runtime::Current()->GetThreadList()->GetList()) {
+      UpdateNeedsDexPcEventsOnStack(thread);
+    }
+  }
 }
 
-static void PotentiallyRemoveListenerFrom(Instrumentation::InstrumentationEvent event,
+static bool PotentiallyRemoveListenerFrom(Instrumentation::InstrumentationEvent event,
                                           uint32_t events,
                                           std::list<InstrumentationListener*>& list,
-                                          InstrumentationListener* listener,
-                                          bool* has_listener)
+                                          InstrumentationListener* listener)
     REQUIRES(Locks::mutator_lock_, !Locks::thread_list_lock_, !Locks::classlinker_classes_lock_) {
   Locks::mutator_lock_->AssertExclusiveHeld(Thread::Current());
   if (!HasEvent(event, events)) {
-    return;
+    return false;
   }
   auto it = std::find(list.begin(), list.end(), listener);
   if (it != list.end()) {
@@ -652,28 +898,73 @@ static void PotentiallyRemoveListenerFrom(Instrumentation::InstrumentationEvent 
     *it = nullptr;
   }
 
-  // Check if the list contains any non-null listener, and update 'has_listener'.
+  // Check if the list contains any non-null listener.
   for (InstrumentationListener* l : list) {
     if (l != nullptr) {
-      Runtime::DoAndMaybeSwitchInterpreter([=](){ *has_listener = true; });
-      return;
+      return false;
     }
   }
-  Runtime::DoAndMaybeSwitchInterpreter([=](){ *has_listener = false; });
+
+  return true;
 }
 
-void Instrumentation::RemoveListener(InstrumentationListener* listener, uint32_t events) {
+static void PotentiallyRemoveListenerFrom(Instrumentation::InstrumentationEvent event,
+                                          uint32_t events,
+                                          std::list<InstrumentationListener*>& list,
+                                          InstrumentationListener* listener,
+                                          bool* has_listener)
+    REQUIRES(Locks::mutator_lock_, !Locks::thread_list_lock_, !Locks::classlinker_classes_lock_) {
+  if (PotentiallyRemoveListenerFrom(event, events, list, listener)) {
+    *has_listener = false;
+  }
+}
+
+static void PotentiallyRemoveListenerFrom(Instrumentation::InstrumentationEvent event,
+                                          uint32_t events,
+                                          std::list<InstrumentationListener*>& list,
+                                          InstrumentationListener* listener,
+                                          uint8_t* has_listener,
+                                          uint8_t flag)
+    REQUIRES(Locks::mutator_lock_, !Locks::thread_list_lock_, !Locks::classlinker_classes_lock_) {
+  if (PotentiallyRemoveListenerFrom(event, events, list, listener)) {
+    *has_listener = *has_listener & ~flag;
+  }
+}
+
+void Instrumentation::RemoveListener(InstrumentationListener* listener,
+                                     uint32_t events,
+                                     bool is_trace_listener) {
   Locks::mutator_lock_->AssertExclusiveHeld(Thread::Current());
-  PotentiallyRemoveListenerFrom(kMethodEntered,
-                                events,
-                                method_entry_listeners_,
-                                listener,
-                                &have_method_entry_listeners_);
-  PotentiallyRemoveListenerFrom(kMethodExited,
-                                events,
-                                method_exit_listeners_,
-                                listener,
-                                &have_method_exit_listeners_);
+  if (is_trace_listener) {
+    PotentiallyRemoveListenerFrom(kMethodEntered,
+                                  events,
+                                  method_entry_fast_trace_listeners_,
+                                  listener,
+                                  &have_method_entry_listeners_,
+                                  kFastTraceListeners);
+  } else {
+    PotentiallyRemoveListenerFrom(kMethodEntered,
+                                  events,
+                                  method_entry_slow_listeners_,
+                                  listener,
+                                  &have_method_entry_listeners_,
+                                  kSlowMethodEntryExitListeners);
+  }
+  if (is_trace_listener) {
+    PotentiallyRemoveListenerFrom(kMethodExited,
+                                  events,
+                                  method_exit_fast_trace_listeners_,
+                                  listener,
+                                  &have_method_exit_listeners_,
+                                  kFastTraceListeners);
+  } else {
+    PotentiallyRemoveListenerFrom(kMethodExited,
+                                  events,
+                                  method_exit_slow_listeners_,
+                                  listener,
+                                  &have_method_exit_listeners_,
+                                  kSlowMethodEntryExitListeners);
+  }
   PotentiallyRemoveListenerFrom(kMethodUnwind,
                                 events,
                                 method_unwind_listeners_,
@@ -714,38 +1005,21 @@ void Instrumentation::RemoveListener(InstrumentationListener* listener, uint32_t
                                 exception_handled_listeners_,
                                 listener,
                                 &have_exception_handled_listeners_);
-  UpdateInterpreterHandlerTable();
-}
-
-Instrumentation::InstrumentationLevel Instrumentation::GetCurrentInstrumentationLevel() const {
-  if (interpreter_stubs_installed_) {
-    return InstrumentationLevel::kInstrumentWithInterpreter;
-  } else if (entry_exit_stubs_installed_) {
-    return InstrumentationLevel::kInstrumentWithInstrumentationStubs;
-  } else {
-    return InstrumentationLevel::kInstrumentNothing;
-  }
-}
-
-bool Instrumentation::RequiresInstrumentationInstallation(InstrumentationLevel new_level) const {
-  // We need to reinstall instrumentation if we go to a different level.
-  return GetCurrentInstrumentationLevel() != new_level;
-}
-
-void Instrumentation::UpdateInstrumentationLevels(InstrumentationLevel level) {
-  if (level == InstrumentationLevel::kInstrumentWithInterpreter) {
-    can_use_instrumentation_trampolines_ = false;
-  }
-  if (UNLIKELY(!can_use_instrumentation_trampolines_)) {
-    for (auto& p : requested_instrumentation_levels_) {
-      if (p.second == InstrumentationLevel::kInstrumentWithInstrumentationStubs) {
-        p.second = InstrumentationLevel::kInstrumentWithInterpreter;
-      }
+  if (HasEvent(kDexPcMoved, events)) {
+    MutexLock mu(Thread::Current(), *Locks::thread_list_lock_);
+    for (Thread* thread : Runtime::Current()->GetThreadList()->GetList()) {
+      UpdateNeedsDexPcEventsOnStack(thread);
     }
   }
 }
 
-void Instrumentation::ConfigureStubs(const char* key, InstrumentationLevel desired_level) {
+Instrumentation::InstrumentationLevel Instrumentation::GetCurrentInstrumentationLevel() const {
+  return instrumentation_level_;
+}
+
+void Instrumentation::ConfigureStubs(const char* key,
+                                     InstrumentationLevel desired_level,
+                                     bool try_switch_to_non_debuggable) {
   // Store the instrumentation level for this key or remove it.
   if (desired_level == InstrumentationLevel::kInstrumentNothing) {
     // The client no longer needs instrumentation.
@@ -755,95 +1029,92 @@ void Instrumentation::ConfigureStubs(const char* key, InstrumentationLevel desir
     requested_instrumentation_levels_.Overwrite(key, desired_level);
   }
 
-  UpdateInstrumentationLevels(desired_level);
-  UpdateStubs();
+  UpdateStubs(try_switch_to_non_debuggable);
 }
 
-void Instrumentation::EnableSingleThreadDeopt() {
-  // Single-thread deopt only uses interpreter.
-  can_use_instrumentation_trampolines_ = false;
-  UpdateInstrumentationLevels(InstrumentationLevel::kInstrumentWithInterpreter);
-  UpdateStubs();
+void Instrumentation::UpdateInstrumentationLevel(InstrumentationLevel requested_level) {
+  instrumentation_level_ = requested_level;
 }
 
-void Instrumentation::UpdateStubs() {
+void Instrumentation::EnableEntryExitHooks(const char* key) {
+  DCHECK(Runtime::Current()->IsJavaDebuggable());
+  ConfigureStubs(key,
+                 InstrumentationLevel::kInstrumentWithEntryExitHooks,
+                 /*try_switch_to_non_debuggable=*/false);
+}
+
+void Instrumentation::MaybeRestoreInstrumentationStack() {
+  // Restore stack only if there is no method currently deoptimized.
+  if (!IsDeoptimizedMethodsEmpty()) {
+    return;
+  }
+
+  Thread* self = Thread::Current();
+  MutexLock mu(self, *Locks::thread_list_lock_);
+  bool no_remaining_deopts = true;
+  // Check that there are no other forced deoptimizations. Do it here so we only need to lock
+  // thread_list_lock once.
+  // The compiler gets confused on the thread annotations, so use
+  // NO_THREAD_SAFETY_ANALYSIS. Note that we hold the mutator lock
+  // exclusively at this point.
+  Locks::mutator_lock_->AssertExclusiveHeld(self);
+  Runtime::Current()->GetThreadList()->ForEach([&](Thread* t) NO_THREAD_SAFETY_ANALYSIS {
+    bool has_force_deopt_frames = HasFramesNeedingForceDeopt(t);
+    if (!has_force_deopt_frames) {
+      // We no longer have any frames that require a force deopt check. If the bit was true then we
+      // had some frames earlier but they already got deoptimized and are no longer on stack.
+      t->SetDeoptCheckRequired(false);
+    }
+    no_remaining_deopts =
+        no_remaining_deopts &&
+        !t->IsForceInterpreter() &&
+        !t->HasDebuggerShadowFrames() &&
+        !has_force_deopt_frames;
+  });
+  if (no_remaining_deopts) {
+    Runtime::Current()->GetThreadList()->ForEach(InstrumentationRestoreStack);
+    run_exit_hooks_ = false;
+  }
+}
+
+void Instrumentation::UpdateStubs(bool try_switch_to_non_debuggable) {
   // Look for the highest required instrumentation level.
   InstrumentationLevel requested_level = InstrumentationLevel::kInstrumentNothing;
   for (const auto& v : requested_instrumentation_levels_) {
     requested_level = std::max(requested_level, v.second);
   }
 
-  DCHECK(can_use_instrumentation_trampolines_ ||
-         requested_level != InstrumentationLevel::kInstrumentWithInstrumentationStubs)
-      << "Use trampolines: " << can_use_instrumentation_trampolines_ << " level "
-      << requested_level;
-
-  interpret_only_ = (requested_level == InstrumentationLevel::kInstrumentWithInterpreter) ||
-                    forced_interpret_only_;
-
-  if (!RequiresInstrumentationInstallation(requested_level)) {
+  if (GetCurrentInstrumentationLevel() == requested_level) {
     // We're already set.
     return;
   }
+
   Thread* const self = Thread::Current();
   Runtime* runtime = Runtime::Current();
   Locks::mutator_lock_->AssertExclusiveHeld(self);
   Locks::thread_list_lock_->AssertNotHeld(self);
+  // The following needs to happen in the same order.
+  // 1. Update the instrumentation level
+  // 2. Switch the runtime to non-debuggable if requested. We switch to non-debuggable only when
+  // the instrumentation level is set to kInstrumentNothing. So this needs to happen only after
+  // updating the instrumentation level.
+  // 3. Update the entry points. We use AOT code only if we aren't debuggable runtime. So update
+  // entrypoints after switching the instrumentation level.
+  UpdateInstrumentationLevel(requested_level);
+  if (try_switch_to_non_debuggable) {
+    MaybeSwitchRuntimeDebugState(self);
+  }
+  InstallStubsClassVisitor visitor(this);
+  runtime->GetClassLinker()->VisitClasses(&visitor);
   if (requested_level > InstrumentationLevel::kInstrumentNothing) {
-    if (requested_level == InstrumentationLevel::kInstrumentWithInterpreter) {
-      interpreter_stubs_installed_ = true;
-      entry_exit_stubs_installed_ = true;
-    } else {
-      CHECK_EQ(requested_level, InstrumentationLevel::kInstrumentWithInstrumentationStubs);
-      entry_exit_stubs_installed_ = true;
-      interpreter_stubs_installed_ = false;
-    }
-    InstallStubsClassVisitor visitor(this);
-    runtime->GetClassLinker()->VisitClasses(&visitor);
-    instrumentation_stubs_installed_ = true;
-    MutexLock mu(self, *Locks::thread_list_lock_);
-    runtime->GetThreadList()->ForEach(InstrumentationInstallStack, this);
+    InstrumentAllThreadStacks(/* force_deopt= */ false);
   } else {
-    interpreter_stubs_installed_ = false;
-    entry_exit_stubs_installed_ = false;
-    InstallStubsClassVisitor visitor(this);
-    runtime->GetClassLinker()->VisitClasses(&visitor);
-    // Restore stack only if there is no method currently deoptimized.
-    bool empty;
-    {
-      ReaderMutexLock mu(self, *GetDeoptimizedMethodsLock());
-      empty = IsDeoptimizedMethodsEmpty();  // Avoid lock violation.
-    }
-    if (empty) {
-      MutexLock mu(self, *Locks::thread_list_lock_);
-      bool no_remaining_deopts = true;
-      // Check that there are no other forced deoptimizations. Do it here so we only need to lock
-      // thread_list_lock once.
-      // The compiler gets confused on the thread annotations, so use
-      // NO_THREAD_SAFETY_ANALYSIS. Note that we hold the mutator lock
-      // exclusively at this point.
-      Locks::mutator_lock_->AssertExclusiveHeld(self);
-      runtime->GetThreadList()->ForEach([&](Thread* t) NO_THREAD_SAFETY_ANALYSIS {
-        no_remaining_deopts =
-            no_remaining_deopts && !t->IsForceInterpreter() &&
-            std::all_of(t->GetInstrumentationStack()->cbegin(),
-                        t->GetInstrumentationStack()->cend(),
-                        [&](const auto& frame) REQUIRES_SHARED(Locks::mutator_lock_) {
-                          return frame.second.force_deopt_id_ == current_force_deopt_id_;
-                        });
-      });
-      if (no_remaining_deopts) {
-        Runtime::Current()->GetThreadList()->ForEach(InstrumentationRestoreStack, this);
-        // Only do this after restoring, as walking the stack when restoring will see
-        // the instrumentation exit pc.
-        instrumentation_stubs_installed_ = false;
-      }
-    }
+    MaybeRestoreInstrumentationStack();
   }
 }
 
-static void ResetQuickAllocEntryPointsForThread(Thread* thread, void* arg ATTRIBUTE_UNUSED) {
-  thread->ResetQuickAllocEntryPointsForThread(kUseReadBarrier && thread->GetIsGcMarking());
+static void ResetQuickAllocEntryPointsForThread(Thread* thread, [[maybe_unused]] void* arg) {
+  thread->ResetQuickAllocEntryPointsForThread();
 }
 
 void Instrumentation::SetEntrypointsInstrumented(bool instrumented) {
@@ -908,71 +1179,80 @@ void Instrumentation::ResetQuickAllocEntryPoints() {
   }
 }
 
-void Instrumentation::UpdateMethodsCodeImpl(ArtMethod* method, const void* quick_code) {
-  const void* new_quick_code;
-  if (LIKELY(!instrumentation_stubs_installed_)) {
-    new_quick_code = quick_code;
-  } else {
-    if ((interpreter_stubs_installed_ || IsDeoptimized(method)) && !method->IsNative()) {
-      new_quick_code = GetQuickToInterpreterBridge();
-    } else {
-      ClassLinker* class_linker = Runtime::Current()->GetClassLinker();
-      if (class_linker->IsQuickResolutionStub(quick_code) ||
-          class_linker->IsQuickToInterpreterBridge(quick_code)) {
-        new_quick_code = quick_code;
-      } else if (entry_exit_stubs_installed_ &&
-                 // We need to make sure not to replace anything that InstallStubsForMethod
-                 // wouldn't. Specifically we cannot stub out Proxy.<init> since subtypes copy the
-                 // implementation directly and this will confuse the instrumentation trampolines.
-                 // TODO We should remove the need for this since it makes it impossible to profile
-                 // Proxy.<init> correctly in all cases.
-                 method != jni::DecodeArtMethod(WellKnownClasses::java_lang_reflect_Proxy_init)) {
-        new_quick_code = GetQuickInstrumentationEntryPoint();
-        if (!method->IsNative() && Runtime::Current()->GetJit() != nullptr) {
-          // Native methods use trampoline entrypoints during interpreter tracing.
-          DCHECK(!Runtime::Current()->GetJit()->GetCodeCache()->GetGarbageCollectCodeUnsafe());
-          ProfilingInfo* profiling_info = method->GetProfilingInfo(kRuntimePointerSize);
-          // Tracing will look at the saved entry point in the profiling info to know the actual
-          // entrypoint, so we store it here.
-          if (profiling_info != nullptr) {
-            profiling_info->SetSavedEntryPoint(quick_code);
-          }
-        }
-      } else {
-        new_quick_code = quick_code;
-      }
-    }
+std::string Instrumentation::EntryPointString(const void* code) {
+  ClassLinker* class_linker = Runtime::Current()->GetClassLinker();
+  jit::Jit* jit = Runtime::Current()->GetJit();
+  if (class_linker->IsQuickToInterpreterBridge(code)) {
+    return "interpreter";
+  } else if (class_linker->IsQuickResolutionStub(code)) {
+    return "resolution";
+  } else if (jit != nullptr && jit->GetCodeCache()->ContainsPc(code)) {
+    return "jit";
+  } else if (code == GetInvokeObsoleteMethodStub()) {
+    return "obsolete";
+  } else if (code == interpreter::GetNterpEntryPoint()) {
+    return "nterp";
+  } else if (code == interpreter::GetNterpWithClinitEntryPoint()) {
+    return "nterp with clinit";
+  } else if (class_linker->IsQuickGenericJniStub(code)) {
+    return "generic jni";
+  } else if (Runtime::Current()->GetOatFileManager().ContainsPc(code)) {
+    return "oat";
+  } else if (OatQuickMethodHeader::IsStub(reinterpret_cast<const uint8_t*>(code)).value_or(false)) {
+    return "stub";
   }
-  UpdateEntrypoints(method, new_quick_code);
+  return "unknown";
 }
 
-void Instrumentation::UpdateNativeMethodsCodeToJitCode(ArtMethod* method, const void* quick_code) {
+void Instrumentation::UpdateMethodsCodeImpl(ArtMethod* method, const void* new_code) {
+  if (!EntryExitStubsInstalled()) {
+    // Fast path: no instrumentation.
+    DCHECK(!IsDeoptimized(method));
+    UpdateEntryPoints(method, new_code);
+    return;
+  }
+
+  ClassLinker* class_linker = Runtime::Current()->GetClassLinker();
+  if (class_linker->IsQuickToInterpreterBridge(new_code)) {
+    // It's always OK to update to the interpreter.
+    UpdateEntryPoints(method, new_code);
+    return;
+  }
+
+  if (InterpretOnly(method)) {
+    DCHECK(class_linker->IsQuickToInterpreterBridge(method->GetEntryPointFromQuickCompiledCode()))
+        << EntryPointString(method->GetEntryPointFromQuickCompiledCode());
+    // Don't update, stay deoptimized.
+    return;
+  }
+
+  if (EntryExitStubsInstalled() && !CodeSupportsEntryExitHooks(new_code, method)) {
+    DCHECK(CodeSupportsEntryExitHooks(method->GetEntryPointFromQuickCompiledCode(), method))
+        << EntryPointString(method->GetEntryPointFromQuickCompiledCode()) << " "
+        << method->PrettyMethod();
+    // If we need entry / exit stubs but the new_code doesn't support entry / exit hooks just skip.
+    return;
+  }
+
+  // At this point, we can update as asked.
+  UpdateEntryPoints(method, new_code);
+}
+
+void Instrumentation::UpdateNativeMethodsCodeToJitCode(ArtMethod* method, const void* new_code) {
   // We don't do any read barrier on `method`'s declaring class in this code, as the JIT might
   // enter here on a soon-to-be deleted ArtMethod. Updating the entrypoint is OK though, as
   // the ArtMethod is still in memory.
-  const void* new_quick_code = quick_code;
-  if (UNLIKELY(instrumentation_stubs_installed_) && entry_exit_stubs_installed_) {
-    new_quick_code = GetQuickInstrumentationEntryPoint();
+  if (EntryExitStubsInstalled() && !CodeSupportsEntryExitHooks(new_code, method)) {
+    // If the new code doesn't support entry exit hooks but we need them don't update with the new
+    // code.
+    return;
   }
-  UpdateEntrypoints(method, new_quick_code);
+  UpdateEntryPoints(method, new_code);
 }
 
-void Instrumentation::UpdateMethodsCode(ArtMethod* method, const void* quick_code) {
+void Instrumentation::UpdateMethodsCode(ArtMethod* method, const void* new_code) {
   DCHECK(method->GetDeclaringClass()->IsResolved());
-  UpdateMethodsCodeImpl(method, quick_code);
-}
-
-void Instrumentation::UpdateMethodsCodeToInterpreterEntryPoint(ArtMethod* method) {
-  UpdateMethodsCodeImpl(method, GetQuickToInterpreterBridge());
-}
-
-void Instrumentation::UpdateMethodsCodeForJavaDebuggable(ArtMethod* method,
-                                                         const void* quick_code) {
-  // When the runtime is set to Java debuggable, we may update the entry points of
-  // all methods of a class to the interpreter bridge. A method's declaring class
-  // might not be in resolved state yet in that case, so we bypass the DCHECK in
-  // UpdateMethodsCode.
-  UpdateMethodsCodeImpl(method, quick_code);
+  UpdateMethodsCodeImpl(method, new_code);
 }
 
 bool Instrumentation::AddDeoptimizedMethod(ArtMethod* method) {
@@ -989,14 +1269,6 @@ bool Instrumentation::IsDeoptimizedMethod(ArtMethod* method) {
   return deoptimized_methods_.find(method) != deoptimized_methods_.end();
 }
 
-ArtMethod* Instrumentation::BeginDeoptimizedMethod() {
-  if (deoptimized_methods_.empty()) {
-    // Empty.
-    return nullptr;
-  }
-  return *deoptimized_methods_.begin();
-}
-
 bool Instrumentation::RemoveDeoptimizedMethod(ArtMethod* method) {
   auto it = deoptimized_methods_.find(method);
   if (it == deoptimized_methods_.end()) {
@@ -1006,31 +1278,34 @@ bool Instrumentation::RemoveDeoptimizedMethod(ArtMethod* method) {
   return true;
 }
 
-bool Instrumentation::IsDeoptimizedMethodsEmpty() const {
-  return deoptimized_methods_.empty();
-}
-
 void Instrumentation::Deoptimize(ArtMethod* method) {
   CHECK(!method->IsNative());
   CHECK(!method->IsProxyMethod());
   CHECK(method->IsInvokable());
 
-  Thread* self = Thread::Current();
   {
-    WriterMutexLock mu(self, *GetDeoptimizedMethodsLock());
+    Locks::mutator_lock_->AssertExclusiveHeld(Thread::Current());
     bool has_not_been_deoptimized = AddDeoptimizedMethod(method);
     CHECK(has_not_been_deoptimized) << "Method " << ArtMethod::PrettyMethod(method)
         << " is already deoptimized";
   }
-  if (!interpreter_stubs_installed_) {
-    UpdateEntrypoints(method, GetQuickInstrumentationEntryPoint());
 
-    // Install instrumentation exit stub and instrumentation frames. We may already have installed
-    // these previously so it will only cover the newly created frames.
-    instrumentation_stubs_installed_ = true;
-    MutexLock mu(self, *Locks::thread_list_lock_);
-    Runtime::Current()->GetThreadList()->ForEach(InstrumentationInstallStack, this);
+  if (method->IsObsolete()) {
+    // If method was marked as obsolete it should have `GetInvokeObsoleteMethodStub`
+    // as its quick entry point
+    CHECK_EQ(method->GetEntryPointFromQuickCompiledCode(), GetInvokeObsoleteMethodStub());
+    return;
   }
+
+  if (!InterpreterStubsInstalled()) {
+    UpdateEntryPoints(method, GetQuickToInterpreterBridge());
+
+    // Instrument thread stacks to request a check if the caller needs a deoptimization.
+    // This isn't a strong deopt. We deopt this method if it is still in the deopt methods list.
+    // If by the time we hit this frame we no longer need a deopt it is safe to continue.
+    InstrumentAllThreadStacks(/* force_deopt= */ false);
+  }
+  CHECK_EQ(method->GetEntryPointFromQuickCompiledCode(), GetQuickToInterpreterBridge());
 }
 
 void Instrumentation::Undeoptimize(ArtMethod* method) {
@@ -1038,178 +1313,178 @@ void Instrumentation::Undeoptimize(ArtMethod* method) {
   CHECK(!method->IsProxyMethod());
   CHECK(method->IsInvokable());
 
-  Thread* self = Thread::Current();
-  bool empty;
   {
-    WriterMutexLock mu(self, *GetDeoptimizedMethodsLock());
+    Locks::mutator_lock_->AssertExclusiveHeld(Thread::Current());
     bool found_and_erased = RemoveDeoptimizedMethod(method);
     CHECK(found_and_erased) << "Method " << ArtMethod::PrettyMethod(method)
         << " is not deoptimized";
-    empty = IsDeoptimizedMethodsEmpty();
   }
 
-  // Restore code and possibly stack only if we did not deoptimize everything.
-  if (!interpreter_stubs_installed_) {
-    // Restore its code or resolution trampoline.
-    ClassLinker* class_linker = Runtime::Current()->GetClassLinker();
-    if (method->IsStatic() && !method->IsConstructor() &&
-        !method->GetDeclaringClass()->IsInitialized()) {
-      UpdateEntrypoints(method, GetQuickResolutionStub());
-    } else {
-      const void* quick_code = NeedDebugVersionFor(method)
-          ? GetQuickToInterpreterBridge()
-          : class_linker->GetQuickOatCodeFor(method);
-      UpdateEntrypoints(method, quick_code);
-    }
-
-    // If there is no deoptimized method left, we can restore the stack of each thread.
-    if (empty && !entry_exit_stubs_installed_) {
-      MutexLock mu(self, *Locks::thread_list_lock_);
-      Runtime::Current()->GetThreadList()->ForEach(InstrumentationRestoreStack, this);
-      instrumentation_stubs_installed_ = false;
-    }
+  // If interpreter stubs are still needed nothing to do.
+  if (InterpreterStubsInstalled()) {
+    return;
   }
+
+  if (method->IsObsolete()) {
+    // Don't update entry points for obsolete methods. The entrypoint should
+    // have been set to InvokeObsoleteMethoStub.
+    DCHECK_EQ(method->GetEntryPointFromQuickCompiledCodePtrSize(kRuntimePointerSize),
+              GetInvokeObsoleteMethodStub());
+    return;
+  }
+
+  // We are not using interpreter stubs for deoptimization. Restore the code of the method.
+  // We still retain interpreter bridge if we need it for other reasons.
+  if (InterpretOnly(method)) {
+    UpdateEntryPoints(method, GetQuickToInterpreterBridge());
+  } else if (method->StillNeedsClinitCheck()) {
+    UpdateEntryPoints(method, GetQuickResolutionStub());
+  } else {
+    UpdateEntryPoints(method, GetMaybeInstrumentedCodeForInvoke(method));
+  }
+
+  // If there is no deoptimized method left, we can restore the stack of each thread.
+  if (!EntryExitStubsInstalled()) {
+    MaybeRestoreInstrumentationStack();
+  }
+}
+
+bool Instrumentation::IsDeoptimizedMethodsEmpty() const {
+  return deoptimized_methods_.empty();
 }
 
 bool Instrumentation::IsDeoptimized(ArtMethod* method) {
   DCHECK(method != nullptr);
-  ReaderMutexLock mu(Thread::Current(), *GetDeoptimizedMethodsLock());
   return IsDeoptimizedMethod(method);
 }
 
-void Instrumentation::EnableDeoptimization() {
-  ReaderMutexLock mu(Thread::Current(), *GetDeoptimizedMethodsLock());
-  CHECK(IsDeoptimizedMethodsEmpty());
-  CHECK_EQ(deoptimization_enabled_, false);
-  deoptimization_enabled_ = true;
-}
-
-void Instrumentation::DisableDeoptimization(const char* key) {
-  CHECK_EQ(deoptimization_enabled_, true);
-  // If we deoptimized everything, undo it.
-  InstrumentationLevel level = GetCurrentInstrumentationLevel();
-  if (level == InstrumentationLevel::kInstrumentWithInterpreter) {
-    UndeoptimizeEverything(key);
-  }
+void Instrumentation::DisableDeoptimization(const char* key, bool try_switch_to_non_debuggable) {
+  // Remove any instrumentation support added for deoptimization.
+  ConfigureStubs(key, InstrumentationLevel::kInstrumentNothing, try_switch_to_non_debuggable);
+  Locks::mutator_lock_->AssertExclusiveHeld(Thread::Current());
   // Undeoptimized selected methods.
   while (true) {
     ArtMethod* method;
     {
-      ReaderMutexLock mu(Thread::Current(), *GetDeoptimizedMethodsLock());
-      if (IsDeoptimizedMethodsEmpty()) {
+      if (deoptimized_methods_.empty()) {
         break;
       }
-      method = BeginDeoptimizedMethod();
+      method = *deoptimized_methods_.begin();
       CHECK(method != nullptr);
     }
     Undeoptimize(method);
   }
-  deoptimization_enabled_ = false;
 }
 
-// Indicates if instrumentation should notify method enter/exit events to the listeners.
-bool Instrumentation::ShouldNotifyMethodEnterExitEvents() const {
-  if (!HasMethodEntryListeners() && !HasMethodExitListeners()) {
-    return false;
+void Instrumentation::MaybeSwitchRuntimeDebugState(Thread* self) {
+  Runtime* runtime = Runtime::Current();
+  // Return early if runtime is shutting down.
+  if (runtime->IsShuttingDown(self)) {
+    return;
   }
-  return !deoptimization_enabled_ && !interpreter_stubs_installed_;
+
+  // Don't switch the state if we started off as JavaDebuggable or if we still need entry / exit
+  // hooks for other reasons.
+  if (EntryExitStubsInstalled() || runtime->IsJavaDebuggableAtInit()) {
+    return;
+  }
+
+  art::jit::Jit* jit = runtime->GetJit();
+  if (jit != nullptr) {
+    jit->GetCodeCache()->InvalidateAllCompiledCode();
+    jit->GetJitCompiler()->SetDebuggableCompilerOption(false);
+  }
+  runtime->SetRuntimeDebugState(art::Runtime::RuntimeDebugState::kNonJavaDebuggable);
 }
 
 void Instrumentation::DeoptimizeEverything(const char* key) {
-  CHECK(deoptimization_enabled_);
-  ConfigureStubs(key, InstrumentationLevel::kInstrumentWithInterpreter);
+  // We want to switch to non-debuggable only when the debugger / profile tools are detaching.
+  // This call is used for supporting debug related features (ex: single stepping across all
+  // threads) while the debugger is still connected.
+  ConfigureStubs(key,
+                 InstrumentationLevel::kInstrumentWithInterpreter,
+                 /*try_switch_to_non_debuggable=*/false);
 }
 
 void Instrumentation::UndeoptimizeEverything(const char* key) {
-  CHECK(interpreter_stubs_installed_);
-  CHECK(deoptimization_enabled_);
-  ConfigureStubs(key, InstrumentationLevel::kInstrumentNothing);
+  CHECK(InterpreterStubsInstalled());
+  // We want to switch to non-debuggable only when the debugger / profile tools are detaching.
+  // This is used when we no longer need to run in interpreter. The debugger is still connected
+  // so don't switch the runtime. We use "DisableDeoptimization" when detaching the debugger.
+  ConfigureStubs(key,
+                 InstrumentationLevel::kInstrumentNothing,
+                 /*try_switch_to_non_debuggable=*/false);
 }
 
-void Instrumentation::EnableMethodTracing(const char* key, bool needs_interpreter) {
+void Instrumentation::EnableMethodTracing(const char* key,
+                                          InstrumentationListener* listener,
+                                          bool needs_interpreter) {
   InstrumentationLevel level;
   if (needs_interpreter) {
     level = InstrumentationLevel::kInstrumentWithInterpreter;
   } else {
-    level = InstrumentationLevel::kInstrumentWithInstrumentationStubs;
+    level = InstrumentationLevel::kInstrumentWithEntryExitHooks;
   }
-  ConfigureStubs(key, level);
+  // We are enabling method tracing here and need to stay in debuggable.
+  ConfigureStubs(key, level, /*try_switch_to_non_debuggable=*/false);
+
+  MutexLock mu(Thread::Current(), *Locks::thread_list_lock_);
+  for (Thread* thread : Runtime::Current()->GetThreadList()->GetList()) {
+    ReportMethodEntryForOnStackMethods(listener, thread);
+  }
 }
 
 void Instrumentation::DisableMethodTracing(const char* key) {
-  ConfigureStubs(key, InstrumentationLevel::kInstrumentNothing);
+  // We no longer need to be in debuggable runtime since we are stopping method tracing. If no
+  // other debugger / profiling tools are active switch back to non-debuggable.
+  ConfigureStubs(key,
+                 InstrumentationLevel::kInstrumentNothing,
+                 /*try_switch_to_non_debuggable=*/true);
 }
 
-const void* Instrumentation::GetCodeForInvoke(ArtMethod* method) const {
-  // This is called by instrumentation entry only and that should never be getting proxy methods.
+const void* Instrumentation::GetCodeForInvoke(ArtMethod* method) {
+  // This is called by instrumentation and resolution trampolines
+  // and that should never be getting proxy methods.
   DCHECK(!method->IsProxyMethod()) << method->PrettyMethod();
   ClassLinker* class_linker = Runtime::Current()->GetClassLinker();
-  if (LIKELY(!instrumentation_stubs_installed_ && !interpreter_stubs_installed_)) {
-    // In general we just return whatever the method thinks its entrypoint is here. The only
-    // exception is if it still has the instrumentation entrypoint. That means we are racing another
-    // thread getting rid of instrumentation which is unexpected but possible. In that case we want
-    // to wait and try to get it from the oat file or jit.
-    const void* code = method->GetEntryPointFromQuickCompiledCodePtrSize(kRuntimePointerSize);
-    DCHECK(code != nullptr);
-    if (code != GetQuickInstrumentationEntryPoint()) {
-      return code;
-    } else if (method->IsNative()) {
-      return class_linker->GetQuickOatCodeFor(method);
-    }
-    // We don't know what it is. Fallthough to try to find the code from the JIT or Oat file.
-  } else if (method->IsNative()) {
-    // TODO We could have JIT compiled native entrypoints. It might be worth it to find these.
-    return class_linker->GetQuickOatCodeFor(method);
-  } else if (UNLIKELY(interpreter_stubs_installed_)) {
+  const void* code = method->GetEntryPointFromQuickCompiledCodePtrSize(kRuntimePointerSize);
+  // If we don't have the instrumentation, the resolution stub, or the
+  // interpreter, just return the current entrypoint,
+  // assuming it's the most optimized.
+  if (!class_linker->IsQuickResolutionStub(code) &&
+      !class_linker->IsQuickToInterpreterBridge(code)) {
+    return code;
+  }
+
+  if (InterpretOnly(method)) {
+    // If we're forced into interpreter just use it.
     return GetQuickToInterpreterBridge();
   }
-  // Since the method cannot be native due to ifs above we can always fall back to interpreter
-  // bridge.
-  const void* result = GetQuickToInterpreterBridge();
-  if (!NeedDebugVersionFor(method)) {
-    // If we don't need a debug version we should see what the oat file/class linker has to say.
-    result = class_linker->GetQuickOatCodeFor(method);
-  }
-  // If both those fail try the jit.
-  if (result == GetQuickToInterpreterBridge()) {
-    jit::Jit* jit = Runtime::Current()->GetJit();
-    if (jit != nullptr) {
-      const void* res = jit->GetCodeCache()->FindCompiledCodeForInstrumentation(method);
-      if (res != nullptr) {
-        result = res;
-      }
-    }
-  }
-  return result;
+
+  return GetOptimizedCodeFor(method);
 }
 
-const void* Instrumentation::GetQuickCodeFor(ArtMethod* method, PointerSize pointer_size) const {
-  ClassLinker* class_linker = Runtime::Current()->GetClassLinker();
-  if (LIKELY(!instrumentation_stubs_installed_)) {
-    const void* code = method->GetEntryPointFromQuickCompiledCodePtrSize(pointer_size);
-    DCHECK(code != nullptr);
-    if (LIKELY(!class_linker->IsQuickResolutionStub(code) &&
-               !class_linker->IsQuickToInterpreterBridge(code)) &&
-               !class_linker->IsQuickResolutionStub(code) &&
-               !class_linker->IsQuickToInterpreterBridge(code)) {
-      return code;
-    }
+const void* Instrumentation::GetMaybeInstrumentedCodeForInvoke(ArtMethod* method) {
+  // This is called by resolution trampolines and that should never be getting proxy methods.
+  DCHECK(!method->IsProxyMethod()) << method->PrettyMethod();
+  const void* code = GetCodeForInvoke(method);
+  if (EntryExitStubsInstalled() && !CodeSupportsEntryExitHooks(code, method)) {
+    return method->IsNative() ? GetQuickGenericJniStub() : GetQuickToInterpreterBridge();
   }
-  return class_linker->GetQuickOatCodeFor(method);
+  return code;
 }
 
-void Instrumentation::MethodEnterEventImpl(Thread* thread,
-                                           ObjPtr<mirror::Object> this_object,
-                                           ArtMethod* method,
-                                           uint32_t dex_pc) const {
+void Instrumentation::MethodEnterEventImpl(Thread* thread, ArtMethod* method) const {
   DCHECK(!method->IsRuntimeMethod());
   if (HasMethodEntryListeners()) {
-    Thread* self = Thread::Current();
-    StackHandleScope<1> hs(self);
-    Handle<mirror::Object> thiz(hs.NewHandle(this_object));
-    for (InstrumentationListener* listener : method_entry_listeners_) {
+    for (InstrumentationListener* listener : method_entry_slow_listeners_) {
       if (listener != nullptr) {
-        listener->MethodEntered(thread, thiz, method, dex_pc);
+        listener->MethodEntered(thread, method);
+      }
+    }
+    for (InstrumentationListener* listener : method_entry_fast_trace_listeners_) {
+      if (listener != nullptr) {
+        listener->MethodEntered(thread, method);
       }
     }
   }
@@ -1217,59 +1492,57 @@ void Instrumentation::MethodEnterEventImpl(Thread* thread,
 
 template <>
 void Instrumentation::MethodExitEventImpl(Thread* thread,
-                                          ObjPtr<mirror::Object> this_object,
                                           ArtMethod* method,
-                                          uint32_t dex_pc,
                                           OptionalFrame frame,
                                           MutableHandle<mirror::Object>& return_value) const {
   if (HasMethodExitListeners()) {
-    Thread* self = Thread::Current();
-    StackHandleScope<1> hs(self);
-    Handle<mirror::Object> thiz(hs.NewHandle(this_object));
-    for (InstrumentationListener* listener : method_exit_listeners_) {
+    for (InstrumentationListener* listener : method_exit_slow_listeners_) {
       if (listener != nullptr) {
-        listener->MethodExited(thread, thiz, method, dex_pc, frame, return_value);
+        listener->MethodExited(thread, method, frame, return_value);
+      }
+    }
+    for (InstrumentationListener* listener : method_exit_fast_trace_listeners_) {
+      if (listener != nullptr) {
+        listener->MethodExited(thread, method, frame, return_value);
       }
     }
   }
 }
 
 template<> void Instrumentation::MethodExitEventImpl(Thread* thread,
-                                                     ObjPtr<mirror::Object> this_object,
                                                      ArtMethod* method,
-                                                     uint32_t dex_pc,
                                                      OptionalFrame frame,
                                                      JValue& return_value) const {
   if (HasMethodExitListeners()) {
     Thread* self = Thread::Current();
-    StackHandleScope<2> hs(self);
-    Handle<mirror::Object> thiz(hs.NewHandle(this_object));
+    StackHandleScope<1> hs(self);
     if (method->GetInterfaceMethodIfProxy(kRuntimePointerSize)->GetReturnTypePrimitive() !=
         Primitive::kPrimNot) {
-      for (InstrumentationListener* listener : method_exit_listeners_) {
+      for (InstrumentationListener* listener : method_exit_slow_listeners_) {
         if (listener != nullptr) {
-          listener->MethodExited(thread, thiz, method, dex_pc, frame, return_value);
+          listener->MethodExited(thread, method, frame, return_value);
+        }
+      }
+      for (InstrumentationListener* listener : method_exit_fast_trace_listeners_) {
+        if (listener != nullptr) {
+          listener->MethodExited(thread, method, frame, return_value);
         }
       }
     } else {
       MutableHandle<mirror::Object> ret(hs.NewHandle(return_value.GetL()));
-      MethodExitEventImpl(thread, thiz.Get(), method, dex_pc, frame, ret);
+      MethodExitEventImpl(thread, method, frame, ret);
       return_value.SetL(ret.Get());
     }
   }
 }
 
 void Instrumentation::MethodUnwindEvent(Thread* thread,
-                                        ObjPtr<mirror::Object> this_object,
                                         ArtMethod* method,
                                         uint32_t dex_pc) const {
   if (HasMethodUnwindListeners()) {
-    Thread* self = Thread::Current();
-    StackHandleScope<1> hs(self);
-    Handle<mirror::Object> thiz(hs.NewHandle(this_object));
     for (InstrumentationListener* listener : method_unwind_listeners_) {
       if (listener != nullptr) {
-        listener->MethodUnwind(thread, thiz, method, dex_pc);
+        listener->MethodUnwind(thread, method, dex_pc);
       }
     }
   }
@@ -1383,41 +1656,6 @@ void Instrumentation::ExceptionHandledEvent(Thread* thread,
   }
 }
 
-void Instrumentation::PushInstrumentationStackFrame(Thread* self,
-                                                    ObjPtr<mirror::Object> this_object,
-                                                    ArtMethod* method,
-                                                    uintptr_t stack_ptr,
-                                                    uintptr_t lr,
-                                                    bool interpreter_entry) {
-  DCHECK(!self->IsExceptionPending());
-  std::map<uintptr_t, instrumentation::InstrumentationStackFrame>* stack =
-      self->GetInstrumentationStack();
-  if (kVerboseInstrumentation) {
-    LOG(INFO) << "Entering " << ArtMethod::PrettyMethod(method) << " from PC "
-              << reinterpret_cast<void*>(lr);
-  }
-
-  // We send the enter event before pushing the instrumentation frame to make cleanup easier. If the
-  // event causes an exception we can simply send the unwind event and return.
-  StackHandleScope<1> hs(self);
-  Handle<mirror::Object> h_this(hs.NewHandle(this_object));
-  if (!interpreter_entry) {
-    MethodEnterEvent(self, h_this.Get(), method, 0);
-    if (self->IsExceptionPending()) {
-      MethodUnwindEvent(self, h_this.Get(), method, 0);
-      return;
-    }
-  }
-
-  // We have a callee-save frame meaning this value is guaranteed to never be 0.
-  DCHECK(!self->IsExceptionPending());
-  size_t frame_id = StackVisitor::ComputeNumFrames(self, kInstrumentationStackWalk);
-
-  instrumentation::InstrumentationStackFrame instrumentation_frame(
-      h_this.Get(), method, lr, frame_id, interpreter_entry, current_force_deopt_id_);
-  stack->insert({stack_ptr, instrumentation_frame});
-}
-
 DeoptimizationMethodType Instrumentation::GetDeoptimizationMethodType(ArtMethod* method) {
   if (method->IsRuntimeMethod()) {
     // Certain methods have strict requirement on whether the dex instruction
@@ -1434,123 +1672,20 @@ DeoptimizationMethodType Instrumentation::GetDeoptimizationMethodType(ArtMethod*
   return DeoptimizationMethodType::kDefault;
 }
 
-// Try to get the shorty of a runtime method if it's an invocation stub.
-static char GetRuntimeMethodShorty(Thread* thread) REQUIRES_SHARED(Locks::mutator_lock_) {
-  char shorty = 'V';
-  StackVisitor::WalkStack(
-      [&shorty](const art::StackVisitor* stack_visitor) REQUIRES_SHARED(Locks::mutator_lock_) {
-        ArtMethod* m = stack_visitor->GetMethod();
-        if (m == nullptr || m->IsRuntimeMethod()) {
-          return true;
-        }
-        // The first Java method.
-        if (m->IsNative()) {
-          // Use JNI method's shorty for the jni stub.
-          shorty = m->GetShorty()[0];
-        } else if (m->IsProxyMethod()) {
-          // Proxy method just invokes its proxied method via
-          // art_quick_proxy_invoke_handler.
-          shorty = m->GetInterfaceMethodIfProxy(kRuntimePointerSize)->GetShorty()[0];
-        } else {
-          const Instruction& instr = m->DexInstructions().InstructionAt(stack_visitor->GetDexPc());
-          if (instr.IsInvoke()) {
-            auto get_method_index_fn = [](ArtMethod* caller,
-                                          const Instruction& inst,
-                                          uint32_t dex_pc)
-                REQUIRES_SHARED(Locks::mutator_lock_) {
-              switch (inst.Opcode()) {
-                case Instruction::INVOKE_VIRTUAL_RANGE_QUICK:
-                case Instruction::INVOKE_VIRTUAL_QUICK: {
-                  uint16_t method_idx = caller->GetIndexFromQuickening(dex_pc);
-                  CHECK_NE(method_idx, DexFile::kDexNoIndex16);
-                  return method_idx;
-                }
-                default: {
-                  return static_cast<uint16_t>(inst.VRegB());
-                }
-              }
-            };
-
-            uint16_t method_index = get_method_index_fn(m, instr, stack_visitor->GetDexPc());
-            const DexFile* dex_file = m->GetDexFile();
-            if (interpreter::IsStringInit(dex_file, method_index)) {
-              // Invoking string init constructor is turned into invoking
-              // StringFactory.newStringFromChars() which returns a string.
-              shorty = 'L';
-            } else {
-              shorty = dex_file->GetMethodShorty(method_index)[0];
-            }
-
-          } else {
-            // It could be that a non-invoke opcode invokes a stub, which in turn
-            // invokes Java code. In such cases, we should never expect a return
-            // value from the stub.
-          }
-        }
-        // Stop stack walking since we've seen a Java frame.
-        return false;
-      },
-      thread,
-      /* context= */ nullptr,
-      art::StackVisitor::StackWalkKind::kIncludeInlinedFrames);
-  return shorty;
-}
-
-TwoWordReturn Instrumentation::PopInstrumentationStackFrame(Thread* self,
-                                                            uintptr_t* return_pc_addr,
-                                                            uint64_t* gpr_result,
-                                                            uint64_t* fpr_result) {
-  DCHECK(gpr_result != nullptr);
-  DCHECK(fpr_result != nullptr);
-  // Do the pop.
-  std::map<uintptr_t, instrumentation::InstrumentationStackFrame>* stack =
-      self->GetInstrumentationStack();
-  CHECK_GT(stack->size(), 0U);
-  auto it = stack->find(reinterpret_cast<uintptr_t>(return_pc_addr));
-  CHECK(it != stack->end());
-  InstrumentationStackFrame instrumentation_frame = it->second;
-  stack->erase(it);
-
-  // Set return PC and check the sanity of the stack.
-  // We don't cache the return pc value in a local as it may change after
-  // sending a method exit event.
-  *return_pc_addr = instrumentation_frame.return_pc_;
-  self->VerifyStack();
-
-  ArtMethod* method = instrumentation_frame.method_;
+JValue Instrumentation::GetReturnValue(ArtMethod* method,
+                                       bool* is_ref,
+                                       uint64_t* gpr_result,
+                                       uint64_t* fpr_result) {
   uint32_t length;
   const PointerSize pointer_size = Runtime::Current()->GetClassLinker()->GetImagePointerSize();
-  char return_shorty;
 
   // Runtime method does not call into MethodExitEvent() so there should not be
   // suspension point below.
   ScopedAssertNoThreadSuspension ants(__FUNCTION__, method->IsRuntimeMethod());
-  if (method->IsRuntimeMethod()) {
-    if (method != Runtime::Current()->GetCalleeSaveMethod(
-        CalleeSaveType::kSaveEverythingForClinit)) {
-      // If the caller is at an invocation point and the runtime method is not
-      // for clinit, we need to pass return results to the caller.
-      // We need the correct shorty to decide whether we need to pass the return
-      // result for deoptimization below.
-      return_shorty = GetRuntimeMethodShorty(self);
-    } else {
-      // Some runtime methods such as allocations, unresolved field getters, etc.
-      // have return value. We don't need to set return_value since MethodExitEvent()
-      // below isn't called for runtime methods. Deoptimization doesn't need the
-      // value either since the dex instruction will be re-executed by the
-      // interpreter, except these two cases:
-      // (1) For an invoke, which is handled above to get the correct shorty.
-      // (2) For MONITOR_ENTER/EXIT, which cannot be re-executed since it's not
-      //     idempotent. However there is no return value for it anyway.
-      return_shorty = 'V';
-    }
-  } else {
-    return_shorty = method->GetInterfaceMethodIfProxy(pointer_size)->GetShorty(&length)[0];
-  }
+  DCHECK(!method->IsRuntimeMethod());
+  char return_shorty = method->GetInterfaceMethodIfProxy(pointer_size)->GetShorty(&length)[0];
 
-  bool is_ref = return_shorty == '[' || return_shorty == 'L';
-  StackHandleScope<1> hs(self);
-  MutableHandle<mirror::Object> res(hs.NewHandle<mirror::Object>(nullptr));
+  *is_ref = return_shorty == '[' || return_shorty == 'L';
   JValue return_value;
   if (return_shorty == 'V') {
     return_value.SetJ(0);
@@ -1559,94 +1694,128 @@ TwoWordReturn Instrumentation::PopInstrumentationStackFrame(Thread* self,
   } else {
     return_value.SetJ(*gpr_result);
   }
-  if (is_ref) {
-    // Take a handle to the return value so we won't lose it if we suspend.
-    res.Assign(return_value.GetL());
-  }
-  // TODO: improve the dex pc information here, requires knowledge of current PC as opposed to
-  //       return_pc.
-  uint32_t dex_pc = dex::kDexNoIndex;
-  if (!method->IsRuntimeMethod() && !instrumentation_frame.interpreter_entry_) {
-    ObjPtr<mirror::Object> this_object = instrumentation_frame.this_object_;
-    // Note that sending the event may change the contents of *return_pc_addr.
-    MethodExitEvent(
-        self, this_object, instrumentation_frame.method_, dex_pc, OptionalFrame{}, return_value);
+  return return_value;
+}
+
+bool Instrumentation::PushDeoptContextIfNeeded(Thread* self,
+                                               DeoptimizationMethodType deopt_type,
+                                               bool is_ref,
+                                               const JValue& return_value)
+    REQUIRES_SHARED(Locks::mutator_lock_) {
+  if (self->IsExceptionPending()) {
+    return false;
   }
 
-  // Deoptimize if the caller needs to continue execution in the interpreter. Do nothing if we get
-  // back to an upcall.
-  NthCallerVisitor visitor(self, 1, true);
-  visitor.WalkStack(true);
-  bool deoptimize = (visitor.caller != nullptr) &&
-                    (interpreter_stubs_installed_ || IsDeoptimized(visitor.caller) ||
-                    self->IsForceInterpreter() ||
-                    // NB Since structurally obsolete compiled methods might have the offsets of
-                    // methods/fields compiled in we need to go back to interpreter whenever we hit
-                    // them.
-                    visitor.caller->GetDeclaringClass()->IsObsoleteObject() ||
-                    // Check if we forced all threads to deoptimize in the time between this frame
-                    // being created and now.
-                    instrumentation_frame.force_deopt_id_ != current_force_deopt_id_ ||
-                    Dbg::IsForcedInterpreterNeededForUpcall(self, visitor.caller));
-  if (is_ref) {
-    // Restore the return value if it's a reference since it might have moved.
-    *reinterpret_cast<mirror::Object**>(gpr_result) = res.Get();
+  ArtMethod** sp = self->GetManagedStack()->GetTopQuickFrame();
+  DCHECK(sp != nullptr && (*sp)->IsRuntimeMethod());
+  if (!ShouldDeoptimizeCaller(self, sp)) {
+    return false;
   }
-  if (deoptimize && Runtime::Current()->IsAsyncDeoptimizeable(*return_pc_addr)) {
-    if (kVerboseInstrumentation) {
-      LOG(INFO) << "Deoptimizing "
-                << visitor.caller->PrettyMethod()
-                << " by returning from "
-                << method->PrettyMethod()
-                << " with result "
-                << std::hex << return_value.GetJ() << std::dec
-                << " in "
-                << *self;
-    }
-    DeoptimizationMethodType deopt_method_type = GetDeoptimizationMethodType(method);
+
+  // TODO(mythria): The current deopt behaviour is we just re-execute the
+  // alloc instruction so we don't need the return value. For instrumentation
+  // related deopts, we actually don't need to and can use the result we got
+  // here. Since this is a debug only feature it is not very important but
+  // consider reusing the result in future.
+  self->PushDeoptimizationContext(
+      return_value, is_ref, nullptr, /* from_code= */ false, deopt_type);
+  self->SetException(Thread::GetDeoptimizationException());
+  return true;
+}
+
+std::unique_ptr<Context> Instrumentation::DeoptimizeIfNeeded(Thread* self,
+                                                             ArtMethod** sp,
+                                                             DeoptimizationMethodType type,
+                                                             JValue return_value,
+                                                             bool is_reference) {
+  if (self->IsAsyncExceptionPending() || ShouldDeoptimizeCaller(self, sp)) {
     self->PushDeoptimizationContext(return_value,
-                                    return_shorty == 'L' || return_shorty == '[',
-                                    /* exception= */ nullptr ,
+                                    is_reference,
+                                    nullptr,
                                     /* from_code= */ false,
-                                    deopt_method_type);
-    return GetTwoWordSuccessValue(*return_pc_addr,
-                                  reinterpret_cast<uintptr_t>(GetQuickDeoptimizationEntryPoint()));
-  } else {
-    if (deoptimize && !Runtime::Current()->IsAsyncDeoptimizeable(*return_pc_addr)) {
-      VLOG(deopt) << "Got a deoptimization request on un-deoptimizable " << method->PrettyMethod()
-                  << " at PC " << reinterpret_cast<void*>(*return_pc_addr);
-    }
-    if (kVerboseInstrumentation) {
-      LOG(INFO) << "Returning from " << method->PrettyMethod()
-                << " to PC " << reinterpret_cast<void*>(*return_pc_addr);
-    }
-    return GetTwoWordSuccessValue(0, *return_pc_addr);
+                                    type);
+    // This is requested from suspend points or when returning from runtime methods so exit
+    // callbacks wouldn't be run yet. So don't skip method callbacks.
+    return self->Deoptimize(DeoptimizationKind::kFullFrame,
+                            /* single_frame= */ false,
+                            /* skip_method_exit_callbacks= */ false);
   }
+  // No exception or deoptimization.
+  return nullptr;
 }
 
-uintptr_t Instrumentation::PopFramesForDeoptimization(Thread* self, uintptr_t pop_until) const {
-  std::map<uintptr_t, instrumentation::InstrumentationStackFrame>* stack =
-      self->GetInstrumentationStack();
-  // Pop all instrumentation frames below `pop_until`.
-  uintptr_t return_pc = 0u;
-  for (auto i = stack->begin(); i != stack->end() && i->first <= pop_until;) {
-    auto e = i;
-    ++i;
-    if (kVerboseInstrumentation) {
-      LOG(INFO) << "Popping for deoptimization " << e->second.method_->PrettyMethod();
-    }
-    return_pc = e->second.return_pc_;
-    stack->erase(e);
-  }
-  return return_pc;
+bool Instrumentation::NeedsSlowInterpreterForMethod(Thread* self, ArtMethod* method) {
+  return (method != nullptr) &&
+         (InterpreterStubsInstalled() ||
+          IsDeoptimized(method) ||
+          self->IsForceInterpreter() ||
+          // NB Since structurally obsolete compiled methods might have the offsets of
+          // methods/fields compiled in we need to go back to interpreter whenever we hit
+          // them.
+          method->GetDeclaringClass()->IsObsoleteObject() ||
+          Dbg::IsForcedInterpreterNeededForUpcall(self, method));
 }
 
-std::string InstrumentationStackFrame::Dump() const {
-  std::ostringstream os;
-  os << "Frame " << frame_id_ << " " << ArtMethod::PrettyMethod(method_) << ":"
-      << reinterpret_cast<void*>(return_pc_) << " this=" << reinterpret_cast<void*>(this_object_)
-      << " force_deopt_id=" << force_deopt_id_;
-  return os.str();
+bool Instrumentation::ShouldDeoptimizeCaller(Thread* self, ArtMethod** sp) {
+  // When exit stubs aren't called we don't need to check for any instrumentation related
+  // deoptimizations.
+  if (!RunExitHooks()) {
+    return false;
+  }
+
+  ArtMethod* runtime_method = *sp;
+  DCHECK(runtime_method->IsRuntimeMethod());
+  QuickMethodFrameInfo frame_info = Runtime::Current()->GetRuntimeMethodFrameInfo(runtime_method);
+  return ShouldDeoptimizeCaller(self, sp, frame_info.FrameSizeInBytes());
+}
+
+bool Instrumentation::ShouldDeoptimizeCaller(Thread* self, ArtMethod** sp, size_t frame_size) {
+  uintptr_t caller_sp = reinterpret_cast<uintptr_t>(sp) + frame_size;
+  ArtMethod* caller = *(reinterpret_cast<ArtMethod**>(caller_sp));
+  uintptr_t caller_pc_addr = reinterpret_cast<uintptr_t>(sp) + (frame_size - sizeof(void*));
+  uintptr_t caller_pc = *reinterpret_cast<uintptr_t*>(caller_pc_addr);
+
+  if (caller == nullptr ||
+      caller->IsNative() ||
+      caller->IsRuntimeMethod()) {
+    // We need to check for a deoptimization here because when a redefinition happens it is
+    // not safe to use any compiled code because the field offsets might change. For native
+    // methods, we don't embed any field offsets so no need to check for a deoptimization.
+    // If the caller is null we don't need to do anything. This can happen when the caller
+    // is being interpreted by the switch interpreter (when called from
+    // artQuickToInterpreterBridge) / during shutdown / early startup.
+    return false;
+  }
+
+  bool needs_deopt = NeedsSlowInterpreterForMethod(self, caller);
+
+  // Non java debuggable apps don't support redefinition and hence it isn't required to check if
+  // frame needs to be deoptimized. Even in debuggable apps, we only need this check when a
+  // redefinition has actually happened. This is indicated by IsDeoptCheckRequired flag. We also
+  // want to avoid getting method header when we need a deopt anyway.
+  if (Runtime::Current()->IsJavaDebuggable() && !needs_deopt && self->IsDeoptCheckRequired()) {
+    const OatQuickMethodHeader* header = caller->GetOatQuickMethodHeader(caller_pc);
+    if (header != nullptr && header->HasShouldDeoptimizeFlag()) {
+      DCHECK(header->IsOptimized());
+      uint8_t* should_deopt_flag_addr =
+          reinterpret_cast<uint8_t*>(caller_sp) + header->GetShouldDeoptimizeFlagOffset();
+      if ((*should_deopt_flag_addr &
+           static_cast<uint8_t>(DeoptimizeFlagValue::kForceDeoptForRedefinition)) != 0) {
+        needs_deopt = true;
+      }
+    }
+  }
+
+  if (needs_deopt) {
+    if (!Runtime::Current()->IsAsyncDeoptimizeable(caller, caller_pc)) {
+      LOG(WARNING) << "Got a deoptimization request on un-deoptimizable method "
+                   << caller->PrettyMethod();
+      return false;
+    }
+    return true;
+  }
+
+  return false;
 }
 
 }  // namespace instrumentation

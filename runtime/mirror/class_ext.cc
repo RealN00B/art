@@ -18,11 +18,11 @@
 
 #include "art_method-inl.h"
 #include "base/casts.h"
-#include "base/enums.h"
+#include "base/pointer_size.h"
 #include "base/utils.h"
 #include "class-alloc-inl.h"
 #include "class-inl.h"
-#include "class_root.h"
+#include "class_root-inl.h"
 #include "dex/dex_file-inl.h"
 #include "gc/accounting/card_table-inl.h"
 #include "mirror/object.h"
@@ -33,12 +33,12 @@
 #include "stack_trace_element.h"
 #include "well_known_classes.h"
 
-namespace art {
+namespace art HIDDEN {
 namespace mirror {
 
 uint32_t ClassExt::ClassSize(PointerSize pointer_size) {
   uint32_t vtable_entries = Object::kVTableLength;
-  return Class::ComputeClassSize(true, vtable_entries, 0, 0, 0, 0, 0, pointer_size);
+  return Class::ComputeClassSize(true, vtable_entries, 0, 0, 0, 0, 0, 0, pointer_size);
 }
 
 void ClassExt::SetObsoleteArrays(ObjPtr<PointerArray> methods,
@@ -84,9 +84,7 @@ bool ClassExt::ExtendObsoleteArrays(Handle<ClassExt> h_this, Thread* self, uint3
   }
   Handle<ObjectArray<DexCache>> new_dex_caches(hs.NewHandle<ObjectArray<DexCache>>(
       ObjectArray<DexCache>::Alloc(self,
-                                   cl->FindClass(self,
-                                                 "[Ljava/lang/DexCache;",
-                                                 ScopedNullHandle<ClassLoader>()),
+                                   cl->FindSystemClass(self, "[Ljava/lang/DexCache;"),
                                    new_len)));
   if (new_dex_caches.IsNull()) {
     // Fail.
@@ -118,11 +116,11 @@ ObjPtr<ClassExt> ClassExt::Alloc(Thread* self) {
   return ObjPtr<ClassExt>::DownCast(GetClassRoot<ClassExt>()->AllocObject(self));
 }
 
-void ClassExt::SetVerifyError(ObjPtr<Object> err) {
+void ClassExt::SetErroneousStateError(ObjPtr<Throwable> err) {
   if (Runtime::Current()->IsActiveTransaction()) {
-    SetFieldObject<true>(OFFSET_OF_OBJECT_MEMBER(ClassExt, verify_error_), err);
+    SetFieldObject<true>(OFFSET_OF_OBJECT_MEMBER(ClassExt, erroneous_state_error_), err);
   } else {
-    SetFieldObject<false>(OFFSET_OF_OBJECT_MEMBER(ClassExt, verify_error_), err);
+    SetFieldObject<false>(OFFSET_OF_OBJECT_MEMBER(ClassExt, erroneous_state_error_), err);
   }
 }
 

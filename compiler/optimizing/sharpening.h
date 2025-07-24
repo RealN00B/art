@@ -17,21 +17,25 @@
 #ifndef ART_COMPILER_OPTIMIZING_SHARPENING_H_
 #define ART_COMPILER_OPTIMIZING_SHARPENING_H_
 
+#include "base/macros.h"
 #include "nodes.h"
 #include "optimization.h"
 
-namespace art {
+namespace art HIDDEN {
 
 class CodeGenerator;
 class DexCompilationUnit;
 
 // Utility methods that try to improve the way we dispatch methods, and access
-// types and strings.
+// types, strings and method types.
 class HSharpening {
  public:
   // Used by the builder and InstructionSimplifier.
-  static HInvokeStaticOrDirect::DispatchInfo SharpenInvokeStaticOrDirect(
-      ArtMethod* callee, CodeGenerator* codegen);
+  static HInvokeStaticOrDirect::DispatchInfo SharpenLoadMethod(
+      ArtMethod* callee,
+      bool has_method_id,
+      bool for_interface_call,
+      CodeGenerator* codegen);
 
   // Used by the builder and the inliner.
   static HLoadClass::LoadKind ComputeLoadClassKind(HLoadClass* load_class,
@@ -50,6 +54,12 @@ class HSharpening {
                                 CodeGenerator* codegen,
                                 const DexCompilationUnit& dex_compilation_unit,
                                 VariableSizedHandleScope* handles);
+
+  // Used by the builder.
+  static void ProcessLoadMethodType(HLoadMethodType* load_method_type,
+                                    CodeGenerator* codegen,
+                                    const DexCompilationUnit& dex_compilation_unit,
+                                    VariableSizedHandleScope* handles);
 };
 
 }  // namespace art

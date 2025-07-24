@@ -29,12 +29,23 @@
 #include <android-base/stringprintf.h>
 #include <android-base/strings.h>
 
+#include "base/array_ref.h"
+
+#include <cpu_features_macros.h>
+
+#ifdef CPU_FEATURES_ARCH_ARM
+// This header can only be included on ARM targets,
+// as determined by cpu_features own define.
+#include <cpuinfo_arm.h>
+#endif
+
+
 #if defined(__arm__)
 extern "C" bool artCheckForArmSdivInstruction();
 extern "C" bool artCheckForArmv8AInstructions();
 #endif
 
-namespace art {
+namespace art HIDDEN {
 
 using android::base::StringPrintf;
 
@@ -55,6 +66,7 @@ ArmFeaturesUniquePtr ArmInstructionSetFeatures::FromVariant(
       "exynos-m1",
       "kryo",
       "kryo385",
+      "kryo785",
   };
   bool has_armv8a = FindVariantInArray(arm_variants_with_armv8a,
                                        arraysize(arm_variants_with_armv8a),
@@ -96,7 +108,19 @@ ArmFeaturesUniquePtr ArmInstructionSetFeatures::FromVariant(
     if (!FindVariantInArray(arm_variants_with_default_features,
                             arraysize(arm_variants_with_default_features),
                             variant)) {
-      *error_msg = StringPrintf("Attempt to use unsupported ARM variant: %s", variant.c_str());
+      std::ostringstream os;
+      os << "Unexpected CPU variant for Arm: " << variant << ".\n"
+         << "Known variants with armv8a support: "
+         << android::base::Join(ArrayRef<const char* const>(arm_variants_with_armv8a), ", ")
+         << ".\n"
+         << "Known variants with divide support: "
+         << android::base::Join(ArrayRef<const char* const>(arm_variants_with_div), ", ") << ".\n"
+         << "Known variants with LPAE support: "
+         << android::base::Join(ArrayRef<const char* const>(arm_variants_with_lpae), ", ") << ".\n"
+         << "Other known variants: "
+         << android::base::Join(ArrayRef<const char* const>(arm_variants_with_default_features),
+                                ", ");
+      *error_msg = os.str();
       return nullptr;
     } else {
       // Warn if we use the default features.
@@ -219,14 +243,14 @@ ArmFeaturesUniquePtr ArmInstructionSetFeatures::FromHwcap() {
 // A signal handler called by a fault for an illegal instruction.  We record the fact in r0
 // and then increment the PC in the signal context to return to the next instruction.  We know the
 // instruction is 4 bytes long.
-static void bad_instr_handle(int signo ATTRIBUTE_UNUSED,
-                            siginfo_t* si ATTRIBUTE_UNUSED,
-                            void* data) {
+static void bad_instr_handle([[maybe_unused]] int signo,
+                             [[maybe_unused]] siginfo_t* si,
+                             void* data) {
 #if defined(__arm__)
-  struct ucontext *uc = (struct ucontext *)data;
-  struct sigcontext *sc = &uc->uc_mcontext;
-  sc->arm_r0 = 0;     // Set R0 to #0 to signal error.
-  sc->arm_pc += 4;    // Skip offending instruction.
+  ucontext_t* uc = reinterpret_cast<ucontext_t*>(data);
+  mcontext_t* mc = &uc->uc_mcontext;
+  mc->arm_r0 = 0;   // Set R0 to #0 to signal error.
+  mc->arm_pc += 4;  // Skip offending instruction.
 #else
   UNUSED(data);
 #endif
@@ -257,7 +281,7 @@ ArmFeaturesUniquePtr ArmInstructionSetFeatures::FromAssembly() {
 
   // Use compile time features to "detect" LPAE support.
   // TODO: write an assembly LPAE support test.
-#if defined(__ARM_FEATURE_LPAE)
+#if defined (__ARM_ARCH_8A__) || defined(__ARM_FEATURE_LPAE)
   const bool has_atomic_ldrd_strd = true;
 #else
   const bool has_atomic_ldrd_strd = false;
@@ -265,6 +289,19 @@ ArmFeaturesUniquePtr ArmInstructionSetFeatures::FromAssembly() {
   return ArmFeaturesUniquePtr(new ArmInstructionSetFeatures(has_div,
                                                             has_atomic_ldrd_strd,
                                                             has_armv8a));
+}
+
+ArmFeaturesUniquePtr ArmInstructionSetFeatures::FromCpuFeatures() {
+#ifdef CPU_FEATURES_ARCH_ARM
+  auto info = cpu_features::GetArmInfo();
+  auto features = info.features;
+  return ArmFeaturesUniquePtr(new ArmInstructionSetFeatures(features.idiva,
+                                                            features.lpae,
+                                                            info.architecture == 8));
+#else
+  UNIMPLEMENTED(WARNING);
+  return FromCppDefines();
+#endif
 }
 
 bool ArmInstructionSetFeatures::Equals(const InstructionSetFeatures* other) const {

@@ -33,7 +33,7 @@ void HiddenApiFinder::CheckMethod(uint32_t method_id,
                                   VeridexResolver* resolver,
                                   MethodReference ref) {
   // Note: we always query whether a method is in boot, as the app
-  // might define blacklisted APIs (which won't be used at runtime).
+  // might define blocked APIs (which won't be used at runtime).
   const auto& name = HiddenApi::GetApiMethodName(resolver->GetDexFile(), method_id);
   method_locations_[name].push_back(ref);
 }
@@ -42,7 +42,7 @@ void HiddenApiFinder::CheckField(uint32_t field_id,
                                  VeridexResolver* resolver,
                                  MethodReference ref) {
   // Note: we always query whether a field is in a boot, as the app
-  // might define blacklisted APIs (which won't be used at runtime).
+  // might define blocked APIs (which won't be used at runtime).
   const auto& name = HiddenApi::GetApiFieldName(resolver->GetDexFile(), field_id);
   field_locations_[name].push_back(ref);
 }
@@ -53,19 +53,26 @@ void HiddenApiFinder::CollectAccesses(VeridexResolver* resolver,
   // Look at all types referenced in this dex file. Any of these
   // types can lead to being used through reflection.
   for (uint32_t i = 0; i < dex_file.NumTypeIds(); ++i) {
-    std::string name(dex_file.StringByTypeIdx(dex::TypeIndex(i)));
+    std::string name(dex_file.GetTypeDescriptorView(dex::TypeIndex(i)));
     classes_.insert(name);
   }
   // Note: we collect strings constants only referenced in code items as the string table
   // contains other kind of strings (eg types).
   for (ClassAccessor accessor : dex_file.GetClasses()) {
-    if (class_filter.Matches(accessor.GetDescriptor())) {
+    if (class_filter.Matches(accessor.GetDescriptorView())) {
       for (const ClassAccessor::Method& method : accessor.GetMethods()) {
-        for (const DexInstructionPcPair& inst : method.GetInstructions()) {
+        CodeItemInstructionAccessor codes = method.GetInstructions();
+        const uint32_t max_pc = codes.InsnsSizeInCodeUnits();
+        for (const DexInstructionPcPair& inst : codes) {
+          if (inst.DexPc() >= max_pc) {
+            // We need to prevent abnormal access for outside of code
+            break;
+          }
+
           switch (inst->Opcode()) {
             case Instruction::CONST_STRING: {
               dex::StringIndex string_index(inst->VRegB_21c());
-              const auto& name = std::string(dex_file.StringDataByIdx(string_index));
+              const std::string name(dex_file.GetStringView(string_index));
               // Cheap filtering on the string literal. We know it cannot be a field/method/class
               // if it contains a space.
               if (name.find(' ') == std::string::npos) {
@@ -210,7 +217,7 @@ void HiddenApiFinder::Dump(std::ostream& os,
     // Dump potential reflection uses.
     for (const std::string& cls : classes_) {
       for (const std::string& name : strings_) {
-        std::string full_name = cls + "->" + name;
+        std::string full_name = ART_FORMAT("{}->{}", cls, name);
         if (hidden_api_.GetSignatureSource(full_name) != SignatureSource::APP &&
             hidden_api_.ShouldReport(full_name)) {
           hiddenapi::ApiList api_list = hidden_api_.GetApiList(full_name);

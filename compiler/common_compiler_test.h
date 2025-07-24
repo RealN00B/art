@@ -24,64 +24,59 @@
 
 #include "arch/instruction_set.h"
 #include "arch/instruction_set_features.h"
+#include "base/macros.h"
 #include "common_runtime_test.h"
 #include "compiler.h"
-#include "oat_file.h"
+#include "oat/oat_file.h"
 
-namespace art {
+namespace art HIDDEN {
 namespace mirror {
 class ClassLoader;
 }  // namespace mirror
 
-class CompiledMethod;
 class CompilerOptions;
 class CumulativeLogger;
 class DexFile;
 class TimingLogger;
-class VerificationResults;
 
 template<class T> class Handle;
 
-class CommonCompilerTest : public CommonRuntimeTest {
+// Export all symbols in `CommonCompilerTestImpl` for dex2oat tests.
+class EXPORT CommonCompilerTestImpl {
  public:
-  CommonCompilerTest();
-  ~CommonCompilerTest();
+  // Create compiler options from the given instruction set and variant. Optionally use a string of
+  // instruction set features in addition to the features from the variant.
+  static std::unique_ptr<CompilerOptions> CreateCompilerOptions(
+      InstructionSet instruction_set,
+      const std::string& variant,
+      const std::optional<std::string>& extra_features = std::nullopt);
 
-  void MakeExecutable(ArtMethod* method, const CompiledMethod* compiled_method)
-      REQUIRES_SHARED(Locks::mutator_lock_);
+  CommonCompilerTestImpl();
+  virtual ~CommonCompilerTestImpl();
 
-  static void MakeExecutable(const void* code_start, size_t code_length);
+  // Create an executable copy of the code with given metadata.
+  const void* MakeExecutable(ArrayRef<const uint8_t> code,
+                             ArrayRef<const uint8_t> vmap_table,
+                             InstructionSet instruction_set);
 
  protected:
-  void SetUp() override;
+  void SetUp();
 
-  void SetUpRuntimeOptions(RuntimeOptions* options) override;
-
-  Compiler::Kind GetCompilerKind() const;
-  void SetCompilerKind(Compiler::Kind compiler_kind);
+  void SetUpRuntimeOptionsImpl();
 
   virtual CompilerFilter::Filter GetCompilerFilter() const {
     return CompilerFilter::kDefaultCompilerFilter;
   }
 
-  void TearDown() override;
+  void TearDown();
 
   void CompileMethod(ArtMethod* method) REQUIRES_SHARED(Locks::mutator_lock_);
-
-  void CompileDirectMethod(Handle<mirror::ClassLoader> class_loader, const char* class_name,
-                           const char* method_name, const char* signature)
-      REQUIRES_SHARED(Locks::mutator_lock_);
-
-  void CompileVirtualMethod(Handle<mirror::ClassLoader> class_loader, const char* class_name,
-                            const char* method_name, const char* signature)
-      REQUIRES_SHARED(Locks::mutator_lock_);
+  std::vector<uint8_t> JniCompileCode(ArtMethod* method) REQUIRES_SHARED(Locks::mutator_lock_);
 
   void ApplyInstructionSet();
   void OverrideInstructionSetFeatures(InstructionSet instruction_set, const std::string& variant);
 
   void ClearBootImageOption();
-
-  Compiler::Kind compiler_kind_ = Compiler::kOptimizing;
 
   InstructionSet instruction_set_ =
       (kRuntimeISA == InstructionSet::kArm) ? InstructionSet::kThumb2 : kRuntimeISA;
@@ -90,12 +85,48 @@ class CommonCompilerTest : public CommonRuntimeTest {
       = InstructionSetFeatures::FromCppDefines();
 
   std::unique_ptr<CompilerOptions> compiler_options_;
-  std::unique_ptr<VerificationResults> verification_results_;
+
+ protected:
+  virtual ClassLinker* GetClassLinker() = 0;
+  virtual Runtime* GetRuntime() = 0;
+  class OneCompiledMethodStorage;
 
  private:
-  // Chunks must not move their storage after being created - use the node-based std::list.
-  std::list<std::vector<uint8_t>> header_code_and_maps_chunks_;
+  class CodeAndMetadata;
+
+  std::vector<CodeAndMetadata> code_and_metadata_;
 };
+
+template <typename RuntimeBase>
+class CommonCompilerTestBase : public CommonCompilerTestImpl, public RuntimeBase {
+ public:
+  void SetUp() override {
+    RuntimeBase::SetUp();
+    CommonCompilerTestImpl::SetUp();
+  }
+  void SetUpRuntimeOptions(RuntimeOptions* options) override {
+    RuntimeBase::SetUpRuntimeOptions(options);
+    CommonCompilerTestImpl::SetUpRuntimeOptionsImpl();
+  }
+  void TearDown() override {
+    CommonCompilerTestImpl::TearDown();
+    RuntimeBase::TearDown();
+  }
+
+ protected:
+  ClassLinker* GetClassLinker() override {
+    return RuntimeBase::class_linker_;
+  }
+  Runtime* GetRuntime() override {
+    return RuntimeBase::runtime_.get();
+  }
+};
+
+class CommonCompilerTest : public CommonCompilerTestBase<CommonRuntimeTest> {};
+
+template <typename Param>
+class CommonCompilerTestWithParam
+    : public CommonCompilerTestBase<CommonRuntimeTestWithParam<Param>> {};
 
 }  // namespace art
 

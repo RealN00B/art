@@ -18,8 +18,9 @@
 #define ART_RUNTIME_ARCH_ARM_INSTRUCTION_SET_FEATURES_ARM_H_
 
 #include "arch/instruction_set_features.h"
+#include "base/macros.h"
 
-namespace art {
+namespace art HIDDEN {
 
 class ArmInstructionSetFeatures;
 using ArmFeaturesUniquePtr = std::unique_ptr<const ArmInstructionSetFeatures>;
@@ -46,6 +47,9 @@ class ArmInstructionSetFeatures final : public InstructionSetFeatures {
   // Use assembly tests of the current runtime (ie kRuntimeISA) to determine the
   // InstructionSetFeatures. This works around kernel bugs in AT_HWCAP and /proc/cpuinfo.
   static ArmFeaturesUniquePtr FromAssembly();
+
+  // Use external cpu_features library.
+  static ArmFeaturesUniquePtr FromCpuFeatures();
 
   bool Equals(const InstructionSetFeatures* other) const override;
 

@@ -22,11 +22,13 @@
 #include <functional>
 #include <memory>
 #include <numeric>
+#include <string_view>
 #include <type_traits>
 #include <vector>
 
 #include "android-base/strings.h"
 
+#include "base/indenter.h"
 #include "cmdline_parse_result.h"
 #include "cmdline_types.h"
 #include "token_range.h"
@@ -35,6 +37,7 @@
 namespace art {
 // Implementation details for the parser. Do not look inside if you hate templates.
 namespace detail {
+
 // A non-templated base class for argument parsers. Used by the general parser
 // to parse arguments, without needing to know the argument type at compile time.
 //
@@ -77,6 +80,10 @@ struct CmdlineParseArgumentAny {
   // Returns how many tokens were either matched (or ignored because there was a
   // wildcard present). 0 means no match. If the Size() tokens are returned.
   virtual size_t MaybeMatches(const TokenRange& tokens) = 0;
+
+  virtual void DumpHelp(VariableIndentationOutputStream& os) = 0;
+
+  virtual const std::optional<const char*>& GetCategory() = 0;
 };
 
 template <typename T>
@@ -136,10 +143,52 @@ struct CmdlineParserArgumentInfo {
     return std::make_pair(best_match_ptr, best_match);
   }
 
+  template <typename T = TArg>  // Necessary to get SFINAE to kick in.
+  void DumpHelp(VariableIndentationOutputStream& vios) {
+    // Separate arguments
+    vios.Stream() << std::endl;
+    for (auto cname : names_) {
+      std::string_view name = cname;
+      if (using_blanks_) {
+        name = name.substr(0, name.find('_'));
+      }
+      auto& os = vios.Stream();
+      auto print_once = [&]() {
+        os << name;
+        if (using_blanks_) {
+          if (has_value_map_) {
+            bool first = true;
+            for (auto [val, unused] : value_map_) {
+              os << (first ? "{" : "|") << val;
+              first = false;
+            }
+            os << "}";
+          } else if (metavar_.has_value()) {
+            os << *metavar_;
+          } else {
+            os << "{" << CmdlineType<T>::DescribeType() << "}";
+          }
+        }
+      };
+      print_once();
+      if (appending_values_) {
+        os << " [";
+        print_once();
+        os << "...]";
+      }
+      os << std::endl;
+    }
+    if (help_.has_value()) {
+      ScopedIndentation si(&vios);
+      vios.Stream() << *help_ << std::endl;
+    }
+  }
+
+
   // Mark the argument definition as completed, do not mutate the object anymore after this
   // call is done.
   //
-  // Performs several sanity checks and token calculations.
+  // Performs several checks of the validity and token calculations.
   void CompleteArgument() {
     assert(names_.size() >= 1);
     assert(!is_completed_);
@@ -279,11 +328,15 @@ struct CmdlineParserArgumentInfo {
   bool has_value_list_ = false;
   std::vector<TArg> value_list_;
 
+  std::optional<const char*> help_;
+  std::optional<const char*> category_;
+  std::optional<const char*> metavar_;
+
   // Make sure there's a default constructor.
   CmdlineParserArgumentInfo() = default;
 
   // Ensure there's a default move constructor.
-  CmdlineParserArgumentInfo(CmdlineParserArgumentInfo&&) = default;
+  CmdlineParserArgumentInfo(CmdlineParserArgumentInfo&&) noexcept = default;
 
  private:
   // Perform type-specific checks at runtime.
@@ -380,6 +433,14 @@ struct CmdlineParseArgument : CmdlineParseArgumentAny {
     return ParseArgumentSingle(blank_value);
   }
 
+  virtual void DumpHelp(VariableIndentationOutputStream& os) {
+    argument_info_.DumpHelp(os);
+  }
+
+  virtual const std::optional<const char*>& GetCategory() {
+    return argument_info_.category_;
+  }
+
  private:
   virtual CmdlineResult ParseArgumentSingle(const std::string& argument) {
     // TODO: refactor to use LookupValue for the value lists/maps
@@ -424,6 +485,7 @@ struct CmdlineParseArgument : CmdlineParseArgumentAny {
 
       // Error case: Fail, telling the user what the allowed values were.
       std::vector<std::string> allowed_values;
+      allowed_values.reserve(argument_info_.names_.size());
       for (auto&& arg_name : argument_info_.names_) {
         allowed_values.push_back(arg_name);
       }

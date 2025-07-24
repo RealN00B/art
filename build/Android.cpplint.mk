@@ -16,16 +16,18 @@
 
 include art/build/Android.common_build.mk
 
+# We need to be in art directory to properly initialize ART_CPPLINT_SRC variable.
+LOCAL_PATH := $(art_path)
+
 # Use upstream cpplint (toolpath from .repo/manifests/GLOBAL-PREUPLOAD.cfg).
-ART_CPPLINT := external/google-styleguide/cpplint/cpplint.py
+ART_CPPLINT := tools/repohooks/tools/cpplint.py
 
 # This file previously configured many cpplint settings.
 # Everything that could be moved to CPPLINT.cfg has moved there.
 # Please add new settings to CPPLINT.cfg over adding new flags in this file.
 
-ART_CPPLINT_FLAGS :=
 # No output when there are no errors.
-ART_CPPLINT_QUIET := --quiet
+ART_CPPLINT_FLAGS := --quiet
 
 #  1) Get list of all .h & .cc files in the art directory.
 #  2) Prepends 'art/' to each of them to make the full name.
@@ -55,7 +57,7 @@ art_cpplint_file := $(1)
 art_cpplint_touch := $$(OUT_CPPLINT)/$$(subst /,__,$$(art_cpplint_file))
 
 $$(art_cpplint_touch): $$(art_cpplint_file) $(ART_CPPLINT) $(ART_CPPLINT_CFG) art/build/Android.cpplint.mk
-	$(hide) $(ART_CPPLINT) $(ART_CPPLINT_QUIET) $(ART_CPPLINT_FLAGS) $$<
+	$(hide) $(ART_CPPLINT) $(ART_CPPLINT_FLAGS) $$<
 	$(hide) mkdir -p $$(dir $$@)
 	$(hide) touch $$@
 
@@ -67,6 +69,9 @@ $(foreach file, $(ART_CPPLINT_SRC), $(eval $(call declare-art-cpplint-target,$(f
 
 include $(CLEAR_VARS)
 LOCAL_MODULE := cpplint-art-phony
+LOCAL_LICENSE_KINDS := SPDX-license-identifier-Apache-2.0
+LOCAL_LICENSE_CONDITIONS := notice
+LOCAL_NOTICE_FILE := $(LOCAL_PATH)/../NOTICE
 LOCAL_MODULE_TAGS := optional
 LOCAL_ADDITIONAL_DEPENDENCIES := $(ART_CPPLINT_TARGETS)
 include $(BUILD_PHONY_PACKAGE)

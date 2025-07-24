@@ -25,12 +25,12 @@
 #include "art_field-inl.h"
 #include "art_method-inl.h"
 #include "asm_support.h"
-#include "base/enums.h"
+#include "base/pointer_size.h"
 #include "class-alloc-inl.h"
 #include "class-inl.h"
 #include "class_linker-inl.h"
 #include "class_linker.h"
-#include "class_root.h"
+#include "class_root-inl.h"
 #include "common_runtime_test.h"
 #include "dex/dex_file.h"
 #include "entrypoints/entrypoint_utils-inl.h"
@@ -45,11 +45,15 @@
 #include "scoped_thread_state_change-inl.h"
 #include "string-inl.h"
 
-namespace art {
+namespace art HIDDEN {
 namespace mirror {
 
 class ObjectTest : public CommonRuntimeTest {
  protected:
+  ObjectTest() {
+    use_boot_image_ = true;  // Make the Runtime creation cheaper.
+  }
+
   void AssertString(int32_t expected_utf16_length,
                     const char* utf8_in,
                     const char* utf16_expected_le,
@@ -147,9 +151,9 @@ TEST_F(ObjectTest, AllocObjectArray) {
   Handle<mirror::Class> klass(hs.NewHandle(oa->GetClass()));
   ASSERT_EQ(2U, klass->NumDirectInterfaces());
   EXPECT_OBJ_PTR_EQ(class_linker_->FindSystemClass(soa.Self(), "Ljava/lang/Cloneable;"),
-                    mirror::Class::GetDirectInterface(soa.Self(), klass.Get(), 0));
+                    klass->GetDirectInterface(0));
   EXPECT_OBJ_PTR_EQ(class_linker_->FindSystemClass(soa.Self(), "Ljava/io/Serializable;"),
-                    mirror::Class::GetDirectInterface(soa.Self(), klass.Get(), 1));
+                    klass->GetDirectInterface(1));
 }
 
 TEST_F(ObjectTest, AllocArray) {
@@ -251,6 +255,48 @@ TEST_F(ObjectTest, PrimitiveArray_Long_Alloc) {
 }
 TEST_F(ObjectTest, PrimitiveArray_Short_Alloc) {
   TestPrimitiveArray<ShortArray>(class_linker_);
+}
+
+TEST_F(ObjectTest, PointerArrayWriteRead) {
+  ScopedObjectAccess soa(Thread::Current());
+  StackHandleScope<2> hs(soa.Self());
+
+  Handle<PointerArray> a32 =
+      hs.NewHandle(ObjPtr<PointerArray>::DownCast<Array>(IntArray::Alloc(soa.Self(), 1)));
+  ASSERT_TRUE(a32 != nullptr);
+  ASSERT_EQ(1, a32->GetLength());
+  EXPECT_EQ(0u, (a32->GetElementPtrSize<uint32_t, PointerSize::k32>(0u)));
+  EXPECT_EQ(0u, (a32->GetElementPtrSizeUnchecked<uint32_t, PointerSize::k32>(0u)));
+  for (uint32_t value : { 0u, 1u, 0x7fffffffu, 0x80000000u, 0xffffffffu }) {
+    a32->SetElementPtrSize(0u, value, PointerSize::k32);
+    EXPECT_EQ(value, (a32->GetElementPtrSize<uint32_t, PointerSize::k32>(0u)));
+    EXPECT_EQ(value, (a32->GetElementPtrSizeUnchecked<uint32_t, PointerSize::k32>(0u)));
+    // Check that the value matches also when retrieved as `uint64_t`.
+    // This is a regression test for unintended sign-extension. b/155780442
+    // (Using `uint64_t` rather than `uintptr_t`, so that the 32-bit test checks this too.)
+    EXPECT_EQ(value, (a32->GetElementPtrSize<uint64_t, PointerSize::k32>(0u)));
+    EXPECT_EQ(value, (a32->GetElementPtrSizeUnchecked<uint64_t, PointerSize::k32>(0u)));
+  }
+
+  Handle<PointerArray> a64 =
+      hs.NewHandle(ObjPtr<PointerArray>::DownCast<Array>(LongArray::Alloc(soa.Self(), 1)));
+  ASSERT_TRUE(a64 != nullptr);
+  ASSERT_EQ(1, a64->GetLength());
+  EXPECT_EQ(0u, (a64->GetElementPtrSize<uint32_t, PointerSize::k64>(0u)));
+  EXPECT_EQ(0u, (a64->GetElementPtrSizeUnchecked<uint32_t, PointerSize::k64>(0u)));
+  for (uint64_t value : { UINT64_C(0),
+                          UINT64_C(1),
+                          UINT64_C(0x7fffffff),
+                          UINT64_C(0x80000000),
+                          UINT64_C(0xffffffff),
+                          UINT64_C(0x100000000),
+                          UINT64_C(0x7fffffffffffffff),
+                          UINT64_C(0x8000000000000000),
+                          UINT64_C(0xffffffffffffffff) }) {
+    a64->SetElementPtrSize(0u, value, PointerSize::k64);
+    EXPECT_EQ(value, (a64->GetElementPtrSize<uint64_t, PointerSize::k64>(0u)));
+    EXPECT_EQ(value, (a64->GetElementPtrSizeUnchecked<uint64_t, PointerSize::k64>(0u)));
+  }
 }
 
 TEST_F(ObjectTest, PrimitiveArray_Double_Alloc) {
@@ -361,8 +407,7 @@ TEST_F(ObjectTest, StaticFieldFromCode) {
 
   StackHandleScope<3> hs(soa.Self());
   Handle<mirror::ClassLoader> loader(hs.NewHandle(soa.Decode<ClassLoader>(class_loader)));
-  Handle<Class> klass =
-      hs.NewHandle(class_linker_->FindClass(soa.Self(), "LStaticsFromCode;", loader));
+  Handle<Class> klass = hs.NewHandle(FindClass("LStaticsFromCode;", loader));
   ArtMethod* clinit = klass->FindClassInitializer(kRuntimePointerSize);
   const dex::TypeId* klass_type_id = dex_file->FindTypeId("LStaticsFromCode;");
   ASSERT_TRUE(klass_type_id != nullptr);
@@ -378,10 +423,12 @@ TEST_F(ObjectTest, StaticFieldFromCode) {
   ASSERT_TRUE(field_id != nullptr);
   uint32_t field_idx = dex_file->GetIndexForFieldId(*field_id);
 
-  ArtField* field = FindFieldFromCode<StaticObjectRead, true>(field_idx, clinit, Thread::Current(),
-                                                              sizeof(HeapReference<Object>));
+  ArtField* field = FindFieldFromCode<StaticObjectRead>(field_idx,
+                                                        clinit,
+                                                        Thread::Current(),
+                                                        sizeof(HeapReference<Object>));
   ObjPtr<Object> s0 = field->GetObj(klass.Get());
-  EXPECT_TRUE(s0 != nullptr);
+  EXPECT_TRUE(s0 != nullptr) << field->PrettyField();
 
   Handle<CharArray> char_array(hs.NewHandle(CharArray::Alloc(soa.Self(), 0)));
   field->SetObj<false>(field->GetDeclaringClass(), char_array.Get());
@@ -480,13 +527,12 @@ TEST_F(ObjectTest, StringLength) {
   StackHandleScope<1> hs(soa.Self());
   Handle<String> string(hs.NewHandle(String::AllocFromModifiedUtf8(soa.Self(), "android")));
   EXPECT_EQ(string->GetLength(), 7);
-  EXPECT_EQ(string->GetUtfLength(), 7);
+  EXPECT_EQ(string->GetModifiedUtf8Length(), 7);
 }
 
 TEST_F(ObjectTest, DescriptorCompare) {
   // Two classloaders conflicts in compile_time_class_paths_.
   ScopedObjectAccess soa(Thread::Current());
-  ClassLinker* linker = class_linker_;
 
   jobject jclass_loader_1 = LoadDex("ProtoCompare");
   jobject jclass_loader_2 = LoadDex("ProtoCompare2");
@@ -494,11 +540,9 @@ TEST_F(ObjectTest, DescriptorCompare) {
   Handle<ClassLoader> class_loader_1(hs.NewHandle(soa.Decode<ClassLoader>(jclass_loader_1)));
   Handle<ClassLoader> class_loader_2(hs.NewHandle(soa.Decode<ClassLoader>(jclass_loader_2)));
 
-  Handle<Class> klass1 =
-      hs.NewHandle(linker->FindClass(soa.Self(), "LProtoCompare;", class_loader_1));
+  Handle<Class> klass1 = hs.NewHandle(FindClass("LProtoCompare;", class_loader_1));
   ASSERT_TRUE(klass1 != nullptr);
-  Handle<Class> klass2 =
-      hs.NewHandle(linker->FindClass(soa.Self(), "LProtoCompare2;", class_loader_2));
+  Handle<Class> klass2 = hs.NewHandle(FindClass("LProtoCompare2;", class_loader_2));
   ASSERT_TRUE(klass2 != nullptr);
 
   ArtMethod* m1_1 = klass1->GetVirtualMethod(0, kRuntimePointerSize);
@@ -538,8 +582,8 @@ TEST_F(ObjectTest, InstanceOf) {
   StackHandleScope<10> hs(soa.Self());
   Handle<ClassLoader> class_loader(hs.NewHandle(soa.Decode<ClassLoader>(jclass_loader)));
 
-  Handle<Class> X = hs.NewHandle(class_linker_->FindClass(soa.Self(), "LX;", class_loader));
-  Handle<Class> Y = hs.NewHandle(class_linker_->FindClass(soa.Self(), "LY;", class_loader));
+  Handle<Class> X = hs.NewHandle(FindClass("LX;", class_loader));
+  Handle<Class> Y = hs.NewHandle(FindClass("LY;", class_loader));
   ASSERT_TRUE(X != nullptr);
   ASSERT_TRUE(Y != nullptr);
 
@@ -577,8 +621,8 @@ TEST_F(ObjectTest, IsAssignableFrom) {
   jobject jclass_loader = LoadDex("XandY");
   StackHandleScope<5> hs(soa.Self());
   Handle<ClassLoader> class_loader(hs.NewHandle(soa.Decode<ClassLoader>(jclass_loader)));
-  Handle<Class> X = hs.NewHandle(class_linker_->FindClass(soa.Self(), "LX;", class_loader));
-  Handle<Class> Y = hs.NewHandle(class_linker_->FindClass(soa.Self(), "LY;", class_loader));
+  Handle<Class> X = hs.NewHandle(FindClass("LX;", class_loader));
+  Handle<Class> Y = hs.NewHandle(FindClass("LY;", class_loader));
 
   EXPECT_TRUE(X->IsAssignableFrom(X.Get()));
   EXPECT_TRUE(X->IsAssignableFrom(Y.Get()));
@@ -617,17 +661,17 @@ TEST_F(ObjectTest, IsAssignableFromArray) {
   jobject jclass_loader = LoadDex("XandY");
   StackHandleScope<14> hs(soa.Self());
   Handle<ClassLoader> class_loader(hs.NewHandle(soa.Decode<ClassLoader>(jclass_loader)));
-  Handle<Class> X = hs.NewHandle(class_linker_->FindClass(soa.Self(), "LX;", class_loader));
-  Handle<Class> Y = hs.NewHandle(class_linker_->FindClass(soa.Self(), "LY;", class_loader));
+  Handle<Class> X = hs.NewHandle(FindClass("LX;", class_loader));
+  Handle<Class> Y = hs.NewHandle(FindClass("LY;", class_loader));
   ASSERT_TRUE(X != nullptr);
   ASSERT_TRUE(Y != nullptr);
 
-  Handle<Class> YA = hs.NewHandle(class_linker_->FindClass(soa.Self(), "[LY;", class_loader));
-  Handle<Class> YAA = hs.NewHandle(class_linker_->FindClass(soa.Self(), "[[LY;", class_loader));
+  Handle<Class> YA = hs.NewHandle(FindClass("[LY;", class_loader));
+  Handle<Class> YAA = hs.NewHandle(FindClass("[[LY;", class_loader));
   ASSERT_TRUE(YA != nullptr);
   ASSERT_TRUE(YAA != nullptr);
 
-  Handle<Class> XAA = hs.NewHandle(class_linker_->FindClass(soa.Self(), "[[LX;", class_loader));
+  Handle<Class> XAA = hs.NewHandle(FindClass("[[LX;", class_loader));
   ASSERT_TRUE(XAA != nullptr);
 
   Handle<Class> O = hs.NewHandle(class_linker_->FindSystemClass(soa.Self(), "Ljava/lang/Object;"));
@@ -716,20 +760,16 @@ TEST_F(ObjectTest, FindStaticField) {
 
   // Wrong type.
   EXPECT_TRUE(c->FindDeclaredStaticField("CASE_INSENSITIVE_ORDER", "I") == nullptr);
-  EXPECT_TRUE(mirror::Class::FindStaticField(
-      soa.Self(), c.Get(), "CASE_INSENSITIVE_ORDER", "I") == nullptr);
+  EXPECT_TRUE(c->FindStaticField("CASE_INSENSITIVE_ORDER", "I") == nullptr);
 
   // Wrong name.
   EXPECT_TRUE(c->FindDeclaredStaticField(
       "cASE_INSENSITIVE_ORDER", "Ljava/util/Comparator;") == nullptr);
-  EXPECT_TRUE(
-      mirror::Class::FindStaticField(
-          soa.Self(), c.Get(), "cASE_INSENSITIVE_ORDER", "Ljava/util/Comparator;") == nullptr);
+  EXPECT_TRUE(c->FindStaticField("cASE_INSENSITIVE_ORDER", "Ljava/util/Comparator;") == nullptr);
 
   // Right name and type.
   ArtField* f1 = c->FindDeclaredStaticField("CASE_INSENSITIVE_ORDER", "Ljava/util/Comparator;");
-  ArtField* f2 = mirror::Class::FindStaticField(
-      soa.Self(), c.Get(), "CASE_INSENSITIVE_ORDER", "Ljava/util/Comparator;");
+  ArtField* f2 = c->FindStaticField("CASE_INSENSITIVE_ORDER", "Ljava/util/Comparator;");
   EXPECT_TRUE(f1 != nullptr);
   EXPECT_TRUE(f2 != nullptr);
   EXPECT_EQ(f1, f2);
@@ -753,8 +793,7 @@ TEST_F(ObjectTest, ObjectPointer) {
   jobject jclass_loader = LoadDex("XandY");
   StackHandleScope<2> hs(soa.Self());
   Handle<ClassLoader> class_loader(hs.NewHandle(soa.Decode<ClassLoader>(jclass_loader)));
-  Handle<mirror::Class> h_X(
-      hs.NewHandle(class_linker_->FindClass(soa.Self(), "LX;", class_loader)));
+  Handle<mirror::Class> h_X = hs.NewHandle(FindClass("LX;", class_loader));
 
   if (kObjPtrPoisoning) {
     ObjPtr<mirror::Object> null_ptr;
@@ -772,7 +811,7 @@ TEST_F(ObjectTest, ObjectPointer) {
     EXPECT_TRUE(X.Ptr() != nullptr);
     EXPECT_OBJ_PTR_EQ(h_X.Get(), X);
     // FindClass may cause thread suspension, it should invalidate X.
-    ObjPtr<Class> Y(class_linker_->FindClass(soa.Self(), "LY;", class_loader));
+    ObjPtr<Class> Y = FindClass("LY;", class_loader);
     EXPECT_TRUE(!Y.IsNull());
     EXPECT_TRUE(Y.IsValid());
     EXPECT_TRUE(Y.Ptr() != nullptr);

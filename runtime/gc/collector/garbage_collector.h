@@ -21,6 +21,8 @@
 #include <list>
 
 #include "base/histogram.h"
+#include "base/macros.h"
+#include "base/metrics/metrics.h"
 #include "base/mutex.h"
 #include "base/timing_logger.h"
 #include "gc/collector_type.h"
@@ -31,7 +33,7 @@
 #include "object_byte_pair.h"
 #include "object_callbacks.h"
 
-namespace art {
+namespace art HIDDEN {
 
 namespace mirror {
 class Class;
@@ -43,8 +45,17 @@ namespace gc {
 
 class Heap;
 
-namespace collector {
+namespace accounting {
+template <typename T>
+class AtomicStack;
+using ObjectStack = AtomicStack<mirror::Object>;
+}  // namespace accounting
 
+namespace space {
+class ContinuousSpace;
+}  // namespace space
+
+namespace collector {
 class GarbageCollector : public RootVisitor, public IsMarkedVisitor, public MarkObjectVisitor {
  public:
   class SCOPED_LOCKABLE ScopedPause {
@@ -75,7 +86,6 @@ class GarbageCollector : public RootVisitor, public IsMarkedVisitor, public Mark
   const CumulativeLogger& GetCumulativeTimings() const {
     return cumulative_timings_;
   }
-  void ResetCumulativeStatistics() REQUIRES(!pause_histogram_lock_);
   // Swap the live and mark bitmaps of spaces that are active for the collector. For partial GC,
   // this is the allocation space, for full GC then we swap the zygote bitmaps too.
   void SwapBitmaps()
@@ -90,6 +100,9 @@ class GarbageCollector : public RootVisitor, public IsMarkedVisitor, public Mark
   }
   uint64_t GetTotalFreedObjects() const {
     return total_freed_objects_;
+  }
+  uint64_t GetTotalScannedBytes() const {
+    return total_scanned_bytes_;
   }
   // Reset the cumulative timings and pause histogram.
   void ResetMeasurements() REQUIRES(!pause_histogram_lock_);
@@ -139,11 +152,19 @@ class GarbageCollector : public RootVisitor, public IsMarkedVisitor, public Mark
     return is_transaction_active_;
   }
 
+  bool ShouldEagerlyReleaseMemoryToOS() const;
+
  protected:
   // Run all of the GC phases.
-  virtual void RunPhases() = 0;
+  virtual void RunPhases() REQUIRES(!Locks::mutator_lock_) = 0;
   // Revoke all the thread-local buffers.
   virtual void RevokeAllThreadLocalBuffers() = 0;
+  // Deallocates unmarked objects referenced by 'obj_arr' that reside either in the
+  // given continuous-spaces or in large-object space. WARNING: Trashes objects.
+  void SweepArray(accounting::ObjectStack* obj_arr,
+                  bool swap_bitmaps,
+                  std::vector<space::ContinuousSpace*>* sweep_spaces)
+      REQUIRES(Locks::heap_bitmap_lock_) REQUIRES_SHARED(Locks::mutator_lock_);
 
   static constexpr size_t kPauseBucketSize = 500;
   static constexpr size_t kPauseBucketCount = 32;
@@ -156,13 +177,31 @@ class GarbageCollector : public RootVisitor, public IsMarkedVisitor, public Mark
   Histogram<uint64_t> pause_histogram_ GUARDED_BY(pause_histogram_lock_);
   Histogram<uint64_t> rss_histogram_;
   Histogram<size_t> freed_bytes_histogram_;
+  metrics::MetricsBase<int64_t>* gc_time_histogram_;
+  metrics::MetricsBase<uint64_t>* metrics_gc_count_;
+  metrics::MetricsBase<uint64_t>* metrics_gc_count_delta_;
+  metrics::MetricsBase<int64_t>* gc_throughput_histogram_;
+  metrics::MetricsBase<int64_t>* gc_tracing_throughput_hist_;
+  metrics::MetricsBase<uint64_t>* gc_throughput_avg_;
+  metrics::MetricsBase<uint64_t>* gc_tracing_throughput_avg_;
+  metrics::MetricsBase<uint64_t>* gc_scanned_bytes_;
+  metrics::MetricsBase<uint64_t>* gc_scanned_bytes_delta_;
+  metrics::MetricsBase<uint64_t>* gc_freed_bytes_;
+  metrics::MetricsBase<uint64_t>* gc_freed_bytes_delta_;
+  metrics::MetricsBase<uint64_t>* gc_duration_;
+  metrics::MetricsBase<uint64_t>* gc_duration_delta_;
   uint64_t total_thread_cpu_time_ns_;
   uint64_t total_time_ns_;
   uint64_t total_freed_objects_;
   int64_t total_freed_bytes_;
+  uint64_t total_scanned_bytes_;
   CumulativeLogger cumulative_timings_;
   mutable Mutex pause_histogram_lock_ DEFAULT_MUTEX_ACQUIRED_AFTER;
   bool is_transaction_active_;
+  // The garbage collector algorithms will either have all the metrics pointers
+  // (above) initialized, or none of them. So instead of checking each time, we
+  // use this flag.
+  bool are_metrics_initialized_;
 
  private:
   DISALLOW_IMPLICIT_CONSTRUCTORS(GarbageCollector);

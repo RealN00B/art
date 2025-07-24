@@ -17,16 +17,19 @@
 #ifndef ART_RUNTIME_ART_FIELD_H_
 #define ART_RUNTIME_ART_FIELD_H_
 
+#include "base/macros.h"
 #include "dex/modifiers.h"
 #include "dex/primitive.h"
 #include "gc_root.h"
 #include "obj_ptr.h"
 #include "offsets.h"
 #include "read_barrier_option.h"
+#include "verify_object.h"
 
-namespace art {
+namespace art HIDDEN {
 
 class DexFile;
+template<typename T> class LengthPrefixedArray;
 class ScopedObjectAccessAlreadyRunnable;
 
 namespace mirror {
@@ -37,8 +40,17 @@ class Object;
 class String;
 }  // namespace mirror
 
-class ArtField final {
+class EXPORT ArtField final {
  public:
+  // Visit declaring classes of all the art-fields in 'array' that reside
+  // in [start_boundary, end_boundary).
+  template<typename RootVisitorType>
+  static void VisitArrayRoots(RootVisitorType& visitor,
+                              uint8_t* start_boundary,
+                              uint8_t* end_boundary,
+                              LengthPrefixedArray<ArtField>* array)
+      REQUIRES_SHARED(Locks::mutator_lock_);
+
   template<ReadBarrierOption kReadBarrierOption = kWithReadBarrier>
   ObjPtr<mirror::Class> GetDeclaringClass() REQUIRES_SHARED(Locks::mutator_lock_);
 
@@ -51,31 +63,28 @@ class ArtField final {
     return declaring_class_.AddressWithoutBarrier();
   }
 
-  uint32_t GetAccessFlags() REQUIRES_SHARED(Locks::mutator_lock_) {
-    if (kIsDebugBuild) {
-      GetAccessFlagsDCheck();
-    }
+  uint32_t GetAccessFlags() {
     return access_flags_;
   }
 
-  void SetAccessFlags(uint32_t new_access_flags) REQUIRES_SHARED(Locks::mutator_lock_) {
+  void SetAccessFlags(uint32_t new_access_flags) {
     // Not called within a transaction.
     access_flags_ = new_access_flags;
   }
 
-  bool IsPublic() REQUIRES_SHARED(Locks::mutator_lock_) {
+  bool IsPublic() {
     return (GetAccessFlags() & kAccPublic) != 0;
   }
 
-  bool IsStatic() REQUIRES_SHARED(Locks::mutator_lock_) {
+  bool IsStatic() {
     return (GetAccessFlags() & kAccStatic) != 0;
   }
 
-  bool IsFinal() REQUIRES_SHARED(Locks::mutator_lock_) {
+  bool IsFinal() {
     return (GetAccessFlags() & kAccFinal) != 0;
   }
 
-  bool IsPrivate() REQUIRES_SHARED(Locks::mutator_lock_) {
+  bool IsPrivate() {
     return (GetAccessFlags() & kAccPrivate) != 0;
   }
 
@@ -89,10 +98,7 @@ class ArtField final {
   }
 
   // Offset to field within an Object.
-  MemberOffset GetOffset() REQUIRES_SHARED(Locks::mutator_lock_) {
-    if (kIsDebugBuild) {
-      GetOffsetDCheck();
-    }
+  MemberOffset GetOffset() {
     return MemberOffset(offset_);
   }
 
@@ -120,6 +126,7 @@ class ArtField final {
   void SetByte(ObjPtr<mirror::Object> object, int8_t b) REQUIRES_SHARED(Locks::mutator_lock_);
 
   uint16_t GetChar(ObjPtr<mirror::Object> object) REQUIRES_SHARED(Locks::mutator_lock_);
+  uint16_t GetCharacter(ObjPtr<mirror::Object> object) REQUIRES_SHARED(Locks::mutator_lock_);
 
   template<bool kTransactionActive>
   void SetChar(ObjPtr<mirror::Object> object, uint16_t c) REQUIRES_SHARED(Locks::mutator_lock_);
@@ -130,6 +137,7 @@ class ArtField final {
   void SetShort(ObjPtr<mirror::Object> object, int16_t s) REQUIRES_SHARED(Locks::mutator_lock_);
 
   int32_t GetInt(ObjPtr<mirror::Object> object) REQUIRES_SHARED(Locks::mutator_lock_);
+  int32_t GetInteger(ObjPtr<mirror::Object> object) REQUIRES_SHARED(Locks::mutator_lock_);
 
   template<bool kTransactionActive>
   void SetInt(ObjPtr<mirror::Object> object, int32_t i) REQUIRES_SHARED(Locks::mutator_lock_);
@@ -149,6 +157,7 @@ class ArtField final {
   template<bool kTransactionActive>
   void SetDouble(ObjPtr<mirror::Object> object, double d) REQUIRES_SHARED(Locks::mutator_lock_);
 
+  template<ReadBarrierOption kReadBarrierOption = kWithReadBarrier>
   ObjPtr<mirror::Object> GetObject(ObjPtr<mirror::Object> object)
       REQUIRES_SHARED(Locks::mutator_lock_);
 
@@ -169,7 +178,8 @@ class ArtField final {
   void Set64(ObjPtr<mirror::Object> object, uint64_t new_value)
       REQUIRES_SHARED(Locks::mutator_lock_);
 
-  template<class MirrorType = mirror::Object>
+  template<class MirrorType = mirror::Object,
+           ReadBarrierOption kReadBarrierOption = kWithReadBarrier>
   ObjPtr<MirrorType> GetObj(ObjPtr<mirror::Object> object)
       REQUIRES_SHARED(Locks::mutator_lock_);
 
@@ -183,14 +193,16 @@ class ArtField final {
     visitor.VisitRoot(declaring_class_.AddressWithoutBarrier());
   }
 
-  bool IsVolatile() REQUIRES_SHARED(Locks::mutator_lock_) {
+  bool IsVolatile() {
     return (GetAccessFlags() & kAccVolatile) != 0;
   }
 
   // Returns an instance field with this offset in the given class or null if not found.
   // If kExactOffset is true then we only find the matching offset, not the field containing the
   // offset.
-  template <bool kExactOffset = true>
+  template <bool kExactOffset = true,
+            VerifyObjectFlags kVerifyFlags = kDefaultVerifyFlags,
+            ReadBarrierOption kReadBarrierOption = kWithReadBarrier>
   static ArtField* FindInstanceFieldWithOffset(ObjPtr<mirror::Class> klass, uint32_t field_offset)
       REQUIRES_SHARED(Locks::mutator_lock_);
 
@@ -202,11 +214,13 @@ class ArtField final {
       REQUIRES_SHARED(Locks::mutator_lock_);
 
   const char* GetName() REQUIRES_SHARED(Locks::mutator_lock_);
+  std::string_view GetNameView() REQUIRES_SHARED(Locks::mutator_lock_);
 
   // Resolves / returns the name from the dex cache.
   ObjPtr<mirror::String> ResolveNameString() REQUIRES_SHARED(Locks::mutator_lock_);
 
   const char* GetTypeDescriptor() REQUIRES_SHARED(Locks::mutator_lock_);
+  std::string_view GetTypeDescriptorView() REQUIRES_SHARED(Locks::mutator_lock_);
 
   Primitive::Type GetTypeAsPrimitiveType() REQUIRES_SHARED(Locks::mutator_lock_);
 
@@ -221,6 +235,9 @@ class ArtField final {
   ObjPtr<mirror::DexCache> GetDexCache() REQUIRES_SHARED(Locks::mutator_lock_);
 
   const DexFile* GetDexFile() REQUIRES_SHARED(Locks::mutator_lock_);
+
+  const char* GetDeclaringClassDescriptor() REQUIRES_SHARED(Locks::mutator_lock_);
+  std::string_view GetDeclaringClassDescriptorView() REQUIRES_SHARED(Locks::mutator_lock_);
 
   GcRoot<mirror::Class>& DeclaringClassRoot() {
     return declaring_class_;
@@ -239,11 +256,8 @@ class ArtField final {
  private:
   bool IsProxyField() REQUIRES_SHARED(Locks::mutator_lock_);
 
-  ObjPtr<mirror::Class> ProxyFindSystemClass(const char* descriptor)
+  ObjPtr<mirror::Class> ProxyFindSystemClass(std::string_view descriptor)
       REQUIRES_SHARED(Locks::mutator_lock_);
-
-  void GetAccessFlagsDCheck() REQUIRES_SHARED(Locks::mutator_lock_);
-  void GetOffsetDCheck() REQUIRES_SHARED(Locks::mutator_lock_);
 
   GcRoot<mirror::Class> declaring_class_;
 

@@ -17,10 +17,11 @@
 #ifndef ART_RUNTIME_REFLECTIVE_HANDLE_H_
 #define ART_RUNTIME_REFLECTIVE_HANDLE_H_
 
+#include "base/macros.h"
 #include "base/value_object.h"
 #include "reflective_reference.h"
 
-namespace art {
+namespace art HIDDEN {
 
 // This is a holder similar to Handle<T> that is used to hold reflective references to ArtField and
 // ArtMethod structures. A reflective reference is one that must be updated if the underlying class
@@ -81,14 +82,12 @@ class MutableReflectiveHandle : public ReflectiveHandle<T> {
  public:
   MutableReflectiveHandle() {}
 
-  ALWAYS_INLINE MutableReflectiveHandle(const MutableReflectiveHandle<T>& handle)
-      REQUIRES_SHARED(Locks::mutator_lock_) = default;
+  ALWAYS_INLINE MutableReflectiveHandle(const MutableReflectiveHandle<T>& handle) = default;
 
   ALWAYS_INLINE MutableReflectiveHandle<T>& operator=(const MutableReflectiveHandle<T>& handle)
-      REQUIRES_SHARED(Locks::mutator_lock_) = default;
+      = default;
 
   ALWAYS_INLINE explicit MutableReflectiveHandle(ReflectiveReference<T>* reference)
-      REQUIRES_SHARED(Locks::mutator_lock_)
       : ReflectiveHandle<T>(reference) {}
 
   ALWAYS_INLINE T* Assign(T* reference) REQUIRES_SHARED(Locks::mutator_lock_) {

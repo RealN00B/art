@@ -19,15 +19,15 @@
 #include <string>
 
 #include "base/atomic.h"
+#include "base/common_art_test.h"
 #include "base/utils.h"
-#include "common_runtime_test.h"
 #include "handle_scope-inl.h"
 #include "mirror/class-inl.h"
 #include "mirror/string-inl.h"  // Strings are easiest to allocate
 #include "scoped_thread_state_change-inl.h"
 #include "thread_pool.h"
 
-namespace art {
+namespace art HIDDEN {
 
 namespace mirror {
 class Object;
@@ -36,7 +36,7 @@ class Object;
 namespace gc {
 namespace accounting {
 
-class CardTableTest : public CommonRuntimeTest {
+class CardTableTest : public CommonArtTest {
  public:
   std::unique_ptr<CardTable> card_table_;
 

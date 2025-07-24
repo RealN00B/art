@@ -14,12 +14,17 @@
  * limitations under the License.
  */
 
+#include "android-base/logging.h"
+#include "arch/context.h"
+#include "arch/instruction_set.h"
 #include "art_method-inl.h"
+#include "art_method.h"
 #include "base/callee_save_type.h"
-#include "base/enums.h"
+#include "base/globals.h"
+#include "base/pointer_size.h"
 #include "callee_save_frame.h"
 #include "common_throws.h"
-#include "class_root.h"
+#include "class_root-inl.h"
 #include "debug_print.h"
 #include "debugger.h"
 #include "dex/dex_file-inl.h"
@@ -32,7 +37,6 @@
 #include "gc/accounting/card_table-inl.h"
 #include "imt_conflict_table.h"
 #include "imtable-inl.h"
-#include "index_bss_mapping.h"
 #include "instrumentation.h"
 #include "interpreter/interpreter.h"
 #include "interpreter/interpreter_common.h"
@@ -48,9 +52,9 @@
 #include "mirror/object-inl.h"
 #include "mirror/object_array-inl.h"
 #include "mirror/var_handle.h"
-#include "oat.h"
-#include "oat_file.h"
-#include "oat_quick_method_header.h"
+#include "oat/oat.h"
+#include "oat/oat_file.h"
+#include "oat/oat_quick_method_header.h"
 #include "quick_exception_handler.h"
 #include "runtime.h"
 #include "scoped_thread_state_change-inl.h"
@@ -58,11 +62,13 @@
 #include "thread-inl.h"
 #include "var_handles.h"
 #include "well_known_classes.h"
+#include "runtime_entrypoints_list.h"
 
-namespace art {
+namespace art HIDDEN {
 
 // Visits the arguments as saved to the stack by a CalleeSaveType::kRefAndArgs callee save frame.
-class QuickArgumentVisitor {
+template <typename FrameInfo>
+class QuickArgumentVisitorImpl {
   // Number of bytes for each out register in the caller method's frame.
   static constexpr size_t kBytesStackArgLocation = 4;
   // Frame size in bytes of a callee-save frame for RefsAndArgs.
@@ -77,158 +83,28 @@ class QuickArgumentVisitor {
   // Offset of return address.
   static constexpr size_t kQuickCalleeSaveFrame_RefAndArgs_ReturnPcOffset =
       RuntimeCalleeSaveFrame::GetReturnPcOffset(CalleeSaveType::kSaveRefsAndArgs);
-#if defined(__arm__)
-  // The callee save frame is pointed to by SP.
-  // | argN       |  |
-  // | ...        |  |
-  // | arg4       |  |
-  // | arg3 spill |  |  Caller's frame
-  // | arg2 spill |  |
-  // | arg1 spill |  |
-  // | Method*    | ---
-  // | LR         |
-  // | ...        |    4x6 bytes callee saves
-  // | R3         |
-  // | R2         |
-  // | R1         |
-  // | S15        |
-  // | :          |
-  // | S0         |
-  // |            |    4x2 bytes padding
-  // | Method*    |  <- sp
-  static constexpr bool kSplitPairAcrossRegisterAndStack = false;
-  static constexpr bool kAlignPairRegister = true;
-  static constexpr bool kQuickSoftFloatAbi = false;
-  static constexpr bool kQuickDoubleRegAlignedFloatBackFilled = true;
-  static constexpr bool kQuickSkipOddFpRegisters = false;
-  static constexpr size_t kNumQuickGprArgs = 3;
-  static constexpr size_t kNumQuickFprArgs = 16;
-  static constexpr bool kGprFprLockstep = false;
+
   static size_t GprIndexToGprOffset(uint32_t gpr_index) {
-    return gpr_index * GetBytesPerGprSpillLocation(kRuntimeISA);
+    return FrameInfo::GprIndexToGprOffsetImpl(gpr_index);
   }
-#elif defined(__aarch64__)
-  // The callee save frame is pointed to by SP.
-  // | argN       |  |
-  // | ...        |  |
-  // | arg4       |  |
-  // | arg3 spill |  |  Caller's frame
-  // | arg2 spill |  |
-  // | arg1 spill |  |
-  // | Method*    | ---
-  // | LR         |
-  // | X29        |
-  // |  :         |
-  // | X20        |
-  // | X7         |
-  // | :          |
-  // | X1         |
-  // | D7         |
-  // |  :         |
-  // | D0         |
-  // |            |    padding
-  // | Method*    |  <- sp
-  static constexpr bool kSplitPairAcrossRegisterAndStack = false;
-  static constexpr bool kAlignPairRegister = false;
-  static constexpr bool kQuickSoftFloatAbi = false;  // This is a hard float ABI.
-  static constexpr bool kQuickDoubleRegAlignedFloatBackFilled = false;
-  static constexpr bool kQuickSkipOddFpRegisters = false;
-  static constexpr size_t kNumQuickGprArgs = 7;  // 7 arguments passed in GPRs.
-  static constexpr size_t kNumQuickFprArgs = 8;  // 8 arguments passed in FPRs.
-  static constexpr bool kGprFprLockstep = false;
-  static size_t GprIndexToGprOffset(uint32_t gpr_index) {
-    return gpr_index * GetBytesPerGprSpillLocation(kRuntimeISA);
-  }
-#elif defined(__i386__)
-  // The callee save frame is pointed to by SP.
-  // | argN        |  |
-  // | ...         |  |
-  // | arg4        |  |
-  // | arg3 spill  |  |  Caller's frame
-  // | arg2 spill  |  |
-  // | arg1 spill  |  |
-  // | Method*     | ---
-  // | Return      |
-  // | EBP,ESI,EDI |    callee saves
-  // | EBX         |    arg3
-  // | EDX         |    arg2
-  // | ECX         |    arg1
-  // | XMM3        |    float arg 4
-  // | XMM2        |    float arg 3
-  // | XMM1        |    float arg 2
-  // | XMM0        |    float arg 1
-  // | EAX/Method* |  <- sp
-  static constexpr bool kSplitPairAcrossRegisterAndStack = false;
-  static constexpr bool kAlignPairRegister = false;
-  static constexpr bool kQuickSoftFloatAbi = false;  // This is a hard float ABI.
-  static constexpr bool kQuickDoubleRegAlignedFloatBackFilled = false;
-  static constexpr bool kQuickSkipOddFpRegisters = false;
-  static constexpr size_t kNumQuickGprArgs = 3;  // 3 arguments passed in GPRs.
-  static constexpr size_t kNumQuickFprArgs = 4;  // 4 arguments passed in FPRs.
-  static constexpr bool kGprFprLockstep = false;
-  static size_t GprIndexToGprOffset(uint32_t gpr_index) {
-    return gpr_index * GetBytesPerGprSpillLocation(kRuntimeISA);
-  }
-#elif defined(__x86_64__)
-  // The callee save frame is pointed to by SP.
-  // | argN            |  |
-  // | ...             |  |
-  // | reg. arg spills |  |  Caller's frame
-  // | Method*         | ---
-  // | Return          |
-  // | R15             |    callee save
-  // | R14             |    callee save
-  // | R13             |    callee save
-  // | R12             |    callee save
-  // | R9              |    arg5
-  // | R8              |    arg4
-  // | RSI/R6          |    arg1
-  // | RBP/R5          |    callee save
-  // | RBX/R3          |    callee save
-  // | RDX/R2          |    arg2
-  // | RCX/R1          |    arg3
-  // | XMM7            |    float arg 8
-  // | XMM6            |    float arg 7
-  // | XMM5            |    float arg 6
-  // | XMM4            |    float arg 5
-  // | XMM3            |    float arg 4
-  // | XMM2            |    float arg 3
-  // | XMM1            |    float arg 2
-  // | XMM0            |    float arg 1
-  // | Padding         |
-  // | RDI/Method*     |  <- sp
-  static constexpr bool kSplitPairAcrossRegisterAndStack = false;
-  static constexpr bool kAlignPairRegister = false;
-  static constexpr bool kQuickSoftFloatAbi = false;  // This is a hard float ABI.
-  static constexpr bool kQuickDoubleRegAlignedFloatBackFilled = false;
-  static constexpr bool kQuickSkipOddFpRegisters = false;
-  static constexpr size_t kNumQuickGprArgs = 5;  // 5 arguments passed in GPRs.
-  static constexpr size_t kNumQuickFprArgs = 8;  // 8 arguments passed in FPRs.
-  static constexpr bool kGprFprLockstep = false;
-  static size_t GprIndexToGprOffset(uint32_t gpr_index) {
-    switch (gpr_index) {
-      case 0: return (4 * GetBytesPerGprSpillLocation(kRuntimeISA));
-      case 1: return (1 * GetBytesPerGprSpillLocation(kRuntimeISA));
-      case 2: return (0 * GetBytesPerGprSpillLocation(kRuntimeISA));
-      case 3: return (5 * GetBytesPerGprSpillLocation(kRuntimeISA));
-      case 4: return (6 * GetBytesPerGprSpillLocation(kRuntimeISA));
-      default:
-      LOG(FATAL) << "Unexpected GPR index: " << gpr_index;
-      UNREACHABLE();
-    }
-  }
-#else
-#error "Unsupported architecture"
-#endif
+
+  static constexpr bool kSplitPairAcrossRegisterAndStack =
+      FrameInfo::kSplitPairAcrossRegisterAndStack;
+  static constexpr bool kAlignPairRegister = FrameInfo::kAlignPairRegister;
+  static constexpr bool kQuickSoftFloatAbi = FrameInfo::kQuickSoftFloatAbi;
+  static constexpr bool kQuickDoubleRegAlignedFloatBackFilled =
+      FrameInfo::kQuickDoubleRegAlignedFloatBackFilled;
+  static constexpr bool kQuickSkipOddFpRegisters = FrameInfo::kQuickSkipOddFpRegisters;
+  static constexpr size_t kNumQuickGprArgs = FrameInfo::kNumQuickGprArgs;
+  static constexpr size_t kNumQuickFprArgs = FrameInfo::kNumQuickFprArgs;
+  static constexpr bool kGprFprLockstep = FrameInfo::kGprFprLockstep;
+  static constexpr bool kNaNBoxing = FrameInfo::kNanBoxing;
 
  public:
-  // Special handling for proxy methods. Proxy methods are instance methods so the
-  // 'this' object is the 1st argument. They also have the same frame layout as the
-  // kRefAndArgs runtime method. Since 'this' is a reference, it is located in the
-  // 1st GPR.
-  static StackReference<mirror::Object>* GetProxyThisObjectReference(ArtMethod** sp)
+  static constexpr bool NaNBoxing() { return FrameInfo::kNaNBoxing; }
+
+  static StackReference<mirror::Object>* GetThisObjectReference(ArtMethod** sp)
       REQUIRES_SHARED(Locks::mutator_lock_) {
-    CHECK((*sp)->IsProxyMethod());
     CHECK_GT(kNumQuickGprArgs, 0u);
     constexpr uint32_t kThisGprIndex = 0u;  // 'this' is in the 1st GPR.
     size_t this_arg_offset = kQuickCalleeSaveFrame_RefAndArgs_Gpr1Offset +
@@ -237,9 +113,15 @@ class QuickArgumentVisitor {
     return reinterpret_cast<StackReference<mirror::Object>*>(this_arg_address);
   }
 
-  static ArtMethod* GetCallingMethod(ArtMethod** sp) REQUIRES_SHARED(Locks::mutator_lock_) {
+  static ArtMethod* GetCallingMethodAndDexPc(ArtMethod** sp, uint32_t* dex_pc)
+      REQUIRES_SHARED(Locks::mutator_lock_) {
     DCHECK((*sp)->IsCalleeSaveMethod());
-    return GetCalleeSaveMethodCaller(sp, CalleeSaveType::kSaveRefsAndArgs);
+    return GetCalleeSaveMethodCallerAndDexPc(sp, CalleeSaveType::kSaveRefsAndArgs, dex_pc);
+  }
+
+  static ArtMethod* GetCallingMethod(ArtMethod** sp) REQUIRES_SHARED(Locks::mutator_lock_) {
+    uint32_t dex_pc;
+    return GetCallingMethodAndDexPc(sp, &dex_pc);
   }
 
   static ArtMethod* GetOuterMethod(ArtMethod** sp) REQUIRES_SHARED(Locks::mutator_lock_) {
@@ -247,31 +129,6 @@ class QuickArgumentVisitor {
     uint8_t* previous_sp =
         reinterpret_cast<uint8_t*>(sp) + kQuickCalleeSaveFrame_RefAndArgs_FrameSize;
     return *reinterpret_cast<ArtMethod**>(previous_sp);
-  }
-
-  static uint32_t GetCallingDexPc(ArtMethod** sp) REQUIRES_SHARED(Locks::mutator_lock_) {
-    DCHECK((*sp)->IsCalleeSaveMethod());
-    constexpr size_t callee_frame_size =
-        RuntimeCalleeSaveFrame::GetFrameSize(CalleeSaveType::kSaveRefsAndArgs);
-    ArtMethod** caller_sp = reinterpret_cast<ArtMethod**>(
-        reinterpret_cast<uintptr_t>(sp) + callee_frame_size);
-    uintptr_t outer_pc = QuickArgumentVisitor::GetCallingPc(sp);
-    const OatQuickMethodHeader* current_code = (*caller_sp)->GetOatQuickMethodHeader(outer_pc);
-    uintptr_t outer_pc_offset = current_code->NativeQuickPcOffset(outer_pc);
-
-    if (current_code->IsOptimized()) {
-      CodeInfo code_info = CodeInfo::DecodeInlineInfoOnly(current_code);
-      StackMap stack_map = code_info.GetStackMapForNativePcOffset(outer_pc_offset);
-      DCHECK(stack_map.IsValid());
-      BitTableRange<InlineInfo> inline_infos = code_info.GetInlineInfosOf(stack_map);
-      if (!inline_infos.empty()) {
-        return inline_infos.back().GetDexPc();
-      } else {
-        return stack_map.GetDexPc();
-      }
-    } else {
-      return current_code->ToDexPc(caller_sp, outer_pc);
-    }
   }
 
   static uint8_t* GetCallingPcAddr(ArtMethod** sp) REQUIRES_SHARED(Locks::mutator_lock_) {
@@ -286,15 +143,20 @@ class QuickArgumentVisitor {
     return *reinterpret_cast<uintptr_t*>(GetCallingPcAddr(sp));
   }
 
-  QuickArgumentVisitor(ArtMethod** sp, bool is_static, const char* shorty,
-                       uint32_t shorty_len) REQUIRES_SHARED(Locks::mutator_lock_) :
-          is_static_(is_static), shorty_(shorty), shorty_len_(shorty_len),
-          gpr_args_(reinterpret_cast<uint8_t*>(sp) + kQuickCalleeSaveFrame_RefAndArgs_Gpr1Offset),
-          fpr_args_(reinterpret_cast<uint8_t*>(sp) + kQuickCalleeSaveFrame_RefAndArgs_Fpr1Offset),
-          stack_args_(reinterpret_cast<uint8_t*>(sp) + kQuickCalleeSaveFrame_RefAndArgs_FrameSize
-              + sizeof(ArtMethod*)),  // Skip ArtMethod*.
-          gpr_index_(0), fpr_index_(0), fpr_double_index_(0), stack_index_(0),
-          cur_type_(Primitive::kPrimVoid), is_split_long_or_double_(false) {
+  QuickArgumentVisitorImpl(ArtMethod** sp, bool is_static, std::string_view shorty)
+      REQUIRES_SHARED(Locks::mutator_lock_)
+      : is_static_(is_static),
+        shorty_(shorty),
+        gpr_args_(reinterpret_cast<uint8_t*>(sp) + kQuickCalleeSaveFrame_RefAndArgs_Gpr1Offset),
+        fpr_args_(reinterpret_cast<uint8_t*>(sp) + kQuickCalleeSaveFrame_RefAndArgs_Fpr1Offset),
+        stack_args_(reinterpret_cast<uint8_t*>(sp) + kQuickCalleeSaveFrame_RefAndArgs_FrameSize +
+            sizeof(ArtMethod*)),  // Skip ArtMethod*.
+        gpr_index_(0),
+        fpr_index_(0),
+        fpr_double_index_(0),
+        stack_index_(0),
+        cur_type_(Primitive::kPrimVoid),
+        is_split_long_or_double_(false) {
     static_assert(kQuickSoftFloatAbi == (kNumQuickFprArgs == 0),
                   "Number of Quick FPR arguments unexpected");
     static_assert(!(kQuickSoftFloatAbi && kQuickDoubleRegAlignedFloatBackFilled),
@@ -306,7 +168,7 @@ class QuickArgumentVisitor {
     DCHECK_EQ(Runtime::Current()->GetClassLinker()->GetImagePointerSize(), kRuntimePointerSize);
   }
 
-  virtual ~QuickArgumentVisitor() {}
+  virtual ~QuickArgumentVisitorImpl() {}
 
   virtual void Visit() = 0;
 
@@ -320,10 +182,11 @@ class QuickArgumentVisitor {
       if (UNLIKELY((type == Primitive::kPrimDouble) || (type == Primitive::kPrimFloat))) {
         if (type == Primitive::kPrimDouble && kQuickDoubleRegAlignedFloatBackFilled) {
           if (fpr_double_index_ + 2 < kNumQuickFprArgs + 1) {
-            return fpr_args_ + (fpr_double_index_ * GetBytesPerFprSpillLocation(kRuntimeISA));
+            return fpr_args_ +
+                   (fpr_double_index_ * GetBytesPerFprSpillLocation(kRuntimeQuickCodeISA));
           }
         } else if (fpr_index_ + 1 < kNumQuickFprArgs + 1) {
-          return fpr_args_ + (fpr_index_ * GetBytesPerFprSpillLocation(kRuntimeISA));
+          return fpr_args_ + (fpr_index_ * GetBytesPerFprSpillLocation(kRuntimeQuickCodeISA));
         }
         return stack_args_ + (stack_index_ * kBytesStackArgLocation);
       }
@@ -335,8 +198,8 @@ class QuickArgumentVisitor {
   }
 
   bool IsSplitLongOrDouble() const {
-    if ((GetBytesPerGprSpillLocation(kRuntimeISA) == 4) ||
-        (GetBytesPerFprSpillLocation(kRuntimeISA) == 4)) {
+    if ((GetBytesPerGprSpillLocation(kRuntimeQuickCodeISA) == 4) ||
+        (GetBytesPerFprSpillLocation(kRuntimeQuickCodeISA) == 4)) {
       return is_split_long_or_double_;
     } else {
       return false;  // An optimization for when GPR and FPRs are 64bit.
@@ -391,8 +254,8 @@ class QuickArgumentVisitor {
         IncGprIndex();
       }
     }
-    for (uint32_t shorty_index = 1; shorty_index < shorty_len_; ++shorty_index) {
-      cur_type_ = Primitive::GetType(shorty_[shorty_index]);
+    for (char c : shorty_.substr(1u)) {
+      cur_type_ = Primitive::GetType(c);
       switch (cur_type_) {
         case Primitive::kPrimNot:
         case Primitive::kPrimBoolean:
@@ -442,7 +305,7 @@ class QuickArgumentVisitor {
               // even-numbered registers by skipping R1 and using R2 instead.
               IncGprIndex();
             }
-            is_split_long_or_double_ = (GetBytesPerGprSpillLocation(kRuntimeISA) == 4) &&
+            is_split_long_or_double_ = (GetBytesPerGprSpillLocation(kRuntimeQuickCodeISA) == 4) &&
                 ((gpr_index_ + 1) == kNumQuickGprArgs);
             if (!kSplitPairAcrossRegisterAndStack && is_split_long_or_double_) {
               // We don't want to split this. Pass over this register.
@@ -458,14 +321,14 @@ class QuickArgumentVisitor {
             }
             if (gpr_index_ < kNumQuickGprArgs) {
               IncGprIndex();
-              if (GetBytesPerGprSpillLocation(kRuntimeISA) == 4) {
+              if (GetBytesPerGprSpillLocation(kRuntimeQuickCodeISA) == 4) {
                 if (gpr_index_ < kNumQuickGprArgs) {
                   IncGprIndex();
                 }
               }
             }
           } else {
-            is_split_long_or_double_ = (GetBytesPerFprSpillLocation(kRuntimeISA) == 4) &&
+            is_split_long_or_double_ = (GetBytesPerFprSpillLocation(kRuntimeQuickCodeISA) == 4) &&
                 ((fpr_index_ + 1) == kNumQuickFprArgs) && !kQuickDoubleRegAlignedFloatBackFilled;
             Visit();
             if (kBytesStackArgLocation == 4) {
@@ -484,7 +347,7 @@ class QuickArgumentVisitor {
               }
             } else if (fpr_index_ + 1 < kNumQuickFprArgs + 1) {
               IncFprIndex();
-              if (GetBytesPerFprSpillLocation(kRuntimeISA) == 4) {
+              if (GetBytesPerFprSpillLocation(kRuntimeQuickCodeISA) == 4) {
                 if (fpr_index_ + 1 < kNumQuickFprArgs + 1) {
                   IncFprIndex();
                 }
@@ -500,8 +363,7 @@ class QuickArgumentVisitor {
 
  protected:
   const bool is_static_;
-  const char* const shorty_;
-  const uint32_t shorty_len_;
+  const std::string_view shorty_;
 
  private:
   uint8_t* const gpr_args_;  // Address of GPR arguments in callee save frame.
@@ -523,21 +385,258 @@ class QuickArgumentVisitor {
   bool is_split_long_or_double_;
 };
 
+class QuickArgumentFrameInfoARM {
+ public:
+  // The callee save frame is pointed to by SP.
+  // | argN       |  |
+  // | ...        |  |
+  // | arg4       |  |
+  // | arg3 spill |  |  Caller's frame
+  // | arg2 spill |  |
+  // | arg1 spill |  |
+  // | Method*    | ---
+  // | LR         |
+  // | ...        |    4x6 bytes callee saves
+  // | R3         |
+  // | R2         |
+  // | R1         |
+  // | S15        |
+  // | :          |
+  // | S0         |
+  // |            |    4x2 bytes padding
+  // | Method*    |  <- sp
+  static constexpr bool kSplitPairAcrossRegisterAndStack = false;
+  static constexpr bool kAlignPairRegister = true;
+  static constexpr bool kQuickSoftFloatAbi = false;
+  static constexpr bool kQuickDoubleRegAlignedFloatBackFilled = true;
+  static constexpr bool kQuickSkipOddFpRegisters = false;
+  static constexpr size_t kNumQuickGprArgs = 3;
+  static constexpr size_t kNumQuickFprArgs = 16;
+  static constexpr bool kGprFprLockstep = false;
+  static constexpr bool kNaNBoxing = false;
+  static size_t GprIndexToGprOffsetImpl(uint32_t gpr_index) {
+    return gpr_index * GetBytesPerGprSpillLocation(InstructionSet::kArm);
+  }
+};
+
+class QuickArgumentFrameInfoARM64 {
+ public:
+  // The callee save frame is pointed to by SP.
+  // | argN       |  |
+  // | ...        |  |
+  // | arg4       |  |
+  // | arg3 spill |  |  Caller's frame
+  // | arg2 spill |  |
+  // | arg1 spill |  |
+  // | Method*    | ---
+  // | LR         |
+  // | X29        |
+  // |  :         |
+  // | X20        |
+  // | X7         |
+  // | :          |
+  // | X1         |
+  // | D7         |
+  // |  :         |
+  // | D0         |
+  // |            |    padding
+  // | Method*    |  <- sp
+  static constexpr bool kSplitPairAcrossRegisterAndStack = false;
+  static constexpr bool kAlignPairRegister = false;
+  static constexpr bool kQuickSoftFloatAbi = false;  // This is a hard float ABI.
+  static constexpr bool kQuickDoubleRegAlignedFloatBackFilled = false;
+  static constexpr bool kQuickSkipOddFpRegisters = false;
+  static constexpr size_t kNumQuickGprArgs = 7;  // 7 arguments passed in GPRs.
+  static constexpr size_t kNumQuickFprArgs = 8;  // 8 arguments passed in FPRs.
+  static constexpr bool kGprFprLockstep = false;
+  static constexpr bool kNaNBoxing = false;
+  static size_t GprIndexToGprOffsetImpl(uint32_t gpr_index) {
+    return gpr_index * GetBytesPerGprSpillLocation(InstructionSet::kArm64);
+  }
+};
+
+class QuickArgumentFrameInfoRISCV64 {
+ public:
+  // The callee save frame is pointed to by SP.
+  // | argN            |  |
+  // | ...             |  |
+  // | reg. arg spills |  |  Caller's frame
+  // | Method*         | ---
+  // | RA              |
+  // | S11/X27         |  callee-saved 11
+  // | S10/X26         |  callee-saved 10
+  // | S9/X25          |  callee-saved 9
+  // | S9/X24          |  callee-saved 8
+  // | S7/X23          |  callee-saved 7
+  // | S6/X22          |  callee-saved 6
+  // | S5/X21          |  callee-saved 5
+  // | S4/X20          |  callee-saved 4
+  // | S3/X19          |  callee-saved 3
+  // | S2/X18          |  callee-saved 2
+  // | A7/X17          |  arg 7
+  // | A6/X16          |  arg 6
+  // | A5/X15          |  arg 5
+  // | A4/X14          |  arg 4
+  // | A3/X13          |  arg 3
+  // | A2/X12          |  arg 2
+  // | A1/X11          |  arg 1 (A0 is the method => skipped)
+  // | S0/X8/FP        |  callee-saved 0 (S1 is TR => skipped)
+  // | FA7             |  float arg 8
+  // | FA6             |  float arg 7
+  // | FA5             |  float arg 6
+  // | FA4             |  float arg 5
+  // | FA3             |  float arg 4
+  // | FA2             |  float arg 3
+  // | FA1             |  float arg 2
+  // | FA0             |  float arg 1
+  // | A0/Method*      | <- sp
+  static constexpr bool kSplitPairAcrossRegisterAndStack = false;
+  static constexpr bool kAlignPairRegister = false;
+  static constexpr bool kQuickSoftFloatAbi = false;
+  static constexpr bool kQuickDoubleRegAlignedFloatBackFilled = false;
+  static constexpr bool kQuickSkipOddFpRegisters = false;
+  static constexpr size_t kNumQuickGprArgs = 7;
+  static constexpr size_t kNumQuickFprArgs = 8;
+  static constexpr bool kGprFprLockstep = false;
+  static constexpr bool kNaNBoxing = true;
+  static size_t GprIndexToGprOffsetImpl(uint32_t gpr_index) {
+    // skip S0/X8/FP
+    return (gpr_index + 1) * GetBytesPerGprSpillLocation(InstructionSet::kRiscv64);
+  }
+};
+
+class QuickArgumentFrameInfoX86 {
+ public:
+  // The callee save frame is pointed to by SP.
+  // | argN        |  |
+  // | ...         |  |
+  // | arg4        |  |
+  // | arg3 spill  |  |  Caller's frame
+  // | arg2 spill  |  |
+  // | arg1 spill  |  |
+  // | Method*     | ---
+  // | Return      |
+  // | EBP,ESI,EDI |    callee saves
+  // | EBX         |    arg3
+  // | EDX         |    arg2
+  // | ECX         |    arg1
+  // | XMM3        |    float arg 4
+  // | XMM2        |    float arg 3
+  // | XMM1        |    float arg 2
+  // | XMM0        |    float arg 1
+  // | EAX/Method* |  <- sp
+  static constexpr bool kSplitPairAcrossRegisterAndStack = false;
+  static constexpr bool kAlignPairRegister = false;
+  static constexpr bool kQuickSoftFloatAbi = false;  // This is a hard float ABI.
+  static constexpr bool kQuickDoubleRegAlignedFloatBackFilled = false;
+  static constexpr bool kQuickSkipOddFpRegisters = false;
+  static constexpr size_t kNumQuickGprArgs = 3;  // 3 arguments passed in GPRs.
+  static constexpr size_t kNumQuickFprArgs = 4;  // 4 arguments passed in FPRs.
+  static constexpr bool kGprFprLockstep = false;
+  static constexpr bool kNaNBoxing = false;
+  static size_t GprIndexToGprOffsetImpl(uint32_t gpr_index) {
+    return gpr_index * GetBytesPerGprSpillLocation(InstructionSet::kX86);
+  }
+};
+
+class QuickArgumentFrameInfoX86_64 {
+ public:
+  // The callee save frame is pointed to by SP.
+  // | argN            |  |
+  // | ...             |  |
+  // | reg. arg spills |  |  Caller's frame
+  // | Method*         | ---
+  // | Return          |
+  // | R15             |    callee save
+  // | R14             |    callee save
+  // | R13             |    callee save
+  // | R12             |    callee save
+  // | R9              |    arg5
+  // | R8              |    arg4
+  // | RSI/R6          |    arg1
+  // | RBP/R5          |    callee save
+  // | RBX/R3          |    callee save
+  // | RDX/R2          |    arg2
+  // | RCX/R1          |    arg3
+  // | XMM15           |    callee save
+  // | XMM14           |    callee save
+  // | XMM13           |    callee save
+  // | XMM12           |    callee save
+  // | XMM7            |    float arg 8
+  // | XMM6            |    float arg 7
+  // | XMM5            |    float arg 6
+  // | XMM4            |    float arg 5
+  // | XMM3            |    float arg 4
+  // | XMM2            |    float arg 3
+  // | XMM1            |    float arg 2
+  // | XMM0            |    float arg 1
+  // | Padding         |
+  // | RDI/Method*     |  <- sp
+  static constexpr bool kSplitPairAcrossRegisterAndStack = false;
+  static constexpr bool kAlignPairRegister = false;
+  static constexpr bool kQuickSoftFloatAbi = false;  // This is a hard float ABI.
+  static constexpr bool kQuickDoubleRegAlignedFloatBackFilled = false;
+  static constexpr bool kQuickSkipOddFpRegisters = false;
+  static constexpr size_t kNumQuickGprArgs = 5;  // 5 arguments passed in GPRs.
+  static constexpr size_t kNumQuickFprArgs = 8;  // 8 arguments passed in FPRs.
+  static constexpr bool kGprFprLockstep = false;
+  static constexpr bool kNaNBoxing = false;
+  static size_t GprIndexToGprOffsetImpl(uint32_t gpr_index) {
+    static constexpr size_t kBytesPerSpill = GetBytesPerGprSpillLocation(InstructionSet::kX86_64);
+    switch (gpr_index) {
+      case 0: return (4 * kBytesPerSpill);
+      case 1: return (1 * kBytesPerSpill);
+      case 2: return (0 * kBytesPerSpill);
+      case 3: return (5 * kBytesPerSpill);
+      case 4: return (6 * kBytesPerSpill);
+      default:
+      LOG(FATAL) << "Unexpected GPR index: " << gpr_index;
+      UNREACHABLE();
+    }
+  }
+};
+
+namespace detail {
+
+template <InstructionSet>
+struct QAFISelector;
+
+template <>
+struct QAFISelector<InstructionSet::kArm> { using type = QuickArgumentFrameInfoARM; };
+template <>
+struct QAFISelector<InstructionSet::kArm64> { using type = QuickArgumentFrameInfoARM64; };
+template <>
+struct QAFISelector<InstructionSet::kRiscv64> { using type = QuickArgumentFrameInfoRISCV64; };
+template <>
+struct QAFISelector<InstructionSet::kX86> { using type = QuickArgumentFrameInfoX86; };
+template <>
+struct QAFISelector<InstructionSet::kX86_64> { using type = QuickArgumentFrameInfoX86_64; };
+
+}  // namespace detail
+
+using QuickArgumentVisitor =
+    QuickArgumentVisitorImpl<detail::QAFISelector<kRuntimeQuickCodeISA>::type>;
+
 // Returns the 'this' object of a proxy method. This function is only used by StackVisitor. It
 // allows to use the QuickArgumentVisitor constants without moving all the code in its own module.
 extern "C" mirror::Object* artQuickGetProxyThisObject(ArtMethod** sp)
     REQUIRES_SHARED(Locks::mutator_lock_) {
-  return QuickArgumentVisitor::GetProxyThisObjectReference(sp)->AsMirrorPtr();
+  DCHECK((*sp)->IsProxyMethod());
+  return QuickArgumentVisitor::GetThisObjectReference(sp)->AsMirrorPtr();
 }
 
 // Visits arguments on the stack placing them into the shadow frame.
 class BuildQuickShadowFrameVisitor final : public QuickArgumentVisitor {
  public:
-  BuildQuickShadowFrameVisitor(ArtMethod** sp, bool is_static, const char* shorty,
-                               uint32_t shorty_len, ShadowFrame* sf, size_t first_arg_reg) :
-      QuickArgumentVisitor(sp, is_static, shorty, shorty_len), sf_(sf), cur_reg_(first_arg_reg) {}
+  BuildQuickShadowFrameVisitor(ArtMethod** sp,
+                               bool is_static,
+                               std::string_view shorty,
+                               ShadowFrame* sf,
+                               size_t first_arg_reg)
+      : QuickArgumentVisitor(sp, is_static, shorty), sf_(sf), cur_reg_(first_arg_reg) {}
 
   void Visit() REQUIRES_SHARED(Locks::mutator_lock_) override;
+  void SetReceiver(ObjPtr<mirror::Object> receiver) REQUIRES_SHARED(Locks::mutator_lock_);
 
  private:
   ShadowFrame* const sf_;
@@ -545,6 +644,12 @@ class BuildQuickShadowFrameVisitor final : public QuickArgumentVisitor {
 
   DISALLOW_COPY_AND_ASSIGN(BuildQuickShadowFrameVisitor);
 };
+
+void BuildQuickShadowFrameVisitor::SetReceiver(ObjPtr<mirror::Object> receiver) {
+  DCHECK_EQ(cur_reg_, 0u);
+  sf_->SetVRegReference(cur_reg_, receiver);
+  ++cur_reg_;
+}
 
 void BuildQuickShadowFrameVisitor::Visit() {
   Primitive::Type type = GetParamPrimitiveType();
@@ -589,8 +694,8 @@ static void HandleDeoptimization(JValue* result,
   // Coming from partial-fragment deopt.
   Thread* self = Thread::Current();
   if (kIsDebugBuild) {
-    // Sanity-check: are the methods as expected? We check that the last shadow frame (the bottom
-    // of the call-stack) corresponds to the called method.
+    // Consistency-check: are the methods as expected? We check that the last shadow frame
+    // (the bottom of the call-stack) corresponds to the called method.
     ShadowFrame* linked = deopt_frame;
     while (linked->GetLink() != nullptr) {
       linked = linked->GetLink();
@@ -618,19 +723,19 @@ static void HandleDeoptimization(JValue* result,
 
   // Ensure that the stack is still in order.
   if (kIsDebugBuild) {
-    class DummyStackVisitor : public StackVisitor {
+    class EntireStackVisitor : public StackVisitor {
      public:
-      explicit DummyStackVisitor(Thread* self_in) REQUIRES_SHARED(Locks::mutator_lock_)
+      explicit EntireStackVisitor(Thread* self_in) REQUIRES_SHARED(Locks::mutator_lock_)
           : StackVisitor(self_in, nullptr, StackVisitor::StackWalkKind::kIncludeInlinedFrames) {}
 
       bool VisitFrame() override REQUIRES_SHARED(Locks::mutator_lock_) {
-        // Nothing to do here. In a debug build, SanityCheckFrame will do the work in the walking
+        // Nothing to do here. In a debug build, ValidateFrame will do the work in the walking
         // logic. Just always say we want to continue.
         return true;
       }
     };
-    DummyStackVisitor dsv(self);
-    dsv.WalkStack();
+    EntireStackVisitor esv(self);
+    esv.WalkStack();
   }
 
   // Restore the exception that was pending before deoptimization then interpret the
@@ -642,9 +747,16 @@ static void HandleDeoptimization(JValue* result,
                                               deopt_frame,
                                               result,
                                               from_code,
-                                              DeoptimizationMethodType::kDefault);
+                                              method_type);
 }
 
+static int64_t NanBoxResultIfNeeded(int64_t result, char result_shorty) {
+  return (QuickArgumentVisitor::NaNBoxing() && result_shorty == 'F')
+      ? result | UINT64_C(0xffffffff00000000)
+      : result;
+}
+
+NO_STACK_PROTECTOR
 extern "C" uint64_t artQuickToInterpreterBridge(ArtMethod* method, Thread* self, ArtMethod** sp)
     REQUIRES_SHARED(Locks::mutator_lock_) {
   // Ensure we don't get thread suspension until the object arguments are safely in the shadow
@@ -652,112 +764,90 @@ extern "C" uint64_t artQuickToInterpreterBridge(ArtMethod* method, Thread* self,
   ScopedQuickEntrypointChecks sqec(self);
 
   if (UNLIKELY(!method->IsInvokable())) {
-    method->ThrowInvocationTimeError();
+    method->ThrowInvocationTimeError(
+        method->IsStatic()
+            ? nullptr
+            : QuickArgumentVisitor::GetThisObjectReference(sp)->AsMirrorPtr());
     return 0;
   }
 
-  JValue tmp_value;
-  ShadowFrame* deopt_frame = self->PopStackedShadowFrame(
-      StackedShadowFrameType::kDeoptimizationShadowFrame, false);
-  ManagedStack fragment;
-
   DCHECK(!method->IsNative()) << method->PrettyMethod();
-  uint32_t shorty_len = 0;
-  ArtMethod* non_proxy_method = method->GetInterfaceMethodIfProxy(kRuntimePointerSize);
-  DCHECK(non_proxy_method->GetCodeItem() != nullptr) << method->PrettyMethod();
-  CodeItemDataAccessor accessor(non_proxy_method->DexInstructionData());
-  const char* shorty = non_proxy_method->GetShorty(&shorty_len);
 
   JValue result;
-  bool force_frame_pop = false;
 
+  ArtMethod* non_proxy_method = method->GetInterfaceMethodIfProxy(kRuntimePointerSize);
+  DCHECK(non_proxy_method->GetCodeItem() != nullptr) << method->PrettyMethod();
+  std::string_view shorty = non_proxy_method->GetShortyView();
+
+  ManagedStack fragment;
+  ShadowFrame* deopt_frame = self->MaybePopDeoptimizedStackedShadowFrame();
   if (UNLIKELY(deopt_frame != nullptr)) {
     HandleDeoptimization(&result, method, deopt_frame, &fragment);
   } else {
+    CodeItemDataAccessor accessor(non_proxy_method->DexInstructionData());
     const char* old_cause = self->StartAssertNoThreadSuspension(
         "Building interpreter shadow frame");
     uint16_t num_regs = accessor.RegistersSize();
     // No last shadow coming from quick.
     ShadowFrameAllocaUniquePtr shadow_frame_unique_ptr =
-        CREATE_SHADOW_FRAME(num_regs, /* link= */ nullptr, method, /* dex_pc= */ 0);
+        CREATE_SHADOW_FRAME(num_regs, method, /* dex_pc= */ 0);
     ShadowFrame* shadow_frame = shadow_frame_unique_ptr.get();
     size_t first_arg_reg = accessor.RegistersSize() - accessor.InsSize();
-    BuildQuickShadowFrameVisitor shadow_frame_builder(sp, method->IsStatic(), shorty, shorty_len,
-                                                      shadow_frame, first_arg_reg);
+    BuildQuickShadowFrameVisitor shadow_frame_builder(
+        sp, method->IsStatic(), shorty, shadow_frame, first_arg_reg);
     shadow_frame_builder.VisitArguments();
+    self->EndAssertNoThreadSuspension(old_cause);
+
+    // Potentially run <clinit> before pushing the shadow frame. We do not want
+    // to have the called method on the stack if there is an exception.
+    if (!EnsureInitialized(self, shadow_frame)) {
+      DCHECK(self->IsExceptionPending());
+      return 0;
+    }
+
     // Push a transition back into managed code onto the linked list in thread.
     self->PushManagedStackFragment(&fragment);
     self->PushShadowFrame(shadow_frame);
-    self->EndAssertNoThreadSuspension(old_cause);
-
-    if (NeedsClinitCheckBeforeCall(method)) {
-      ObjPtr<mirror::Class> declaring_class = method->GetDeclaringClass();
-      if (UNLIKELY(!declaring_class->IsVisiblyInitialized())) {
-        // Ensure static method's class is initialized.
-        StackHandleScope<1> hs(self);
-        Handle<mirror::Class> h_class(hs.NewHandle(declaring_class));
-        if (!Runtime::Current()->GetClassLinker()->EnsureInitialized(self, h_class, true, true)) {
-          DCHECK(Thread::Current()->IsExceptionPending()) << method->PrettyMethod();
-          self->PopManagedStackFragment(fragment);
-          return 0;
-        }
-      }
-    }
-
     result = interpreter::EnterInterpreterFromEntryPoint(self, accessor, shadow_frame);
-    force_frame_pop = shadow_frame->GetForcePopFrame();
   }
 
   // Pop transition.
   self->PopManagedStackFragment(fragment);
 
-  // Request a stack deoptimization if needed
-  ArtMethod* caller = QuickArgumentVisitor::GetCallingMethod(sp);
-  uintptr_t caller_pc = QuickArgumentVisitor::GetCallingPc(sp);
-  // If caller_pc is the instrumentation exit stub, the stub will check to see if deoptimization
-  // should be done and it knows the real return pc. NB If the upcall is null we don't need to do
-  // anything. This can happen during shutdown or early startup.
-  if (UNLIKELY(
-          caller != nullptr &&
-          caller_pc != reinterpret_cast<uintptr_t>(GetQuickInstrumentationExitPc()) &&
-          (self->IsForceInterpreter() || Dbg::IsForcedInterpreterNeededForUpcall(self, caller)))) {
-    if (!Runtime::Current()->IsAsyncDeoptimizeable(caller_pc)) {
-      LOG(WARNING) << "Got a deoptimization request on un-deoptimizable method "
-                   << caller->PrettyMethod();
-    } else {
-      VLOG(deopt) << "Forcing deoptimization on return from method " << method->PrettyMethod()
-                  << " to " << caller->PrettyMethod()
-                  << (force_frame_pop ? " for frame-pop" : "");
-      DCHECK(!force_frame_pop || result.GetJ() == 0) << "Force frame pop should have no result.";
-      if (force_frame_pop && self->GetException() != nullptr) {
-        LOG(WARNING) << "Suppressing exception for instruction-retry: "
-                     << self->GetException()->Dump();
-      }
-      // Push the context of the deoptimization stack so we can restore the return value and the
-      // exception before executing the deoptimized frames.
-      self->PushDeoptimizationContext(
-          result,
-          shorty[0] == 'L' || shorty[0] == '[',  /* class or array */
-          force_frame_pop ? nullptr : self->GetException(),
-          /* from_code= */ false,
-          DeoptimizationMethodType::kDefault);
+  // Check if caller needs to be deoptimized for instrumentation reasons.
+  instrumentation::Instrumentation* instr = Runtime::Current()->GetInstrumentation();
+  if (UNLIKELY(instr->ShouldDeoptimizeCaller(self, sp))) {
+    ArtMethod* caller = QuickArgumentVisitor::GetOuterMethod(sp);
+    uintptr_t caller_pc = QuickArgumentVisitor::GetCallingPc(sp);
+    DCHECK(Runtime::Current()->IsAsyncDeoptimizeable(caller, caller_pc));
+    DCHECK(caller != nullptr);
+    DCHECK(self->GetException() != Thread::GetDeoptimizationException());
+    // Push the context of the deoptimization stack so we can restore the return value and the
+    // exception before executing the deoptimized frames.
+    self->PushDeoptimizationContext(result,
+                                    shorty[0] == 'L' || shorty[0] == '[',  // class or array
+                                    self->GetException(),
+                                    /* from_code= */ false,
+                                    DeoptimizationMethodType::kDefault);
 
-      // Set special exception to cause deoptimization.
-      self->SetException(Thread::GetDeoptimizationException());
-    }
+    // Set special exception to cause deoptimization.
+    self->SetException(Thread::GetDeoptimizationException());
   }
 
   // No need to restore the args since the method has already been run by the interpreter.
-  return result.GetJ();
+  return NanBoxResultIfNeeded(result.GetJ(), shorty[0]);
 }
 
 // Visits arguments on the stack placing them into the args vector, Object* arguments are converted
 // to jobjects.
 class BuildQuickArgumentVisitor final : public QuickArgumentVisitor {
  public:
-  BuildQuickArgumentVisitor(ArtMethod** sp, bool is_static, const char* shorty, uint32_t shorty_len,
-                            ScopedObjectAccessUnchecked* soa, std::vector<jvalue>* args) :
-      QuickArgumentVisitor(sp, is_static, shorty, shorty_len), soa_(soa), args_(args) {}
+  BuildQuickArgumentVisitor(ArtMethod** sp,
+                            bool is_static,
+                            std::string_view shorty,
+                            ScopedObjectAccessUnchecked* soa,
+                            std::vector<jvalue>* args)
+      : QuickArgumentVisitor(sp, is_static, shorty), soa_(soa), args_(args) {}
 
   void Visit() REQUIRES_SHARED(Locks::mutator_lock_) override;
 
@@ -829,9 +919,9 @@ extern "C" uint64_t artQuickProxyInvokeHandler(
                                        << non_proxy_method->PrettyMethod();
   std::vector<jvalue> args;
   uint32_t shorty_len = 0;
-  const char* shorty = non_proxy_method->GetShorty(&shorty_len);
-  BuildQuickArgumentVisitor local_ref_visitor(
-      sp, /* is_static= */ false, shorty, shorty_len, &soa, &args);
+  const char* raw_shorty = non_proxy_method->GetShorty(&shorty_len);
+  std::string_view shorty(raw_shorty, shorty_len);
+  BuildQuickArgumentVisitor local_ref_visitor(sp, /* is_static= */ false, shorty, &soa, &args);
 
   local_ref_visitor.VisitArguments();
   DCHECK_GT(args.size(), 0U) << proxy_method->PrettyMethod();
@@ -845,7 +935,7 @@ extern "C" uint64_t artQuickProxyInvokeHandler(
   DCHECK_EQ(Runtime::Current()->GetClassLinker()->GetImagePointerSize(), kRuntimePointerSize);
   DCHECK(!Runtime::Current()->IsActiveTransaction());
   ObjPtr<mirror::Method> interface_reflect_method =
-      mirror::Method::CreateFromArtMethod<kRuntimePointerSize, false>(soa.Self(), interface_method);
+      mirror::Method::CreateFromArtMethod<kRuntimePointerSize>(soa.Self(), interface_method);
   if (interface_reflect_method == nullptr) {
     soa.Self()->AssertPendingOOMException();
     return 0;
@@ -856,51 +946,43 @@ extern "C" uint64_t artQuickProxyInvokeHandler(
   // that performs allocations or instrumentation events.
   instrumentation::Instrumentation* instr = Runtime::Current()->GetInstrumentation();
   if (instr->HasMethodEntryListeners()) {
-    instr->MethodEnterEvent(soa.Self(),
-                            soa.Decode<mirror::Object>(rcvr_jobj),
-                            proxy_method,
-                            0);
+    instr->MethodEnterEvent(soa.Self(), proxy_method);
     if (soa.Self()->IsExceptionPending()) {
       instr->MethodUnwindEvent(self,
-                               soa.Decode<mirror::Object>(rcvr_jobj),
                                proxy_method,
                                0);
       return 0;
     }
   }
-  JValue result = InvokeProxyInvocationHandler(soa, shorty, rcvr_jobj, interface_method_jobj, args);
+  JValue result =
+      InvokeProxyInvocationHandler(soa, raw_shorty, rcvr_jobj, interface_method_jobj, args);
   if (soa.Self()->IsExceptionPending()) {
     if (instr->HasMethodUnwindListeners()) {
       instr->MethodUnwindEvent(self,
-                               soa.Decode<mirror::Object>(rcvr_jobj),
                                proxy_method,
                                0);
     }
   } else if (instr->HasMethodExitListeners()) {
     instr->MethodExitEvent(self,
-                           soa.Decode<mirror::Object>(rcvr_jobj),
                            proxy_method,
-                           0,
                            {},
                            result);
   }
-  return result.GetJ();
+
+  return NanBoxResultIfNeeded(result.GetJ(), shorty[0]);
 }
 
 // Visitor returning a reference argument at a given position in a Quick stack frame.
 // NOTE: Only used for testing purposes.
 class GetQuickReferenceArgumentAtVisitor final : public QuickArgumentVisitor {
  public:
-  GetQuickReferenceArgumentAtVisitor(ArtMethod** sp,
-                                     const char* shorty,
-                                     uint32_t shorty_len,
-                                     size_t arg_pos)
-      : QuickArgumentVisitor(sp, /* is_static= */ false, shorty, shorty_len),
+  GetQuickReferenceArgumentAtVisitor(ArtMethod** sp, std::string_view shorty, size_t arg_pos)
+      : QuickArgumentVisitor(sp, /* is_static= */ false, shorty),
         cur_pos_(0u),
         arg_pos_(arg_pos),
         ref_arg_(nullptr) {
-          CHECK_LT(arg_pos, shorty_len) << "Argument position greater than the number arguments";
-        }
+    CHECK_LT(arg_pos, shorty.length()) << "Argument position greater than the number arguments";
+  }
 
   void Visit() REQUIRES_SHARED(Locks::mutator_lock_) override {
     if (cur_pos_ == arg_pos_) {
@@ -928,16 +1010,14 @@ class GetQuickReferenceArgumentAtVisitor final : public QuickArgumentVisitor {
 
 // Returning reference argument at position `arg_pos` in Quick stack frame at address `sp`.
 // NOTE: Only used for testing purposes.
-extern "C" StackReference<mirror::Object>* artQuickGetProxyReferenceArgumentAt(size_t arg_pos,
-                                                                               ArtMethod** sp)
-    REQUIRES_SHARED(Locks::mutator_lock_) {
+EXPORT extern "C" StackReference<mirror::Object>* artQuickGetProxyReferenceArgumentAt(
+    size_t arg_pos, ArtMethod** sp) REQUIRES_SHARED(Locks::mutator_lock_) {
   ArtMethod* proxy_method = *sp;
   ArtMethod* non_proxy_method = proxy_method->GetInterfaceMethodIfProxy(kRuntimePointerSize);
   CHECK(!non_proxy_method->IsStatic())
       << proxy_method->PrettyMethod() << " " << non_proxy_method->PrettyMethod();
-  uint32_t shorty_len = 0;
-  const char* shorty = non_proxy_method->GetShorty(&shorty_len);
-  GetQuickReferenceArgumentAtVisitor ref_arg_visitor(sp, shorty, shorty_len, arg_pos);
+  std::string_view shorty = non_proxy_method->GetShortyView();
+  GetQuickReferenceArgumentAtVisitor ref_arg_visitor(sp, shorty, arg_pos);
   ref_arg_visitor.VisitArguments();
   StackReference<mirror::Object>* ref_arg = ref_arg_visitor.GetReferenceArgument();
   return ref_arg;
@@ -946,11 +1026,8 @@ extern "C" StackReference<mirror::Object>* artQuickGetProxyReferenceArgumentAt(s
 // Visitor returning all the reference arguments in a Quick stack frame.
 class GetQuickReferenceArgumentsVisitor final : public QuickArgumentVisitor {
  public:
-  GetQuickReferenceArgumentsVisitor(ArtMethod** sp,
-                                    bool is_static,
-                                    const char* shorty,
-                                    uint32_t shorty_len)
-      : QuickArgumentVisitor(sp, is_static, shorty, shorty_len) {}
+  GetQuickReferenceArgumentsVisitor(ArtMethod** sp, bool is_static, std::string_view shorty)
+      : QuickArgumentVisitor(sp, is_static, shorty) {}
 
   void Visit() REQUIRES_SHARED(Locks::mutator_lock_) override {
     Primitive::Type type = GetParamPrimitiveType();
@@ -979,9 +1056,8 @@ std::vector<StackReference<mirror::Object>*> GetProxyReferenceArguments(ArtMetho
   ArtMethod* non_proxy_method = proxy_method->GetInterfaceMethodIfProxy(kRuntimePointerSize);
   CHECK(!non_proxy_method->IsStatic())
       << proxy_method->PrettyMethod() << " " << non_proxy_method->PrettyMethod();
-  uint32_t shorty_len = 0;
-  const char* shorty = non_proxy_method->GetShorty(&shorty_len);
-  GetQuickReferenceArgumentsVisitor ref_args_visitor(sp, /*is_static=*/ false, shorty, shorty_len);
+  std::string_view shorty = non_proxy_method->GetShortyView();
+  GetQuickReferenceArgumentsVisitor ref_args_visitor(sp, /*is_static=*/ false, shorty);
   ref_args_visitor.VisitArguments();
   std::vector<StackReference<mirror::Object>*> ref_args = ref_args_visitor.GetReferenceArguments();
   return ref_args;
@@ -991,9 +1067,11 @@ std::vector<StackReference<mirror::Object>*> GetProxyReferenceArguments(ArtMetho
 // so they don't get garbage collected.
 class RememberForGcArgumentVisitor final : public QuickArgumentVisitor {
  public:
-  RememberForGcArgumentVisitor(ArtMethod** sp, bool is_static, const char* shorty,
-                               uint32_t shorty_len, ScopedObjectAccessUnchecked* soa) :
-      QuickArgumentVisitor(sp, is_static, shorty, shorty_len), soa_(soa) {}
+  RememberForGcArgumentVisitor(ArtMethod** sp,
+                               bool is_static,
+                               std::string_view shorty,
+                               ScopedObjectAccessUnchecked* soa)
+      : QuickArgumentVisitor(sp, is_static, shorty), soa_(soa) {}
 
   void Visit() REQUIRES_SHARED(Locks::mutator_lock_) override;
 
@@ -1025,100 +1103,10 @@ void RememberForGcArgumentVisitor::FixupReferences() {
   }
 }
 
-extern "C" const void* artInstrumentationMethodEntryFromCode(ArtMethod* method,
-                                                             mirror::Object* this_object,
-                                                             Thread* self,
-                                                             ArtMethod** sp)
-    REQUIRES_SHARED(Locks::mutator_lock_) {
-  const void* result;
-  // Instrumentation changes the stack. Thus, when exiting, the stack cannot be verified, so skip
-  // that part.
-  ScopedQuickEntrypointChecks sqec(self, kIsDebugBuild, false);
-  instrumentation::Instrumentation* instrumentation = Runtime::Current()->GetInstrumentation();
-  DCHECK(!method->IsProxyMethod())
-      << "Proxy method " << method->PrettyMethod()
-      << " (declaring class: " << method->GetDeclaringClass()->PrettyClass() << ")"
-      << " should not hit instrumentation entrypoint.";
-  if (instrumentation->IsDeoptimized(method)) {
-    result = GetQuickToInterpreterBridge();
-  } else {
-    // This will get the entry point either from the oat file, the JIT or the appropriate bridge
-    // method if none of those can be found.
-    result = instrumentation->GetCodeForInvoke(method);
-    jit::Jit* jit = Runtime::Current()->GetJit();
-    DCHECK_NE(result, GetQuickInstrumentationEntryPoint()) << method->PrettyMethod();
-    DCHECK(jit == nullptr ||
-           // Native methods come through here in Interpreter entrypoints. We might not have
-           // disabled jit-gc but that is fine since we won't return jit-code for native methods.
-           method->IsNative() ||
-           !jit->GetCodeCache()->GetGarbageCollectCode());
-    DCHECK(!method->IsNative() ||
-           jit == nullptr ||
-           !jit->GetCodeCache()->ContainsPc(result))
-        << method->PrettyMethod() << " code will jump to possibly cleaned up jit code!";
-  }
-
-  bool interpreter_entry = (result == GetQuickToInterpreterBridge());
-  bool is_static = method->IsStatic();
-  uint32_t shorty_len;
-  const char* shorty =
-      method->GetInterfaceMethodIfProxy(kRuntimePointerSize)->GetShorty(&shorty_len);
-
-  ScopedObjectAccessUnchecked soa(self);
-  RememberForGcArgumentVisitor visitor(sp, is_static, shorty, shorty_len, &soa);
-  visitor.VisitArguments();
-
-  instrumentation->PushInstrumentationStackFrame(self,
-                                                 is_static ? nullptr : this_object,
-                                                 method,
-                                                 reinterpret_cast<uintptr_t>(
-                                                     QuickArgumentVisitor::GetCallingPcAddr(sp)),
-                                                 QuickArgumentVisitor::GetCallingPc(sp),
-                                                 interpreter_entry);
-
-  visitor.FixupReferences();
-  if (UNLIKELY(self->IsExceptionPending())) {
-    return nullptr;
-  }
-  CHECK(result != nullptr) << method->PrettyMethod();
-  return result;
-}
-
-extern "C" TwoWordReturn artInstrumentationMethodExitFromCode(Thread* self,
-                                                              ArtMethod** sp,
-                                                              uint64_t* gpr_result,
-                                                              uint64_t* fpr_result)
-    REQUIRES_SHARED(Locks::mutator_lock_) {
-  DCHECK_EQ(reinterpret_cast<uintptr_t>(self), reinterpret_cast<uintptr_t>(Thread::Current()));
-  CHECK(gpr_result != nullptr);
-  CHECK(fpr_result != nullptr);
-  // Instrumentation exit stub must not be entered with a pending exception.
-  CHECK(!self->IsExceptionPending()) << "Enter instrumentation exit stub with pending exception "
-                                     << self->GetException()->Dump();
-  // Compute address of return PC and sanity check that it currently holds 0.
-  constexpr size_t return_pc_offset =
-      RuntimeCalleeSaveFrame::GetReturnPcOffset(CalleeSaveType::kSaveEverything);
-  uintptr_t* return_pc_addr = reinterpret_cast<uintptr_t*>(reinterpret_cast<uint8_t*>(sp) +
-                                                           return_pc_offset);
-  CHECK_EQ(*return_pc_addr, 0U);
-
-  // Pop the frame filling in the return pc. The low half of the return value is 0 when
-  // deoptimization shouldn't be performed with the high-half having the return address. When
-  // deoptimization should be performed the low half is zero and the high-half the address of the
-  // deoptimization entry point.
-  instrumentation::Instrumentation* instrumentation = Runtime::Current()->GetInstrumentation();
-  TwoWordReturn return_or_deoptimize_pc = instrumentation->PopInstrumentationStackFrame(
-      self, return_pc_addr, gpr_result, fpr_result);
-  if (self->IsExceptionPending() || self->ObserveAsyncException()) {
-    return GetTwoWordFailureValue();
-  }
-  return return_or_deoptimize_pc;
-}
-
 static std::string DumpInstruction(ArtMethod* method, uint32_t dex_pc)
     REQUIRES_SHARED(Locks::mutator_lock_) {
   if (dex_pc == static_cast<uint32_t>(-1)) {
-    CHECK(method == jni::DecodeArtMethod(WellKnownClasses::java_lang_String_charAt));
+    CHECK(method == WellKnownClasses::java_lang_String_charAt);
     return "<native>";
   } else {
     CodeItemInstructionAccessor accessor = method->DexInstructions();
@@ -1157,12 +1145,6 @@ static void DumpB74410240DebugData(ArtMethod** sp) REQUIRES_SHARED(Locks::mutato
       (reinterpret_cast<uint8_t*>(sp) + callee_return_pc_offset));
   ArtMethod* outer_method = *caller_sp;
 
-  if (UNLIKELY(caller_pc == reinterpret_cast<uintptr_t>(GetQuickInstrumentationExitPc()))) {
-    LOG(FATAL_WITHOUT_ABORT) << "Method: " << outer_method->PrettyMethod()
-        << " native pc: " << caller_pc << " Instrumented!";
-    return;
-  }
-
   const OatQuickMethodHeader* current_code = outer_method->GetOatQuickMethodHeader(caller_pc);
   CHECK(current_code != nullptr);
   CHECK(current_code->IsOptimized());
@@ -1196,7 +1178,7 @@ static void DumpB74410240DebugData(ArtMethod** sp) REQUIRES_SHARED(Locks::mutato
       if (dex_pc == static_cast<uint32_t>(-1)) {
         tag = "special ";
         CHECK(inline_info.Equals(inline_infos.back()));
-        caller = jni::DecodeArtMethod(WellKnownClasses::java_lang_String_charAt);
+        caller = WellKnownClasses::java_lang_String_charAt;
         CHECK_EQ(caller->GetDexMethodIndex(), method_index);
       } else {
         ObjPtr<mirror::DexCache> dex_cache = caller->GetDexCache();
@@ -1237,11 +1219,11 @@ extern "C" const void* artQuickResolutionTrampoline(
   const bool called_method_known_on_entry = !called->IsRuntimeMethod();
   ArtMethod* caller = nullptr;
   if (!called_method_known_on_entry) {
-    caller = QuickArgumentVisitor::GetCallingMethod(sp);
+    uint32_t dex_pc;
+    caller = QuickArgumentVisitor::GetCallingMethodAndDexPc(sp, &dex_pc);
     called_method.dex_file = caller->GetDexFile();
 
     {
-      uint32_t dex_pc = QuickArgumentVisitor::GetCallingDexPc(sp);
       CodeItemInstructionAccessor accessor(caller->DexInstructions());
       CHECK_LT(dex_pc, accessor.InsnsSizeInCodeUnits());
       const Instruction& instr = accessor.InstructionAt(dex_pc);
@@ -1302,44 +1284,20 @@ extern "C" const void* artQuickResolutionTrampoline(
     called_method.dex_file = called->GetDexFile();
     called_method.index = called->GetDexMethodIndex();
   }
-  uint32_t shorty_len;
-  const char* shorty =
-      called_method.dex_file->GetMethodShorty(called_method.GetMethodId(), &shorty_len);
-  RememberForGcArgumentVisitor visitor(sp, invoke_type == kStatic, shorty, shorty_len, &soa);
+  std::string_view shorty =
+      called_method.dex_file->GetMethodShortyView(called_method.GetMethodId());
+  RememberForGcArgumentVisitor visitor(sp, invoke_type == kStatic, shorty, &soa);
   visitor.VisitArguments();
   self->EndAssertNoThreadSuspension(old_cause);
   const bool virtual_or_interface = invoke_type == kVirtual || invoke_type == kInterface;
   // Resolve method filling in dex cache.
   if (!called_method_known_on_entry) {
     StackHandleScope<1> hs(self);
-    mirror::Object* dummy = nullptr;
+    mirror::Object* fake_receiver = nullptr;
     HandleWrapper<mirror::Object> h_receiver(
-        hs.NewHandleWrapper(virtual_or_interface ? &receiver : &dummy));
+        hs.NewHandleWrapper(virtual_or_interface ? &receiver : &fake_receiver));
     DCHECK_EQ(caller->GetDexFile(), called_method.dex_file);
-    called = linker->ResolveMethod<ClassLinker::ResolveMode::kCheckICCEAndIAE>(
-        self, called_method.index, caller, invoke_type);
-
-    // Update .bss entry in oat file if any.
-    if (called != nullptr && called_method.dex_file->GetOatDexFile() != nullptr) {
-      size_t bss_offset = IndexBssMappingLookup::GetBssOffset(
-          called_method.dex_file->GetOatDexFile()->GetMethodBssMapping(),
-          called_method.index,
-          called_method.dex_file->NumMethodIds(),
-          static_cast<size_t>(kRuntimePointerSize));
-      if (bss_offset != IndexBssMappingLookup::npos) {
-        DCHECK_ALIGNED(bss_offset, static_cast<size_t>(kRuntimePointerSize));
-        const OatFile* oat_file = called_method.dex_file->GetOatDexFile()->GetOatFile();
-        ArtMethod** method_entry = reinterpret_cast<ArtMethod**>(const_cast<uint8_t*>(
-            oat_file->BssBegin() + bss_offset));
-        DCHECK_GE(method_entry, oat_file->GetBssMethods().data());
-        DCHECK_LT(method_entry,
-                  oat_file->GetBssMethods().data() + oat_file->GetBssMethods().size());
-        std::atomic<ArtMethod*>* atomic_entry =
-            reinterpret_cast<std::atomic<ArtMethod*>*>(method_entry);
-        static_assert(sizeof(*method_entry) == sizeof(*atomic_entry), "Size check.");
-        atomic_entry->store(called, std::memory_order_release);
-      }
-    }
+    called = linker->ResolveMethodWithChecks(called_method.index, caller, invoke_type);
   }
   const void* code = nullptr;
   if (LIKELY(!self->IsExceptionPending())) {
@@ -1373,36 +1331,49 @@ extern "C" const void* artQuickResolutionTrampoline(
                                << mirror::Object::PrettyTypeOf(receiver) << " "
                                << invoke_type << " " << orig_called->GetVtableIndex();
     }
-
-    ObjPtr<mirror::Class> called_class = called->GetDeclaringClass();
-    if (NeedsClinitCheckBeforeCall(called) && !called_class->IsVisiblyInitialized()) {
-      // Ensure that the called method's class is initialized.
-      StackHandleScope<1> hs(soa.Self());
-      HandleWrapperObjPtr<mirror::Class> h_called_class(hs.NewHandleWrapper(&called_class));
-      linker->EnsureInitialized(soa.Self(), h_called_class, true, true);
-    }
-    bool force_interpreter = self->IsForceInterpreter() && !called->IsNative();
-    if (called_class->IsInitialized() || called_class->IsInitializing()) {
-      if (UNLIKELY(force_interpreter)) {
-        // If we are single-stepping or the called method is deoptimized (by a
-        // breakpoint, for example), then we have to execute the called method
-        // with the interpreter.
-        code = GetQuickToInterpreterBridge();
-      } else {
-        code = called->GetEntryPointFromQuickCompiledCode();
-        if (linker->IsQuickResolutionStub(code)) {
-          DCHECK_EQ(invoke_type, kStatic);
-          // Go to JIT or oat and grab code.
-          code = linker->GetQuickOatCodeFor(called);
-          if (called_class->IsInitialized()) {
-            // Only update the entrypoint once the class is initialized. Other
-            // threads still need to go through the resolution stub.
-            Runtime::Current()->GetInstrumentation()->UpdateMethodsCode(called, code);
-          }
+    // Now that we know the actual target, update .bss entry in oat file, if
+    // any.
+    if (!called_method_known_on_entry) {
+      // We only put non copied methods in the BSS. Putting a copy can lead to an
+      // odd situation where the ArtMethod being executed is unrelated to the
+      // receiver of the method.
+      called = called->GetCanonicalMethod();
+      if (invoke_type == kSuper || invoke_type == kInterface || invoke_type == kVirtual) {
+        if (called->GetDexFile() == called_method.dex_file) {
+          called_method.index = called->GetDexMethodIndex();
+        } else {
+          called_method.index = called->FindDexMethodIndexInOtherDexFile(
+              *called_method.dex_file, called_method.index);
+          DCHECK_NE(called_method.index, dex::kDexNoIndex);
         }
       }
+      ArtMethod* outer_method = QuickArgumentVisitor::GetOuterMethod(sp);
+      MaybeUpdateBssMethodEntry(called, called_method, outer_method);
+    }
+
+    // Static invokes need class initialization check but instance invokes can proceed even if
+    // the class is erroneous, i.e. in the edge case of escaping instances of erroneous classes.
+    bool success = true;
+    if (called->StillNeedsClinitCheck()) {
+      // Ensure that the called method's class is initialized.
+      StackHandleScope<1> hs(soa.Self());
+      Handle<mirror::Class> h_called_class = hs.NewHandle(called->GetDeclaringClass());
+      success = linker->EnsureInitialized(soa.Self(), h_called_class, true, true);
+    }
+    if (success) {
+      // When the clinit check is at entry of the AOT/nterp code, we do the clinit check
+      // before doing the suspend check. To ensure the code sees the latest
+      // version of the class (the code doesn't do a read barrier to reduce
+      // size), do a suspend check now.
+      self->CheckSuspend();
+      instrumentation::Instrumentation* instrumentation = Runtime::Current()->GetInstrumentation();
+      // Check if we need instrumented code here. Since resolution stubs could suspend, it is
+      // possible that we instrumented the entry points after we started executing the resolution
+      // stub.
+      code = instrumentation->GetMaybeInstrumentedCodeForInvoke(called);
     } else {
-      DCHECK(called_class->IsErroneous());
+      DCHECK(called->GetDeclaringClass()->IsErroneous());
+      DCHECK(self->IsExceptionPending());
     }
   }
   CHECK_EQ(code == nullptr, self->IsExceptionPending());
@@ -1447,62 +1418,67 @@ extern "C" const void* artQuickResolutionTrampoline(
  *                            necessary.
  *
  * void PushStack(uintptr_t): Push a value to the stack.
- *
- * uintptr_t PushHandleScope(mirror::Object* ref): Add a reference to the HandleScope. This _will_ have nullptr,
- *                                          as this might be important for null initialization.
- *                                          Must return the jobject, that is, the reference to the
- *                                          entry in the HandleScope (nullptr if necessary).
- *
  */
 template<class T> class BuildNativeCallFrameStateMachine {
  public:
+  static constexpr bool kNaNBoxing = QuickArgumentVisitor::NaNBoxing();
 #if defined(__arm__)
-  // TODO: These are all dummy values!
   static constexpr bool kNativeSoftFloatAbi = true;
+  static constexpr bool kNativeSoftFloatAfterHardFloat = false;
   static constexpr size_t kNumNativeGprArgs = 4;  // 4 arguments passed in GPRs, r0-r3
   static constexpr size_t kNumNativeFprArgs = 0;  // 0 arguments passed in FPRs.
 
   static constexpr size_t kRegistersNeededForLong = 2;
   static constexpr size_t kRegistersNeededForDouble = 2;
   static constexpr bool kMultiRegistersAligned = true;
-  static constexpr bool kMultiFPRegistersWidened = false;
   static constexpr bool kMultiGPRegistersWidened = false;
   static constexpr bool kAlignLongOnStack = true;
   static constexpr bool kAlignDoubleOnStack = true;
 #elif defined(__aarch64__)
   static constexpr bool kNativeSoftFloatAbi = false;  // This is a hard float ABI.
+  static constexpr bool kNativeSoftFloatAfterHardFloat = false;
   static constexpr size_t kNumNativeGprArgs = 8;  // 8 arguments passed in GPRs.
   static constexpr size_t kNumNativeFprArgs = 8;  // 8 arguments passed in FPRs.
 
   static constexpr size_t kRegistersNeededForLong = 1;
   static constexpr size_t kRegistersNeededForDouble = 1;
   static constexpr bool kMultiRegistersAligned = false;
-  static constexpr bool kMultiFPRegistersWidened = false;
   static constexpr bool kMultiGPRegistersWidened = false;
   static constexpr bool kAlignLongOnStack = false;
   static constexpr bool kAlignDoubleOnStack = false;
+#elif defined(__riscv)
+  static constexpr bool kNativeSoftFloatAbi = false;
+  static constexpr bool kNativeSoftFloatAfterHardFloat = true;
+  static constexpr size_t kNumNativeGprArgs = 8;
+  static constexpr size_t kNumNativeFprArgs = 8;
+
+  static constexpr size_t kRegistersNeededForLong = 1;
+  static constexpr size_t kRegistersNeededForDouble = 1;
+  static constexpr bool kMultiRegistersAligned = false;
+  static constexpr bool kMultiGPRegistersWidened = true;
+  static constexpr bool kAlignLongOnStack = false;
+  static constexpr bool kAlignDoubleOnStack = false;
 #elif defined(__i386__)
-  // TODO: Check these!
   static constexpr bool kNativeSoftFloatAbi = false;  // Not using int registers for fp
+  static constexpr bool kNativeSoftFloatAfterHardFloat = false;
   static constexpr size_t kNumNativeGprArgs = 0;  // 0 arguments passed in GPRs.
   static constexpr size_t kNumNativeFprArgs = 0;  // 0 arguments passed in FPRs.
 
   static constexpr size_t kRegistersNeededForLong = 2;
   static constexpr size_t kRegistersNeededForDouble = 2;
   static constexpr bool kMultiRegistersAligned = false;  // x86 not using regs, anyways
-  static constexpr bool kMultiFPRegistersWidened = false;
   static constexpr bool kMultiGPRegistersWidened = false;
   static constexpr bool kAlignLongOnStack = false;
   static constexpr bool kAlignDoubleOnStack = false;
 #elif defined(__x86_64__)
   static constexpr bool kNativeSoftFloatAbi = false;  // This is a hard float ABI.
+  static constexpr bool kNativeSoftFloatAfterHardFloat = false;
   static constexpr size_t kNumNativeGprArgs = 6;  // 6 arguments passed in GPRs.
   static constexpr size_t kNumNativeFprArgs = 8;  // 8 arguments passed in FPRs.
 
   static constexpr size_t kRegistersNeededForLong = 1;
   static constexpr size_t kRegistersNeededForDouble = 1;
   static constexpr bool kMultiRegistersAligned = false;
-  static constexpr bool kMultiFPRegistersWidened = false;
   static constexpr bool kMultiGPRegistersWidened = false;
   static constexpr bool kAlignLongOnStack = false;
   static constexpr bool kAlignDoubleOnStack = false;
@@ -1535,22 +1511,6 @@ template<class T> class BuildNativeCallFrameStateMachine {
     } else {
       stack_entries_++;  // TODO: have a field for pointer length as multiple of 32b
       PushStack(reinterpret_cast<uintptr_t>(val));
-      gpr_index_ = 0;
-    }
-  }
-
-  bool HaveHandleScopeGpr() const {
-    return gpr_index_ > 0;
-  }
-
-  void AdvanceHandleScope(mirror::Object* ptr) REQUIRES_SHARED(Locks::mutator_lock_) {
-    uintptr_t handle = PushHandle(ptr);
-    if (HaveHandleScopeGpr()) {
-      gpr_index_--;
-      PushGpr(handle);
-    } else {
-      stack_entries_++;
-      PushStack(handle);
       gpr_index_ = 0;
     }
   }
@@ -1630,34 +1590,30 @@ template<class T> class BuildNativeCallFrameStateMachine {
     return fpr_index_ > 0;
   }
 
-  void AdvanceFloat(float val) {
+  void AdvanceFloat(uint32_t val) {
     if (kNativeSoftFloatAbi) {
-      AdvanceInt(bit_cast<uint32_t, float>(val));
-    } else {
-      if (HaveFloatFpr()) {
-        fpr_index_--;
-        if (kRegistersNeededForDouble == 1) {
-          if (kMultiFPRegistersWidened) {
-            PushFpr8(bit_cast<uint64_t, double>(val));
-          } else {
-            // No widening, just use the bits.
-            PushFpr8(static_cast<uint64_t>(bit_cast<uint32_t, float>(val)));
-          }
+      AdvanceInt(val);
+    } else if (HaveFloatFpr()) {
+      fpr_index_--;
+      if (kRegistersNeededForDouble == 1) {
+        if (kNaNBoxing) {
+          // NaN boxing: no widening, just use the bits, but reset upper bits to 1s.
+          // See e.g. RISC-V manual, D extension, section "NaN Boxing of Narrower Values".
+          PushFpr8(UINT64_C(0xFFFFFFFF00000000) | static_cast<uint64_t>(val));
         } else {
-          PushFpr4(val);
+          // No widening, just use the bits.
+          PushFpr8(static_cast<uint64_t>(val));
         }
       } else {
-        stack_entries_++;
-        if (kRegistersNeededForDouble == 1 && kMultiFPRegistersWidened) {
-          // Need to widen before storing: Note the "double" in the template instantiation.
-          // Note: We need to jump through those hoops to make the compiler happy.
-          DCHECK_EQ(sizeof(uintptr_t), sizeof(uint64_t));
-          PushStack(static_cast<uintptr_t>(bit_cast<uint64_t, double>(val)));
-        } else {
-          PushStack(static_cast<uintptr_t>(bit_cast<uint32_t, float>(val)));
-        }
-        fpr_index_ = 0;
+        PushFpr4(val);
       }
+    } else if (kNativeSoftFloatAfterHardFloat) {
+      // After using FP arg registers, pass FP args in general purpose registers or on the stack.
+      AdvanceInt(val);
+    } else {
+      stack_entries_++;
+      PushStack(static_cast<uintptr_t>(val));
+      fpr_index_ = 0;
     }
   }
 
@@ -1680,29 +1636,30 @@ template<class T> class BuildNativeCallFrameStateMachine {
   void AdvanceDouble(uint64_t val) {
     if (kNativeSoftFloatAbi) {
       AdvanceLong(val);
-    } else {
-      if (HaveDoubleFpr()) {
-        if (DoubleFprNeedsPadding()) {
-          PushFpr4(0);
-          fpr_index_--;
-        }
-        PushFpr8(val);
-        fpr_index_ -= kRegistersNeededForDouble;
-      } else {
-        if (DoubleStackNeedsPadding()) {
-          PushStack(0);
-          stack_entries_++;
-        }
-        if (kRegistersNeededForDouble == 1) {
-          PushStack(static_cast<uintptr_t>(val));
-          stack_entries_++;
-        } else {
-          PushStack(static_cast<uintptr_t>(val & 0xFFFFFFFF));
-          PushStack(static_cast<uintptr_t>((val >> 32) & 0xFFFFFFFF));
-          stack_entries_ += 2;
-        }
-        fpr_index_ = 0;
+    } else if (HaveDoubleFpr()) {
+      if (DoubleFprNeedsPadding()) {
+        PushFpr4(0);
+        fpr_index_--;
       }
+      PushFpr8(val);
+      fpr_index_ -= kRegistersNeededForDouble;
+    } else if (kNativeSoftFloatAfterHardFloat) {
+      // After using FP arg registers, pass FP args in general purpose registers or on the stack.
+      AdvanceLong(val);
+    } else {
+      if (DoubleStackNeedsPadding()) {
+        PushStack(0);
+        stack_entries_++;
+      }
+      if (kRegistersNeededForDouble == 1) {
+        PushStack(static_cast<uintptr_t>(val));
+        stack_entries_++;
+      } else {
+        PushStack(static_cast<uintptr_t>(val & 0xFFFFFFFF));
+        PushStack(static_cast<uintptr_t>((val >> 32) & 0xFFFFFFFF));
+        stack_entries_ += 2;
+      }
+      fpr_index_ = 0;
     }
   }
 
@@ -1730,9 +1687,6 @@ template<class T> class BuildNativeCallFrameStateMachine {
   }
   void PushStack(uintptr_t val) {
     delegate_->PushStack(val);
-  }
-  uintptr_t PushHandle(mirror::Object* ref) REQUIRES_SHARED(Locks::mutator_lock_) {
-    return delegate_->PushHandle(ref);
   }
 
   uint32_t gpr_index_;      // Number of free GPRs
@@ -1765,24 +1719,20 @@ class ComputeNativeCallFrameSize {
   }
 
   virtual void WalkHeader(
-      BuildNativeCallFrameStateMachine<ComputeNativeCallFrameSize>* sm ATTRIBUTE_UNUSED)
-      REQUIRES_SHARED(Locks::mutator_lock_) {
-  }
+      [[maybe_unused]] BuildNativeCallFrameStateMachine<ComputeNativeCallFrameSize>* sm)
+      REQUIRES_SHARED(Locks::mutator_lock_) {}
 
-  void Walk(const char* shorty, uint32_t shorty_len) REQUIRES_SHARED(Locks::mutator_lock_) {
+  void Walk(std::string_view shorty) REQUIRES_SHARED(Locks::mutator_lock_) {
     BuildNativeCallFrameStateMachine<ComputeNativeCallFrameSize> sm(this);
 
     WalkHeader(&sm);
 
-    for (uint32_t i = 1; i < shorty_len; ++i) {
-      Primitive::Type cur_type_ = Primitive::GetType(shorty[i]);
+    for (char c : shorty.substr(1u)) {
+      Primitive::Type cur_type_ = Primitive::GetType(c);
       switch (cur_type_) {
         case Primitive::kPrimNot:
-          // TODO: fix abuse of mirror types.
-          sm.AdvanceHandleScope(
-              reinterpret_cast<mirror::Object*>(0x12345678));
+          sm.AdvancePointer(nullptr);
           break;
-
         case Primitive::kPrimBoolean:
         case Primitive::kPrimByte:
         case Primitive::kPrimChar:
@@ -1824,10 +1774,6 @@ class ComputeNativeCallFrameSize {
     // counting is already done in the superclass
   }
 
-  virtual uintptr_t PushHandle(mirror::Object* /* ptr */) {
-    return reinterpret_cast<uintptr_t>(nullptr);
-  }
-
  protected:
   uint32_t num_stack_entries_;
 };
@@ -1835,26 +1781,18 @@ class ComputeNativeCallFrameSize {
 class ComputeGenericJniFrameSize final : public ComputeNativeCallFrameSize {
  public:
   explicit ComputeGenericJniFrameSize(bool critical_native)
-    : num_handle_scope_references_(0), critical_native_(critical_native) {}
+    : critical_native_(critical_native) {}
 
-  uintptr_t* ComputeLayout(Thread* self,
-                           ArtMethod** managed_sp,
-                           const char* shorty,
-                           uint32_t shorty_len,
-                           HandleScope** handle_scope) REQUIRES_SHARED(Locks::mutator_lock_) {
+  uintptr_t* ComputeLayout(ArtMethod** managed_sp, std::string_view shorty)
+      REQUIRES_SHARED(Locks::mutator_lock_) {
     DCHECK_EQ(Runtime::Current()->GetClassLinker()->GetImagePointerSize(), kRuntimePointerSize);
 
-    Walk(shorty, shorty_len);
+    Walk(shorty);
 
-    // Add space for cookie and HandleScope.
-    void* storage = GetGenericJniHandleScope(managed_sp, num_handle_scope_references_);
-    DCHECK_ALIGNED(storage, sizeof(uintptr_t));
-    *handle_scope =
-        HandleScope::Create(storage, self->GetTopHandleScope(), num_handle_scope_references_);
-    DCHECK_EQ(*handle_scope, storage);
-    uint8_t* sp8 = reinterpret_cast<uint8_t*>(*handle_scope);
-    DCHECK_GE(static_cast<size_t>(reinterpret_cast<uint8_t*>(managed_sp) - sp8),
-              HandleScope::SizeOf(num_handle_scope_references_) + kJniCookieSize);
+    // Add space for cookie.
+    DCHECK_ALIGNED(managed_sp, sizeof(uintptr_t));
+    static_assert(sizeof(uintptr_t) >= sizeof(jni::LRTSegmentState));
+    uint8_t* sp8 = reinterpret_cast<uint8_t*>(managed_sp) - sizeof(uintptr_t);
 
     // Layout stack arguments.
     sp8 = LayoutStackArgs(sp8);
@@ -1886,21 +1824,13 @@ class ComputeGenericJniFrameSize final : public ComputeNativeCallFrameSize {
     return GetHiddenArgSlot(reserved_area) + 1;
   }
 
-  uintptr_t PushHandle(mirror::Object* /* ptr */) override;
-
   // Add JNIEnv* and jobj/jclass before the shorty-derived elements.
   void WalkHeader(BuildNativeCallFrameStateMachine<ComputeNativeCallFrameSize>* sm) override
       REQUIRES_SHARED(Locks::mutator_lock_);
 
  private:
-  uint32_t num_handle_scope_references_;
   const bool critical_native_;
 };
-
-uintptr_t ComputeGenericJniFrameSize::PushHandle(mirror::Object* /* ptr */) {
-  num_handle_scope_references_++;
-  return reinterpret_cast<uintptr_t>(nullptr);
-}
 
 void ComputeGenericJniFrameSize::WalkHeader(
     BuildNativeCallFrameStateMachine<ComputeNativeCallFrameSize>* sm) {
@@ -1913,7 +1843,7 @@ void ComputeGenericJniFrameSize::WalkHeader(
   sm->AdvancePointer(nullptr);
 
   // Class object or this as first argument
-  sm->AdvanceHandleScope(reinterpret_cast<mirror::Object*>(0x12345678));
+  sm->AdvancePointer(nullptr);
 }
 
 // Class to push values to three separate regions. Used to fill the native call part. Adheres to
@@ -1952,11 +1882,6 @@ class FillNativeCall {
     cur_stack_arg_++;
   }
 
-  virtual uintptr_t PushHandle(mirror::Object*) REQUIRES_SHARED(Locks::mutator_lock_) {
-    LOG(FATAL) << "(Non-JNI) Native call does not use handles.";
-    UNREACHABLE();
-  }
-
  private:
   uintptr_t* cur_gpr_reg_;
   uint32_t* cur_fpr_reg_;
@@ -1970,19 +1895,18 @@ class BuildGenericJniFrameVisitor final : public QuickArgumentVisitor {
   BuildGenericJniFrameVisitor(Thread* self,
                               bool is_static,
                               bool critical_native,
-                              const char* shorty,
-                              uint32_t shorty_len,
+                              std::string_view shorty,
                               ArtMethod** managed_sp,
                               uintptr_t* reserved_area)
-     : QuickArgumentVisitor(managed_sp, is_static, shorty, shorty_len),
-       jni_call_(nullptr, nullptr, nullptr, nullptr, critical_native),
-       sm_(&jni_call_) {
+      : QuickArgumentVisitor(managed_sp, is_static, shorty),
+        jni_call_(nullptr, nullptr, nullptr),
+        sm_(&jni_call_),
+        current_vreg_(nullptr) {
     DCHECK_ALIGNED(managed_sp, kStackAlignment);
     DCHECK_ALIGNED(reserved_area, sizeof(uintptr_t));
 
     ComputeGenericJniFrameSize fsc(critical_native);
-    uintptr_t* out_args_sp =
-        fsc.ComputeLayout(self, managed_sp, shorty, shorty_len, &handle_scope_);
+    uintptr_t* out_args_sp = fsc.ComputeLayout(managed_sp, shorty);
 
     // Store hidden argument for @CriticalNative.
     uintptr_t* hidden_arg_slot = fsc.GetHiddenArgSlot(reserved_area);
@@ -1995,10 +1919,15 @@ class BuildGenericJniFrameVisitor final : public QuickArgumentVisitor {
     uintptr_t* out_args_sp_slot = fsc.GetOutArgsSpSlot(reserved_area);
     *out_args_sp_slot = reinterpret_cast<uintptr_t>(out_args_sp);
 
+    // Prepare vreg pointer for spilling references.
+    static constexpr size_t frame_size =
+        RuntimeCalleeSaveFrame::GetFrameSize(CalleeSaveType::kSaveRefsAndArgs);
+    current_vreg_ = reinterpret_cast<uint32_t*>(
+        reinterpret_cast<uint8_t*>(managed_sp) + frame_size + sizeof(ArtMethod*));
+
     jni_call_.Reset(fsc.GetStartGprRegs(reserved_area),
                     fsc.GetStartFprRegs(reserved_area),
-                    out_args_sp,
-                    handle_scope_);
+                    out_args_sp);
 
     // First 2 parameters are always excluded for CriticalNative methods.
     if (LIKELY(!critical_native)) {
@@ -2006,81 +1935,30 @@ class BuildGenericJniFrameVisitor final : public QuickArgumentVisitor {
       sm_.AdvancePointer(self->GetJniEnv());
 
       if (is_static) {
-        sm_.AdvanceHandleScope(method->GetDeclaringClass().Ptr());
+        // The `jclass` is a pointer to the method's declaring class.
+        // The declaring class must be marked.
+        auto* declaring_class = reinterpret_cast<mirror::CompressedReference<mirror::Class>*>(
+            method->GetDeclaringClassAddressWithoutBarrier());
+        if (gUseReadBarrier) {
+          artJniReadBarrier(method);
+        }
+        sm_.AdvancePointer(declaring_class);
       }  // else "this" reference is already handled by QuickArgumentVisitor.
     }
   }
 
   void Visit() REQUIRES_SHARED(Locks::mutator_lock_) override;
 
-  void FinalizeHandleScope(Thread* self) REQUIRES_SHARED(Locks::mutator_lock_);
-
-  StackReference<mirror::Object>* GetFirstHandleScopeEntry() {
-    return handle_scope_->GetHandle(0).GetReference();
-  }
-
-  jobject GetFirstHandleScopeJObject() const REQUIRES_SHARED(Locks::mutator_lock_) {
-    return handle_scope_->GetHandle(0).ToJObject();
-  }
-
  private:
-  // A class to fill a JNI call. Adds reference/handle-scope management to FillNativeCall.
-  class FillJniCall final : public FillNativeCall {
-   public:
-    FillJniCall(uintptr_t* gpr_regs, uint32_t* fpr_regs, uintptr_t* stack_args,
-                HandleScope* handle_scope, bool critical_native)
-      : FillNativeCall(gpr_regs, fpr_regs, stack_args),
-                       handle_scope_(handle_scope),
-        cur_entry_(0),
-        critical_native_(critical_native) {}
+  FillNativeCall jni_call_;
+  BuildNativeCallFrameStateMachine<FillNativeCall> sm_;
 
-    uintptr_t PushHandle(mirror::Object* ref) override REQUIRES_SHARED(Locks::mutator_lock_);
-
-    void Reset(uintptr_t* gpr_regs, uint32_t* fpr_regs, uintptr_t* stack_args, HandleScope* scope) {
-      FillNativeCall::Reset(gpr_regs, fpr_regs, stack_args);
-      handle_scope_ = scope;
-      cur_entry_ = 0U;
-    }
-
-    void ResetRemainingScopeSlots() REQUIRES_SHARED(Locks::mutator_lock_) {
-      // Initialize padding entries.
-      size_t expected_slots = handle_scope_->NumberOfReferences();
-      while (cur_entry_ < expected_slots) {
-        handle_scope_->GetMutableHandle(cur_entry_++).Assign(nullptr);
-      }
-
-      if (!critical_native_) {
-        // Non-critical natives have at least the self class (jclass) or this (jobject).
-        DCHECK_NE(cur_entry_, 0U);
-      }
-    }
-
-    bool CriticalNative() const {
-      return critical_native_;
-    }
-
-   private:
-    HandleScope* handle_scope_;
-    size_t cur_entry_;
-    const bool critical_native_;
-  };
-
-  HandleScope* handle_scope_;
-  FillJniCall jni_call_;
-
-  BuildNativeCallFrameStateMachine<FillJniCall> sm_;
+  // Pointer to the current vreg in caller's reserved out vreg area.
+  // Used for spilling reference arguments.
+  uint32_t* current_vreg_;
 
   DISALLOW_COPY_AND_ASSIGN(BuildGenericJniFrameVisitor);
 };
-
-uintptr_t BuildGenericJniFrameVisitor::FillJniCall::PushHandle(mirror::Object* ref) {
-  uintptr_t tmp;
-  MutableHandle<mirror::Object> h = handle_scope_->GetMutableHandle(cur_entry_);
-  h.Assign(ref);
-  tmp = reinterpret_cast<uintptr_t>(h.ToJObject());
-  cur_entry_++;
-  return tmp;
-}
 
 void BuildGenericJniFrameVisitor::Visit() {
   Primitive::Type type = GetParamPrimitiveType();
@@ -2093,6 +1971,7 @@ void BuildGenericJniFrameVisitor::Visit() {
         long_arg = *reinterpret_cast<jlong*>(GetParamAddress());
       }
       sm_.AdvanceLong(long_arg);
+      current_vreg_ += 2u;
       break;
     }
     case Primitive::kPrimDouble: {
@@ -2104,16 +1983,22 @@ void BuildGenericJniFrameVisitor::Visit() {
         double_arg = *reinterpret_cast<uint64_t*>(GetParamAddress());
       }
       sm_.AdvanceDouble(double_arg);
+      current_vreg_ += 2u;
       break;
     }
     case Primitive::kPrimNot: {
-      StackReference<mirror::Object>* stack_ref =
-          reinterpret_cast<StackReference<mirror::Object>*>(GetParamAddress());
-      sm_.AdvanceHandleScope(stack_ref->AsMirrorPtr());
+      mirror::Object* obj =
+          reinterpret_cast<StackReference<mirror::Object>*>(GetParamAddress())->AsMirrorPtr();
+      StackReference<mirror::Object>* spill_ref =
+          reinterpret_cast<StackReference<mirror::Object>*>(current_vreg_);
+      spill_ref->Assign(obj);
+      sm_.AdvancePointer(obj != nullptr ? spill_ref : nullptr);
+      current_vreg_ += 1u;
       break;
     }
     case Primitive::kPrimFloat:
-      sm_.AdvanceFloat(*reinterpret_cast<float*>(GetParamAddress()));
+      sm_.AdvanceFloat(*reinterpret_cast<uint32_t*>(GetParamAddress()));
+      current_vreg_ += 1u;
       break;
     case Primitive::kPrimBoolean:  // Fall-through.
     case Primitive::kPrimByte:     // Fall-through.
@@ -2121,19 +2006,11 @@ void BuildGenericJniFrameVisitor::Visit() {
     case Primitive::kPrimShort:    // Fall-through.
     case Primitive::kPrimInt:      // Fall-through.
       sm_.AdvanceInt(*reinterpret_cast<jint*>(GetParamAddress()));
+      current_vreg_ += 1u;
       break;
     case Primitive::kPrimVoid:
       LOG(FATAL) << "UNREACHABLE";
       UNREACHABLE();
-  }
-}
-
-void BuildGenericJniFrameVisitor::FinalizeHandleScope(Thread* self) {
-  // Clear out rest of the scope.
-  jni_call_.ResetRemainingScopeSlots();
-  if (!jni_call_.CriticalNative()) {
-    // Install HandleScope.
-    self->PushHandleScope(handle_scope_);
   }
 }
 
@@ -2152,17 +2029,19 @@ void BuildGenericJniFrameVisitor::FinalizeHandleScope(Thread* self) {
  * needed and return to the stub.
  *
  * The return value is the pointer to the native code, null on failure.
+ *
+ * NO_THREAD_SAFETY_ANALYSIS: Depending on the use case, the trampoline may
+ * or may not lock a synchronization object and transition out of Runnable.
  */
 extern "C" const void* artQuickGenericJniTrampoline(Thread* self,
                                                     ArtMethod** managed_sp,
                                                     uintptr_t* reserved_area)
-    REQUIRES_SHARED(Locks::mutator_lock_) {
+    REQUIRES_SHARED(Locks::mutator_lock_) NO_THREAD_SAFETY_ANALYSIS {
   // Note: We cannot walk the stack properly until fixed up below.
   ArtMethod* called = *managed_sp;
   DCHECK(called->IsNative()) << called->PrettyMethod(true);
   Runtime* runtime = Runtime::Current();
-  uint32_t shorty_len = 0;
-  const char* shorty = called->GetShorty(&shorty_len);
+  std::string_view shorty = called->GetShortyView();
   bool critical_native = called->IsCriticalNative();
   bool fast_native = called->IsFastNative();
   bool normal_native = !critical_native && !fast_native;
@@ -2172,18 +2051,15 @@ extern "C" const void* artQuickGenericJniTrampoline(Thread* self,
                                       called->IsStatic(),
                                       critical_native,
                                       shorty,
-                                      shorty_len,
                                       managed_sp,
                                       reserved_area);
   {
     ScopedAssertNoThreadSuspension sants(__FUNCTION__);
     visitor.VisitArguments();
-    // FinalizeHandleScope pushes the handle scope on the thread.
-    visitor.FinalizeHandleScope(self);
   }
 
   // Fix up managed-stack things in Thread. After this we can walk the stack.
-  self->SetTopOfStackTagged(managed_sp);
+  self->SetTopOfStackGenericJniTagged(managed_sp);
 
   self->VerifyStack();
 
@@ -2196,41 +2072,54 @@ extern "C" const void* artQuickGenericJniTrampoline(Thread* self,
   // We can set the entrypoint of a native method to generic JNI even when the
   // class hasn't been initialized, so we need to do the initialization check
   // before invoking the native code.
-  if (NeedsClinitCheckBeforeCall(called)) {
-    ObjPtr<mirror::Class> declaring_class = called->GetDeclaringClass();
-    if (UNLIKELY(!declaring_class->IsVisiblyInitialized())) {
-      // Ensure static method's class is initialized.
-      StackHandleScope<1> hs(self);
-      Handle<mirror::Class> h_class(hs.NewHandle(declaring_class));
-      if (!runtime->GetClassLinker()->EnsureInitialized(self, h_class, true, true)) {
-        DCHECK(Thread::Current()->IsExceptionPending()) << called->PrettyMethod();
-        self->PopHandleScope();
-        return nullptr;  // Report error.
-      }
+  if (called->StillNeedsClinitCheck()) {
+    // Ensure static method's class is initialized.
+    StackHandleScope<1> hs(self);
+    Handle<mirror::Class> h_class = hs.NewHandle(called->GetDeclaringClass());
+    if (!runtime->GetClassLinker()->EnsureInitialized(self, h_class, true, true)) {
+      DCHECK(Thread::Current()->IsExceptionPending()) << called->PrettyMethod();
+      return nullptr;  // Report error.
     }
   }
 
-  uint32_t cookie;
-  uint32_t* sp32;
-  // Skip calling JniMethodStart for @CriticalNative.
-  if (LIKELY(!critical_native)) {
-    // Start JNI, save the cookie.
+  instrumentation::Instrumentation* instr = Runtime::Current()->GetInstrumentation();
+  if (UNLIKELY(instr->HasMethodEntryListeners())) {
+    instr->MethodEnterEvent(self, called);
+    if (self->IsExceptionPending()) {
+      return nullptr;
+    }
+  }
+
+  // Skip calling `artJniMethodStart()` for @CriticalNative and @FastNative.
+  if (LIKELY(normal_native)) {
+    // Start JNI.
     if (called->IsSynchronized()) {
-      DCHECK(normal_native) << " @FastNative and synchronize is not supported";
-      cookie = JniMethodStartSynchronized(visitor.GetFirstHandleScopeJObject(), self);
+      ObjPtr<mirror::Object> lock = GetGenericJniSynchronizationObject(self, called);
+      DCHECK(lock != nullptr);
+      lock->MonitorEnter(self);
       if (self->IsExceptionPending()) {
-        self->PopHandleScope();
         return nullptr;  // Report error.
       }
-    } else {
-      if (fast_native) {
-        cookie = JniMethodFastStart(self);
-      } else {
-        DCHECK(normal_native);
-        cookie = JniMethodStart(self);
-      }
     }
-    sp32 = reinterpret_cast<uint32_t*>(managed_sp);
+    if (UNLIKELY(self->ReadFlag(ThreadFlag::kMonitorJniEntryExit))) {
+      artJniMonitoredMethodStart(self);
+    } else {
+      artJniMethodStart(self);
+    }
+  } else {
+    DCHECK(!called->IsSynchronized())
+        << "@FastNative/@CriticalNative and synchronize is not supported";
+  }
+
+  // Skip pushing LRT frame for @CriticalNative.
+  if (LIKELY(!critical_native)) {
+    // Push local reference frame.
+    JNIEnvExt* env = self->GetJniEnv();
+    DCHECK(env != nullptr);
+    uint32_t cookie = bit_cast<uint32_t>(env->PushLocalReferenceFrame());
+
+    // Save the cookie on the stack.
+    uint32_t* sp32 = reinterpret_cast<uint32_t*>(managed_sp);
     *(sp32 - 1) = cookie;
   }
 
@@ -2268,18 +2157,10 @@ extern "C" uint64_t artQuickGenericJniEndTrampoline(Thread* self,
   // anything that requires a mutator lock before that would cause problems as GC may have the
   // exclusive mutator lock and may be moving objects, etc.
   ArtMethod** sp = self->GetManagedStack()->GetTopQuickFrame();
-  DCHECK(self->GetManagedStack()->GetTopQuickFrameTag());
+  DCHECK(self->GetManagedStack()->GetTopQuickFrameGenericJniTag());
   uint32_t* sp32 = reinterpret_cast<uint32_t*>(sp);
   ArtMethod* called = *sp;
   uint32_t cookie = *(sp32 - 1);
-  if (kIsDebugBuild && !called->IsCriticalNative()) {
-    BaseHandleScope* handle_scope = self->GetTopHandleScope();
-    DCHECK(handle_scope != nullptr);
-    DCHECK(!handle_scope->IsVariableSized());
-    // Note: We do not hold mutator lock here for normal JNI, so we cannot use the method's shorty
-    // to determine the number of references. Instead rely on the value from the HandleScope.
-    DCHECK_EQ(handle_scope, GetGenericJniHandleScope(sp, handle_scope->NumberOfReferences()));
-  }
   return GenericJniMethodEnd(self, cookie, result, result_f, called);
 }
 
@@ -2289,28 +2170,43 @@ extern "C" uint64_t artQuickGenericJniEndTrampoline(Thread* self,
 // It is valid to use this, as at the usage points here (returns from C functions) we are assuming
 // to hold the mutator lock (see REQUIRES_SHARED(Locks::mutator_lock_) annotations).
 
-template <InvokeType type, bool access_check>
+template <InvokeType type>
 static TwoWordReturn artInvokeCommon(uint32_t method_idx,
                                      ObjPtr<mirror::Object> this_object,
                                      Thread* self,
                                      ArtMethod** sp) {
   ScopedQuickEntrypointChecks sqec(self);
   DCHECK_EQ(*sp, Runtime::Current()->GetCalleeSaveMethod(CalleeSaveType::kSaveRefsAndArgs));
-  ArtMethod* caller_method = QuickArgumentVisitor::GetCallingMethod(sp);
-  ArtMethod* method = FindMethodFast<type, access_check>(method_idx, this_object, caller_method);
+  uint32_t dex_pc;
+  ArtMethod* caller_method = QuickArgumentVisitor::GetCallingMethodAndDexPc(sp, &dex_pc);
+  CodeItemInstructionAccessor accessor(caller_method->DexInstructions());
+  DCHECK_LT(dex_pc, accessor.InsnsSizeInCodeUnits());
+  const Instruction& instr = accessor.InstructionAt(dex_pc);
+  bool string_init = false;
+  ArtMethod* method = FindMethodToCall<type>(
+      self, caller_method, &this_object, instr, /* only_lookup_tls_cache= */ true, &string_init);
+
   if (UNLIKELY(method == nullptr)) {
+    if (self->IsExceptionPending()) {
+      // Return a failure if the first lookup threw an exception.
+      return GetTwoWordFailureValue();  // Failure.
+    }
     const DexFile* dex_file = caller_method->GetDexFile();
-    uint32_t shorty_len;
-    const char* shorty = dex_file->GetMethodShorty(dex_file->GetMethodId(method_idx), &shorty_len);
+    std::string_view shorty =
+        dex_file->GetMethodShortyView(dex_file->GetMethodId(method_idx));
     {
-      // Remember the args in case a GC happens in FindMethodFromCode.
+      // Remember the args in case a GC happens in FindMethodToCall.
       ScopedObjectAccessUnchecked soa(self->GetJniEnv());
-      RememberForGcArgumentVisitor visitor(sp, type == kStatic, shorty, shorty_len, &soa);
+      RememberForGcArgumentVisitor visitor(sp, type == kStatic, shorty, &soa);
       visitor.VisitArguments();
-      method = FindMethodFromCode<type, access_check>(method_idx,
-                                                      &this_object,
-                                                      caller_method,
-                                                      self);
+
+      method = FindMethodToCall<type>(self,
+                                      caller_method,
+                                      &this_object,
+                                      instr,
+                                      /* only_lookup_tls_cache= */ false,
+                                      &string_init);
+
       visitor.FixupReferences();
     }
 
@@ -2332,71 +2228,49 @@ static TwoWordReturn artInvokeCommon(uint32_t method_idx,
 }
 
 // Explicit artInvokeCommon template function declarations to please analysis tool.
-#define EXPLICIT_INVOKE_COMMON_TEMPLATE_DECL(type, access_check)                                \
-  template REQUIRES_SHARED(Locks::mutator_lock_)                                          \
-  TwoWordReturn artInvokeCommon<type, access_check>(                                            \
+#define EXPLICIT_INVOKE_COMMON_TEMPLATE_DECL(type)                                            \
+  template REQUIRES_SHARED(Locks::mutator_lock_)                                              \
+  TwoWordReturn artInvokeCommon<type>(                                                        \
       uint32_t method_idx, ObjPtr<mirror::Object> his_object, Thread* self, ArtMethod** sp)
 
-EXPLICIT_INVOKE_COMMON_TEMPLATE_DECL(kVirtual, false);
-EXPLICIT_INVOKE_COMMON_TEMPLATE_DECL(kVirtual, true);
-EXPLICIT_INVOKE_COMMON_TEMPLATE_DECL(kInterface, false);
-EXPLICIT_INVOKE_COMMON_TEMPLATE_DECL(kInterface, true);
-EXPLICIT_INVOKE_COMMON_TEMPLATE_DECL(kDirect, false);
-EXPLICIT_INVOKE_COMMON_TEMPLATE_DECL(kDirect, true);
-EXPLICIT_INVOKE_COMMON_TEMPLATE_DECL(kStatic, false);
-EXPLICIT_INVOKE_COMMON_TEMPLATE_DECL(kStatic, true);
-EXPLICIT_INVOKE_COMMON_TEMPLATE_DECL(kSuper, false);
-EXPLICIT_INVOKE_COMMON_TEMPLATE_DECL(kSuper, true);
+EXPLICIT_INVOKE_COMMON_TEMPLATE_DECL(kVirtual);
+EXPLICIT_INVOKE_COMMON_TEMPLATE_DECL(kInterface);
+EXPLICIT_INVOKE_COMMON_TEMPLATE_DECL(kDirect);
+EXPLICIT_INVOKE_COMMON_TEMPLATE_DECL(kStatic);
+EXPLICIT_INVOKE_COMMON_TEMPLATE_DECL(kSuper);
 #undef EXPLICIT_INVOKE_COMMON_TEMPLATE_DECL
 
 // See comments in runtime_support_asm.S
 extern "C" TwoWordReturn artInvokeInterfaceTrampolineWithAccessCheck(
     uint32_t method_idx, mirror::Object* this_object, Thread* self, ArtMethod** sp)
     REQUIRES_SHARED(Locks::mutator_lock_) {
-  return artInvokeCommon<kInterface, true>(method_idx, this_object, self, sp);
+  return artInvokeCommon<kInterface>(method_idx, this_object, self, sp);
 }
 
 extern "C" TwoWordReturn artInvokeDirectTrampolineWithAccessCheck(
     uint32_t method_idx, mirror::Object* this_object, Thread* self, ArtMethod** sp)
     REQUIRES_SHARED(Locks::mutator_lock_) {
-  return artInvokeCommon<kDirect, true>(method_idx, this_object, self, sp);
+  return artInvokeCommon<kDirect>(method_idx, this_object, self, sp);
 }
 
 extern "C" TwoWordReturn artInvokeStaticTrampolineWithAccessCheck(
-    uint32_t method_idx,
-    mirror::Object* this_object ATTRIBUTE_UNUSED,
-    Thread* self,
-    ArtMethod** sp) REQUIRES_SHARED(Locks::mutator_lock_) {
+    uint32_t method_idx, [[maybe_unused]] mirror::Object* this_object, Thread* self, ArtMethod** sp)
+    REQUIRES_SHARED(Locks::mutator_lock_) {
   // For static, this_object is not required and may be random garbage. Don't pass it down so that
   // it doesn't cause ObjPtr alignment failure check.
-  return artInvokeCommon<kStatic, true>(method_idx, nullptr, self, sp);
+  return artInvokeCommon<kStatic>(method_idx, nullptr, self, sp);
 }
 
 extern "C" TwoWordReturn artInvokeSuperTrampolineWithAccessCheck(
     uint32_t method_idx, mirror::Object* this_object, Thread* self, ArtMethod** sp)
     REQUIRES_SHARED(Locks::mutator_lock_) {
-  return artInvokeCommon<kSuper, true>(method_idx, this_object, self, sp);
+  return artInvokeCommon<kSuper>(method_idx, this_object, self, sp);
 }
 
 extern "C" TwoWordReturn artInvokeVirtualTrampolineWithAccessCheck(
     uint32_t method_idx, mirror::Object* this_object, Thread* self, ArtMethod** sp)
     REQUIRES_SHARED(Locks::mutator_lock_) {
-  return artInvokeCommon<kVirtual, true>(method_idx, this_object, self, sp);
-}
-
-// Helper function for art_quick_imt_conflict_trampoline to look up the interface method.
-extern "C" ArtMethod* artLookupResolvedMethod(uint32_t method_index, ArtMethod* referrer)
-    REQUIRES_SHARED(Locks::mutator_lock_) {
-  ScopedAssertNoThreadSuspension ants(__FUNCTION__);
-  DCHECK(!referrer->IsProxyMethod());
-  ArtMethod* result = Runtime::Current()->GetClassLinker()->LookupResolvedMethod(
-      method_index, referrer->GetDexCache(), referrer->GetClassLoader());
-  DCHECK(result == nullptr ||
-         result->GetDeclaringClass()->IsInterface() ||
-         result->GetDeclaringClass() ==
-             WellKnownClasses::ToClass(WellKnownClasses::java_lang_Object))
-      << result->PrettyMethod();
-  return result;
+  return artInvokeCommon<kVirtual>(method_idx, this_object, self, sp);
 }
 
 // Determine target of interface dispatch. The interface method and this object are known non-null.
@@ -2407,19 +2281,17 @@ extern "C" TwoWordReturn artInvokeInterfaceTrampoline(ArtMethod* interface_metho
                                                       ArtMethod** sp)
     REQUIRES_SHARED(Locks::mutator_lock_) {
   ScopedQuickEntrypointChecks sqec(self);
-  StackHandleScope<2> hs(self);
-  Handle<mirror::Object> this_object = hs.NewHandle(raw_this_object);
-  Handle<mirror::Class> cls = hs.NewHandle(this_object->GetClass());
 
-  ArtMethod* caller_method = QuickArgumentVisitor::GetCallingMethod(sp);
-  ArtMethod* method = nullptr;
-  ImTable* imt = cls->GetImt(kRuntimePointerSize);
-
-  if (UNLIKELY(interface_method == nullptr)) {
+  Runtime* runtime = Runtime::Current();
+  bool resolve_method = ((interface_method == nullptr) || interface_method->IsRuntimeMethod());
+  if (UNLIKELY(resolve_method)) {
     // The interface method is unresolved, so resolve it in the dex file of the caller.
     // Fetch the dex_method_idx of the target interface method from the caller.
+    StackHandleScope<1> hs(self);
+    Handle<mirror::Object> this_object = hs.NewHandle(raw_this_object);
+    uint32_t dex_pc;
+    ArtMethod* caller_method = QuickArgumentVisitor::GetCallingMethodAndDexPc(sp, &dex_pc);
     uint32_t dex_method_idx;
-    uint32_t dex_pc = QuickArgumentVisitor::GetCallingDexPc(sp);
     const Instruction& instr = caller_method->DexInstructions().InstructionAt(dex_pc);
     Instruction::Code instr_code = instr.Opcode();
     DCHECK(instr_code == Instruction::INVOKE_INTERFACE ||
@@ -2433,17 +2305,15 @@ extern "C" TwoWordReturn artInvokeInterfaceTrampoline(ArtMethod* interface_metho
     }
 
     const DexFile& dex_file = *caller_method->GetDexFile();
-    uint32_t shorty_len;
-    const char* shorty = dex_file.GetMethodShorty(dex_file.GetMethodId(dex_method_idx),
-                                                  &shorty_len);
+    std::string_view shorty =
+        dex_file.GetMethodShortyView(dex_file.GetMethodId(dex_method_idx));
     {
       // Remember the args in case a GC happens in ClassLinker::ResolveMethod().
       ScopedObjectAccessUnchecked soa(self->GetJniEnv());
-      RememberForGcArgumentVisitor visitor(sp, false, shorty, shorty_len, &soa);
+      RememberForGcArgumentVisitor visitor(sp, false, shorty, &soa);
       visitor.VisitArguments();
-      ClassLinker* class_linker = Runtime::Current()->GetClassLinker();
-      interface_method = class_linker->ResolveMethod<ClassLinker::ResolveMode::kNoChecks>(
-          self, dex_method_idx, caller_method, kInterface);
+      ClassLinker* class_linker = runtime->GetClassLinker();
+      interface_method = class_linker->ResolveMethodId(dex_method_idx, caller_method);
       visitor.FixupReferences();
     }
 
@@ -2451,58 +2321,61 @@ extern "C" TwoWordReturn artInvokeInterfaceTrampoline(ArtMethod* interface_metho
       CHECK(self->IsExceptionPending());
       return GetTwoWordFailureValue();  // Failure.
     }
+    ArtMethod* outer_method = QuickArgumentVisitor::GetOuterMethod(sp);
+    MaybeUpdateBssMethodEntry(
+        interface_method, MethodReference(&dex_file, dex_method_idx), outer_method);
+
+    // Refresh `raw_this_object` which may have changed after resolution.
+    raw_this_object = this_object.Get();
   }
 
   // The compiler and interpreter make sure the conflict trampoline is never
   // called on a method that resolves to j.l.Object.
-  CHECK(!interface_method->GetDeclaringClass()->IsObjectClass());
-  CHECK(interface_method->GetDeclaringClass()->IsInterface());
-
+  DCHECK(!interface_method->GetDeclaringClass()->IsObjectClass());
+  DCHECK(interface_method->GetDeclaringClass()->IsInterface());
   DCHECK(!interface_method->IsRuntimeMethod());
-  // Look whether we have a match in the ImtConflictTable.
+  DCHECK(!interface_method->IsCopied());
+
+  ObjPtr<mirror::Object> obj_this = raw_this_object;
+  ObjPtr<mirror::Class> cls = obj_this->GetClass();
   uint32_t imt_index = interface_method->GetImtIndex();
+  ImTable* imt = cls->GetImt(kRuntimePointerSize);
   ArtMethod* conflict_method = imt->Get(imt_index, kRuntimePointerSize);
-  if (LIKELY(conflict_method->IsRuntimeMethod())) {
+  DCHECK(conflict_method->IsRuntimeMethod());
+
+  if (UNLIKELY(resolve_method)) {
+    // Now that we know the interface method, look it up in the conflict table.
     ImtConflictTable* current_table = conflict_method->GetImtConflictTable(kRuntimePointerSize);
     DCHECK(current_table != nullptr);
-    method = current_table->Lookup(interface_method, kRuntimePointerSize);
-  } else {
-    // It seems we aren't really a conflict method!
-    if (kIsDebugBuild) {
-      ArtMethod* m = cls->FindVirtualMethodForInterface(interface_method, kRuntimePointerSize);
-      CHECK_EQ(conflict_method, m)
-          << interface_method->PrettyMethod() << " / " << conflict_method->PrettyMethod() << " / "
-          << " / " << ArtMethod::PrettyMethod(m) << " / " << cls->PrettyClass();
+    ArtMethod* method = current_table->Lookup(interface_method, kRuntimePointerSize);
+    if (method != nullptr) {
+      return GetTwoWordSuccessValue(
+          reinterpret_cast<uintptr_t>(method->GetEntryPointFromQuickCompiledCode()),
+          reinterpret_cast<uintptr_t>(method));
     }
-    method = conflict_method;
-  }
-  if (method != nullptr) {
-    return GetTwoWordSuccessValue(
-        reinterpret_cast<uintptr_t>(method->GetEntryPointFromQuickCompiledCode()),
-        reinterpret_cast<uintptr_t>(method));
+    // Interface method is not in the conflict table. Continue looking up in the
+    // iftable.
   }
 
-  // No match, use the IfTable.
-  method = cls->FindVirtualMethodForInterface(interface_method, kRuntimePointerSize);
+  ArtMethod* method = cls->FindVirtualMethodForInterface(interface_method, kRuntimePointerSize);
   if (UNLIKELY(method == nullptr)) {
+    ArtMethod* caller_method = QuickArgumentVisitor::GetCallingMethod(sp);
     ThrowIncompatibleClassChangeErrorClassForInterfaceDispatch(
-        interface_method, this_object.Get(), caller_method);
-    return GetTwoWordFailureValue();  // Failure.
+        interface_method, obj_this.Ptr(), caller_method);
+    return GetTwoWordFailureValue();
   }
 
   // We arrive here if we have found an implementation, and it is not in the ImtConflictTable.
   // We create a new table with the new pair { interface_method, method }.
-  DCHECK(conflict_method->IsRuntimeMethod());
 
   // Classes in the boot image should never need to update conflict methods in
   // their IMT.
-  CHECK(!Runtime::Current()->GetHeap()->ObjectIsInBootImageSpace(cls.Get())) << cls->PrettyClass();
-  ArtMethod* new_conflict_method = Runtime::Current()->GetClassLinker()->AddMethodToConflictTable(
-      cls.Get(),
+  CHECK(!runtime->GetHeap()->ObjectIsInBootImageSpace(cls.Ptr())) << cls->PrettyClass();
+  ArtMethod* new_conflict_method = runtime->GetClassLinker()->AddMethodToConflictTable(
+      cls.Ptr(),
       conflict_method,
       interface_method,
-      method,
-      /*force_new_conflict_method=*/false);
+      method);
   if (new_conflict_method != conflict_method) {
     // Update the IMT if we create a new conflict method. No fence needed here, as the
     // data is consistent.
@@ -2535,16 +2408,15 @@ extern "C" uint64_t artInvokePolymorphic(mirror::Object* raw_receiver, Thread* s
   const char* old_cause = self->StartAssertNoThreadSuspension("Making stack arguments safe.");
 
   // From the instruction, get the |callsite_shorty| and expose arguments on the stack to the GC.
-  ArtMethod* caller_method = QuickArgumentVisitor::GetCallingMethod(sp);
-  uint32_t dex_pc = QuickArgumentVisitor::GetCallingDexPc(sp);
+  uint32_t dex_pc;
+  ArtMethod* caller_method = QuickArgumentVisitor::GetCallingMethodAndDexPc(sp, &dex_pc);
   const Instruction& inst = caller_method->DexInstructions().InstructionAt(dex_pc);
   DCHECK(inst.Opcode() == Instruction::INVOKE_POLYMORPHIC ||
          inst.Opcode() == Instruction::INVOKE_POLYMORPHIC_RANGE);
   const dex::ProtoIndex proto_idx(inst.VRegH());
-  const char* shorty = caller_method->GetDexFile()->GetShorty(proto_idx);
-  const size_t shorty_length = strlen(shorty);
+  std::string_view shorty = caller_method->GetDexFile()->GetShortyView(proto_idx);
   static const bool kMethodIsStatic = false;  // invoke() and invokeExact() are not static.
-  RememberForGcArgumentVisitor gc_visitor(sp, kMethodIsStatic, shorty, shorty_length, &soa);
+  RememberForGcArgumentVisitor gc_visitor(sp, kMethodIsStatic, shorty, &soa);
   gc_visitor.VisitArguments();
 
   // Wrap raw_receiver in a Handle for safety.
@@ -2555,16 +2427,8 @@ extern "C" uint64_t artInvokePolymorphic(mirror::Object* raw_receiver, Thread* s
 
   // Resolve method.
   ClassLinker* linker = Runtime::Current()->GetClassLinker();
-  ArtMethod* resolved_method = linker->ResolveMethod<ClassLinker::ResolveMode::kCheckICCEAndIAE>(
-      self, inst.VRegB(), caller_method, kVirtual);
-
-  Handle<mirror::MethodType> method_type(
-      hs.NewHandle(linker->ResolveMethodType(self, proto_idx, caller_method)));
-  if (UNLIKELY(method_type.IsNull())) {
-    // This implies we couldn't resolve one or more types in this method handle.
-    CHECK(self->IsExceptionPending());
-    return 0UL;
-  }
+  ArtMethod* resolved_method = linker->ResolveMethodWithChecks(
+      inst.VRegB(), caller_method, kVirtual);
 
   DCHECK_EQ(ArtMethod::NumArgRegisters(shorty) + 1u, (uint32_t)inst.VRegA());
   DCHECK_EQ(resolved_method->IsStatic(), kMethodIsStatic);
@@ -2577,14 +2441,12 @@ extern "C" uint64_t artInvokePolymorphic(mirror::Object* raw_receiver, Thread* s
   const size_t num_vregs = is_range ? inst.VRegA_4rcc() : inst.VRegA_45cc();
   const size_t first_arg = 0;
   ShadowFrameAllocaUniquePtr shadow_frame_unique_ptr =
-      CREATE_SHADOW_FRAME(num_vregs, /* link= */ nullptr, resolved_method, dex_pc);
+      CREATE_SHADOW_FRAME(num_vregs, resolved_method, dex_pc);
   ShadowFrame* shadow_frame = shadow_frame_unique_ptr.get();
-  ScopedStackedShadowFramePusher
-      frame_pusher(self, shadow_frame, StackedShadowFrameType::kShadowFrameUnderConstruction);
+  ScopedStackedShadowFramePusher frame_pusher(self, shadow_frame);
   BuildQuickShadowFrameVisitor shadow_frame_builder(sp,
                                                     kMethodIsStatic,
                                                     shorty,
-                                                    strlen(shorty),
                                                     shadow_frame,
                                                     first_arg);
   shadow_frame_builder.VisitArguments();
@@ -2596,10 +2458,18 @@ extern "C" uint64_t artInvokePolymorphic(mirror::Object* raw_receiver, Thread* s
   // Call DoInvokePolymorphic with |is_range| = true, as shadow frame has argument registers in
   // consecutive order.
   RangeInstructionOperands operands(first_arg + 1, num_vregs - 1);
-  Intrinsics intrinsic = static_cast<Intrinsics>(resolved_method->GetIntrinsic());
+  Intrinsics intrinsic = resolved_method->GetIntrinsic();
   JValue result;
   bool success = false;
   if (resolved_method->GetDeclaringClass() == GetClassRoot<mirror::MethodHandle>(linker)) {
+    Handle<mirror::MethodType> method_type(
+        hs.NewHandle(linker->ResolveMethodType(self, proto_idx, caller_method)));
+    if (UNLIKELY(method_type.IsNull())) {
+      // This implies we couldn't resolve one or more types in this method handle.
+      CHECK(self->IsExceptionPending());
+      return 0UL;
+    }
+
     Handle<mirror::MethodHandle> method_handle(hs.NewHandle(
         ObjPtr<mirror::MethodHandle>::DownCast(receiver_handle.Get())));
     if (intrinsic == Intrinsics::kMethodHandleInvokeExact) {
@@ -2625,10 +2495,12 @@ extern "C" uint64_t artInvokePolymorphic(mirror::Object* raw_receiver, Thread* s
         ObjPtr<mirror::VarHandle>::DownCast(receiver_handle.Get())));
     mirror::VarHandle::AccessMode access_mode =
         mirror::VarHandle::GetAccessModeByIntrinsic(intrinsic);
+
     success = VarHandleInvokeAccessor(self,
                                       *shadow_frame,
                                       var_handle,
-                                      method_type,
+                                      caller_method,
+                                      proto_idx,
                                       access_mode,
                                       &operands,
                                       &result);
@@ -2639,7 +2511,111 @@ extern "C" uint64_t artInvokePolymorphic(mirror::Object* raw_receiver, Thread* s
   // Pop transition record.
   self->PopManagedStackFragment(fragment);
 
-  return result.GetJ();
+  bool is_ref = (shorty[0] == 'L');
+  Runtime::Current()->GetInstrumentation()->PushDeoptContextIfNeeded(
+      self, DeoptimizationMethodType::kDefault, is_ref, result);
+
+  return NanBoxResultIfNeeded(result.GetJ(), shorty[0]);
+}
+
+extern "C" uint64_t artInvokePolymorphicWithHiddenReceiver(mirror::Object* raw_receiver,
+                                                           Thread* self,
+                                                           ArtMethod** sp)
+    REQUIRES_SHARED(Locks::mutator_lock_) {
+  ScopedQuickEntrypointChecks sqec(self);
+  DCHECK(raw_receiver != nullptr);
+  DCHECK(raw_receiver->InstanceOf(WellKnownClasses::java_lang_invoke_MethodHandle.Get()));
+  DCHECK_EQ(*sp, Runtime::Current()->GetCalleeSaveMethod(CalleeSaveType::kSaveRefsAndArgs));
+
+  JNIEnvExt* env = self->GetJniEnv();
+  ScopedObjectAccessUnchecked soa(env);
+  ScopedJniEnvLocalRefState env_state(env);
+  const char* old_cause = self->StartAssertNoThreadSuspension("Making stack arguments safe.");
+
+  // From the instruction, get the |callsite_shorty| and expose arguments on the stack to the GC.
+  uint32_t dex_pc;
+  ArtMethod* caller_method = QuickArgumentVisitor::GetCallingMethodAndDexPc(sp, &dex_pc);
+  const Instruction& inst = caller_method->DexInstructions().InstructionAt(dex_pc);
+  DCHECK(inst.Opcode() == Instruction::INVOKE_POLYMORPHIC ||
+         inst.Opcode() == Instruction::INVOKE_POLYMORPHIC_RANGE);
+  const dex::ProtoIndex proto_idx(inst.VRegH());
+  std::string_view shorty = caller_method->GetDexFile()->GetShortyView(proto_idx);
+
+  // invokeExact is not a static method, but here we use custom calling convention and the receiver
+  // (MethodHandle) object is not passed as a first argument, but through different means and hence
+  // shorty and arguments allocation looks as-if invokeExact was static.
+  RememberForGcArgumentVisitor gc_visitor(sp, /* is_static= */ true, shorty, &soa);
+  gc_visitor.VisitArguments();
+
+  // Wrap raw_receiver in a Handle for safety.
+  StackHandleScope<2> hs(self);
+  Handle<mirror::MethodHandle> method_handle(
+      hs.NewHandle(down_cast<mirror::MethodHandle*>(raw_receiver)));
+
+  self->EndAssertNoThreadSuspension(old_cause);
+
+  ClassLinker* linker = Runtime::Current()->GetClassLinker();
+  ArtMethod* invoke_exact = WellKnownClasses::java_lang_invoke_MethodHandle_invokeExact;
+  if (kIsDebugBuild) {
+    ArtMethod* resolved_method = linker->ResolveMethodWithChecks(
+        inst.VRegB(), caller_method, kVirtual);
+    CHECK_EQ(resolved_method, invoke_exact);
+  }
+
+  Handle<mirror::MethodType> method_type(
+      hs.NewHandle(linker->ResolveMethodType(self, proto_idx, caller_method)));
+  if (UNLIKELY(method_type.IsNull())) {
+    // This implies we couldn't resolve one or more types in this method handle.
+    CHECK(self->IsExceptionPending());
+    return 0UL;
+  }
+
+  DCHECK_EQ(ArtMethod::NumArgRegisters(shorty) + 1u, (uint32_t)inst.VRegA());
+
+  // Fix references before constructing the shadow frame.
+  gc_visitor.FixupReferences();
+
+  // Construct shadow frame placing arguments consecutively from |first_arg|.
+  const bool is_range = inst.Opcode() == Instruction::INVOKE_POLYMORPHIC_RANGE;
+  const size_t num_vregs = is_range ? inst.VRegA_4rcc() : inst.VRegA_45cc();
+  const size_t first_arg = 0;
+  ShadowFrameAllocaUniquePtr shadow_frame_unique_ptr =
+      CREATE_SHADOW_FRAME(num_vregs, invoke_exact, dex_pc);
+  ShadowFrame* shadow_frame = shadow_frame_unique_ptr.get();
+  ScopedStackedShadowFramePusher frame_pusher(self, shadow_frame);
+  // Pretend the method is static, see the gc_visitor comment above.
+  BuildQuickShadowFrameVisitor shadow_frame_builder(sp,
+                                                    /* is_static= */ true,
+                                                    shorty,
+                                                    shadow_frame,
+                                                    first_arg);
+  // Receiver is not passed as a regular argument, adding it to ShadowFrame manually.
+  shadow_frame_builder.SetReceiver(method_handle.Get());
+  shadow_frame_builder.VisitArguments();
+
+  // Push a transition back into managed code onto the linked list in thread.
+  ManagedStack fragment;
+  self->PushManagedStackFragment(&fragment);
+
+  RangeInstructionOperands operands(first_arg + 1, num_vregs - 1);
+  JValue result;
+  bool success = MethodHandleInvokeExact(self,
+                                         *shadow_frame,
+                                         method_handle,
+                                         method_type,
+                                         &operands,
+                                         &result);
+
+  DCHECK(success || self->IsExceptionPending());
+
+  // Pop transition record.
+  self->PopManagedStackFragment(fragment);
+
+  bool is_ref = shorty[0] == 'L';
+  Runtime::Current()->GetInstrumentation()->PushDeoptContextIfNeeded(
+      self, DeoptimizationMethodType::kDefault, is_ref, result);
+
+  return NanBoxResultIfNeeded(result.GetJ(), shorty[0]);
 }
 
 // Returns uint64_t representing raw bits from JValue.
@@ -2659,25 +2635,22 @@ extern "C" uint64_t artInvokeCustom(uint32_t call_site_idx, Thread* self, ArtMet
   const char* old_cause = self->StartAssertNoThreadSuspension("Making stack arguments safe.");
 
   // From the instruction, get the |callsite_shorty| and expose arguments on the stack to the GC.
-  ArtMethod* caller_method = QuickArgumentVisitor::GetCallingMethod(sp);
-  uint32_t dex_pc = QuickArgumentVisitor::GetCallingDexPc(sp);
+  uint32_t dex_pc;
+  ArtMethod* caller_method = QuickArgumentVisitor::GetCallingMethodAndDexPc(sp, &dex_pc);
   const DexFile* dex_file = caller_method->GetDexFile();
   const dex::ProtoIndex proto_idx(dex_file->GetProtoIndexForCallSite(call_site_idx));
-  const char* shorty = caller_method->GetDexFile()->GetShorty(proto_idx);
-  const uint32_t shorty_len = strlen(shorty);
+  std::string_view shorty = caller_method->GetDexFile()->GetShortyView(proto_idx);
 
   // Construct the shadow frame placing arguments consecutively from |first_arg|.
   const size_t first_arg = 0;
   const size_t num_vregs = ArtMethod::NumArgRegisters(shorty);
   ShadowFrameAllocaUniquePtr shadow_frame_unique_ptr =
-      CREATE_SHADOW_FRAME(num_vregs, /* link= */ nullptr, caller_method, dex_pc);
+      CREATE_SHADOW_FRAME(num_vregs, caller_method, dex_pc);
   ShadowFrame* shadow_frame = shadow_frame_unique_ptr.get();
-  ScopedStackedShadowFramePusher
-      frame_pusher(self, shadow_frame, StackedShadowFrameType::kShadowFrameUnderConstruction);
+  ScopedStackedShadowFramePusher frame_pusher(self, shadow_frame);
   BuildQuickShadowFrameVisitor shadow_frame_builder(sp,
                                                     kMethodIsStatic,
                                                     shorty,
-                                                    shorty_len,
                                                     shadow_frame,
                                                     first_arg);
   shadow_frame_builder.VisitArguments();
@@ -2697,7 +2670,129 @@ extern "C" uint64_t artInvokeCustom(uint32_t call_site_idx, Thread* self, ArtMet
   // Pop transition record.
   self->PopManagedStackFragment(fragment);
 
-  return result.GetJ();
+  bool is_ref = (shorty[0] == 'L');
+  Runtime::Current()->GetInstrumentation()->PushDeoptContextIfNeeded(
+      self, DeoptimizationMethodType::kDefault, is_ref, result);
+
+  return NanBoxResultIfNeeded(result.GetJ(), shorty[0]);
+}
+
+extern "C" void artJniMethodEntryHook(Thread* self)
+    REQUIRES_SHARED(Locks::mutator_lock_) {
+  instrumentation::Instrumentation* instr = Runtime::Current()->GetInstrumentation();
+  ArtMethod* method = *self->GetManagedStack()->GetTopQuickFrame();
+  instr->MethodEnterEvent(self, method);
+}
+
+extern "C" Context* artMethodEntryHook(ArtMethod* method, Thread* self, ArtMethod** sp)
+    REQUIRES_SHARED(Locks::mutator_lock_) {
+  ScopedQuickEntrypointChecks sqec(self);
+  instrumentation::Instrumentation* instr = Runtime::Current()->GetInstrumentation();
+  if (instr->HasFastMethodEntryListenersOnly()) {
+    instr->MethodEnterEvent(self, method);
+    // No exception or deoptimization.
+    return nullptr;
+  }
+
+  if (instr->HasMethodEntryListeners()) {
+    instr->MethodEnterEvent(self, method);
+    // MethodEnter callback could have requested a deopt for ex: by setting a breakpoint, so
+    // check if we need a deopt here.
+    if (instr->ShouldDeoptimizeCaller(self, sp) || instr->IsDeoptimized(method)) {
+      // Instrumentation can request deoptimizing only a particular method (for ex: when
+      // there are break points on the method). In such cases deoptimize only this method.
+      // FullFrame deoptimizations are handled on method exits.
+      return artDeoptimizeFromCompiledCode(DeoptimizationKind::kDebugging, self);
+    }
+  } else {
+    DCHECK(!instr->IsDeoptimized(method));
+  }
+  // No exception or deoptimization.
+  return nullptr;
+}
+
+extern "C" Context* artMethodExitHook(Thread* self,
+                                      ArtMethod** sp,
+                                      uint64_t* gpr_result,
+                                      uint64_t* fpr_result,
+                                      uint32_t frame_size)
+  REQUIRES_SHARED(Locks::mutator_lock_) {
+  ScopedQuickEntrypointChecks sqec(self);
+  DCHECK_EQ(reinterpret_cast<uintptr_t>(self), reinterpret_cast<uintptr_t>(Thread::Current()));
+  // Instrumentation exit stub must not be entered with a pending exception.
+  CHECK(!self->IsExceptionPending())
+      << "Enter instrumentation exit stub with pending exception " << self->GetException()->Dump();
+
+  instrumentation::Instrumentation* instr = Runtime::Current()->GetInstrumentation();
+  DCHECK(instr->RunExitHooks());
+
+  ArtMethod* method = *sp;
+  if (instr->HasFastMethodExitListenersOnly()) {
+    // Fast method listeners are only used for tracing which don't need any deoptimization checks
+    // or a return value.
+    JValue return_value;
+    instr->MethodExitEvent(self, method, /* frame= */ {}, return_value);
+    // No exception or deoptimization.
+    return nullptr;
+  }
+
+  bool is_ref = false;
+  if (instr->HasMethodExitListeners()) {
+    StackHandleScope<1> hs(self);
+
+    CHECK(gpr_result != nullptr);
+    CHECK(fpr_result != nullptr);
+
+    JValue return_value = instr->GetReturnValue(method, &is_ref, gpr_result, fpr_result);
+    MutableHandle<mirror::Object> res(hs.NewHandle<mirror::Object>(nullptr));
+    if (is_ref) {
+      // Take a handle to the return value so we won't lose it if we suspend.
+      res.Assign(return_value.GetL());
+    }
+    DCHECK(!method->IsRuntimeMethod());
+
+    // If we need a deoptimization MethodExitEvent will be called by the interpreter when it
+    // re-executes the return instruction. For native methods we have to process method exit
+    // events here since deoptimization just removes the native frame.
+    instr->MethodExitEvent(self, method, /* frame= */ {}, return_value);
+
+    if (is_ref) {
+      // Restore the return value if it's a reference since it might have moved.
+      *reinterpret_cast<mirror::Object**>(gpr_result) = res.Get();
+      return_value.SetL(res.Get());
+    }
+  }
+
+  if (self->IsExceptionPending() || self->ObserveAsyncException()) {
+    // The exception was thrown from the method exit callback. We should not call method unwind
+    // callbacks for this case.
+    std::unique_ptr<Context> context =
+        self->QuickDeliverException(/* is_method_exit_exception= */ true);
+    DCHECK(context != nullptr);
+    return context.release();
+  }
+
+  // We should deoptimize here if the caller requires a deoptimization or if the current method
+  // needs a deoptimization. We may need deoptimization for the current method if method exit
+  // hooks requested this frame to be popped. IsForcedInterpreterNeededForUpcall checks for that.
+  const bool deoptimize = instr->ShouldDeoptimizeCaller(self, sp, frame_size) ||
+                          Dbg::IsForcedInterpreterNeededForUpcall(self, method);
+  if (deoptimize) {
+    JValue ret_val = instr->GetReturnValue(method, &is_ref, gpr_result, fpr_result);
+    DeoptimizationMethodType deopt_method_type = instr->GetDeoptimizationMethodType(method);
+    self->PushDeoptimizationContext(
+        ret_val, is_ref, self->GetException(), false, deopt_method_type);
+    // Method exit callback has already been run for this method. So tell the deoptimizer to skip
+    // callbacks for this frame.
+    std::unique_ptr<Context> context = self->Deoptimize(DeoptimizationKind::kFullFrame,
+                                                        /* single_frame= */ false,
+                                                        /* skip_method_exit_callbacks= */ true);
+    DCHECK(context != nullptr);
+    return context.release();
+  }
+
+  // No exception or deoptimization.
+  return nullptr;
 }
 
 }  // namespace art

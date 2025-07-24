@@ -23,12 +23,12 @@
 #include "jni/jni_internal.h"
 #include "mirror/field.h"
 #include "mirror/method.h"
-#include "mirror/method_handle_impl.h"
+#include "mirror/method_handle_impl-inl.h"
 #include "native_util.h"
 #include "runtime.h"
 #include "scoped_thread_state_change-inl.h"
 
-namespace art {
+namespace art HIDDEN {
 
 static jobject MethodHandleImpl_getMemberInternal(JNIEnv* env, jobject thiz) {
   ScopedObjectAccess soa(env);
@@ -40,23 +40,18 @@ static jobject MethodHandleImpl_getMemberInternal(JNIEnv* env, jobject thiz) {
   // a Method for method invokers and a Constructor for constructors.
   const mirror::MethodHandle::Kind handle_kind = handle->GetHandleKind();
 
-  // We check this here because we pass false to CreateFromArtField and
-  // CreateFromArtMethod.
-  DCHECK(!Runtime::Current()->IsActiveTransaction());
-
   MutableHandle<mirror::Object> h_object(hs.NewHandle<mirror::Object>(nullptr));
   if (handle_kind >= mirror::MethodHandle::kFirstAccessorKind) {
     ArtField* const field = handle->GetTargetField();
-    h_object.Assign(mirror::Field::CreateFromArtField<kRuntimePointerSize, false>(
-        soa.Self(), field, /* force_resolve= */ false));
+    h_object.Assign(
+        mirror::Field::CreateFromArtField(soa.Self(), field, /* force_resolve= */ false));
   } else {
     ArtMethod* const method = handle->GetTargetMethod();
     if (method->IsConstructor()) {
-      h_object.Assign(mirror::Constructor::CreateFromArtMethod<kRuntimePointerSize, false>(
-          soa.Self(), method));
+      h_object.Assign(
+          mirror::Constructor::CreateFromArtMethod<kRuntimePointerSize>(soa.Self(), method));
     } else {
-      h_object.Assign(mirror::Method::CreateFromArtMethod<kRuntimePointerSize, false>(
-          soa.Self(), method));
+      h_object.Assign(mirror::Method::CreateFromArtMethod<kRuntimePointerSize>(soa.Self(), method));
     }
   }
 

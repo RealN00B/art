@@ -17,7 +17,6 @@
 #ifndef ART_RUNTIME_BASE_TIMING_LOGGER_H_
 #define ART_RUNTIME_BASE_TIMING_LOGGER_H_
 
-#include "base/histogram.h"
 #include "base/locks.h"
 #include "base/macros.h"
 #include "base/time_utils.h"
@@ -27,7 +26,7 @@
 #include <string>
 #include <vector>
 
-namespace art {
+namespace art HIDDEN {
 class TimingLogger;
 
 class CumulativeLogger {
@@ -48,19 +47,24 @@ class CumulativeLogger {
   size_t GetIterations() const REQUIRES(!GetLock());
 
  private:
-  class HistogramComparator {
+  class CumulativeTime {
    public:
-    bool operator()(const Histogram<uint64_t>* a, const Histogram<uint64_t>* b) const {
-      return a->Name() < b->Name();
+    CumulativeTime(const char* name, uint64_t time) : name_(name), time_(time) {}
+    void Add(uint64_t time) { time_ += time; }
+    const char* Name() const { return name_; }
+    uint64_t Sum() const { return time_; }
+    // Compare addresses of names for sorting.
+    bool operator< (const CumulativeTime& ct) const {
+      return std::less<const char*>()(name_, ct.name_);
     }
+
+   private:
+    const char* name_;
+    uint64_t time_;
   };
 
-  static constexpr size_t kLowMemoryBucketCount = 16;
-  static constexpr size_t kDefaultBucketCount = 100;
-  static constexpr size_t kInitialBucketSize = 50;  // 50 microseconds.
-
-  void AddPair(const std::string &label, uint64_t delta_time) REQUIRES(GetLock());
-  void DumpHistogram(std::ostream &os) const REQUIRES(GetLock());
+  void DumpAverages(std::ostream &os) const REQUIRES(GetLock());
+  void AddPair(const char* label, uint64_t delta_time) REQUIRES(GetLock());
   uint64_t GetTotalTime() const {
     return total_time_;
   }
@@ -69,8 +73,11 @@ class CumulativeLogger {
     return lock_.get();
   }
 
-  static const uint64_t kAdjust = 1000;
-  std::set<Histogram<uint64_t>*, HistogramComparator> histograms_ GUARDED_BY(GetLock());
+  static constexpr uint64_t kAdjust = 1000;
+  // Use a vector to keep dirty memory to minimal number of pages. Using a
+  // hashtable would be performant, but could lead to more dirty pages. Also, we
+  // don't expect this vector to be too big.
+  std::vector<CumulativeTime> cumulative_timers_ GUARDED_BY(GetLock());
   std::string name_;
   const std::string lock_name_;
   mutable std::unique_ptr<Mutex> lock_ DEFAULT_MUTEX_ACQUIRED_AFTER;
@@ -125,13 +132,8 @@ class TimingLogger {
   class TimingData {
    public:
     TimingData() = default;
-    TimingData(TimingData&& other) {
-      std::swap(data_, other.data_);
-    }
-    TimingData& operator=(TimingData&& other) {
-      std::swap(data_, other.data_);
-      return *this;
-    }
+    TimingData(TimingData&& other) noexcept = default;
+    TimingData& operator=(TimingData&& other) noexcept = default;
     uint64_t GetTotalTime(size_t idx) {
       return data_[idx].total_time;
     }
@@ -151,19 +153,19 @@ class TimingLogger {
     friend class TimingLogger;
   };
 
-  TimingLogger(const char* name,
-               bool precise,
-               bool verbose,
-               TimingKind kind = TimingKind::kMonotonic);
-  ~TimingLogger();
+  EXPORT TimingLogger(const char* name,
+                      bool precise,
+                      bool verbose,
+                      TimingKind kind = TimingKind::kMonotonic);
+  EXPORT ~TimingLogger();
   // Verify that all open timings have related closed timings.
   void Verify();
   // Clears current timings and labels.
   void Reset();
   // Starts a timing.
-  void StartTiming(const char* new_split_label);
+  EXPORT void StartTiming(const char* new_split_label);
   // Ends the current timing.
-  void EndTiming();
+  EXPORT void EndTiming();
   // End the current timing and start a new timing. Usage not recommended.
   void NewTiming(const char* new_split_label) {
     EndTiming();
@@ -173,7 +175,7 @@ class TimingLogger {
   uint64_t GetTotalNs() const;
   // Find the index of a timing by name.
   size_t FindTimingIndex(const char* name, size_t start_idx) const;
-  void Dump(std::ostream& os, const char* indent_string = "  ") const;
+  EXPORT void Dump(std::ostream& os, const char* indent_string = "  ") const;
 
   // Scoped timing splits that can be nested and composed with the explicit split
   // starts and ends.

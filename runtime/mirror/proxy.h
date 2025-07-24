@@ -17,9 +17,10 @@
 #ifndef ART_RUNTIME_MIRROR_PROXY_H_
 #define ART_RUNTIME_MIRROR_PROXY_H_
 
+#include "base/macros.h"
 #include "object.h"
 
-namespace art {
+namespace art HIDDEN {
 
 struct ProxyOffsets;
 
@@ -28,6 +29,8 @@ namespace mirror {
 // C++ mirror of java.lang.reflect.Proxy.
 class MANAGED Proxy final : public Object {
  private:
+  MIRROR_CLASS("Ljava/lang/reflect/Proxy;");
+
   HeapReference<Object> h_;
 
   friend struct art::ProxyOffsets;  // for verifying offset information

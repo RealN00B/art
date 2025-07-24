@@ -28,9 +28,18 @@
 #include <android-base/stringprintf.h>
 #include <android-base/strings.h>
 
+#include "base/array_ref.h"
 #include "base/stl_util.h"
 
-namespace art {
+#include <cpu_features_macros.h>
+
+#ifdef CPU_FEATURES_ARCH_AARCH64
+// This header can only be included on aarch64 targets,
+// as determined by cpu_features own define.
+#include <cpuinfo_aarch64.h>
+#endif
+
+namespace art HIDDEN {
 
 using android::base::StringPrintf;
 
@@ -72,6 +81,7 @@ Arm64FeaturesUniquePtr Arm64InstructionSetFeatures::FromVariant(
       "exynos-m3",
       "kryo",
       "kryo385",
+      "kryo785",
   };
 
   static const char* arm64_variants_with_lse[] = {
@@ -79,6 +89,7 @@ Arm64FeaturesUniquePtr Arm64InstructionSetFeatures::FromVariant(
       "cortex-a75",
       "cortex-a76",
       "kryo385",
+      "kryo785",
   };
 
   static const char* arm64_variants_with_fp16[] = {
@@ -86,6 +97,7 @@ Arm64FeaturesUniquePtr Arm64InstructionSetFeatures::FromVariant(
       "cortex-a75",
       "cortex-a76",
       "kryo385",
+      "kryo785",
   };
 
   static const char* arm64_variants_with_dotprod[] = {
@@ -120,8 +132,9 @@ Arm64FeaturesUniquePtr Arm64InstructionSetFeatures::FromVariant(
   bool has_sve = false;
 
   if (!needs_a53_835769_fix) {
-    // Check to see if this is an expected variant.
-    static const char* arm64_known_variants[] = {
+    // Check to see if this is an expected variant. `other_arm64_known_variants` contains the
+    // variants which do *not* need a fix for a53 erratum 835769.
+    static const char* other_arm64_known_variants[] = {
         "cortex-a35",
         "cortex-a55",
         "cortex-a75",
@@ -132,10 +145,19 @@ Arm64FeaturesUniquePtr Arm64InstructionSetFeatures::FromVariant(
         "kryo",
         "kryo300",
         "kryo385",
+        "kryo785",
+        "oryon",
     };
-    if (!FindVariantInArray(arm64_known_variants, arraysize(arm64_known_variants), variant)) {
+    if (!FindVariantInArray(
+            other_arm64_known_variants, arraysize(other_arm64_known_variants), variant)) {
       std::ostringstream os;
-      os << "Unexpected CPU variant for Arm64: " << variant;
+      os << "Unexpected CPU variant for Arm64: " << variant << ".\n"
+         << "Known variants that need a fix for a53 erratum 835769: "
+         << android::base::Join(ArrayRef<const char* const>(arm64_variants_with_a53_835769_bug),
+                                ", ")
+         << ".\n"
+         << "Known variants that do not need a fix for a53 erratum 835769: "
+         << android::base::Join(ArrayRef<const char* const>(other_arm64_known_variants), ", ");
       *error_msg = os.str();
       return nullptr;
     }
@@ -148,6 +170,18 @@ Arm64FeaturesUniquePtr Arm64InstructionSetFeatures::FromVariant(
                                                                 has_fp16,
                                                                 has_dotprod,
                                                                 has_sve));
+}
+
+Arm64FeaturesUniquePtr Arm64InstructionSetFeatures::IntersectWithHwcap() const {
+  Arm64FeaturesUniquePtr hwcaps = Arm64InstructionSetFeatures::FromHwcap();
+  return Arm64FeaturesUniquePtr(new Arm64InstructionSetFeatures(
+      fix_cortex_a53_835769_,
+      fix_cortex_a53_843419_,
+      has_crc_ && hwcaps->has_crc_,
+      has_lse_ && hwcaps->has_lse_,
+      has_fp16_ && hwcaps->has_fp16_,
+      has_dotprod_ && hwcaps->has_dotprod_,
+      has_sve_ && hwcaps->has_sve_));
 }
 
 Arm64FeaturesUniquePtr Arm64InstructionSetFeatures::FromBitmap(uint32_t bitmap) {
@@ -243,6 +277,22 @@ Arm64FeaturesUniquePtr Arm64InstructionSetFeatures::FromHwcap() {
 Arm64FeaturesUniquePtr Arm64InstructionSetFeatures::FromAssembly() {
   UNIMPLEMENTED(WARNING);
   return FromCppDefines();
+}
+
+Arm64FeaturesUniquePtr Arm64InstructionSetFeatures::FromCpuFeatures() {
+#ifdef CPU_FEATURES_ARCH_AARCH64
+  auto features = cpu_features::GetAarch64Info().features;
+  return Arm64FeaturesUniquePtr(new Arm64InstructionSetFeatures(false,
+                                                                false,
+                                                                features.crc32,
+                                                                features.atomics,
+                                                                features.fphp,
+                                                                features.asimddp,
+                                                                features.sve));
+#else
+  UNIMPLEMENTED(WARNING);
+  return FromCppDefines();
+#endif
 }
 
 bool Arm64InstructionSetFeatures::Equals(const InstructionSetFeatures* other) const {

@@ -16,28 +16,32 @@
 
 #include "jni_internal.h"
 
+#include <log/log.h>
+
 #include <cstdarg>
 #include <memory>
 #include <utility>
 
 #include "art_field-inl.h"
-#include "art_method-inl.h"
+#include "art_method-alloc-inl.h"
 #include "base/allocator.h"
 #include "base/atomic.h"
-#include "base/enums.h"
+#include "base/casts.h"
 #include "base/file_utils.h"
 #include "base/logging.h"  // For VLOG.
 #include "base/mutex.h"
+#include "base/pointer_size.h"
 #include "base/safe_map.h"
 #include "base/stl_util.h"
 #include "class_linker-inl.h"
-#include "class_root.h"
+#include "class_root-inl.h"
 #include "dex/dex_file-inl.h"
-#include "dex/utf.h"
+#include "dex/utf-inl.h"
 #include "fault_handler.h"
-#include "hidden_api.h"
 #include "gc/accounting/card_table-inl.h"
 #include "gc_root.h"
+#include "handle_scope.h"
+#include "hidden_api.h"
 #include "indirect_reference_table-inl.h"
 #include "interpreter/interpreter.h"
 #include "java_vm_ext.h"
@@ -47,7 +51,7 @@
 #include "mirror/class-inl.h"
 #include "mirror/class_loader.h"
 #include "mirror/dex_cache-inl.h"
-#include "mirror/field-inl.h"
+#include "mirror/field.h"
 #include "mirror/method.h"
 #include "mirror/object-inl.h"
 #include "mirror/object_array-alloc-inl.h"
@@ -55,15 +59,20 @@
 #include "mirror/string-alloc-inl.h"
 #include "mirror/string-inl.h"
 #include "mirror/throwable.h"
+#include "nativebridge/native_bridge.h"
 #include "nativehelper/scoped_local_ref.h"
+#include "nativeloader/native_loader.h"
 #include "parsed_options.h"
 #include "reflection.h"
 #include "runtime.h"
 #include "scoped_thread_state_change-inl.h"
 #include "thread.h"
-#include "well_known_classes.h"
+#include "well_known_classes-inl.h"
+
+namespace art HIDDEN {
 
 namespace {
+
 // Frees the given va_list upon destruction.
 // This also guards the returns from inside of the CHECK_NON_NULL_ARGUMENTs.
 struct ScopedVAArgs {
@@ -76,28 +85,186 @@ struct ScopedVAArgs {
   va_list* args;
 };
 
-}  // namespace
+constexpr char kBadUtf8ReplacementChar = '?';
 
-namespace art {
+// This is a modified version of `CountModifiedUtf8Chars()` from utf.cc,
+// with extra checks and different output options.
+//
+// The `good` functor can process valid characters.
+// The `bad` functor is called when we find an invalid character.
+//
+// Returns the number of UTF-16 characters.
+template <typename GoodFunc, typename BadFunc>
+size_t VisitUtf8Chars(const char* utf8, size_t byte_count, GoodFunc good, BadFunc bad) {
+  DCHECK_LE(byte_count, strlen(utf8));
+  size_t len = 0;
+  const char* end = utf8 + byte_count;
+  while (utf8 != end) {
+    int ic = *utf8;
+    if (LIKELY((ic & 0x80) == 0)) {
+      // One-byte encoding.
+      good(utf8, 1u);
+      utf8 += 1u;
+      len += 1u;
+      continue;
+    }
+    // Note: We do not check whether the bit 0x40 is correctly set in the leading byte of
+    // a multi-byte sequence. Nor do we verify the top two bits of continuation characters.
+    if ((ic & 0x20) == 0) {
+      // Two-byte encoding.
+      if (static_cast<size_t>(end - utf8) < 2u) {
+        bad();
+        return len + 1u;  // Reached end of sequence.
+      }
+      good(utf8, 2u);
+      utf8 += 2u;
+      len += 1u;
+      continue;
+    }
+    if ((ic & 0x10) == 0) {
+      // Three-byte encoding.
+      if (static_cast<size_t>(end - utf8) < 3u) {
+        bad();
+        return len + 1u;  // Reached end of sequence
+      }
+      good(utf8, 3u);
+      utf8 += 3u;
+      len += 1u;
+      continue;
+    }
+
+    // Four-byte encoding: needs to be converted into a surrogate pair.
+    if (static_cast<size_t>(end - utf8) < 4u) {
+      bad();
+      return len + 1u;  // Reached end of sequence.
+    }
+    good(utf8, 4u);
+    utf8 += 4u;
+    len += 2u;
+  }
+  return len;
+}
+
+ALWAYS_INLINE
+static inline uint16_t DecodeModifiedUtf8Character(const char* ptr, size_t length) {
+  switch (length) {
+    case 1:
+      return ptr[0];
+    case 2:
+      return ((ptr[0] & 0x1fu) << 6) | (ptr[1] & 0x3fu);
+    case 3:
+      return ((ptr[0] & 0x0fu) << 12) | ((ptr[1] & 0x3fu) << 6) | (ptr[2] & 0x3fu);
+    default:
+      LOG(FATAL) << "UNREACHABLE";  // 4-byte sequences are not valid Modified UTF-8.
+      UNREACHABLE();
+  }
+}
+
+class NewStringUTFVisitor {
+ public:
+  NewStringUTFVisitor(const char* utf, size_t utf8_length, int32_t count, bool has_bad_char)
+      : utf_(utf), utf8_length_(utf8_length), count_(count), has_bad_char_(has_bad_char) {}
+
+  void operator()(ObjPtr<mirror::Object> obj, [[maybe_unused]] size_t usable_size) const
+      REQUIRES_SHARED(Locks::mutator_lock_) {
+    // Avoid AsString as object is not yet in live bitmap or allocation stack.
+    ObjPtr<mirror::String> string = ObjPtr<mirror::String>::DownCast(obj);
+    string->SetCount(count_);
+    DCHECK_IMPLIES(string->IsCompressed(), mirror::kUseStringCompression);
+    if (string->IsCompressed()) {
+      uint8_t* value_compressed = string->GetValueCompressed();
+      auto good = [&](const char* ptr, size_t length) {
+        uint16_t c = DecodeModifiedUtf8Character(ptr, length);
+        DCHECK(mirror::String::IsASCII(c));
+        *value_compressed++ = dchecked_integral_cast<uint8_t>(c);
+      };
+      auto bad = [&]() {
+        DCHECK(has_bad_char_);
+        *value_compressed++ = kBadUtf8ReplacementChar;
+      };
+      VisitUtf8Chars(utf_, utf8_length_, good, bad);
+    } else {
+      // Uncompressed.
+      uint16_t* value = string->GetValue();
+      auto good = [&](const char* ptr, size_t length) {
+        if (length != 4u) {
+          *value++ = DecodeModifiedUtf8Character(ptr, length);
+        } else {
+          const uint32_t code_point = ((ptr[0] & 0x0fu) << 18) |
+                                      ((ptr[1] & 0x3fu) << 12) |
+                                      ((ptr[2] & 0x3fu) << 6) |
+                                      (ptr[3] & 0x3fu);
+          // TODO: What do we do about values outside the range [U+10000, U+10FFFF]?
+          // The spec says they're invalid but nobody appears to check for them.
+          const uint32_t code_point_bits = code_point - 0x10000u;
+          *value++ = 0xd800u | ((code_point_bits >> 10) & 0x3ffu);
+          *value++ = 0xdc00u | (code_point_bits & 0x3ffu);
+        }
+      };
+      auto bad = [&]() {
+        DCHECK(has_bad_char_);
+        *value++ = kBadUtf8ReplacementChar;
+      };
+      VisitUtf8Chars(utf_, utf8_length_, good, bad);
+      DCHECK_IMPLIES(mirror::kUseStringCompression,
+                     !mirror::String::AllASCII(string->GetValue(), string->GetLength()));
+    }
+  }
+
+ private:
+  const char* utf_;
+  size_t utf8_length_;
+  const int32_t count_;
+  bool has_bad_char_;
+};
+
+// The JNI specification says that `GetStringUTFLength()`, `GetStringUTFChars()`
+// and `GetStringUTFRegion()` should emit the Modified UTF-8 encoding.
+// However, we have been emitting 4-byte UTF-8 sequences for several years now
+// and changing that would risk breaking a lot of binary interfaces.
+constexpr bool kUtfUseShortZero = false;
+constexpr bool kUtfUse4ByteSequence = true;  // This is against the JNI spec.
+constexpr bool kUtfReplaceBadSurrogates = false;
+
+jsize GetUncompressedStringUTFLength(const uint16_t* chars, size_t length) {
+  jsize byte_count = 0;
+  ConvertUtf16ToUtf8<kUtfUseShortZero, kUtfUse4ByteSequence, kUtfReplaceBadSurrogates>(
+      chars, length, [&]([[maybe_unused]] char c) { ++byte_count; });
+  return byte_count;
+}
+
+char* GetUncompressedStringUTFChars(const uint16_t* chars, size_t length, char* dest) {
+  ConvertUtf16ToUtf8<kUtfUseShortZero, kUtfUse4ByteSequence, kUtfReplaceBadSurrogates>(
+      chars, length, [&](char c) { *dest++ = c; });
+  return dest;
+}
+
+}  // namespace
 
 // Consider turning this on when there is errors which could be related to JNI array copies such as
 // things not rendering correctly. E.g. b/16858794
 static constexpr bool kWarnJniAbort = false;
 
+static hiddenapi::AccessContext GetJniAccessContext(Thread* self)
+    REQUIRES_SHARED(Locks::mutator_lock_) {
+  // Construct AccessContext from the first calling class on stack.
+  // If the calling class cannot be determined, e.g. unattached threads,
+  // we conservatively assume the caller is trusted.
+  ObjPtr<mirror::Class> caller = GetCallingClass(self, /* num_frames= */ 1);
+  return caller.IsNull() ? hiddenapi::AccessContext(/* is_trusted= */ true)
+                         : hiddenapi::AccessContext(caller);
+}
+
 template<typename T>
-ALWAYS_INLINE static bool ShouldDenyAccessToMember(T* member, Thread* self)
+ALWAYS_INLINE static bool ShouldDenyAccessToMember(
+    T* member,
+    Thread* self,
+    hiddenapi::AccessMethod access_kind = hiddenapi::AccessMethod::kJNI)
     REQUIRES_SHARED(Locks::mutator_lock_) {
   return hiddenapi::ShouldDenyAccessToMember(
       member,
-      [&]() REQUIRES_SHARED(Locks::mutator_lock_) {
-        // Construct AccessContext from the first calling class on stack.
-        // If the calling class cannot be determined, e.g. unattached threads,
-        // we conservatively assume the caller is trusted.
-        ObjPtr<mirror::Class> caller = GetCallingClass(self, /* num_frames */ 1);
-        return caller.IsNull() ? hiddenapi::AccessContext(/* is_trusted= */ true)
-                               : hiddenapi::AccessContext(caller);
-      },
-      hiddenapi::AccessMethod::kJNI);
+      [self]() REQUIRES_SHARED(Locks::mutator_lock_) { return GetJniAccessContext(self); },
+      access_kind);
 }
 
 // Helpers to call instrumentation functions for fields. These take jobjects so we don't need to set
@@ -229,8 +396,7 @@ static ObjPtr<mirror::ClassLoader> GetClassLoader(const ScopedObjectAccess& soa)
     REQUIRES_SHARED(Locks::mutator_lock_) {
   ArtMethod* method = soa.Self()->GetCurrentMethod(nullptr);
   // If we are running Runtime.nativeLoad, use the overriding ClassLoader it set.
-  if (method ==
-      jni::DecodeArtMethod<kEnableIndexIds>(WellKnownClasses::java_lang_Runtime_nativeLoad)) {
+  if (method == WellKnownClasses::java_lang_Runtime_nativeLoad) {
     return soa.Decode<mirror::ClassLoader>(soa.Self()->GetClassLoaderOverride());
   }
   // If we have a method, use its ClassLoader for context.
@@ -327,8 +493,22 @@ ArtMethod* FindMethodJNI(const ScopedObjectAccess& soa,
   } else {
     method = c->FindClassMethod(name, sig, pointer_size);
   }
-  if (method != nullptr && ShouldDenyAccessToMember(method, soa.Self())) {
-    method = nullptr;
+  if (method != nullptr &&
+      ShouldDenyAccessToMember(method, soa.Self(), hiddenapi::AccessMethod::kNone)) {
+    // The resolved method that we have found cannot be accessed due to
+    // hiddenapi (typically it is declared up the hierarchy and is not an SDK
+    // method). Try to find an interface method from the implemented interfaces which is
+    // accessible.
+    ArtMethod* itf_method = c->FindAccessibleInterfaceMethod(method, pointer_size);
+    if (itf_method == nullptr) {
+      // No interface method. Call ShouldDenyAccessToMember again but this time
+      // with AccessMethod::kJNI to ensure that an appropriate warning is
+      // logged.
+      ShouldDenyAccessToMember(method, soa.Self(), hiddenapi::AccessMethod::kJNI);
+      method = nullptr;
+    } else {
+      // We found an interface method that is accessible, continue with the resolved method.
+    }
   }
   if (method == nullptr || method->IsStatic() != is_static) {
     ThrowNoSuchMethodError(soa, c, name, sig, is_static ? "static" : "non-static");
@@ -355,7 +535,7 @@ ArtField* FindFieldJNI(const ScopedObjectAccess& soa,
     DCHECK(field == nullptr);
   } else if (sig[1] != '\0') {
     Handle<mirror::ClassLoader> class_loader(hs.NewHandle(c->GetClassLoader()));
-    field_type = class_linker->FindClass(soa.Self(), sig, class_loader);
+    field_type = class_linker->FindClass(soa.Self(), sig, strlen(sig), class_loader);
   } else {
     field_type = class_linker->FindPrimitiveClass(*sig);
   }
@@ -377,8 +557,7 @@ ArtField* FindFieldJNI(const ScopedObjectAccess& soa,
   }
   std::string temp;
   if (is_static) {
-    field = mirror::Class::FindStaticField(
-        soa.Self(), c.Get(), name, field_type->GetDescriptor(&temp));
+    field = c->FindStaticField(name, field_type->GetDescriptor(&temp));
   } else {
     field = c->FindInstanceField(name, field_type->GetDescriptor(&temp));
   }
@@ -496,14 +675,11 @@ class JNI {
     ClassLinker* class_linker = runtime->GetClassLinker();
     std::string descriptor(NormalizeJniClassDescriptor(name));
     ScopedObjectAccess soa(env);
-    ObjPtr<mirror::Class> c = nullptr;
-    if (runtime->IsStarted()) {
-      StackHandleScope<1> hs(soa.Self());
-      Handle<mirror::ClassLoader> class_loader(hs.NewHandle(GetClassLoader<kEnableIndexIds>(soa)));
-      c = class_linker->FindClass(soa.Self(), descriptor.c_str(), class_loader);
-    } else {
-      c = class_linker->FindSystemClass(soa.Self(), descriptor.c_str());
-    }
+    StackHandleScope<1> hs(soa.Self());
+    Handle<mirror::ClassLoader> class_loader = hs.NewHandle(
+        runtime->IsStarted() ? GetClassLoader<kEnableIndexIds>(soa) : nullptr);
+    ObjPtr<mirror::Class> c = class_linker->FindClass(
+        soa.Self(), descriptor.c_str(), descriptor.length(), class_loader);
     return soa.AddLocalReference<jclass>(c);
   }
 
@@ -531,11 +707,10 @@ class JNI {
     ArtMethod* m = jni::DecodeArtMethod(mid);
     ObjPtr<mirror::Executable> method;
     DCHECK_EQ(Runtime::Current()->GetClassLinker()->GetImagePointerSize(), kRuntimePointerSize);
-    DCHECK(!Runtime::Current()->IsActiveTransaction());
     if (m->IsConstructor()) {
-      method = mirror::Constructor::CreateFromArtMethod<kRuntimePointerSize, false>(soa.Self(), m);
+      method = mirror::Constructor::CreateFromArtMethod<kRuntimePointerSize>(soa.Self(), m);
     } else {
-      method = mirror::Method::CreateFromArtMethod<kRuntimePointerSize, false>(soa.Self(), m);
+      method = mirror::Method::CreateFromArtMethod<kRuntimePointerSize>(soa.Self(), m);
     }
     return soa.AddLocalReference<jobject>(method);
   }
@@ -545,7 +720,7 @@ class JNI {
     ScopedObjectAccess soa(env);
     ArtField* f = jni::DecodeArtField(fid);
     return soa.AddLocalReference<jobject>(
-        mirror::Field::CreateFromArtField<kRuntimePointerSize>(soa.Self(), f, true));
+        mirror::Field::CreateFromArtField(soa.Self(), f, true));
   }
 
   static jclass GetObjectClass(JNIEnv* env, jobject java_object) {
@@ -716,7 +891,7 @@ class JNI {
     // it. b/22119403
     ScopedObjectAccess soa(env);
     auto* ext_env = down_cast<JNIEnvExt*>(env);
-    if (!ext_env->locals_.Remove(ext_env->local_ref_cookie_, obj)) {
+    if (!ext_env->locals_.Remove(obj)) {
       // Attempting to delete a local reference that is not in the
       // topmost local reference frame is a no-op.  DeleteLocalRef returns
       // void and doesn't throw any exceptions, but we should probably
@@ -724,6 +899,8 @@ class JNI {
       // going quite the way they expect.
       LOG(WARNING) << "JNI WARNING: DeleteLocalRef(" << obj << ") "
                    << "failed to find entry";
+      // Investigating b/228295454: Scudo ERROR: internal map failure (NO MEMORY).
+      soa.Self()->DumpJavaStack(LOG_STREAM(WARNING));
     }
   }
 
@@ -777,16 +954,15 @@ class JNI {
           WellKnownClasses::StringInitToStringFactory(jni::DecodeArtMethod(mid)));
       return CallStaticObjectMethodV(env, WellKnownClasses::java_lang_StringFactory, sf_mid, args);
     }
-    ObjPtr<mirror::Object> result = c->AllocObject(soa.Self());
+    ScopedLocalRef<jobject> result(env, soa.AddLocalReference<jobject>(c->AllocObject(soa.Self())));
     if (result == nullptr) {
       return nullptr;
     }
-    jobject local_result = soa.AddLocalReference<jobject>(result);
-    CallNonvirtualVoidMethodV(env, local_result, java_class, mid, args);
+    CallNonvirtualVoidMethodV(env, result.get(), java_class, mid, args);
     if (soa.Self()->IsExceptionPending()) {
       return nullptr;
     }
-    return local_result;
+    return result.release();
   }
 
   static jobject NewObjectA(JNIEnv* env, jclass java_class, jmethodID mid, const jvalue* args) {
@@ -804,16 +980,15 @@ class JNI {
           WellKnownClasses::StringInitToStringFactory(jni::DecodeArtMethod(mid)));
       return CallStaticObjectMethodA(env, WellKnownClasses::java_lang_StringFactory, sf_mid, args);
     }
-    ObjPtr<mirror::Object> result = c->AllocObject(soa.Self());
+    ScopedLocalRef<jobject> result(env, soa.AddLocalReference<jobject>(c->AllocObject(soa.Self())));
     if (result == nullptr) {
       return nullptr;
     }
-    jobject local_result = soa.AddLocalReference<jobjectArray>(result);
-    CallNonvirtualVoidMethodA(env, local_result, java_class, mid, args);
+    CallNonvirtualVoidMethodA(env, result.get(), java_class, mid, args);
     if (soa.Self()->IsExceptionPending()) {
       return nullptr;
     }
-    return local_result;
+    return result.release();
   }
 
   static jmethodID GetMethodID(JNIEnv* env, jclass java_class, const char* name, const char* sig) {
@@ -1092,8 +1267,7 @@ class JNI {
     CHECK_NON_NULL_ARGUMENT(mid);
     ScopedObjectAccess soa(env);
     JValue result(InvokeWithVarArgs(soa, obj, mid, ap));
-    jobject local_result = soa.AddLocalReference<jobject>(result.GetL());
-    return local_result;
+    return soa.AddLocalReference<jobject>(result.GetL());
   }
 
   static jobject CallNonvirtualObjectMethodV(JNIEnv* env, jobject obj, jclass, jmethodID mid,
@@ -1579,8 +1753,7 @@ class JNI {
     CHECK_NON_NULL_ARGUMENT(mid);
     ScopedObjectAccess soa(env);
     JValue result(InvokeWithVarArgs(soa, nullptr, mid, ap));
-    jobject local_result = soa.AddLocalReference<jobject>(result.GetL());
-    return local_result;
+    return soa.AddLocalReference<jobject>(result.GetL());
   }
 
   static jobject CallStaticObjectMethodV(JNIEnv* env, jclass, jmethodID mid, va_list args) {
@@ -1773,6 +1946,7 @@ class JNI {
     return InvokeWithJValues(soa, nullptr, mid, args).GetD();
   }
 
+  NO_STACK_PROTECTOR
   static void CallStaticVoidMethod(JNIEnv* env, jclass, jmethodID mid, ...) {
     va_list ap;
     va_start(ap, mid);
@@ -1782,6 +1956,7 @@ class JNI {
     InvokeWithVarArgs(soa, nullptr, mid, ap);
   }
 
+  NO_STACK_PROTECTOR
   static void CallStaticVoidMethodV(JNIEnv* env, jclass, jmethodID mid, va_list args) {
     CHECK_NON_NULL_ARGUMENT_RETURN_VOID(mid);
     ScopedObjectAccess soa(env);
@@ -1808,12 +1983,76 @@ class JNI {
     return soa.AddLocalReference<jstring>(result);
   }
 
+  // For historical reasons, NewStringUTF() accepts 4-byte UTF-8
+  // sequences which are not valid Modified UTF-8. This can be
+  // considered an extension of the JNI specification.
   static jstring NewStringUTF(JNIEnv* env, const char* utf) {
     if (utf == nullptr) {
       return nullptr;
     }
+
+    // The input may come from an untrusted source, so we need to validate it.
+    // We do not perform full validation, only as much as necessary to avoid reading
+    // beyond the terminating null character. CheckJNI performs stronger validation.
+    size_t utf8_length = strlen(utf);
+    bool compressible = mirror::kUseStringCompression;
+    bool has_bad_char = false;
+    size_t utf16_length = VisitUtf8Chars(
+        utf,
+        utf8_length,
+        /*good=*/ [&compressible](const char* ptr, size_t length) {
+          if (mirror::kUseStringCompression) {
+            switch (length) {
+              case 1:
+                DCHECK(mirror::String::IsASCII(*ptr));
+                break;
+              case 2:
+              case 3:
+                if (!mirror::String::IsASCII(DecodeModifiedUtf8Character(ptr, length))) {
+                  compressible = false;
+                }
+                break;
+              default:
+                // 4-byte sequences lead to uncompressible surroate pairs.
+                DCHECK_EQ(length, 4u);
+                compressible = false;
+                break;
+            }
+          }
+        },
+        /*bad=*/ [&has_bad_char]() {
+          static_assert(mirror::String::IsASCII(kBadUtf8ReplacementChar));  // Compressible.
+          has_bad_char = true;
+        });
+    if (UNLIKELY(utf16_length > static_cast<uint32_t>(std::numeric_limits<int32_t>::max()))) {
+      // Converting the utf16_length to int32_t would overflow. Explicitly throw an OOME.
+      std::string error =
+          android::base::StringPrintf("NewStringUTF input has 2^31 or more characters: %zu",
+                                      utf16_length);
+      ScopedObjectAccess soa(env);
+      soa.Self()->ThrowOutOfMemoryError(error.c_str());
+      return nullptr;
+    }
+    if (UNLIKELY(has_bad_char)) {
+      // VisitUtf8Chars() found a bad character.
+      android_errorWriteLog(0x534e4554, "172655291");  // Report to SafetyNet.
+      // Report the error to logcat but avoid too much spam.
+      static const uint64_t kMinDelay = UINT64_C(10000000000);  // 10s
+      static std::atomic<uint64_t> prev_bad_input_time(UINT64_C(0));
+      uint64_t prev_time = prev_bad_input_time.load(std::memory_order_relaxed);
+      uint64_t now = NanoTime();
+      if ((prev_time == 0u || now - prev_time >= kMinDelay) &&
+          prev_bad_input_time.compare_exchange_strong(prev_time, now, std::memory_order_relaxed)) {
+        LOG(ERROR) << "Invalid UTF-8 input to JNI::NewStringUTF()";
+      }
+    }
+    const int32_t length_with_flag = mirror::String::GetFlaggedCount(utf16_length, compressible);
+    NewStringUTFVisitor visitor(utf, utf8_length, length_with_flag, has_bad_char);
+
     ScopedObjectAccess soa(env);
-    ObjPtr<mirror::String> result = mirror::String::AllocFromModifiedUtf8(soa.Self(), utf);
+    gc::AllocatorType allocator_type = Runtime::Current()->GetHeap()->GetCurrentAllocator();
+    ObjPtr<mirror::String> result =
+        mirror::String::Alloc(soa.Self(), length_with_flag, allocator_type, visitor);
     return soa.AddLocalReference<jstring>(result);
   }
 
@@ -1826,7 +2065,10 @@ class JNI {
   static jsize GetStringUTFLength(JNIEnv* env, jstring java_string) {
     CHECK_NON_NULL_ARGUMENT_RETURN_ZERO(java_string);
     ScopedObjectAccess soa(env);
-    return soa.Decode<mirror::String>(java_string)->GetUtfLength();
+    ObjPtr<mirror::String> str = soa.Decode<mirror::String>(java_string);
+    return str->IsCompressed()
+        ? str->GetLength()
+        : GetUncompressedStringUTFLength(str->GetValue(), str->GetLength());
   }
 
   static void GetStringRegion(JNIEnv* env, jstring java_string, jsize start, jsize length,
@@ -1839,8 +2081,9 @@ class JNI {
     } else {
       CHECK_NON_NULL_MEMCPY_ARGUMENT(length, buf);
       if (s->IsCompressed()) {
+        const uint8_t* src = s->GetValueCompressed() + start;
         for (int i = 0; i < length; ++i) {
-          buf[i] = static_cast<jchar>(s->CharAt(start+i));
+          buf[i] = static_cast<jchar>(src[i]);
         }
       } else {
         const jchar* chars = static_cast<jchar*>(s->GetValue());
@@ -1858,14 +2101,19 @@ class JNI {
       ThrowSIOOBE(soa, start, length, s->GetLength());
     } else {
       CHECK_NON_NULL_MEMCPY_ARGUMENT(length, buf);
+      if (length == 0 && buf == nullptr) {
+        // Don't touch anything when length is 0 and null buffer.
+        return;
+      }
       if (s->IsCompressed()) {
+        const uint8_t* src = s->GetValueCompressed() + start;
         for (int i = 0; i < length; ++i) {
-          buf[i] = s->CharAt(start+i);
+          buf[i] = static_cast<jchar>(src[i]);
         }
+        buf[length] = '\0';
       } else {
-        const jchar* chars = s->GetValue();
-        size_t bytes = CountUtf8Bytes(chars + start, length);
-        ConvertUtf16ToModifiedUtf8(buf, bytes, chars + start, length);
+        char* end = GetUncompressedStringUTFChars(s->GetValue() + start, length, buf);
+        *end = '\0';
       }
     }
   }
@@ -1879,8 +2127,9 @@ class JNI {
       jchar* chars = new jchar[s->GetLength()];
       if (s->IsCompressed()) {
         int32_t length = s->GetLength();
+        const uint8_t* src = s->GetValueCompressed();
         for (int i = 0; i < length; ++i) {
-          chars[i] = s->CharAt(i);
+          chars[i] = static_cast<jchar>(src[i]);
         }
       } else {
         memcpy(chars, s->GetValue(), sizeof(jchar) * s->GetLength());
@@ -1910,28 +2159,32 @@ class JNI {
     ScopedObjectAccess soa(env);
     ObjPtr<mirror::String> s = soa.Decode<mirror::String>(java_string);
     gc::Heap* heap = Runtime::Current()->GetHeap();
-    if (heap->IsMovableObject(s)) {
-      StackHandleScope<1> hs(soa.Self());
-      HandleWrapperObjPtr<mirror::String> h(hs.NewHandleWrapper(&s));
-      if (!kUseReadBarrier) {
-        heap->IncrementDisableMovingGC(soa.Self());
-      } else {
-        // For the CC collector, we only need to wait for the thread flip rather than the whole GC
-        // to occur thanks to the to-space invariant.
-        heap->IncrementDisableThreadFlip(soa.Self());
-      }
-    }
     if (s->IsCompressed()) {
       if (is_copy != nullptr) {
         *is_copy = JNI_TRUE;
       }
       int32_t length = s->GetLength();
+      const uint8_t* src = s->GetValueCompressed();
       jchar* chars = new jchar[length];
       for (int i = 0; i < length; ++i) {
-        chars[i] = s->CharAt(i);
+        chars[i] = static_cast<jchar>(src[i]);
       }
       return chars;
     } else {
+      if (heap->IsMovableObject(s)) {
+        StackHandleScope<1> hs(soa.Self());
+        HandleWrapperObjPtr<mirror::String> h(hs.NewHandleWrapper(&s));
+        if (!gUseReadBarrier && !gUseUserfaultfd) {
+          heap->IncrementDisableMovingGC(soa.Self());
+        } else {
+          // For the CC and CMC collector, we only need to wait for the thread flip rather
+          // than the whole GC to occur thanks to the to-space invariant.
+          heap->IncrementDisableThreadFlip(soa.Self());
+        }
+      }
+      // Ensure that the string doesn't cause userfaults in case passed on to
+      // the kernel.
+      heap->EnsureObjectUserfaulted(s);
       if (is_copy != nullptr) {
         *is_copy = JNI_FALSE;
       }
@@ -1946,14 +2199,16 @@ class JNI {
     ScopedObjectAccess soa(env);
     gc::Heap* heap = Runtime::Current()->GetHeap();
     ObjPtr<mirror::String> s = soa.Decode<mirror::String>(java_string);
-    if (heap->IsMovableObject(s)) {
-      if (!kUseReadBarrier) {
+    if (!s->IsCompressed() && heap->IsMovableObject(s)) {
+      if (!gUseReadBarrier && !gUseUserfaultfd) {
         heap->DecrementDisableMovingGC(soa.Self());
       } else {
         heap->DecrementDisableThreadFlip(soa.Self());
       }
     }
-    if (s->IsCompressed() || (s->IsCompressed() == false && s->GetValue() != chars)) {
+    // TODO: For uncompressed strings GetStringCritical() always returns `s->GetValue()`.
+    // Should we report an error if the user passes a different `chars`?
+    if (s->IsCompressed() || (!s->IsCompressed() && s->GetValue() != chars)) {
       delete[] chars;
     }
   }
@@ -1965,18 +2220,22 @@ class JNI {
     if (is_copy != nullptr) {
       *is_copy = JNI_TRUE;
     }
+
     ScopedObjectAccess soa(env);
     ObjPtr<mirror::String> s = soa.Decode<mirror::String>(java_string);
-    size_t byte_count = s->GetUtfLength();
+    size_t length = s->GetLength();
+    size_t byte_count =
+        s->IsCompressed() ? length : GetUncompressedStringUTFLength(s->GetValue(), length);
     char* bytes = new char[byte_count + 1];
     CHECK(bytes != nullptr);  // bionic aborts anyway.
     if (s->IsCompressed()) {
+      const uint8_t* src = s->GetValueCompressed();
       for (size_t i = 0; i < byte_count; ++i) {
-        bytes[i] = s->CharAt(i);
+        bytes[i] = src[i];
       }
     } else {
-      const uint16_t* chars = s->GetValue();
-      ConvertUtf16ToModifiedUtf8(bytes, byte_count, chars, s->GetLength());
+      char* end = GetUncompressedStringUTFChars(s->GetValue(), length, bytes);
+      DCHECK_EQ(byte_count, static_cast<size_t>(end - bytes));
     }
     bytes[byte_count] = '\0';
     return bytes;
@@ -2108,16 +2367,18 @@ class JNI {
     }
     gc::Heap* heap = Runtime::Current()->GetHeap();
     if (heap->IsMovableObject(array)) {
-      if (!kUseReadBarrier) {
+      if (!gUseReadBarrier && !gUseUserfaultfd) {
         heap->IncrementDisableMovingGC(soa.Self());
       } else {
-        // For the CC collector, we only need to wait for the thread flip rather than the whole GC
-        // to occur thanks to the to-space invariant.
+        // For the CC and CMC collector, we only need to wait for the thread flip rather
+        // than the whole GC to occur thanks to the to-space invariant.
         heap->IncrementDisableThreadFlip(soa.Self());
       }
       // Re-decode in case the object moved since IncrementDisableGC waits for GC to complete.
       array = soa.Decode<mirror::Array>(java_array);
     }
+    // Ensure that the array doesn't cause userfaults in case passed on to the kernel.
+    heap->EnsureObjectUserfaulted(array);
     if (is_copy != nullptr) {
       *is_copy = JNI_FALSE;
     }
@@ -2305,14 +2566,33 @@ class JNI {
       return JNI_ERR;  // Not reached except in unit tests.
     }
     CHECK_NON_NULL_ARGUMENT_FN_NAME("RegisterNatives", java_class, JNI_ERR);
+    ClassLinker* class_linker = Runtime::Current()->GetClassLinker();
     ScopedObjectAccess soa(env);
     StackHandleScope<1> hs(soa.Self());
     Handle<mirror::Class> c = hs.NewHandle(soa.Decode<mirror::Class>(java_class));
     if (UNLIKELY(method_count == 0)) {
       LOG(WARNING) << "JNI RegisterNativeMethods: attempt to register 0 native methods for "
-          << c->PrettyDescriptor();
+                   << c->PrettyDescriptor();
       return JNI_OK;
     }
+    ScopedLocalRef<jobject> jclass_loader(env, nullptr);
+    if (c->GetClassLoader() != nullptr) {
+      jclass_loader.reset(soa.Env()->AddLocalReference<jobject>(c->GetClassLoader()));
+    }
+
+    bool is_class_loader_namespace_natively_bridged = false;
+    {
+      // Making sure to release mutator_lock_ before proceeding.
+      // FindNativeLoaderNamespaceByClassLoader eventually acquires lock on g_namespaces_mutex
+      // which may cause a deadlock if another thread is waiting for mutator_lock_
+      // for IsSameObject call in libnativeloader's CreateClassLoaderNamespace (which happens
+      // under g_namespace_mutex lock)
+      ScopedThreadSuspension sts(soa.Self(), ThreadState::kNative);
+
+      is_class_loader_namespace_natively_bridged =
+          IsClassLoaderNamespaceNativelyBridged(env, jclass_loader.get());
+    }
+
     CHECK_NON_NULL_ARGUMENT_FN_NAME("RegisterNatives", methods, JNI_ERR);
     for (jint i = 0; i < method_count; ++i) {
       const char* name = methods[i].name;
@@ -2421,7 +2701,10 @@ class JNI {
         // TODO: make this a hard register error in the future.
       }
 
-      const void* final_function_ptr = m->RegisterNative(fnPtr);
+      if (is_class_loader_namespace_natively_bridged) {
+        fnPtr = GenerateNativeBridgeTrampoline(fnPtr, m);
+      }
+      const void* final_function_ptr = class_linker->RegisterNative(soa.Self(), m, fnPtr);
       UNUSED(final_function_ptr);
     }
     return JNI_OK;
@@ -2435,10 +2718,11 @@ class JNI {
     VLOG(jni) << "[Unregistering JNI native methods for " << mirror::Class::PrettyClass(c) << "]";
 
     size_t unregistered_count = 0;
-    auto pointer_size = Runtime::Current()->GetClassLinker()->GetImagePointerSize();
+    ClassLinker* class_linker = Runtime::Current()->GetClassLinker();
+    auto pointer_size = class_linker->GetImagePointerSize();
     for (auto& m : c->GetMethods(pointer_size)) {
       if (m.IsNative()) {
-        m.UnregisterNative();
+        class_linker->UnregisterNative(soa.Self(), &m);
         unregistered_count++;
       }
     }
@@ -2512,10 +2796,10 @@ class JNI {
     jlong address_arg = reinterpret_cast<jlong>(address);
     jint capacity_arg = static_cast<jint>(capacity);
 
-    jobject result = env->NewObject(WellKnownClasses::java_nio_DirectByteBuffer,
-                                    WellKnownClasses::java_nio_DirectByteBuffer_init,
-                                    address_arg, capacity_arg);
-    return static_cast<JNIEnvExt*>(env)->self_->IsExceptionPending() ? nullptr : result;
+    ScopedObjectAccess soa(env);
+    return soa.AddLocalReference<jobject>(
+        WellKnownClasses::java_nio_DirectByteBuffer_init->NewObject<'J', 'I'>(
+            soa.Self(), address_arg, capacity_arg));
   }
 
   static void* GetDirectBufferAddress(JNIEnv* env, jobject java_buffer) {
@@ -2524,27 +2808,50 @@ class JNI {
       return nullptr;
     }
 
+    ScopedObjectAccess soa(env);
+    ObjPtr<mirror::Object> buffer = soa.Decode<mirror::Object>(java_buffer);
+
     // Return null if |java_buffer| is not a java.nio.Buffer instance.
-    if (!IsInstanceOf(env, java_buffer, WellKnownClasses::java_nio_Buffer)) {
+    if (!buffer->InstanceOf(WellKnownClasses::java_nio_Buffer.Get())) {
       return nullptr;
     }
 
     // Buffer.address is non-null when the |java_buffer| is direct.
-    return reinterpret_cast<void*>(env->GetLongField(
-        java_buffer, WellKnownClasses::java_nio_Buffer_address));
+    return reinterpret_cast<void*>(WellKnownClasses::java_nio_Buffer_address->GetLong(buffer));
   }
 
   static jlong GetDirectBufferCapacity(JNIEnv* env, jobject java_buffer) {
-    // Check if |java_buffer| is a direct buffer, bail if not.
-    if (GetDirectBufferAddress(env, java_buffer) == nullptr) {
+    if (java_buffer == nullptr) {
       return -1;
     }
 
-    return static_cast<jlong>(env->GetIntField(
-        java_buffer, WellKnownClasses::java_nio_Buffer_capacity));
+    ScopedObjectAccess soa(env);
+    StackHandleScope<1u> hs(soa.Self());
+    Handle<mirror::Object> buffer = hs.NewHandle(soa.Decode<mirror::Object>(java_buffer));
+    if (!buffer->InstanceOf(WellKnownClasses::java_nio_Buffer.Get())) {
+      return -1;
+    }
+
+    // When checking the buffer capacity, it's important to note that a zero-sized direct buffer
+    // may have a null address field which means we can't tell whether it is direct or not.
+    // We therefore call Buffer.isDirect(). One path that creates such a buffer is
+    // FileChannel.map() if the file size is zero.
+    //
+    // NB GetDirectBufferAddress() does not need to call `Buffer.isDirect()` since it is only
+    // able return a valid address if the Buffer address field is not-null.
+    //
+    // Note: We can hit a `StackOverflowError` during the invocation but `Buffer.isDirect()`
+    // implementations should not otherwise throw any exceptions.
+    bool direct = WellKnownClasses::java_nio_Buffer_isDirect->InvokeVirtual<'Z'>(
+        soa.Self(), buffer.Get());
+    if (UNLIKELY(soa.Self()->IsExceptionPending()) || !direct) {
+      return -1;
+    }
+
+    return static_cast<jlong>(WellKnownClasses::java_nio_Buffer_capacity->GetInt(buffer.Get()));
   }
 
-  static jobjectRefType GetObjectRefType(JNIEnv* env ATTRIBUTE_UNUSED, jobject java_object) {
+  static jobjectRefType GetObjectRefType([[maybe_unused]] JNIEnv* env, jobject java_object) {
     if (java_object == nullptr) {
       return JNIInvalidRefType;
     }
@@ -2559,8 +2866,8 @@ class JNI {
       return JNIGlobalRefType;
     case kWeakGlobal:
       return JNIWeakGlobalRefType;
-    case kHandleScopeOrInvalid:
-      // Assume value is in a handle scope.
+    case kJniTransition:
+      // Assume value is in a JNI transition frame.
       return JNILocalRefType;
     }
     LOG(FATAL) << "IndirectRefKind[" << kind << "]";
@@ -2571,17 +2878,19 @@ class JNI {
   static jint EnsureLocalCapacityInternal(ScopedObjectAccess& soa, jint desired_capacity,
                                           const char* caller)
       REQUIRES_SHARED(Locks::mutator_lock_) {
-    if (desired_capacity < 0) {
+    if (desired_capacity > 0) {
+      std::string error_msg;
+      if (!soa.Env()->locals_.EnsureFreeCapacity(static_cast<size_t>(desired_capacity),
+                                                 &error_msg)) {
+        std::string caller_error = android::base::StringPrintf("%s: %s", caller,
+                                                               error_msg.c_str());
+        soa.Self()->ThrowOutOfMemoryError(caller_error.c_str());
+        return JNI_ERR;
+      }
+    } else if (desired_capacity < 0) {
       LOG(ERROR) << "Invalid capacity given to " << caller << ": " << desired_capacity;
       return JNI_ERR;
-    }
-
-    std::string error_msg;
-    if (!soa.Env()->locals_.EnsureFreeCapacity(static_cast<size_t>(desired_capacity), &error_msg)) {
-      std::string caller_error = android::base::StringPrintf("%s: %s", caller, error_msg.c_str());
-      soa.Self()->ThrowOutOfMemoryError(caller_error.c_str());
-      return JNI_ERR;
-    }
+    }  // The zero case is a no-op.
     return JNI_OK;
   }
 
@@ -2615,6 +2924,33 @@ class JNI {
     }
     DCHECK_EQ(sizeof(ElementT), array->GetClass()->GetComponentSize());
     return array;
+  }
+
+  static bool IsClassLoaderNamespaceNativelyBridged(JNIEnv* env, jobject jclass_loader) {
+#if defined(ART_TARGET_ANDROID)
+    android::NativeLoaderNamespace* ns =
+        android::FindNativeLoaderNamespaceByClassLoader(env, jclass_loader);
+    return ns != nullptr && android::IsNamespaceNativeBridged(ns);
+#else
+    UNUSED(env, jclass_loader);
+    return false;
+#endif
+  }
+
+  static const void* GenerateNativeBridgeTrampoline(const void* fn_ptr, ArtMethod* method)
+      REQUIRES_SHARED(Locks::mutator_lock_) {
+#if defined(ART_TARGET_ANDROID)
+    uint32_t shorty_length;
+    const char* shorty = method->GetShorty(&shorty_length);
+    android::JNICallType jni_call_type = method->IsCriticalNative() ?
+                                             android::JNICallType::kJNICallTypeCriticalNative :
+                                             android::JNICallType::kJNICallTypeRegular;
+    return NativeBridgeGetTrampolineForFunctionPointer(
+        fn_ptr, shorty, shorty_length, jni_call_type);
+#else
+    UNUSED(method);
+    return fn_ptr;
+#endif
   }
 
   template <typename ArrayT, typename ElementT, typename ArtArrayT>
@@ -2667,7 +3003,7 @@ class JNI {
     bool is_copy = array_data != elements;
     size_t bytes = array->GetLength() * component_size;
     if (is_copy) {
-      // Sanity check: If elements is not the same as the java array's data, it better not be a
+      // Integrity check: If elements is not the same as the java array's data, it better not be a
       // heap address. TODO: This might be slow to check, may be worth keeping track of which
       // copies we make?
       if (heap->IsNonDiscontinuousSpaceHeapAddress(elements)) {
@@ -2689,7 +3025,7 @@ class JNI {
         delete[] reinterpret_cast<uint64_t*>(elements);
       } else if (heap->IsMovableObject(array)) {
         // Non copy to a movable object must means that we had disabled the moving GC.
-        if (!kUseReadBarrier) {
+        if (!gUseReadBarrier && !gUseUserfaultfd) {
           heap->DecrementDisableMovingGC(soa.Self());
         } else {
           heap->DecrementDisableThreadFlip(soa.Self());
@@ -2984,244 +3320,245 @@ const JNINativeInterface* GetJniNativeInterface() {
              : &JniNativeInterfaceFunctions<true>::gJniNativeInterface;
 }
 
-void (*gJniSleepForeverStub[])()  = {
-  nullptr,  // reserved0.
-  nullptr,  // reserved1.
-  nullptr,  // reserved2.
-  nullptr,  // reserved3.
-  SleepForever,
-  SleepForever,
-  SleepForever,
-  SleepForever,
-  SleepForever,
-  SleepForever,
-  SleepForever,
-  SleepForever,
-  SleepForever,
-  SleepForever,
-  SleepForever,
-  SleepForever,
-  SleepForever,
-  SleepForever,
-  SleepForever,
-  SleepForever,
-  SleepForever,
-  SleepForever,
-  SleepForever,
-  SleepForever,
-  SleepForever,
-  SleepForever,
-  SleepForever,
-  SleepForever,
-  SleepForever,
-  SleepForever,
-  SleepForever,
-  SleepForever,
-  SleepForever,
-  SleepForever,
-  SleepForever,
-  SleepForever,
-  SleepForever,
-  SleepForever,
-  SleepForever,
-  SleepForever,
-  SleepForever,
-  SleepForever,
-  SleepForever,
-  SleepForever,
-  SleepForever,
-  SleepForever,
-  SleepForever,
-  SleepForever,
-  SleepForever,
-  SleepForever,
-  SleepForever,
-  SleepForever,
-  SleepForever,
-  SleepForever,
-  SleepForever,
-  SleepForever,
-  SleepForever,
-  SleepForever,
-  SleepForever,
-  SleepForever,
-  SleepForever,
-  SleepForever,
-  SleepForever,
-  SleepForever,
-  SleepForever,
-  SleepForever,
-  SleepForever,
-  SleepForever,
-  SleepForever,
-  SleepForever,
-  SleepForever,
-  SleepForever,
-  SleepForever,
-  SleepForever,
-  SleepForever,
-  SleepForever,
-  SleepForever,
-  SleepForever,
-  SleepForever,
-  SleepForever,
-  SleepForever,
-  SleepForever,
-  SleepForever,
-  SleepForever,
-  SleepForever,
-  SleepForever,
-  SleepForever,
-  SleepForever,
-  SleepForever,
-  SleepForever,
-  SleepForever,
-  SleepForever,
-  SleepForever,
-  SleepForever,
-  SleepForever,
-  SleepForever,
-  SleepForever,
-  SleepForever,
-  SleepForever,
-  SleepForever,
-  SleepForever,
-  SleepForever,
-  SleepForever,
-  SleepForever,
-  SleepForever,
-  SleepForever,
-  SleepForever,
-  SleepForever,
-  SleepForever,
-  SleepForever,
-  SleepForever,
-  SleepForever,
-  SleepForever,
-  SleepForever,
-  SleepForever,
-  SleepForever,
-  SleepForever,
-  SleepForever,
-  SleepForever,
-  SleepForever,
-  SleepForever,
-  SleepForever,
-  SleepForever,
-  SleepForever,
-  SleepForever,
-  SleepForever,
-  SleepForever,
-  SleepForever,
-  SleepForever,
-  SleepForever,
-  SleepForever,
-  SleepForever,
-  SleepForever,
-  SleepForever,
-  SleepForever,
-  SleepForever,
-  SleepForever,
-  SleepForever,
-  SleepForever,
-  SleepForever,
-  SleepForever,
-  SleepForever,
-  SleepForever,
-  SleepForever,
-  SleepForever,
-  SleepForever,
-  SleepForever,
-  SleepForever,
-  SleepForever,
-  SleepForever,
-  SleepForever,
-  SleepForever,
-  SleepForever,
-  SleepForever,
-  SleepForever,
-  SleepForever,
-  SleepForever,
-  SleepForever,
-  SleepForever,
-  SleepForever,
-  SleepForever,
-  SleepForever,
-  SleepForever,
-  SleepForever,
-  SleepForever,
-  SleepForever,
-  SleepForever,
-  SleepForever,
-  SleepForever,
-  SleepForever,
-  SleepForever,
-  SleepForever,
-  SleepForever,
-  SleepForever,
-  SleepForever,
-  SleepForever,
-  SleepForever,
-  SleepForever,
-  SleepForever,
-  SleepForever,
-  SleepForever,
-  SleepForever,
-  SleepForever,
-  SleepForever,
-  SleepForever,
-  SleepForever,
-  SleepForever,
-  SleepForever,
-  SleepForever,
-  SleepForever,
-  SleepForever,
-  SleepForever,
-  SleepForever,
-  SleepForever,
-  SleepForever,
-  SleepForever,
-  SleepForever,
-  SleepForever,
-  SleepForever,
-  SleepForever,
-  SleepForever,
-  SleepForever,
-  SleepForever,
-  SleepForever,
-  SleepForever,
-  SleepForever,
-  SleepForever,
-  SleepForever,
-  SleepForever,
-  SleepForever,
-  SleepForever,
-  SleepForever,
-  SleepForever,
-  SleepForever,
-  SleepForever,
-  SleepForever,
-  SleepForever,
-  SleepForever,
-  SleepForever,
-  SleepForever,
-  SleepForever,
-  SleepForever,
-  SleepForever,
-  SleepForever,
-  SleepForever,
-  SleepForever,
-  SleepForever,
-  SleepForever,
-  SleepForever,
-  SleepForever,
-  SleepForever,
-  SleepForever,
-  SleepForever,
+JNINativeInterface gJniSleepForeverStub = {
+    nullptr,  // reserved0.
+    nullptr,  // reserved1.
+    nullptr,  // reserved2.
+    nullptr,  // reserved3.
+    reinterpret_cast<jint (*)(JNIEnv*)>(SleepForever),
+    reinterpret_cast<jclass (*)(JNIEnv*, const char*, jobject, const jbyte*, jsize)>(SleepForever),
+    reinterpret_cast<jclass (*)(JNIEnv*, const char*)>(SleepForever),
+    reinterpret_cast<jmethodID (*)(JNIEnv*, jobject)>(SleepForever),
+    reinterpret_cast<jfieldID (*)(JNIEnv*, jobject)>(SleepForever),
+    reinterpret_cast<jobject (*)(JNIEnv*, jclass, jmethodID, jboolean)>(SleepForever),
+    reinterpret_cast<jclass (*)(JNIEnv*, jclass)>(SleepForever),
+    reinterpret_cast<jboolean (*)(JNIEnv*, jclass, jclass)>(SleepForever),
+    reinterpret_cast<jobject (*)(JNIEnv*, jclass, jfieldID, jboolean)>(SleepForever),
+    reinterpret_cast<jint (*)(JNIEnv*, jthrowable)>(SleepForever),
+    reinterpret_cast<jint (*)(JNIEnv*, jclass, const char*)>(SleepForever),
+    reinterpret_cast<jthrowable (*)(JNIEnv*)>(SleepForever),
+    reinterpret_cast<void (*)(JNIEnv*)>(SleepForever),
+    reinterpret_cast<void (*)(JNIEnv*)>(SleepForever),
+    reinterpret_cast<void (*)(JNIEnv*, const char*)>(SleepForever),
+    reinterpret_cast<jint (*)(JNIEnv*, jint)>(SleepForever),
+    reinterpret_cast<jobject (*)(JNIEnv*, jobject)>(SleepForever),
+    reinterpret_cast<jobject (*)(JNIEnv*, jobject)>(SleepForever),
+    reinterpret_cast<void (*)(JNIEnv*, jobject)>(SleepForever),
+    reinterpret_cast<void (*)(JNIEnv*, jobject)>(SleepForever),
+    reinterpret_cast<jboolean (*)(JNIEnv*, jobject, jobject)>(SleepForever),
+    reinterpret_cast<jobject (*)(JNIEnv*, jobject)>(SleepForever),
+    reinterpret_cast<jint (*)(JNIEnv*, jint)>(SleepForever),
+    reinterpret_cast<jobject (*)(JNIEnv*, jclass)>(SleepForever),
+    reinterpret_cast<jobject (*)(JNIEnv*, jclass, jmethodID, ...)>(SleepForever),
+    reinterpret_cast<jobject (*)(JNIEnv*, jclass, jmethodID, va_list)>(SleepForever),
+    reinterpret_cast<jobject (*)(JNIEnv*, jclass, jmethodID, const jvalue*)>(SleepForever),
+    reinterpret_cast<jclass (*)(JNIEnv*, jobject)>(SleepForever),
+    reinterpret_cast<jboolean (*)(JNIEnv*, jobject, jclass)>(SleepForever),
+    reinterpret_cast<jmethodID (*)(JNIEnv*, jclass, const char*, const char*)>(SleepForever),
+    reinterpret_cast<jobject (*)(JNIEnv*, jobject, jmethodID, ...)>(SleepForever),
+    reinterpret_cast<jobject (*)(JNIEnv*, jobject, jmethodID, va_list)>(SleepForever),
+    reinterpret_cast<jobject (*)(JNIEnv*, jobject, jmethodID, const jvalue*)>(SleepForever),
+    reinterpret_cast<jboolean (*)(JNIEnv*, jobject, jmethodID, ...)>(SleepForever),
+    reinterpret_cast<jboolean (*)(JNIEnv*, jobject, jmethodID, va_list)>(SleepForever),
+    reinterpret_cast<jboolean (*)(JNIEnv*, jobject, jmethodID, const jvalue*)>(SleepForever),
+    reinterpret_cast<jbyte (*)(JNIEnv*, jobject, jmethodID, ...)>(SleepForever),
+    reinterpret_cast<jbyte (*)(JNIEnv*, jobject, jmethodID, va_list)>(SleepForever),
+    reinterpret_cast<jbyte (*)(JNIEnv*, jobject, jmethodID, const jvalue*)>(SleepForever),
+    reinterpret_cast<jchar (*)(JNIEnv*, jobject, jmethodID, ...)>(SleepForever),
+    reinterpret_cast<jchar (*)(JNIEnv*, jobject, jmethodID, va_list)>(SleepForever),
+    reinterpret_cast<jchar (*)(JNIEnv*, jobject, jmethodID, const jvalue*)>(SleepForever),
+    reinterpret_cast<jshort (*)(JNIEnv*, jobject, jmethodID, ...)>(SleepForever),
+    reinterpret_cast<jshort (*)(JNIEnv*, jobject, jmethodID, va_list)>(SleepForever),
+    reinterpret_cast<jshort (*)(JNIEnv*, jobject, jmethodID, const jvalue*)>(SleepForever),
+    reinterpret_cast<jint (*)(JNIEnv*, jobject, jmethodID, ...)>(SleepForever),
+    reinterpret_cast<jint (*)(JNIEnv*, jobject, jmethodID, va_list)>(SleepForever),
+    reinterpret_cast<jint (*)(JNIEnv*, jobject, jmethodID, const jvalue*)>(SleepForever),
+    reinterpret_cast<jlong (*)(JNIEnv*, jobject, jmethodID, ...)>(SleepForever),
+    reinterpret_cast<jlong (*)(JNIEnv*, jobject, jmethodID, va_list)>(SleepForever),
+    reinterpret_cast<jlong (*)(JNIEnv*, jobject, jmethodID, const jvalue*)>(SleepForever),
+    reinterpret_cast<jfloat (*)(JNIEnv*, jobject, jmethodID, ...)>(SleepForever),
+    reinterpret_cast<jfloat (*)(JNIEnv*, jobject, jmethodID, va_list)>(SleepForever),
+    reinterpret_cast<jfloat (*)(JNIEnv*, jobject, jmethodID, const jvalue*)>(SleepForever),
+    reinterpret_cast<jdouble (*)(JNIEnv*, jobject, jmethodID, ...)>(SleepForever),
+    reinterpret_cast<jdouble (*)(JNIEnv*, jobject, jmethodID, va_list)>(SleepForever),
+    reinterpret_cast<jdouble (*)(JNIEnv*, jobject, jmethodID, const jvalue*)>(SleepForever),
+    reinterpret_cast<void (*)(JNIEnv*, jobject, jmethodID, ...)>(SleepForever),
+    reinterpret_cast<void (*)(JNIEnv*, jobject, jmethodID, va_list)>(SleepForever),
+    reinterpret_cast<void (*)(JNIEnv*, jobject, jmethodID, const jvalue*)>(SleepForever),
+    reinterpret_cast<jobject (*)(JNIEnv*, jobject, jclass, jmethodID, ...)>(SleepForever),
+    reinterpret_cast<jobject (*)(JNIEnv*, jobject, jclass, jmethodID, va_list)>(SleepForever),
+    reinterpret_cast<jobject (*)(JNIEnv*, jobject, jclass, jmethodID, const jvalue*)>(SleepForever),
+    reinterpret_cast<jboolean (*)(JNIEnv*, jobject, jclass, jmethodID, ...)>(SleepForever),
+    reinterpret_cast<jboolean (*)(JNIEnv*, jobject, jclass, jmethodID, va_list)>(SleepForever),
+    reinterpret_cast<jboolean (*)(JNIEnv*, jobject, jclass, jmethodID, const jvalue*)>(
+        SleepForever),
+    reinterpret_cast<jbyte (*)(JNIEnv*, jobject, jclass, jmethodID, ...)>(SleepForever),
+    reinterpret_cast<jbyte (*)(JNIEnv*, jobject, jclass, jmethodID, va_list)>(SleepForever),
+    reinterpret_cast<jbyte (*)(JNIEnv*, jobject, jclass, jmethodID, const jvalue*)>(SleepForever),
+    reinterpret_cast<jchar (*)(JNIEnv*, jobject, jclass, jmethodID, ...)>(SleepForever),
+    reinterpret_cast<jchar (*)(JNIEnv*, jobject, jclass, jmethodID, va_list)>(SleepForever),
+    reinterpret_cast<jchar (*)(JNIEnv*, jobject, jclass, jmethodID, const jvalue*)>(SleepForever),
+    reinterpret_cast<jshort (*)(JNIEnv*, jobject, jclass, jmethodID, ...)>(SleepForever),
+    reinterpret_cast<jshort (*)(JNIEnv*, jobject, jclass, jmethodID, va_list)>(SleepForever),
+    reinterpret_cast<jshort (*)(JNIEnv*, jobject, jclass, jmethodID, const jvalue*)>(SleepForever),
+    reinterpret_cast<jint (*)(JNIEnv*, jobject, jclass, jmethodID, ...)>(SleepForever),
+    reinterpret_cast<jint (*)(JNIEnv*, jobject, jclass, jmethodID, va_list)>(SleepForever),
+    reinterpret_cast<jint (*)(JNIEnv*, jobject, jclass, jmethodID, const jvalue*)>(SleepForever),
+    reinterpret_cast<jlong (*)(JNIEnv*, jobject, jclass, jmethodID, ...)>(SleepForever),
+    reinterpret_cast<jlong (*)(JNIEnv*, jobject, jclass, jmethodID, va_list)>(SleepForever),
+    reinterpret_cast<jlong (*)(JNIEnv*, jobject, jclass, jmethodID, const jvalue*)>(SleepForever),
+    reinterpret_cast<jfloat (*)(JNIEnv*, jobject, jclass, jmethodID, ...)>(SleepForever),
+    reinterpret_cast<jfloat (*)(JNIEnv*, jobject, jclass, jmethodID, va_list)>(SleepForever),
+    reinterpret_cast<jfloat (*)(JNIEnv*, jobject, jclass, jmethodID, const jvalue*)>(SleepForever),
+    reinterpret_cast<jdouble (*)(JNIEnv*, jobject, jclass, jmethodID, ...)>(SleepForever),
+    reinterpret_cast<jdouble (*)(JNIEnv*, jobject, jclass, jmethodID, va_list)>(SleepForever),
+    reinterpret_cast<jdouble (*)(JNIEnv*, jobject, jclass, jmethodID, const jvalue*)>(SleepForever),
+    reinterpret_cast<void (*)(JNIEnv*, jobject, jclass, jmethodID, ...)>(SleepForever),
+    reinterpret_cast<void (*)(JNIEnv*, jobject, jclass, jmethodID, va_list)>(SleepForever),
+    reinterpret_cast<void (*)(JNIEnv*, jobject, jclass, jmethodID, const jvalue*)>(SleepForever),
+    reinterpret_cast<jfieldID (*)(JNIEnv*, jclass, const char*, const char*)>(SleepForever),
+    reinterpret_cast<jobject (*)(JNIEnv*, jobject, jfieldID)>(SleepForever),
+    reinterpret_cast<jboolean (*)(JNIEnv*, jobject, jfieldID)>(SleepForever),
+    reinterpret_cast<jbyte (*)(JNIEnv*, jobject, jfieldID)>(SleepForever),
+    reinterpret_cast<jchar (*)(JNIEnv*, jobject, jfieldID)>(SleepForever),
+    reinterpret_cast<jshort (*)(JNIEnv*, jobject, jfieldID)>(SleepForever),
+    reinterpret_cast<jint (*)(JNIEnv*, jobject, jfieldID)>(SleepForever),
+    reinterpret_cast<jlong (*)(JNIEnv*, jobject, jfieldID)>(SleepForever),
+    reinterpret_cast<jfloat (*)(JNIEnv*, jobject, jfieldID)>(SleepForever),
+    reinterpret_cast<jdouble (*)(JNIEnv*, jobject, jfieldID)>(SleepForever),
+    reinterpret_cast<void (*)(JNIEnv*, jobject, jfieldID, jobject)>(SleepForever),
+    reinterpret_cast<void (*)(JNIEnv*, jobject, jfieldID, jboolean)>(SleepForever),
+    reinterpret_cast<void (*)(JNIEnv*, jobject, jfieldID, jbyte)>(SleepForever),
+    reinterpret_cast<void (*)(JNIEnv*, jobject, jfieldID, jchar)>(SleepForever),
+    reinterpret_cast<void (*)(JNIEnv*, jobject, jfieldID, jshort)>(SleepForever),
+    reinterpret_cast<void (*)(JNIEnv*, jobject, jfieldID, jint)>(SleepForever),
+    reinterpret_cast<void (*)(JNIEnv*, jobject, jfieldID, jlong)>(SleepForever),
+    reinterpret_cast<void (*)(JNIEnv*, jobject, jfieldID, jfloat)>(SleepForever),
+    reinterpret_cast<void (*)(JNIEnv*, jobject, jfieldID, jdouble)>(SleepForever),
+    reinterpret_cast<jmethodID (*)(JNIEnv*, jclass, const char*, const char*)>(SleepForever),
+    reinterpret_cast<jobject (*)(JNIEnv*, jclass, jmethodID, ...)>(SleepForever),
+    reinterpret_cast<jobject (*)(JNIEnv*, jclass, jmethodID, va_list)>(SleepForever),
+    reinterpret_cast<jobject (*)(JNIEnv*, jclass, jmethodID, const jvalue*)>(SleepForever),
+    reinterpret_cast<jboolean (*)(JNIEnv*, jclass, jmethodID, ...)>(SleepForever),
+    reinterpret_cast<jboolean (*)(JNIEnv*, jclass, jmethodID, va_list)>(SleepForever),
+    reinterpret_cast<jboolean (*)(JNIEnv*, jclass, jmethodID, const jvalue*)>(SleepForever),
+    reinterpret_cast<jbyte (*)(JNIEnv*, jclass, jmethodID, ...)>(SleepForever),
+    reinterpret_cast<jbyte (*)(JNIEnv*, jclass, jmethodID, va_list)>(SleepForever),
+    reinterpret_cast<jbyte (*)(JNIEnv*, jclass, jmethodID, const jvalue*)>(SleepForever),
+    reinterpret_cast<jchar (*)(JNIEnv*, jclass, jmethodID, ...)>(SleepForever),
+    reinterpret_cast<jchar (*)(JNIEnv*, jclass, jmethodID, va_list)>(SleepForever),
+    reinterpret_cast<jchar (*)(JNIEnv*, jclass, jmethodID, const jvalue*)>(SleepForever),
+    reinterpret_cast<jshort (*)(JNIEnv*, jclass, jmethodID, ...)>(SleepForever),
+    reinterpret_cast<jshort (*)(JNIEnv*, jclass, jmethodID, va_list)>(SleepForever),
+    reinterpret_cast<jshort (*)(JNIEnv*, jclass, jmethodID, const jvalue*)>(SleepForever),
+    reinterpret_cast<jint (*)(JNIEnv*, jclass, jmethodID, ...)>(SleepForever),
+    reinterpret_cast<jint (*)(JNIEnv*, jclass, jmethodID, va_list)>(SleepForever),
+    reinterpret_cast<jint (*)(JNIEnv*, jclass, jmethodID, const jvalue*)>(SleepForever),
+    reinterpret_cast<jlong (*)(JNIEnv*, jclass, jmethodID, ...)>(SleepForever),
+    reinterpret_cast<jlong (*)(JNIEnv*, jclass, jmethodID, va_list)>(SleepForever),
+    reinterpret_cast<jlong (*)(JNIEnv*, jclass, jmethodID, const jvalue*)>(SleepForever),
+    reinterpret_cast<jfloat (*)(JNIEnv*, jclass, jmethodID, ...)>(SleepForever),
+    reinterpret_cast<jfloat (*)(JNIEnv*, jclass, jmethodID, va_list)>(SleepForever),
+    reinterpret_cast<jfloat (*)(JNIEnv*, jclass, jmethodID, const jvalue*)>(SleepForever),
+    reinterpret_cast<jdouble (*)(JNIEnv*, jclass, jmethodID, ...)>(SleepForever),
+    reinterpret_cast<jdouble (*)(JNIEnv*, jclass, jmethodID, va_list)>(SleepForever),
+    reinterpret_cast<jdouble (*)(JNIEnv*, jclass, jmethodID, const jvalue*)>(SleepForever),
+    reinterpret_cast<void (*)(JNIEnv*, jclass, jmethodID, ...)>(SleepForever),
+    reinterpret_cast<void (*)(JNIEnv*, jclass, jmethodID, va_list)>(SleepForever),
+    reinterpret_cast<void (*)(JNIEnv*, jclass, jmethodID, const jvalue*)>(SleepForever),
+    reinterpret_cast<jfieldID (*)(JNIEnv*, jclass, const char*, const char*)>(SleepForever),
+    reinterpret_cast<jobject (*)(JNIEnv*, jclass, jfieldID)>(SleepForever),
+    reinterpret_cast<jboolean (*)(JNIEnv*, jclass, jfieldID)>(SleepForever),
+    reinterpret_cast<jbyte (*)(JNIEnv*, jclass, jfieldID)>(SleepForever),
+    reinterpret_cast<jchar (*)(JNIEnv*, jclass, jfieldID)>(SleepForever),
+    reinterpret_cast<jshort (*)(JNIEnv*, jclass, jfieldID)>(SleepForever),
+    reinterpret_cast<jint (*)(JNIEnv*, jclass, jfieldID)>(SleepForever),
+    reinterpret_cast<jlong (*)(JNIEnv*, jclass, jfieldID)>(SleepForever),
+    reinterpret_cast<jfloat (*)(JNIEnv*, jclass, jfieldID)>(SleepForever),
+    reinterpret_cast<jdouble (*)(JNIEnv*, jclass, jfieldID)>(SleepForever),
+    reinterpret_cast<void (*)(JNIEnv*, jclass, jfieldID, jobject)>(SleepForever),
+    reinterpret_cast<void (*)(JNIEnv*, jclass, jfieldID, jboolean)>(SleepForever),
+    reinterpret_cast<void (*)(JNIEnv*, jclass, jfieldID, jbyte)>(SleepForever),
+    reinterpret_cast<void (*)(JNIEnv*, jclass, jfieldID, jchar)>(SleepForever),
+    reinterpret_cast<void (*)(JNIEnv*, jclass, jfieldID, jshort)>(SleepForever),
+    reinterpret_cast<void (*)(JNIEnv*, jclass, jfieldID, jint)>(SleepForever),
+    reinterpret_cast<void (*)(JNIEnv*, jclass, jfieldID, jlong)>(SleepForever),
+    reinterpret_cast<void (*)(JNIEnv*, jclass, jfieldID, jfloat)>(SleepForever),
+    reinterpret_cast<void (*)(JNIEnv*, jclass, jfieldID, jdouble)>(SleepForever),
+    reinterpret_cast<jstring (*)(JNIEnv*, const jchar*, jsize)>(SleepForever),
+    reinterpret_cast<jsize (*)(JNIEnv*, jstring)>(SleepForever),
+    reinterpret_cast<const jchar* (*)(JNIEnv*, jstring, jboolean*)>(SleepForever),
+    reinterpret_cast<void (*)(JNIEnv*, jstring, const jchar*)>(SleepForever),
+    reinterpret_cast<jstring (*)(JNIEnv*, const char*)>(SleepForever),
+    reinterpret_cast<jsize (*)(JNIEnv*, jstring)>(SleepForever),
+    reinterpret_cast<const char* (*)(JNIEnv*, jstring, jboolean*)>(SleepForever),
+    reinterpret_cast<void (*)(JNIEnv*, jstring, const char*)>(SleepForever),
+    reinterpret_cast<jsize (*)(JNIEnv*, jarray)>(SleepForever),
+    reinterpret_cast<jobjectArray (*)(JNIEnv*, jsize, jclass, jobject)>(SleepForever),
+    reinterpret_cast<jobject (*)(JNIEnv*, jobjectArray, jsize)>(SleepForever),
+    reinterpret_cast<void (*)(JNIEnv*, jobjectArray, jsize, jobject)>(SleepForever),
+    reinterpret_cast<jbooleanArray (*)(JNIEnv*, jsize)>(SleepForever),
+    reinterpret_cast<jbyteArray (*)(JNIEnv*, jsize)>(SleepForever),
+    reinterpret_cast<jcharArray (*)(JNIEnv*, jsize)>(SleepForever),
+    reinterpret_cast<jshortArray (*)(JNIEnv*, jsize)>(SleepForever),
+    reinterpret_cast<jintArray (*)(JNIEnv*, jsize)>(SleepForever),
+    reinterpret_cast<jlongArray (*)(JNIEnv*, jsize)>(SleepForever),
+    reinterpret_cast<jfloatArray (*)(JNIEnv*, jsize)>(SleepForever),
+    reinterpret_cast<jdoubleArray (*)(JNIEnv*, jsize)>(SleepForever),
+    reinterpret_cast<jboolean* (*)(JNIEnv*, jbooleanArray, jboolean*)>(SleepForever),
+    reinterpret_cast<jbyte* (*)(JNIEnv*, jbyteArray, jboolean*)>(SleepForever),
+    reinterpret_cast<jchar* (*)(JNIEnv*, jcharArray, jboolean*)>(SleepForever),
+    reinterpret_cast<jshort* (*)(JNIEnv*, jshortArray, jboolean*)>(SleepForever),
+    reinterpret_cast<jint* (*)(JNIEnv*, jintArray, jboolean*)>(SleepForever),
+    reinterpret_cast<jlong* (*)(JNIEnv*, jlongArray, jboolean*)>(SleepForever),
+    reinterpret_cast<jfloat* (*)(JNIEnv*, jfloatArray, jboolean*)>(SleepForever),
+    reinterpret_cast<jdouble* (*)(JNIEnv*, jdoubleArray, jboolean*)>(SleepForever),
+    reinterpret_cast<void (*)(JNIEnv*, jbooleanArray, jboolean*, jint)>(SleepForever),
+    reinterpret_cast<void (*)(JNIEnv*, jbyteArray, jbyte*, jint)>(SleepForever),
+    reinterpret_cast<void (*)(JNIEnv*, jcharArray, jchar*, jint)>(SleepForever),
+    reinterpret_cast<void (*)(JNIEnv*, jshortArray, jshort*, jint)>(SleepForever),
+    reinterpret_cast<void (*)(JNIEnv*, jintArray, jint*, jint)>(SleepForever),
+    reinterpret_cast<void (*)(JNIEnv*, jlongArray, jlong*, jint)>(SleepForever),
+    reinterpret_cast<void (*)(JNIEnv*, jfloatArray, jfloat*, jint)>(SleepForever),
+    reinterpret_cast<void (*)(JNIEnv*, jdoubleArray, jdouble*, jint)>(SleepForever),
+    reinterpret_cast<void (*)(JNIEnv*, jbooleanArray, jsize, jsize, jboolean*)>(SleepForever),
+    reinterpret_cast<void (*)(JNIEnv*, jbyteArray, jsize, jsize, jbyte*)>(SleepForever),
+    reinterpret_cast<void (*)(JNIEnv*, jcharArray, jsize, jsize, jchar*)>(SleepForever),
+    reinterpret_cast<void (*)(JNIEnv*, jshortArray, jsize, jsize, jshort*)>(SleepForever),
+    reinterpret_cast<void (*)(JNIEnv*, jintArray, jsize, jsize, jint*)>(SleepForever),
+    reinterpret_cast<void (*)(JNIEnv*, jlongArray, jsize, jsize, jlong*)>(SleepForever),
+    reinterpret_cast<void (*)(JNIEnv*, jfloatArray, jsize, jsize, jfloat*)>(SleepForever),
+    reinterpret_cast<void (*)(JNIEnv*, jdoubleArray, jsize, jsize, jdouble*)>(SleepForever),
+    reinterpret_cast<void (*)(JNIEnv*, jbooleanArray, jsize, jsize, const jboolean*)>(SleepForever),
+    reinterpret_cast<void (*)(JNIEnv*, jbyteArray, jsize, jsize, const jbyte*)>(SleepForever),
+    reinterpret_cast<void (*)(JNIEnv*, jcharArray, jsize, jsize, const jchar*)>(SleepForever),
+    reinterpret_cast<void (*)(JNIEnv*, jshortArray, jsize, jsize, const jshort*)>(SleepForever),
+    reinterpret_cast<void (*)(JNIEnv*, jintArray, jsize, jsize, const jint*)>(SleepForever),
+    reinterpret_cast<void (*)(JNIEnv*, jlongArray, jsize, jsize, const jlong*)>(SleepForever),
+    reinterpret_cast<void (*)(JNIEnv*, jfloatArray, jsize, jsize, const jfloat*)>(SleepForever),
+    reinterpret_cast<void (*)(JNIEnv*, jdoubleArray, jsize, jsize, const jdouble*)>(SleepForever),
+    reinterpret_cast<jint (*)(JNIEnv*, jclass, const JNINativeMethod*, jint)>(SleepForever),
+    reinterpret_cast<jint (*)(JNIEnv*, jclass)>(SleepForever),
+    reinterpret_cast<jint (*)(JNIEnv*, jobject)>(SleepForever),
+    reinterpret_cast<jint (*)(JNIEnv*, jobject)>(SleepForever),
+    reinterpret_cast<jint (*)(JNIEnv*, JavaVM**)>(SleepForever),
+    reinterpret_cast<void (*)(JNIEnv*, jstring, jsize, jsize, jchar*)>(SleepForever),
+    reinterpret_cast<void (*)(JNIEnv*, jstring, jsize, jsize, char*)>(SleepForever),
+    reinterpret_cast<void* (*)(JNIEnv*, jarray, jboolean*)>(SleepForever),
+    reinterpret_cast<void (*)(JNIEnv*, jarray, void*, jint)>(SleepForever),
+    reinterpret_cast<const jchar* (*)(JNIEnv*, jstring, jboolean*)>(SleepForever),
+    reinterpret_cast<void (*)(JNIEnv*, jstring, const jchar*)>(SleepForever),
+    reinterpret_cast<jweak (*)(JNIEnv*, jobject)>(SleepForever),
+    reinterpret_cast<void (*)(JNIEnv*, jweak)>(SleepForever),
+    reinterpret_cast<jboolean (*)(JNIEnv*)>(SleepForever),
+    reinterpret_cast<jobject (*)(JNIEnv*, void*, jlong)>(SleepForever),
+    reinterpret_cast<void* (*)(JNIEnv*, jobject)>(SleepForever),
+    reinterpret_cast<jlong (*)(JNIEnv*, jobject)>(SleepForever),
+    reinterpret_cast<jobjectRefType (*)(JNIEnv*, jobject)>(SleepForever),
 };
 
 const JNINativeInterface* GetRuntimeShutdownNativeInterface() {
-  return reinterpret_cast<JNINativeInterface*>(&gJniSleepForeverStub);
+  return &gJniSleepForeverStub;
 }
 
 }  // namespace art

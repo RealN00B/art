@@ -18,10 +18,11 @@
 #define ART_RUNTIME_MIRROR_EXECUTABLE_H_
 
 #include "accessible_object.h"
+#include "base/macros.h"
 #include "object.h"
 #include "read_barrier_option.h"
 
-namespace art {
+namespace art HIDDEN {
 
 struct ExecutableOffsets;
 class ArtMethod;
@@ -32,10 +33,7 @@ namespace mirror {
 // C++ mirror of java.lang.reflect.Executable.
 class MANAGED Executable : public AccessibleObject {
  public:
-  // Called from Constructor::CreateFromArtMethod, Method::CreateFromArtMethod.
-  template <PointerSize kPointerSize, bool kTransactionActive>
-  bool CreateFromArtMethod(ArtMethod* method) REQUIRES_SHARED(Locks::mutator_lock_)
-      REQUIRES(!Roles::uninterruptible_);
+  MIRROR_CLASS("Ljava/lang/reflect/Executable;");
 
   template<VerifyObjectFlags kVerifyFlags = kDefaultVerifyFlags>
   ArtMethod* GetArtMethod() REQUIRES_SHARED(Locks::mutator_lock_) {
@@ -56,8 +54,19 @@ class MANAGED Executable : public AccessibleObject {
     return MemberOffset(OFFSETOF_MEMBER(Executable, art_method_));
   }
 
+ protected:
+  // Called from Constructor::CreateFromArtMethod, Method::CreateFromArtMethod.
+  template <PointerSize kPointerSize>
+  void InitializeFromArtMethod(ArtMethod* method) REQUIRES_SHARED(Locks::mutator_lock_)
+      REQUIRES(!Roles::uninterruptible_);
+
+
  private:
-  uint16_t has_real_parameter_data_;
+  uint8_t has_real_parameter_data_;
+
+  // Padding required for matching alignment with the Java peer.
+  [[maybe_unused]] uint8_t padding_[2];
+
   HeapReference<mirror::Class> declaring_class_;
   HeapReference<mirror::Class> declaring_class_of_overridden_method_;
   HeapReference<mirror::Array> parameters_;

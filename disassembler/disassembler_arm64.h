@@ -19,9 +19,10 @@
 
 #include "disassembler.h"
 
-// TODO(VIXL): Make VIXL compile with -Wshadow.
+// TODO(VIXL): Make VIXL compile cleanly with -Wshadow, -Wdeprecated-declarations.
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wshadow"
+#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
 #include "aarch64/decoder-aarch64.h"
 #include "aarch64/disasm-aarch64.h"
 #pragma GCC diagnostic pop
@@ -47,13 +48,26 @@ class CustomDisassembler final : public vixl::aarch64::Disassembler {
   void AppendRegisterNameToOutput(const vixl::aarch64::Instruction* instr,
                                   const vixl::aarch64::CPURegister& reg) override;
 
-  // Improve the disassembly of literal load instructions.
-  void VisitLoadLiteral(const vixl::aarch64::Instruction* instr) override;
+  // Overriding to print the address with trailing zeroes e.g. 0x00004074 instead of 0x4074.
+  void AppendCodeRelativeAddressToOutput(const vixl::aarch64::Instruction* instr,
+                                         const void* addr) override;
 
-  // Improve the disassembly of thread offset.
-  void VisitLoadStoreUnsignedOffset(const vixl::aarch64::Instruction* instr) override;
+  // Intercepts the instruction flow captured by the parent method,
+  // to specially instrument for particular instruction types.
+  void Visit(vixl::aarch64::Metadata* metadata, const vixl::aarch64::Instruction* instr) override;
 
  private:
+  // Improve the disassembly of literal load instructions.
+  void VisitLoadLiteralInstr(const vixl::aarch64::Instruction* instr);
+
+  // Improve the disassembly of thread offset.
+  void VisitLoadStoreUnsignedOffsetInstr(const vixl::aarch64::Instruction* instr);
+
+  // Improve the disassembly of branch to thunk jumping to pointer from thread entrypoint.
+  void VisitUnconditionalBranchInstr(const vixl::aarch64::Instruction* instr);
+
+  void AppendThreadOfsetName(const vixl::aarch64::Instruction* instr);
+
   // Indicate if the disassembler should read data loaded from literal pools.
   // This should only be enabled if reading the target of literal loads is safe.
   // Here are possible outputs when the option is on or off:

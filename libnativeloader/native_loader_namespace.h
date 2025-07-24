@@ -42,12 +42,11 @@ struct NativeLoaderNamespace {
                                               const std::string& search_paths,
                                               const std::string& permitted_paths,
                                               const NativeLoaderNamespace* parent, bool is_shared,
-                                              bool is_greylist_enabled,
+                                              bool is_exempt_list_enabled,
                                               bool also_used_as_anonymous);
 
   NativeLoaderNamespace(NativeLoaderNamespace&&) = default;
   NativeLoaderNamespace(const NativeLoaderNamespace&) = default;
-  NativeLoaderNamespace& operator=(const NativeLoaderNamespace&) = default;
 
   android_namespace_t* ToRawAndroidNamespace() const { return std::get<0>(raw_); }
   native_bridge_namespace_t* ToRawNativeBridgeNamespace() const { return std::get<1>(raw_); }
@@ -55,7 +54,11 @@ struct NativeLoaderNamespace {
   std::string name() const { return name_; }
   bool IsBridged() const { return raw_.index() == 1; }
 
-  Result<void> Link(const NativeLoaderNamespace& target, const std::string& shared_libs) const;
+  // Creates a link from this namespace to target for the ":"-separated list of
+  // libraries in shared_libs. If target is nullptr it creates a link to the
+  // default namespace.
+  Result<void> Link(const NativeLoaderNamespace* target, const std::string& shared_libs) const;
+
   Result<void*> Load(const char* lib_name) const;
 
   static Result<NativeLoaderNamespace> GetExportedNamespace(const std::string& name,
@@ -68,8 +71,8 @@ struct NativeLoaderNamespace {
   explicit NativeLoaderNamespace(const std::string& name, native_bridge_namespace_t* ns)
       : name_(name), raw_(ns) {}
 
-  std::string name_;
-  std::variant<android_namespace_t*, native_bridge_namespace_t*> raw_;
+  const std::string name_;
+  const std::variant<android_namespace_t*, native_bridge_namespace_t*> raw_;
 };
 
 }  // namespace android

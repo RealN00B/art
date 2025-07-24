@@ -18,6 +18,7 @@
 #define ART_RUNTIME_ARCH_ARM_ASM_SUPPORT_ARM_S_
 
 #include "asm_support_arm.h"
+#include "interpreter/cfi_asm_support.h"
 
 // Define special registers.
 
@@ -26,34 +27,55 @@
 // Register holding Thread::Current().
 #define rSELF r9
 
-#if defined(USE_READ_BARRIER) && defined(USE_BAKER_READ_BARRIER)
+#ifdef RESERVE_MARKING_REGISTER
 // Marking Register, holding Thread::Current()->GetIsGcMarking().
-// Only used with the Concurrent Copying (CC) garbage
-// collector, with the Baker read barrier configuration.
 #define rMR r8
 #endif
 
 .syntax unified
 .arch armv7-a
+.arch_extension idiv
 .thumb
 
-// Macro to generate the value of Runtime::Current into rDest. As it uses labels
-// then the labels need to be unique. We bind these to the function name in the ENTRY macros.
-.macro RUNTIME_CURRENT name, num, rDest
-    .if .Lruntime_current\num\()_used
-         .error
+.macro CFI_EXPRESSION_BREG n, b, offset
+    .if (-0x40 <= (\offset)) && ((\offset) < 0x40)
+        CFI_EXPRESSION_BREG_1(\n, \b, \offset)
+    .elseif (-0x2000 <= (\offset)) && ((\offset) < 0x2000)
+        CFI_EXPRESSION_BREG_2(\n, \b, \offset)
+    .else
+        .error "Unsupported offset"
     .endif
-    .set .Lruntime_current\num\()_used, 1
-    ldr \rDest, .Lruntime_instance_\name\()_\num  @ Load GOT_PREL offset of Runtime::instance_.
-.Lload_got_\name\()_\num\():
-    add \rDest, pc                                @ Fixup GOT_PREL address.
-    ldr \rDest, [\rDest]                          @ Load address of Runtime::instance_.
-    ldr \rDest, [\rDest]                          @ Load Runtime::instance_.
+.endm
+
+.macro CFI_DEF_CFA_BREG_PLUS_UCONST reg, offset, size
+    .if ((\size) < 0)
+        .error "Size should be positive"
+    .endif
+    .if (((\offset) < -0x40) || ((\offset) >= 0x40))
+        .error "Unsupported offset"
+    .endif
+    .if ((\size) < 0x80)
+        CFI_DEF_CFA_BREG_PLUS_UCONST_1_1(\reg, \offset, \size)
+    .elseif ((\size) < 0x4000)
+        CFI_DEF_CFA_BREG_PLUS_UCONST_1_2(\reg, \offset, \size)
+    .else
+        .error "Unsupported size"
+    .endif
+.endm
+
+.macro CFI_REMEMBER_STATE
+    .cfi_remember_state
+.endm
+
+// The spec is not clear whether the CFA is part of the saved state and tools
+// differ in the behaviour, so explicitly set the CFA to avoid any ambiguity.
+// The restored CFA state should match the CFA state during CFI_REMEMBER_STATE.
+.macro CFI_RESTORE_STATE_AND_DEF_CFA reg, offset
+    .cfi_restore_state
+    .cfi_def_cfa \reg, \offset
 .endm
 
 // Common ENTRY declaration code for ARM and thumb, an ENTRY should always be paired with an END.
-// Declares the RUNTIME_CURRENT[123] macros that can be used within an ENTRY and will have literals
-// generated at END.
 .macro DEF_ENTRY thumb_or_arm, name, alignment
     \thumb_or_arm
 // Clang ignores .thumb_func and requires an explicit .thumb. Investigate whether we should still
@@ -64,30 +86,10 @@
     .type \name, #function
     .hidden \name  // Hide this as a global symbol, so we do not incur plt calls.
     .global \name
-    // ART-compiled functions have OatQuickMethodHeader but assembly funtions do not.
-    // Prefix the assembly code with 0xFFs, which means there is no method header.
-    .byte 0xFF, 0xFF, 0xFF, 0xFF
-    // Cache alignment for function entry.
-    // NB: 0xFF because there is a bug in balign where 0x00 creates nop instructions.
-    .balign \alignment, 0xFF
+    .balign \alignment
 \name:
     .cfi_startproc
     .fnstart
-    // Track whether RUNTIME_CURRENT was used.
-    .set .Lruntime_current1_used, 0
-    .set .Lruntime_current2_used, 0
-    .set .Lruntime_current3_used, 0
-    // The RUNTIME_CURRENT macros that are bound to the \name argument of DEF_ENTRY to ensure
-    // that label names are unique.
-    .macro RUNTIME_CURRENT1 rDest
-        RUNTIME_CURRENT \name, 1, \rDest
-    .endm
-    .macro RUNTIME_CURRENT2 rDest
-        RUNTIME_CURRENT \name, 2, \rDest
-    .endm
-    .macro RUNTIME_CURRENT3 rDest
-        RUNTIME_CURRENT \name, 3, \rDest
-    .endm
 .endm
 
 // A thumb2 style ENTRY.
@@ -103,25 +105,8 @@
     DEF_ENTRY .arm, \name, 16
 .endm
 
-// Terminate an ENTRY and generate GOT_PREL references.
+// Terminate an ENTRY.
 .macro END name
-     // Generate offsets of GOT and Runtime::instance_ used in RUNTIME_CURRENT.
-     .if .Lruntime_current1_used
-         .Lruntime_instance_\name\()_1:
-             .word   _ZN3art7Runtime9instance_E(GOT_PREL)-(.Lload_got_\name\()_1+4)
-     .endif
-     .if .Lruntime_current2_used
-         .Lruntime_instance_\name\()_2:
-             .word   _ZN3art7Runtime9instance_E(GOT_PREL)-(.Lload_got_\name\()_2+4)
-    .endif
-     .if .Lruntime_current3_used
-         .Lruntime_instance_\name\()_3:
-             .word   _ZN3art7Runtime9instance_E(GOT_PREL)-(.Lload_got_\name\()_3+4)
-    .endif
-    // Remove the RUNTIME_CURRENTx macros so they get rebound in the next function entry.
-    .purgem RUNTIME_CURRENT1
-    .purgem RUNTIME_CURRENT2
-    .purgem RUNTIME_CURRENT3
     .fnend
     .cfi_endproc
     .size \name, .-\name
@@ -149,15 +134,65 @@
 #endif  // USE_HEAP_POISONING
 .endm
 
+.macro INCREASE_FRAME frame_adjustment
+    sub sp, sp, #(\frame_adjustment)
+    .cfi_adjust_cfa_offset (\frame_adjustment)
+.endm
+
+.macro DECREASE_FRAME frame_adjustment
+    add sp, sp, #(\frame_adjustment)
+    .cfi_adjust_cfa_offset -(\frame_adjustment)
+.endm
+
+.macro LOAD_RUNTIME_INSTANCE rDest
+    movw \rDest, #:lower16:(_ZN3art7Runtime9instance_E - (. + 12))
+    movt \rDest, #:upper16:(_ZN3art7Runtime9instance_E - (. + 8))
+    add \rDest, pc
+    ldr \rDest, [\rDest]
+.endm
+
 // Macro to refresh the Marking Register (R8).
 //
 // This macro must be called at the end of functions implementing
 // entrypoints that possibly (directly or indirectly) perform a
 // suspend check (before they return).
 .macro REFRESH_MARKING_REGISTER
-#if defined(USE_READ_BARRIER) && defined(USE_BAKER_READ_BARRIER)
+#ifdef RESERVE_MARKING_REGISTER
     ldr rMR, [rSELF, #THREAD_IS_GC_MARKING_OFFSET]
 #endif
+.endm
+
+.macro CONDITIONAL_CBZ reg, reg_if, dest
+.ifc \reg, \reg_if
+    cbz \reg, \dest
+.endif
+.endm
+
+.macro CONDITIONAL_CMPBZ reg, reg_if, dest
+.ifc \reg, \reg_if
+    cmp \reg, #0
+    beq \dest
+.endif
+.endm
+
+// Use CBZ if the register is in {r0, r7} otherwise compare and branch.
+.macro SMART_CBZ reg, dest
+    CONDITIONAL_CBZ \reg, r0, \dest
+    CONDITIONAL_CBZ \reg, r1, \dest
+    CONDITIONAL_CBZ \reg, r2, \dest
+    CONDITIONAL_CBZ \reg, r3, \dest
+    CONDITIONAL_CBZ \reg, r4, \dest
+    CONDITIONAL_CBZ \reg, r5, \dest
+    CONDITIONAL_CBZ \reg, r6, \dest
+    CONDITIONAL_CBZ \reg, r7, \dest
+    CONDITIONAL_CMPBZ \reg, r8, \dest
+    CONDITIONAL_CMPBZ \reg, r9, \dest
+    CONDITIONAL_CMPBZ \reg, r10, \dest
+    CONDITIONAL_CMPBZ \reg, r11, \dest
+    CONDITIONAL_CMPBZ \reg, r12, \dest
+    CONDITIONAL_CMPBZ \reg, r13, \dest
+    CONDITIONAL_CMPBZ \reg, r14, \dest
+    CONDITIONAL_CMPBZ \reg, r15, \dest
 .endm
 
     /*
@@ -170,9 +205,6 @@
     // later; but it's not worth handling this special case.
     push {r1-r3, r5-r8, r10-r11, lr}   @ 10 words of callee saves and args.
     .cfi_adjust_cfa_offset 40
-    .cfi_rel_offset r1, 0
-    .cfi_rel_offset r2, 4
-    .cfi_rel_offset r3, 8
     .cfi_rel_offset r5, 12
     .cfi_rel_offset r6, 16
     .cfi_rel_offset r7, 20
@@ -199,9 +231,6 @@
     // read barriers, as it is overwritten by REFRESH_MARKING_REGISTER
     // later; but it's not worth handling this special case.
     pop {r1-r3, r5-r8, r10-r11, lr}  @ 10 words of callee saves and args.
-    .cfi_restore r1
-    .cfi_restore r2
-    .cfi_restore r3
     .cfi_restore r5
     .cfi_restore r6
     .cfi_restore r7
@@ -239,7 +268,7 @@
     .cfi_adjust_cfa_offset 64
     sub sp, #12                                   @ 3 words of space, bottom word will hold Method*
     .cfi_adjust_cfa_offset 12
-    RUNTIME_CURRENT1 \rTemp                       @ Load Runtime::Current into rTemp.
+    LOAD_RUNTIME_INSTANCE \rTemp                  @ Load Runtime::Current into rTemp.
     @ Load kSaveAllCalleeSaves Method* into rTemp.
     ldr \rTemp, [\rTemp, #RUNTIME_SAVE_ALL_CALLEE_SAVES_METHOD_OFFSET]
     str \rTemp, [sp, #0]                          @ Place Method* at bottom of stack.
@@ -258,6 +287,8 @@
 .macro DELIVER_PENDING_EXCEPTION_FRAME_READY
     mov    r0, rSELF                           @ pass Thread::Current
     bl     artDeliverPendingExceptionFromCode  @ artDeliverPendingExceptionFromCode(Thread*)
+    bl art_quick_do_long_jump                  @ (Context*)
+    bkpt  // Unreached
 .endm
 
     /*
@@ -267,6 +298,164 @@
 .macro DELIVER_PENDING_EXCEPTION
     SETUP_SAVE_ALL_CALLEE_SAVES_FRAME r0       @ save callee saves for throw
     DELIVER_PENDING_EXCEPTION_FRAME_READY
+.endm
+
+.macro  RETURN_OR_DELIVER_PENDING_EXCEPTION_REG reg
+    ldr \reg, [rSELF, #THREAD_EXCEPTION_OFFSET]  @ Get exception field.
+    cbnz \reg, 1f
+    bx lr
+1:
+    DELIVER_PENDING_EXCEPTION
+.endm
+
+.macro  RETURN_OR_DELIVER_PENDING_EXCEPTION
+    ldr ip, [rSELF, #THREAD_EXCEPTION_OFFSET]  @ Get exception field.
+    cmp ip, #0
+    bne 1f
+    bx lr
+1:
+    DELIVER_PENDING_EXCEPTION
+.endm
+
+    /*
+     * Macro that sets up the callee save frame to conform with
+     * Runtime::CreateCalleeSaveMethod(kSaveRefsOnly).
+     */
+.macro SETUP_SAVE_REFS_ONLY_FRAME rTemp
+    // Note: We could avoid saving R8 in the case of Baker read
+    // barriers, as it is overwritten by REFRESH_MARKING_REGISTER
+    // later; but it's not worth handling this special case.
+    push {r5-r8, r10-r11, lr}                     @ 7 words of callee saves
+    .cfi_adjust_cfa_offset 28
+    .cfi_rel_offset r5, 0
+    .cfi_rel_offset r6, 4
+    .cfi_rel_offset r7, 8
+    .cfi_rel_offset r8, 12
+    .cfi_rel_offset r10, 16
+    .cfi_rel_offset r11, 20
+    .cfi_rel_offset lr, 24
+    sub sp, #4                                    @ bottom word will hold Method*
+    .cfi_adjust_cfa_offset 4
+    LOAD_RUNTIME_INSTANCE \rTemp                  @ Load Runtime::Current into rTemp.
+    @ Load kSaveRefsOnly Method* into rTemp.
+    ldr \rTemp, [\rTemp, #RUNTIME_SAVE_REFS_ONLY_METHOD_OFFSET]
+    str \rTemp, [sp, #0]                          @ Place Method* at bottom of stack.
+    str sp, [rSELF, #THREAD_TOP_QUICK_FRAME_OFFSET]  @ Place sp in Thread::Current()->top_quick_frame.
+
+    // Ugly compile-time check, but we only have the preprocessor.
+#if (FRAME_SIZE_SAVE_REFS_ONLY != 28 + 4)
+#error "FRAME_SIZE_SAVE_REFS_ONLY(ARM) size not as expected."
+#endif
+.endm
+
+.macro RESTORE_SAVE_REFS_ONLY_FRAME
+    add sp, #4               @ bottom word holds Method*
+    .cfi_adjust_cfa_offset -4
+    // Note: Likewise, we could avoid restoring R8 in the case of Baker
+    // read barriers, as it is overwritten by REFRESH_MARKING_REGISTER
+    // later; but it's not worth handling this special case.
+    pop {r5-r8, r10-r11, lr} @ 7 words of callee saves
+    .cfi_restore r5
+    .cfi_restore r6
+    .cfi_restore r7
+    .cfi_restore r8
+    .cfi_restore r10
+    .cfi_restore r11
+    .cfi_restore lr
+    .cfi_adjust_cfa_offset -28
+.endm
+
+// Locking is needed for both managed code and JNI stubs.
+.macro LOCK_OBJECT_FAST_PATH obj, tmp1, tmp2, tmp3, slow_lock, can_be_null
+    ldr    \tmp1, [rSELF, #THREAD_ID_OFFSET]
+    .if \can_be_null
+        cbz \obj, \slow_lock
+    .endif
+1:
+    ldrex  \tmp2, [\obj, #MIRROR_OBJECT_LOCK_WORD_OFFSET]
+    eor    \tmp3, \tmp2, \tmp1        @ Prepare the value to store if unlocked
+                                      @   (thread id, count of 0 and preserved read barrier bits),
+                                      @ or prepare to compare thread id for recursive lock check
+                                      @   (lock_word.ThreadId() ^ self->ThreadId()).
+    ands   ip, \tmp2, #LOCK_WORD_GC_STATE_MASK_SHIFTED_TOGGLED  @ Test the non-gc bits.
+    bne    2f                         @ Check if unlocked.
+    @ unlocked case - store tmp3: original lock word plus thread id, preserved read barrier bits.
+    strex  \tmp2, \tmp3, [\obj, #MIRROR_OBJECT_LOCK_WORD_OFFSET]
+    cbnz   \tmp2, 3f                   @ If store failed, retry.
+    dmb    ish                        @ Full (LoadLoad|LoadStore) memory barrier.
+    bx lr
+2:  @ tmp2: original lock word, tmp1: thread_id, tmp3: tmp2 ^ tmp1
+#if LOCK_WORD_THIN_LOCK_COUNT_SHIFT + LOCK_WORD_THIN_LOCK_COUNT_SIZE != LOCK_WORD_GC_STATE_SHIFT
+#error "Expecting thin lock count and gc state in consecutive bits."
+#endif
+                                      @ Check lock word state and thread id together.
+    bfc    \tmp3, \
+           #LOCK_WORD_THIN_LOCK_COUNT_SHIFT, \
+           #(LOCK_WORD_THIN_LOCK_COUNT_SIZE + LOCK_WORD_GC_STATE_SIZE)
+    cbnz   \tmp3, \slow_lock          @ if either of the top two bits are set, or the lock word's
+                                      @ thread id did not match, go slow path.
+    add    \tmp3, \tmp2, #LOCK_WORD_THIN_LOCK_COUNT_ONE  @ Increment the recursive lock count.
+                                      @ Extract the new thin lock count for overflow check.
+    ubfx   \tmp2, \tmp3, #LOCK_WORD_THIN_LOCK_COUNT_SHIFT, #LOCK_WORD_THIN_LOCK_COUNT_SIZE
+    cbz    \tmp2, \slow_lock          @ Zero as the new count indicates overflow, go slow path.
+                                      @ strex necessary for read barrier bits.
+    strex  \tmp2, \tmp3, [\obj, #MIRROR_OBJECT_LOCK_WORD_OFFSET]
+    cbnz   \tmp2, 3f                  @ If strex failed, retry.
+    bx lr
+3:
+    b      1b                         @ retry
+.endm
+
+// Unlocking is needed for both managed code and JNI stubs.
+.macro UNLOCK_OBJECT_FAST_PATH obj, tmp1, tmp2, tmp3, slow_unlock, can_be_null
+    ldr    \tmp1, [rSELF, #THREAD_ID_OFFSET]
+    .if \can_be_null
+        cbz    \obj, \slow_unlock
+    .endif
+1:
+#ifndef USE_READ_BARRIER
+    ldr    \tmp2, [\obj, #MIRROR_OBJECT_LOCK_WORD_OFFSET]
+#else
+                                      @ Need to use atomic instructions for read barrier.
+    ldrex  \tmp2, [\obj, #MIRROR_OBJECT_LOCK_WORD_OFFSET]
+#endif
+    eor    \tmp3, \tmp2, \tmp1        @ Prepare the value to store if simply locked
+                                      @   (mostly 0s, and preserved read barrier bits),
+                                      @ or prepare to compare thread id for recursive lock check
+                                      @   (lock_word.ThreadId() ^ self->ThreadId()).
+    ands   ip, \tmp3, #LOCK_WORD_GC_STATE_MASK_SHIFTED_TOGGLED  @ Test the non-gc bits.
+    bne    2f                         @ Locked recursively or by other thread?
+    @ Transition to unlocked.
+    dmb    ish                        @ Full (LoadStore|StoreStore) memory barrier.
+#ifndef USE_READ_BARRIER
+    str    \tmp3, [\obj, #MIRROR_OBJECT_LOCK_WORD_OFFSET]
+#else
+                                      @ strex necessary for read barrier bits
+    strex  \tmp2, \tmp3, [\obj, #MIRROR_OBJECT_LOCK_WORD_OFFSET]
+    cbnz   \tmp2, 3f                  @ If the store failed, retry.
+#endif
+    bx     lr
+2:  @ tmp2: original lock word, tmp1: thread_id, tmp3: tmp2 ^ tmp1
+#if LOCK_WORD_THIN_LOCK_COUNT_SHIFT + LOCK_WORD_THIN_LOCK_COUNT_SIZE != LOCK_WORD_GC_STATE_SHIFT
+#error "Expecting thin lock count and gc state in consecutive bits."
+#endif
+                                      @ Check lock word state and thread id together,
+    bfc    \tmp3, \
+           #LOCK_WORD_THIN_LOCK_COUNT_SHIFT, \
+           #(LOCK_WORD_THIN_LOCK_COUNT_SIZE + LOCK_WORD_GC_STATE_SIZE)
+    cbnz   \tmp3, \slow_unlock        @ if either of the top two bits are set, or the lock word's
+                                      @ thread id did not match, go slow path.
+    sub    \tmp3, \tmp2, #LOCK_WORD_THIN_LOCK_COUNT_ONE  @ Decrement recursive lock count.
+#ifndef USE_READ_BARRIER
+    str    \tmp3, [\obj, #MIRROR_OBJECT_LOCK_WORD_OFFSET]
+#else
+                                      @ strex necessary for read barrier bits.
+    strex  \tmp2, \tmp3, [\obj, #MIRROR_OBJECT_LOCK_WORD_OFFSET]
+    cbnz   \tmp2, 3f                  @ If the store failed, retry.
+#endif
+    bx     lr
+3:
+    b      1b                         @ retry
 .endm
 
 #endif  // ART_RUNTIME_ARCH_X86_ASM_SUPPORT_X86_S_

@@ -17,11 +17,11 @@
 #include "instruction_simplifier_x86_shared.h"
 #include "code_generator_x86.h"
 
-namespace art {
+namespace art HIDDEN {
 
 namespace x86 {
 
-class InstructionSimplifierX86Visitor : public HGraphVisitor {
+class InstructionSimplifierX86Visitor final : public HGraphVisitor {
  public:
   InstructionSimplifierX86Visitor(HGraph* graph,
                                   CodeGenerator* codegen,
@@ -57,6 +57,10 @@ class InstructionSimplifierX86Visitor : public HGraphVisitor {
 
 
 void InstructionSimplifierX86Visitor::VisitAnd(HAnd* instruction) {
+  if (!HasAVX2()) {
+    return;
+  }
+
   if (TryCombineAndNot(instruction)) {
     RecordSimplification();
   } else if (instruction->GetResultType() == DataType::Type::kInt32) {
@@ -67,6 +71,10 @@ void InstructionSimplifierX86Visitor::VisitAnd(HAnd* instruction) {
 }
 
 void InstructionSimplifierX86Visitor::VisitXor(HXor* instruction) {
+  if (!HasAVX2()) {
+    return;
+  }
+
   if (instruction->GetResultType() == DataType::Type::kInt32) {
     if (TryGenerateMaskUptoLeastSetBit(instruction)) {
       RecordSimplification();
@@ -76,11 +84,8 @@ void InstructionSimplifierX86Visitor::VisitXor(HXor* instruction) {
 
 bool InstructionSimplifierX86::Run() {
   InstructionSimplifierX86Visitor visitor(graph_, codegen_, stats_);
-  if (visitor.HasAVX2()) {
-    visitor.VisitReversePostOrder();
-    return true;
-  }
-  return false;
+  visitor.VisitReversePostOrder();
+  return true;
 }
 
 }  // namespace x86

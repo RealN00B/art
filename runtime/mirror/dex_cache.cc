@@ -20,8 +20,9 @@
 #include "class_linker.h"
 #include "gc/accounting/card_table-inl.h"
 #include "gc/heap.h"
+#include "jit/profile_saver.h"
 #include "linear_alloc.h"
-#include "oat_file.h"
+#include "oat/oat_file.h"
 #include "object-inl.h"
 #include "object.h"
 #include "object_array-inl.h"
@@ -30,251 +31,125 @@
 #include "runtime_globals.h"
 #include "string.h"
 #include "thread.h"
-#include "utils/dex_cache_arrays_layout-inl.h"
 #include "write_barrier.h"
 
-namespace art {
+namespace art HIDDEN {
 namespace mirror {
 
-void DexCache::InitializeDexCache(Thread* self,
-                                  ObjPtr<mirror::DexCache> dex_cache,
-                                  ObjPtr<mirror::String> location,
-                                  const DexFile* dex_file,
-                                  LinearAlloc* linear_alloc,
-                                  PointerSize image_pointer_size) {
-  DCHECK(dex_file != nullptr);
+// Whether to allocate full dex cache arrays during startup. Currently disabled
+// while debugging b/283632504.
+static constexpr bool kEnableFullArraysAtStartup = false;
+
+void DexCache::Initialize(const DexFile* dex_file, ObjPtr<ClassLoader> class_loader) {
+  DCHECK(GetDexFile() == nullptr);
+  DCHECK(GetStrings() == nullptr);
+  DCHECK(GetResolvedTypes() == nullptr);
+  DCHECK(GetResolvedMethods() == nullptr);
+  DCHECK(GetResolvedFields() == nullptr);
+  DCHECK(GetResolvedMethodTypes() == nullptr);
+  DCHECK(GetResolvedCallSites() == nullptr);
+
   ScopedAssertNoThreadSuspension sants(__FUNCTION__);
-  DexCacheArraysLayout layout(image_pointer_size, dex_file);
-  uint8_t* raw_arrays = nullptr;
 
-  if (dex_file->NumStringIds() != 0u ||
-      dex_file->NumTypeIds() != 0u ||
-      dex_file->NumMethodIds() != 0u ||
-      dex_file->NumFieldIds() != 0u) {
-    static_assert(ArenaAllocator::kAlignment == 8, "Expecting arena alignment of 8.");
-    DCHECK(layout.Alignment() == 8u || layout.Alignment() == 16u);
-    // Zero-initialized.
-    raw_arrays = (layout.Alignment() == 16u)
-        ? reinterpret_cast<uint8_t*>(linear_alloc->AllocAlign16(self, layout.Size()))
-        : reinterpret_cast<uint8_t*>(linear_alloc->Alloc(self, layout.Size()));
-  }
-
-  StringDexCacheType* strings = (dex_file->NumStringIds() == 0u) ? nullptr :
-      reinterpret_cast<StringDexCacheType*>(raw_arrays + layout.StringsOffset());
-  TypeDexCacheType* types = (dex_file->NumTypeIds() == 0u) ? nullptr :
-      reinterpret_cast<TypeDexCacheType*>(raw_arrays + layout.TypesOffset());
-  MethodDexCacheType* methods = (dex_file->NumMethodIds() == 0u) ? nullptr :
-      reinterpret_cast<MethodDexCacheType*>(raw_arrays + layout.MethodsOffset());
-  FieldDexCacheType* fields = (dex_file->NumFieldIds() == 0u) ? nullptr :
-      reinterpret_cast<FieldDexCacheType*>(raw_arrays + layout.FieldsOffset());
-
-  size_t num_strings = kDexCacheStringCacheSize;
-  if (dex_file->NumStringIds() < num_strings) {
-    num_strings = dex_file->NumStringIds();
-  }
-  size_t num_types = kDexCacheTypeCacheSize;
-  if (dex_file->NumTypeIds() < num_types) {
-    num_types = dex_file->NumTypeIds();
-  }
-  size_t num_fields = kDexCacheFieldCacheSize;
-  if (dex_file->NumFieldIds() < num_fields) {
-    num_fields = dex_file->NumFieldIds();
-  }
-  size_t num_methods = kDexCacheMethodCacheSize;
-  if (dex_file->NumMethodIds() < num_methods) {
-    num_methods = dex_file->NumMethodIds();
-  }
-
-  // Note that we allocate the method type dex caches regardless of this flag,
-  // and we make sure here that they're not used by the runtime. This is in the
-  // interest of simplicity and to avoid extensive compiler and layout class changes.
-  //
-  // If this needs to be mitigated in a production system running this code,
-  // DexCache::kDexCacheMethodTypeCacheSize can be set to zero.
-  MethodTypeDexCacheType* method_types = nullptr;
-  size_t num_method_types = 0;
-
-  if (dex_file->NumProtoIds() < kDexCacheMethodTypeCacheSize) {
-    num_method_types = dex_file->NumProtoIds();
-  } else {
-    num_method_types = kDexCacheMethodTypeCacheSize;
-  }
-
-  if (num_method_types > 0) {
-    method_types = reinterpret_cast<MethodTypeDexCacheType*>(
-        raw_arrays + layout.MethodTypesOffset());
-  }
-
-  GcRoot<mirror::CallSite>* call_sites = (dex_file->NumCallSiteIds() == 0)
-      ? nullptr
-      : reinterpret_cast<GcRoot<CallSite>*>(raw_arrays + layout.CallSitesOffset());
-
-  DCHECK_ALIGNED(raw_arrays, alignof(StringDexCacheType)) <<
-                 "Expected raw_arrays to align to StringDexCacheType.";
-  DCHECK_ALIGNED(layout.StringsOffset(), alignof(StringDexCacheType)) <<
-                 "Expected StringsOffset() to align to StringDexCacheType.";
-  DCHECK_ALIGNED(strings, alignof(StringDexCacheType)) <<
-                 "Expected strings to align to StringDexCacheType.";
-  static_assert(alignof(StringDexCacheType) == 8u,
-                "Expected StringDexCacheType to have align of 8.");
-  if (kIsDebugBuild) {
-    // Sanity check to make sure all the dex cache arrays are empty. b/28992179
-    for (size_t i = 0; i < num_strings; ++i) {
-      CHECK_EQ(strings[i].load(std::memory_order_relaxed).index, 0u);
-      CHECK(strings[i].load(std::memory_order_relaxed).object.IsNull());
-    }
-    for (size_t i = 0; i < num_types; ++i) {
-      CHECK_EQ(types[i].load(std::memory_order_relaxed).index, 0u);
-      CHECK(types[i].load(std::memory_order_relaxed).object.IsNull());
-    }
-    for (size_t i = 0; i < num_methods; ++i) {
-      CHECK_EQ(GetNativePairPtrSize(methods, i, image_pointer_size).index, 0u);
-      CHECK(GetNativePairPtrSize(methods, i, image_pointer_size).object == nullptr);
-    }
-    for (size_t i = 0; i < num_fields; ++i) {
-      CHECK_EQ(GetNativePairPtrSize(fields, i, image_pointer_size).index, 0u);
-      CHECK(GetNativePairPtrSize(fields, i, image_pointer_size).object == nullptr);
-    }
-    for (size_t i = 0; i < num_method_types; ++i) {
-      CHECK_EQ(method_types[i].load(std::memory_order_relaxed).index, 0u);
-      CHECK(method_types[i].load(std::memory_order_relaxed).object.IsNull());
-    }
-    for (size_t i = 0; i < dex_file->NumCallSiteIds(); ++i) {
-      CHECK(call_sites[i].IsNull());
-    }
-  }
-  if (strings != nullptr) {
-    mirror::StringDexCachePair::Initialize(strings);
-  }
-  if (types != nullptr) {
-    mirror::TypeDexCachePair::Initialize(types);
-  }
-  if (fields != nullptr) {
-    mirror::FieldDexCachePair::Initialize(fields, image_pointer_size);
-  }
-  if (methods != nullptr) {
-    mirror::MethodDexCachePair::Initialize(methods, image_pointer_size);
-  }
-  if (method_types != nullptr) {
-    mirror::MethodTypeDexCachePair::Initialize(method_types);
-  }
-  dex_cache->Init(dex_file,
-                  location,
-                  strings,
-                  num_strings,
-                  types,
-                  num_types,
-                  methods,
-                  num_methods,
-                  fields,
-                  num_fields,
-                  method_types,
-                  num_method_types,
-                  call_sites,
-                  dex_file->NumCallSiteIds());
+  SetDexFile(dex_file);
+  SetClassLoader(class_loader);
 }
 
 void DexCache::VisitReflectiveTargets(ReflectiveValueVisitor* visitor) {
   bool wrote = false;
-  for (size_t i = 0; i < NumResolvedFields(); i++) {
-    auto pair(GetNativePairPtrSize(GetResolvedFields(), i, kRuntimePointerSize));
-    if (pair.index == FieldDexCachePair::InvalidIndexForSlot(i)) {
+  auto* fields = GetResolvedFields();
+  size_t num_fields = NumResolvedFields();
+  // Check both the data pointer and count since the array might be initialized
+  // concurrently on other thread, and we might observe just one of the values.
+  for (size_t i = 0; fields != nullptr && i < num_fields; i++) {
+    auto pair(fields->GetNativePair(i));
+    if (pair.index == NativeDexCachePair<ArtField>::InvalidIndexForSlot(i)) {
       continue;
     }
     ArtField* new_val = visitor->VisitField(
         pair.object, DexCacheSourceInfo(kSourceDexCacheResolvedField, pair.index, this));
     if (UNLIKELY(new_val != pair.object)) {
       if (new_val == nullptr) {
-        pair = FieldDexCachePair(nullptr, FieldDexCachePair::InvalidIndexForSlot(i));
+        pair = NativeDexCachePair<ArtField>(
+            nullptr, NativeDexCachePair<ArtField>::InvalidIndexForSlot(i));
       } else {
         pair.object = new_val;
       }
-      SetNativePairPtrSize(GetResolvedFields(), i, pair, kRuntimePointerSize);
+      fields->SetNativePair(i, pair);
       wrote = true;
     }
   }
-  for (size_t i = 0; i < NumResolvedMethods(); i++) {
-    auto pair(GetNativePairPtrSize(GetResolvedMethods(), i, kRuntimePointerSize));
-    if (pair.index == MethodDexCachePair::InvalidIndexForSlot(i)) {
+  auto* methods = GetResolvedMethods();
+  size_t num_methods = NumResolvedMethods();
+  // Check both the data pointer and count since the array might be initialized
+  // concurrently on other thread, and we might observe just one of the values.
+  for (size_t i = 0; methods != nullptr && i < num_methods; i++) {
+    auto pair(methods->GetNativePair(i));
+    if (pair.index == NativeDexCachePair<ArtMethod>::InvalidIndexForSlot(i)) {
       continue;
     }
     ArtMethod* new_val = visitor->VisitMethod(
         pair.object, DexCacheSourceInfo(kSourceDexCacheResolvedMethod, pair.index, this));
     if (UNLIKELY(new_val != pair.object)) {
       if (new_val == nullptr) {
-        pair = MethodDexCachePair(nullptr, MethodDexCachePair::InvalidIndexForSlot(i));
+        pair = NativeDexCachePair<ArtMethod>(
+            nullptr, NativeDexCachePair<ArtMethod>::InvalidIndexForSlot(i));
       } else {
         pair.object = new_val;
       }
-      SetNativePairPtrSize(GetResolvedMethods(), i, pair, kRuntimePointerSize);
+      methods->SetNativePair(i, pair);
       wrote = true;
     }
   }
+
+  auto* fields_array = GetResolvedFieldsArray();
+  num_fields = NumResolvedFieldsArray();
+  for (size_t i = 0; fields_array != nullptr && i < num_fields; i++) {
+    ArtField* old_val = fields_array->Get(i);
+    if (old_val == nullptr) {
+      continue;
+    }
+    ArtField* new_val = visitor->VisitField(
+        old_val, DexCacheSourceInfo(kSourceDexCacheResolvedField, i, this));
+    if (new_val != old_val) {
+      fields_array->Set(i, new_val);
+      wrote = true;
+    }
+  }
+
+  auto* methods_array = GetResolvedMethodsArray();
+  num_methods = NumResolvedMethodsArray();
+  for (size_t i = 0; methods_array != nullptr && i < num_methods; i++) {
+    ArtMethod* old_val = methods_array->Get(i);
+    if (old_val == nullptr) {
+      continue;
+    }
+    ArtMethod* new_val = visitor->VisitMethod(
+        old_val, DexCacheSourceInfo(kSourceDexCacheResolvedMethod, i, this));
+    if (new_val != old_val) {
+      methods_array->Set(i, new_val);
+      wrote = true;
+    }
+  }
+
   if (wrote) {
     WriteBarrier::ForEveryFieldWrite(this);
   }
 }
 
-bool DexCache::AddPreResolvedStringsArray() {
-  DCHECK_EQ(NumPreResolvedStrings(), 0u);
-  Thread* const self = Thread::Current();
-  LinearAlloc* linear_alloc = Runtime::Current()->GetLinearAlloc();
-  const size_t num_strings = GetDexFile()->NumStringIds();
-  if (num_strings != 0) {
-    GcRoot<mirror::String>* strings =
-        linear_alloc->AllocArray<GcRoot<mirror::String>>(self, num_strings);
-    if (strings == nullptr) {
-      // Failed to allocate pre-resolved string array (probably due to address fragmentation), bail.
-      return false;
-    }
-    SetField32<false>(NumPreResolvedStringsOffset(), num_strings);
+void DexCache::ResetNativeArrays() {
+  SetStrings(nullptr);
+  SetResolvedTypes(nullptr);
+  SetResolvedMethods(nullptr);
+  SetResolvedFields(nullptr);
+  SetResolvedMethodTypes(nullptr);
+  SetResolvedCallSites(nullptr);
 
-    CHECK(strings != nullptr);
-    SetPreResolvedStrings(strings);
-    for (size_t i = 0; i < GetDexFile()->NumStringIds(); ++i) {
-      CHECK(GetPreResolvedStrings()[i].Read() == nullptr);
-    }
-  }
-  return true;
-}
-
-void DexCache::Init(const DexFile* dex_file,
-                    ObjPtr<String> location,
-                    StringDexCacheType* strings,
-                    uint32_t num_strings,
-                    TypeDexCacheType* resolved_types,
-                    uint32_t num_resolved_types,
-                    MethodDexCacheType* resolved_methods,
-                    uint32_t num_resolved_methods,
-                    FieldDexCacheType* resolved_fields,
-                    uint32_t num_resolved_fields,
-                    MethodTypeDexCacheType* resolved_method_types,
-                    uint32_t num_resolved_method_types,
-                    GcRoot<CallSite>* resolved_call_sites,
-                    uint32_t num_resolved_call_sites) {
-  CHECK(dex_file != nullptr);
-  CHECK(location != nullptr);
-  CHECK_EQ(num_strings != 0u, strings != nullptr);
-  CHECK_EQ(num_resolved_types != 0u, resolved_types != nullptr);
-  CHECK_EQ(num_resolved_methods != 0u, resolved_methods != nullptr);
-  CHECK_EQ(num_resolved_fields != 0u, resolved_fields != nullptr);
-  CHECK_EQ(num_resolved_method_types != 0u, resolved_method_types != nullptr);
-  CHECK_EQ(num_resolved_call_sites != 0u, resolved_call_sites != nullptr);
-
-  SetDexFile(dex_file);
-  SetLocation(location);
-  SetStrings(strings);
-  SetResolvedTypes(resolved_types);
-  SetResolvedMethods(resolved_methods);
-  SetResolvedFields(resolved_fields);
-  SetResolvedMethodTypes(resolved_method_types);
-  SetResolvedCallSites(resolved_call_sites);
-  SetField32<false>(NumStringsOffset(), num_strings);
-  SetField32<false>(NumResolvedTypesOffset(), num_resolved_types);
-  SetField32<false>(NumResolvedMethodsOffset(), num_resolved_methods);
-  SetField32<false>(NumResolvedFieldsOffset(), num_resolved_fields);
-  SetField32<false>(NumResolvedMethodTypesOffset(), num_resolved_method_types);
-  SetField32<false>(NumResolvedCallSitesOffset(), num_resolved_call_sites);
+  SetStringsArray(nullptr);
+  SetResolvedTypesArray(nullptr);
+  SetResolvedMethodsArray(nullptr);
+  SetResolvedFieldsArray(nullptr);
+  SetResolvedMethodTypesArray(nullptr);
 }
 
 void DexCache::SetLocation(ObjPtr<mirror::String> location) {
@@ -285,23 +160,100 @@ void DexCache::SetClassLoader(ObjPtr<ClassLoader> class_loader) {
   SetFieldObject<false>(OFFSET_OF_OBJECT_MEMBER(DexCache, class_loader_), class_loader);
 }
 
-#if !defined(__aarch64__) && !defined(__x86_64__)
-static pthread_mutex_t dex_cache_slow_atomic_mutex = PTHREAD_MUTEX_INITIALIZER;
-
-DexCache::ConversionPair64 DexCache::AtomicLoadRelaxed16B(std::atomic<ConversionPair64>* target) {
-  pthread_mutex_lock(&dex_cache_slow_atomic_mutex);
-  DexCache::ConversionPair64 value = *reinterpret_cast<ConversionPair64*>(target);
-  pthread_mutex_unlock(&dex_cache_slow_atomic_mutex);
-  return value;
+ObjPtr<ClassLoader> DexCache::GetClassLoader() {
+  return GetFieldObject<ClassLoader>(OFFSET_OF_OBJECT_MEMBER(DexCache, class_loader_));
 }
 
-void DexCache::AtomicStoreRelease16B(std::atomic<ConversionPair64>* target,
-                                     ConversionPair64 value) {
-  pthread_mutex_lock(&dex_cache_slow_atomic_mutex);
-  *reinterpret_cast<ConversionPair64*>(target) = value;
-  pthread_mutex_unlock(&dex_cache_slow_atomic_mutex);
+bool DexCache::ShouldAllocateFullArrayAtStartup() {
+  if (!kEnableFullArraysAtStartup) {
+    return false;
+  }
+  Runtime* runtime = Runtime::Current();
+  if (runtime->IsAotCompiler()) {
+    // To save on memory in dex2oat, we don't allocate full arrays by default.
+    return false;
+  }
+
+  if (runtime->IsZygote()) {
+    // Zygote doesn't have a notion of startup.
+    return false;
+  }
+
+  if (runtime->GetStartupCompleted()) {
+    // We only allocate full arrays during app startup.
+    return false;
+  }
+
+  if (GetClassLoader() == nullptr) {
+    // Only allocate full array for app dex files (also note that for
+    // multi-image, the `GetCompilerFilter` call below does not work for
+    // non-primary oat files).
+    return false;
+  }
+
+  const OatDexFile* oat_dex_file = GetDexFile()->GetOatDexFile();
+  if (oat_dex_file != nullptr &&
+      CompilerFilter::IsAotCompilationEnabled(oat_dex_file->GetOatFile()->GetCompilerFilter())) {
+    // We only allocate full arrays for dex files where we do not have
+    // compilation.
+    return false;
+  }
+
+  return true;
 }
-#endif
+
+void DexCache::UnlinkStartupCaches() {
+  if (GetDexFile() == nullptr) {
+    // Unused dex cache.
+    return;
+  }
+  UnlinkStringsArrayIfStartup();
+  UnlinkResolvedFieldsArrayIfStartup();
+  UnlinkResolvedMethodsArrayIfStartup();
+  UnlinkResolvedTypesArrayIfStartup();
+  UnlinkResolvedMethodTypesArrayIfStartup();
+}
+
+void DexCache::SetResolvedType(dex::TypeIndex type_idx, ObjPtr<Class> resolved) {
+  DCHECK(resolved != nullptr);
+  DCHECK(resolved->IsResolved()) << resolved->GetStatus();
+  // TODO default transaction support.
+  // Use a release store for SetResolvedType. This is done to prevent other threads from seeing a
+  // class but not necessarily seeing the loaded members like the static fields array.
+  // See b/32075261.
+  SetResolvedTypesEntry(type_idx.index_, resolved.Ptr());
+  // TODO: Fine-grained marking, so that we don't need to go through all arrays in full.
+  WriteBarrier::ForEveryFieldWrite(this);
+
+  if (this == resolved->GetDexCache()) {
+    // If we're updating the dex cache of the class, optimistically update the cache for methods and
+    // fields if the caches are full arrays.
+    auto* resolved_methods = GetResolvedMethodsArray();
+    if (resolved_methods != nullptr) {
+      PointerSize pointer_size = Runtime::Current()->GetClassLinker()->GetImagePointerSize();
+      // Because there could be duplicate method entries, we make sure we only
+      // update the cache with the first one found to be consistent with method
+      // resolution.
+      uint32_t previous_method_index = dex::kDexNoIndex;
+      for (ArtMethod& current_method : resolved->GetDeclaredMethods(pointer_size)) {
+        uint32_t new_index = current_method.GetDexMethodIndex();
+        if (new_index != previous_method_index) {
+          resolved_methods->Set(new_index, &current_method);
+          previous_method_index = new_index;
+        }
+      }
+    }
+    auto* resolved_fields = GetResolvedFieldsArray();
+    if (resolved_fields != nullptr) {
+      for (ArtField& current_field : resolved->GetSFields()) {
+        resolved_fields->Set(current_field.GetDexFieldIndex(), &current_field);
+      }
+      for (ArtField& current_field : resolved->GetIFields()) {
+        resolved_fields->Set(current_field.GetDexFieldIndex(), &current_field);
+      }
+    }
+  }
+}
 
 }  // namespace mirror
 }  // namespace art

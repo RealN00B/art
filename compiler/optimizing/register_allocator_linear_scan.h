@@ -18,11 +18,11 @@
 #define ART_COMPILER_OPTIMIZING_REGISTER_ALLOCATOR_LINEAR_SCAN_H_
 
 #include "arch/instruction_set.h"
-#include "base/scoped_arena_containers.h"
 #include "base/macros.h"
+#include "base/scoped_arena_containers.h"
 #include "register_allocator.h"
 
-namespace art {
+namespace art HIDDEN {
 
 class CodeGenerator;
 class HBasicBlock;
@@ -47,11 +47,11 @@ class RegisterAllocatorLinearScan : public RegisterAllocator {
   void AllocateRegisters() override;
 
   bool Validate(bool log_fatal_on_failure) override {
-    processing_core_registers_ = true;
+    current_register_type_ = RegisterType::kCoreRegister;
     if (!ValidateInternal(log_fatal_on_failure)) {
       return false;
     }
-    processing_core_registers_ = false;
+    current_register_type_ = RegisterType::kFpRegister;
     return ValidateInternal(log_fatal_on_failure);
   }
 
@@ -76,8 +76,7 @@ class RegisterAllocatorLinearScan : public RegisterAllocator {
   bool IsBlocked(int reg) const;
 
   // Update the interval for the register in `location` to cover [start, end).
-  void BlockRegister(Location location, size_t start, size_t end);
-  void BlockRegisters(size_t start, size_t end, bool caller_save_only = false);
+  void BlockRegister(Location location, size_t position, bool will_call);
 
   // Allocate a spill slot for the given interval. Should be called in linear
   // order of interval starting positions.
@@ -97,6 +96,29 @@ class RegisterAllocatorLinearScan : public RegisterAllocator {
   int FindAvailableRegisterPair(size_t* next_use, size_t starting_at) const;
   int FindAvailableRegister(size_t* next_use, LiveInterval* current) const;
   bool IsCallerSaveRegister(int reg) const;
+
+  // If any inputs require specific registers, block those registers
+  // at the position of this instruction.
+  void CheckForFixedInputs(HInstruction* instruction, bool will_call);
+
+  // If the output of an instruction requires a specific register, split
+  // the interval and assign the register to the first part.
+  void CheckForFixedOutput(HInstruction* instruction, bool will_call);
+
+  // Add all applicable safepoints to a live interval.
+  // Currently depends on instruction processing order.
+  void AddSafepointsFor(HInstruction* instruction);
+
+  // Collect all live intervals associated with the temporary locations
+  // needed by an instruction.
+  void CheckForTempLiveIntervals(HInstruction* instruction, bool will_call);
+
+  // If a safe point is needed, add a synthesized interval to later record
+  // the number of live registers at this point.
+  void CheckForSafepoint(HInstruction* instruction);
+
+  // Try to remove the SuspendCheck at function entry. Returns true if it was successful.
+  bool TryRemoveSuspendCheckEntry(HInstruction* instruction);
 
   // Try splitting an active non-pair or unaligned pair interval at the given `position`.
   // Returns whether it was successful at finding such an interval.
@@ -131,6 +153,8 @@ class RegisterAllocatorLinearScan : public RegisterAllocator {
   // where an instruction requires a specific register.
   ScopedArenaVector<LiveInterval*> physical_core_register_intervals_;
   ScopedArenaVector<LiveInterval*> physical_fp_register_intervals_;
+  LiveInterval* block_registers_for_call_interval_;
+  LiveInterval* block_registers_special_interval_;  // For catch block or irreducible loop header.
 
   // Intervals for temporaries. Such intervals cover the positions
   // where an instruction requires a temporary.
@@ -153,9 +177,8 @@ class RegisterAllocatorLinearScan : public RegisterAllocator {
   // Instructions that need a safepoint.
   ScopedArenaVector<HInstruction*> safepoints_;
 
-  // True if processing core registers. False if processing floating
-  // point registers.
-  bool processing_core_registers_;
+  // The register type we're currently processing.
+  RegisterType current_register_type_;
 
   // Number of registers for the current register kind (core or floating point).
   size_t number_of_registers_;

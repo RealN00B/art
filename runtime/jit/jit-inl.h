@@ -17,6 +17,7 @@
 #ifndef ART_RUNTIME_JIT_JIT_INL_H_
 #define ART_RUNTIME_JIT_JIT_INL_H_
 
+#include "android-base/macros.h"
 #include "jit/jit.h"
 
 #include "art_method.h"
@@ -24,41 +25,32 @@
 #include "thread.h"
 #include "runtime-inl.h"
 
-namespace art {
+namespace art HIDDEN {
 namespace jit {
 
-inline bool Jit::ShouldUsePriorityThreadWeight(Thread* self) {
-  return self->IsJitSensitiveThread() && Runtime::Current()->InJankPerceptibleProcessState();
-}
+inline void Jit::AddSamples(Thread* self, ArtMethod* method) {
+  // `hotness_count_` should always be 0 for intrinsics (which are considered hot from the first
+  // call), and for memory shared methods which use `shared_method_hotness`.
+  DCHECK_IMPLIES(method->IsIntrinsic(), method->CounterIsHot());
+  DCHECK_IMPLIES(method->IsMemorySharedMethod(), method->CounterIsHot());
 
-inline void Jit::AddSamples(Thread* self,
-                            ArtMethod* method,
-                            uint16_t samples,
-                            bool with_backedges) {
-  if (Jit::ShouldUsePriorityThreadWeight(self)) {
-    samples *= PriorityThreadWeight();
-  }
-  uint32_t old_count = method->GetCounter();
-  uint32_t new_count = old_count + samples;
-
-  // The full check is fairly expensive so we just add to hotness most of the time,
-  // and we do the full check only when some of the higher bits of the count change.
-  // NB: The method needs to see the transitions of the counter past the thresholds.
-  uint32_t old_batch = RoundDown(old_count, kJitSamplesBatchSize);  // Clear lower bits.
-  uint32_t new_batch = RoundDown(new_count, kJitSamplesBatchSize);  // Clear lower bits.
-  if (UNLIKELY(kSlowMode)) {  // Check every time in slow-debug mode.
-    if (!MaybeCompileMethod(self, method, old_count, new_count, with_backedges)) {
-      // Tests may check that the counter is 0 for methods that we never compile.
-      return;  // Ignore the samples for now and retry later.
+  if (method->CounterIsHot()) {
+    if (method->IsMemorySharedMethod()) {
+      // Intrinsics do not use `shared_method_hotness`.
+      if (!method->IsIntrinsic()) {
+        if (self->DecrementSharedMethodHotness() == 0) {
+          self->ResetSharedMethodHotness();
+        } else {
+          return;
+        }
+      }
+    } else {
+      method->ResetCounter(Runtime::Current()->GetJITOptions()->GetWarmupThreshold());
     }
-  } else if (UNLIKELY(old_batch != new_batch)) {
-    if (!MaybeCompileMethod(self, method, old_batch, new_batch, with_backedges)) {
-      // OSR compilation will ignore the samples if they don't have backedges.
-      return;  // Ignore the samples for now and retry later.
-    }
+    MaybeEnqueueCompilation(method, self);
+  } else {
+    method->UpdateCounter(1);
   }
-
-  method->SetCounter(new_count);
 }
 
 }  // namespace jit

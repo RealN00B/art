@@ -19,16 +19,17 @@
 
 #include "jni_env_ext.h"
 
+#include "local_reference_table-inl.h"
 #include "mirror/object.h"
 
-namespace art {
+namespace art HIDDEN {
 
 template<typename T>
 inline T JNIEnvExt::AddLocalReference(ObjPtr<mirror::Object> obj) {
   std::string error_msg;
-  IndirectRef ref = locals_.Add(local_ref_cookie_, obj, &error_msg);
+  jobject ref = reinterpret_cast<jobject>(locals_.Add(obj, &error_msg));
   if (UNLIKELY(ref == nullptr)) {
-    // This is really unexpected if we allow resizing local IRTs...
+    // This is really unexpected if we allow resizing LRTs...
     LOG(FATAL) << error_msg;
     UNREACHABLE();
   }
@@ -47,6 +48,10 @@ inline T JNIEnvExt::AddLocalReference(ObjPtr<mirror::Object> obj) {
   }
 
   return reinterpret_cast<T>(ref);
+}
+
+inline void JNIEnvExt::UpdateLocal(IndirectRef iref, ObjPtr<mirror::Object> obj) {
+  locals_.Update(iref, obj);
 }
 
 }  // namespace art

@@ -18,8 +18,12 @@
 
 #define CMDLINE_NDEBUG 1  // Do not output any debugging information for parsing.
 
+#include <cstdint>
 #include <list>
+#include <ostream>
 
+#include "android-base/parsebool.h"
+#include "android-base/stringprintf.h"
 #include "cmdline_type_parser.h"
 #include "detail/cmdline_debug_detail.h"
 #include "memory_representation.h"
@@ -65,6 +69,22 @@ struct CmdlineType<Unit> : CmdlineTypeParser<Unit> {
 };
 
 template <>
+struct CmdlineType<bool> : CmdlineTypeParser<bool> {
+  Result Parse(const std::string& args) {
+    switch (::android::base::ParseBool(args)) {
+      case ::android::base::ParseBoolResult::kError:
+        return Result::Failure("Could not parse '" + args + "' as boolean");
+      case ::android::base::ParseBoolResult::kTrue:
+        return Result::Success(true);
+      case ::android::base::ParseBoolResult::kFalse:
+        return Result::Success(false);
+    }
+  }
+
+  static const char* DescribeType() { return "true|false|1|0|y|n|yes|no|on|off"; }
+};
+
+template <>
 struct CmdlineType<JdwpProvider> : CmdlineTypeParser<JdwpProvider> {
   /*
    * Handle a single JDWP provider name. Must be either 'internal', 'default', or the file name of
@@ -87,6 +107,7 @@ struct CmdlineType<JdwpProvider> : CmdlineTypeParser<JdwpProvider> {
     }
   }
   static const char* Name() { return "JdwpProvider"; }
+  static const char* DescribeType() { return "none|adbconnection|default"; }
 };
 
 template <size_t Divisor>
@@ -173,6 +194,13 @@ struct CmdlineType<Memory<Divisor>> : CmdlineTypeParser<Memory<Divisor>> {
   }
 
   static const char* Name() { return Memory<Divisor>::Name(); }
+  static const char* DescribeType() {
+    static std::string str;
+    if (str.empty()) {
+      str = "Memory with granularity of " + std::to_string(Divisor) + " bytes";
+    }
+    return str.c_str();
+  }
 };
 
 template <>
@@ -194,6 +222,7 @@ struct CmdlineType<double> : CmdlineTypeParser<double> {
   }
 
   static const char* Name() { return "double"; }
+  static const char* DescribeType() { return "double value"; }
 };
 
 template <typename T>
@@ -226,7 +255,19 @@ struct CmdlineType<unsigned int> : CmdlineTypeParser<unsigned int> {
   }
 
   static const char* Name() { return "unsigned integer"; }
+  static const char* DescribeType() { return "unsigned integer value"; }
 };
+
+template <>
+struct CmdlineType<uint16_t> : CmdlineTypeParser<uint16_t> {
+  Result Parse(const std::string& str) {
+    return ParseNumeric<uint16_t>(str);
+  }
+
+  static const char* Name() { return "unsigned 16-bit integer"; }
+  static const char* DescribeType() { return "unsigned 16-bit integer value"; }
+};
+
 
 template <>
 struct CmdlineType<int> : CmdlineTypeParser<int> {
@@ -235,6 +276,7 @@ struct CmdlineType<int> : CmdlineTypeParser<int> {
   }
 
   static const char* Name() { return "integer"; }
+  static const char* DescribeType() { return "integer value"; }
 };
 
 // Lightweight nanosecond value type. Allows parser to convert user-input from milliseconds
@@ -289,6 +331,7 @@ struct CmdlineType<MillisecondsToNanoseconds> : CmdlineTypeParser<MillisecondsTo
   }
 
   static const char* Name() { return "MillisecondsToNanoseconds"; }
+  static const char* DescribeType() { return "millisecond value"; }
 };
 
 template <>
@@ -307,6 +350,7 @@ struct CmdlineType<std::string> : CmdlineTypeParser<std::string> {
     }
     return Result::SuccessNoValue();
   }
+  static const char* DescribeType() { return "string value"; }
 };
 
 template <>
@@ -323,6 +367,7 @@ struct CmdlineType<std::vector<Plugin>> : CmdlineTypeParser<std::vector<Plugin>>
   }
 
   static const char* Name() { return "std::vector<Plugin>"; }
+  static const char* DescribeType() { return "/path/to/libplugin.so"; }
 };
 
 template <>
@@ -339,6 +384,7 @@ struct CmdlineType<std::list<ti::AgentSpec>> : CmdlineTypeParser<std::list<ti::A
   }
 
   static const char* Name() { return "std::list<ti::AgentSpec>"; }
+  static const char* DescribeType() { return "/path/to/libagent.so=options"; }
 };
 
 template <>
@@ -355,17 +401,40 @@ struct CmdlineType<std::vector<std::string>> : CmdlineTypeParser<std::vector<std
   }
 
   static const char* Name() { return "std::vector<std::string>"; }
+  static const char* DescribeType() { return "string value"; }
 };
 
-template <char Separator>
-struct ParseStringList {
-  explicit ParseStringList(std::vector<std::string>&& list) : list_(list) {}
+template <>
+struct CmdlineType<std::vector<int>> : CmdlineTypeParser<std::vector<int>> {
+  Result Parse(const std::string& args) {
+    assert(false && "Use AppendValues() for a int vector type");
+    return Result::Failure("Unconditional failure: string vector must be appended: " + args);
+  }
 
-  operator std::vector<std::string>() const {
+  Result ParseAndAppend(const std::string& args,
+                        std::vector<int>& existing_value) {
+    auto result = ParseNumeric<int>(args);
+    if (result.IsSuccess()) {
+      existing_value.push_back(result.GetValue());
+    } else {
+      return Result::CastError(result);
+    }
+    return Result::SuccessNoValue();
+  }
+
+  static const char* Name() { return "std::vector<int>"; }
+  static const char* DescribeType() { return "int values"; }
+};
+
+template <typename ArgType, char Separator>
+struct ParseList {
+  explicit ParseList(std::vector<ArgType>&& list) : list_(list) {}
+
+  operator std::vector<ArgType>() const {
     return list_;
   }
 
-  operator std::vector<std::string>&&() && {
+  operator std::vector<ArgType>&&() && {
     return std::move(list_);
   }
 
@@ -377,6 +446,21 @@ struct ParseStringList {
     return android::base::Join(list_, Separator);
   }
 
+  ParseList() = default;
+  ParseList(const ParseList&) = default;
+  ParseList(ParseList&&) noexcept = default;
+
+ private:
+  std::vector<ArgType> list_;
+};
+
+template <char Separator>
+using ParseIntList = ParseList<int, Separator>;
+
+template <char Separator>
+struct ParseStringList : public ParseList<std::string, Separator> {
+  explicit ParseStringList(std::vector<std::string>&& list) : ParseList<std::string, Separator>(std::move(list)) {}
+
   static ParseStringList<Separator> Split(const std::string& str) {
     std::vector<std::string> list;
     art::Split(str, Separator, &list);
@@ -385,10 +469,7 @@ struct ParseStringList {
 
   ParseStringList() = default;
   ParseStringList(const ParseStringList&) = default;
-  ParseStringList(ParseStringList&&) = default;
-
- private:
-  std::vector<std::string> list_;
+  ParseStringList(ParseStringList&&) noexcept = default;
 };
 
 template <char Separator>
@@ -400,14 +481,21 @@ struct CmdlineType<ParseStringList<Separator>> : CmdlineTypeParser<ParseStringLi
   }
 
   static const char* Name() { return "ParseStringList<Separator>"; }
+  static const char* DescribeType() {
+    static std::string str;
+    if (str.empty()) {
+      str = android::base::StringPrintf("list separated by '%c'", Separator);
+    }
+    return str.c_str();
+  }
 };
 
-template <>
-struct CmdlineType<std::vector<int32_t>> : CmdlineTypeParser<std::vector<int32_t>> {
-  using Result = CmdlineParseResult<std::vector<int32_t>>;
+template <char Separator>
+struct CmdlineType<ParseIntList<Separator>> : CmdlineTypeParser<ParseIntList<Separator>> {
+  using Result = CmdlineParseResult<ParseIntList<Separator>>;
 
   Result Parse(const std::string& args) {
-    std::vector<int32_t> list;
+    std::vector<int> list;
     const char* pos = args.c_str();
     errno = 0;
 
@@ -417,22 +505,29 @@ struct CmdlineType<std::vector<int32_t>> : CmdlineTypeParser<std::vector<int32_t
       if (pos == end ||  errno == EINVAL) {
         return Result::Failure("Failed to parse integer from " + args);
       } else if ((errno == ERANGE) ||  // NOLINT [runtime/int] [4]
-                 value < std::numeric_limits<int32_t>::min() ||
-                 value > std::numeric_limits<int32_t>::max()) {
+                 value < std::numeric_limits<int>::min() ||
+                 value > std::numeric_limits<int>::max()) {
         return Result::OutOfRange("Failed to parse integer from " + args + "; out of range");
       }
-      list.push_back(static_cast<int32_t>(value));
+      list.push_back(static_cast<int>(value));
       if (*end == '\0') {
         break;
-      } else if (*end != ',') {
+      } else if (*end != Separator) {
         return Result::Failure(std::string("Unexpected character: ") + *end);
       }
       pos = end + 1;
     }
-    return Result::Success(std::move(list));
+    return Result::Success(ParseIntList<Separator>(std::move(list)));
   }
 
-  static const char* Name() { return "std::vector<int32_t>"; }
+  static const char* Name() { return "ParseIntList<Separator>"; }
+  static const char* DescribeType() {
+    static std::string str;
+    if (str.empty()) {
+      str = android::base::StringPrintf("integer list separated by '%c'", Separator);
+    }
+    return str.c_str();
+  }
 };
 
 static gc::CollectorType ParseCollectorType(const std::string& option) {
@@ -444,6 +539,8 @@ static gc::CollectorType ParseCollectorType(const std::string& option) {
     return gc::kCollectorTypeSS;
   } else if (option == "CC") {
     return gc::kCollectorTypeCC;
+  } else if (option == "CMC") {
+    return gc::kCollectorTypeCMC;
   } else {
     return gc::kCollectorTypeNone;
   }
@@ -456,7 +553,7 @@ struct XGcOption {
   bool verify_pre_gc_heap_ = false;
   bool verify_pre_sweeping_heap_ = kIsDebugBuild;
   bool generational_cc = kEnableGenerationalCCByDefault;
-  bool verify_post_gc_heap_ = false;
+  bool verify_post_gc_heap_ = kIsDebugBuild;
   bool verify_pre_gc_rosalloc_ = kIsDebugBuild;
   bool verify_pre_sweeping_rosalloc_ = false;
   bool verify_post_gc_rosalloc_ = false;
@@ -534,6 +631,11 @@ struct CmdlineType<XGcOption> : CmdlineTypeParser<XGcOption> {
   }
 
   static const char* Name() { return "XgcOption"; }
+  static const char* DescribeType() {
+    return "MS|nonconccurent|concurrent|CMS|SS|CC|[no]preverify[_rosalloc]|"
+           "[no]presweepingverify[_rosalloc]|[no]generation_cc|[no]postverify[_rosalloc]|"
+           "[no]gcstress|measure|[no]precisce|[no]verifycardtable";
+  }
 };
 
 struct BackgroundGcOption {
@@ -573,6 +675,9 @@ struct CmdlineType<BackgroundGcOption>
   }
 
   static const char* Name() { return "BackgroundGcOption"; }
+  static const char* DescribeType() {
+    return "HSpaceCompact|MS|nonconccurent|CMS|concurrent|SS|CC";
+  }
 };
 
 template <>
@@ -642,6 +747,11 @@ struct CmdlineType<LogVerbosity> : CmdlineTypeParser<LogVerbosity> {
   }
 
   static const char* Name() { return "LogVerbosity"; }
+  static const char* DescribeType() {
+    return "class|collector|compiler|deopt|gc|heap|interpreter|jdwp|jit|jni|monitor|oat|profiler|"
+           "signals|simulator|startup|third-party-jni|threads|verifier|verifier-debug|image|"
+           "systrace-locks|plugin|agents|dex";
+  }
 };
 
 template <>
@@ -703,49 +813,56 @@ struct CmdlineType<ProfileSaverOptions> : CmdlineTypeParser<ProfileSaverOptions>
     // The rest of these options are always the wildcard from '-Xps-*'
     std::string suffix = RemovePrefix(option);
 
-    if (android::base::StartsWith(option, "min-save-period-ms:")) {
+    if (option.starts_with("min-save-period-ms:")) {
       CmdlineType<unsigned int> type_parser;
       return ParseInto(existing,
              &ProfileSaverOptions::min_save_period_ms_,
              type_parser.Parse(suffix));
     }
-    if (android::base::StartsWith(option, "save-resolved-classes-delay-ms:")) {
+    if (option.starts_with("min-first-save-ms:")) {
       CmdlineType<unsigned int> type_parser;
       return ParseInto(existing,
-             &ProfileSaverOptions::save_resolved_classes_delay_ms_,
+             &ProfileSaverOptions::min_first_save_ms_,
              type_parser.Parse(suffix));
     }
-    if (android::base::StartsWith(option, "hot-startup-method-samples:")) {
-      CmdlineType<unsigned int> type_parser;
-      return ParseInto(existing,
-             &ProfileSaverOptions::hot_startup_method_samples_,
-             type_parser.Parse(suffix));
+    if (option.starts_with("save-resolved-classes-delay-ms:")) {
+      LOG(WARNING) << "-Xps-save-resolved-classes-delay-ms is deprecated";
+      return Result::SuccessNoValue();
     }
-    if (android::base::StartsWith(option, "min-methods-to-save:")) {
+    if (option.starts_with("hot-startup-method-samples:")) {
+      LOG(WARNING) << "-Xps-hot-startup-method-samples option is deprecated";
+      return Result::SuccessNoValue();
+    }
+    if (option.starts_with("min-methods-to-save:")) {
       CmdlineType<unsigned int> type_parser;
       return ParseInto(existing,
              &ProfileSaverOptions::min_methods_to_save_,
              type_parser.Parse(suffix));
     }
-    if (android::base::StartsWith(option, "min-classes-to-save:")) {
+    if (option.starts_with("min-classes-to-save:")) {
       CmdlineType<unsigned int> type_parser;
       return ParseInto(existing,
              &ProfileSaverOptions::min_classes_to_save_,
              type_parser.Parse(suffix));
     }
-    if (android::base::StartsWith(option, "min-notification-before-wake:")) {
+    if (option.starts_with("min-notification-before-wake:")) {
       CmdlineType<unsigned int> type_parser;
       return ParseInto(existing,
              &ProfileSaverOptions::min_notification_before_wake_,
              type_parser.Parse(suffix));
     }
-    if (android::base::StartsWith(option, "max-notification-before-wake:")) {
+    if (option.starts_with("max-notification-before-wake:")) {
       CmdlineType<unsigned int> type_parser;
       return ParseInto(existing,
              &ProfileSaverOptions::max_notification_before_wake_,
              type_parser.Parse(suffix));
     }
-    if (android::base::StartsWith(option, "profile-path:")) {
+    if (option.starts_with("inline-cache-threshold:")) {
+      CmdlineType<uint16_t> type_parser;
+      return ParseInto(
+          existing, &ProfileSaverOptions::inline_cache_threshold_, type_parser.Parse(suffix));
+    }
+    if (option.starts_with("profile-path:")) {
       existing.profile_path_ = suffix;
       return Result::SuccessNoValue();
     }
@@ -754,6 +871,7 @@ struct CmdlineType<ProfileSaverOptions> : CmdlineTypeParser<ProfileSaverOptions>
   }
 
   static const char* Name() { return "ProfileSaverOptions"; }
+  static const char* DescribeType() { return "string|unsigned integer"; }
   static constexpr bool kCanParseBlankless = true;
 };
 
@@ -769,6 +887,7 @@ struct CmdlineType<ExperimentalFlags> : CmdlineTypeParser<ExperimentalFlags> {
   }
 
   static const char* Name() { return "ExperimentalFlags"; }
+  static const char* DescribeType() { return "none"; }
 };
 }  // namespace art
 #endif  // ART_CMDLINE_CMDLINE_TYPES_H_

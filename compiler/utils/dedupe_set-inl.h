@@ -27,11 +27,12 @@
 #include "android-base/stringprintf.h"
 
 #include "base/hash_set.h"
+#include "base/macros.h"
 #include "base/mutex.h"
 #include "base/stl_util.h"
 #include "base/time_utils.h"
 
-namespace art {
+namespace art HIDDEN {
 
 template <typename InKey,
           typename StoreKey,
@@ -79,6 +80,11 @@ class DedupeSet<InKey, StoreKey, Alloc, HashType, HashFunc, kShard>::Shard {
     const StoreKey* store_key = alloc_.Copy(in_key);
     keys_.insert(HashedKey<StoreKey> { hash, store_key });
     return store_key;
+  }
+
+  size_t Size(Thread* self) {
+    MutexLock lock(self, lock_);
+    return keys_.size();
   }
 
   void UpdateStats(Thread* self, Stats* global_stats) REQUIRES(!lock_) {
@@ -226,6 +232,20 @@ template <typename InKey,
           HashType kShard>
 DedupeSet<InKey, StoreKey, Alloc, HashType, HashFunc, kShard>::~DedupeSet() {
   // Everything done by member destructors.
+}
+
+template <typename InKey,
+          typename StoreKey,
+          typename Alloc,
+          typename HashType,
+          typename HashFunc,
+          HashType kShard>
+size_t DedupeSet<InKey, StoreKey, Alloc, HashType, HashFunc, kShard>::Size(Thread* self) const {
+  size_t result = 0u;
+  for (const auto& shard : shards_) {
+    result += shard->Size(self);
+  }
+  return result;
 }
 
 template <typename InKey,

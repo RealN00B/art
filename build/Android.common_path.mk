@@ -35,46 +35,8 @@ ART_TARGET_NATIVETEST_OUT := $(TARGET_OUT_DATA_NATIVE_TESTS)/art
 ART_TARGET_TEST_DIR := /data/art-test
 ART_TARGET_TEST_OUT := $(TARGET_OUT_DATA)/art-test
 
-# core.oat location on the device.
-TARGET_CORE_OAT := $(ART_TARGET_TEST_DIR)/$(DEX2OAT_TARGET_ARCH)/core.oat
-ifdef TARGET_2ND_ARCH
-2ND_TARGET_CORE_OAT := $(ART_TARGET_TEST_DIR)/$($(TARGET_2ND_ARCH_VAR_PREFIX)DEX2OAT_TARGET_ARCH)/core.oat
-endif
-
-CORE_OAT_SUFFIX := .oat
-
-# core.oat locations under the out directory.
-HOST_CORE_OAT_OUT_BASE := $(HOST_OUT_JAVA_LIBRARIES)/$(ART_HOST_ARCH)/core
-ifneq ($(HOST_PREFER_32_BIT),true)
-2ND_HOST_CORE_OAT_OUT_BASE := $(HOST_OUT_JAVA_LIBRARIES)/$(2ND_ART_HOST_ARCH)/core
-endif
-HOST_CORE_OAT_OUTS :=
-TARGET_CORE_OAT_OUT_BASE := $(ART_TARGET_TEST_OUT)/$(DEX2OAT_TARGET_ARCH)/core
-ifdef TARGET_2ND_ARCH
-2ND_TARGET_CORE_OAT_OUT_BASE := $(ART_TARGET_TEST_OUT)/$($(TARGET_2ND_ARCH_VAR_PREFIX)DEX2OAT_TARGET_ARCH)/core
-endif
-TARGET_CORE_OAT_OUTS :=
-
-CORE_IMG_SUFFIX := .art
-
-# core.art locations under the out directory.
-HOST_CORE_IMG_OUT_BASE := $(HOST_OUT_JAVA_LIBRARIES)/$(ART_HOST_ARCH)/core
-ifneq ($(HOST_PREFER_32_BIT),true)
-2ND_HOST_CORE_IMG_OUT_BASE := $(HOST_OUT_JAVA_LIBRARIES)/$(2ND_ART_HOST_ARCH)/core
-endif
-HOST_CORE_IMG_OUTS :=
-TARGET_CORE_IMG_OUT_BASE := $(ART_TARGET_TEST_OUT)/$(DEX2OAT_TARGET_ARCH)/core
-ifdef TARGET_2ND_ARCH
-2ND_TARGET_CORE_IMG_OUT_BASE := $(ART_TARGET_TEST_OUT)/$($(TARGET_2ND_ARCH_VAR_PREFIX)DEX2OAT_TARGET_ARCH)/core
-endif
-TARGET_CORE_IMG_OUTS :=
-
-# Oat location of core.art.
-HOST_CORE_IMG_LOCATION := $(HOST_OUT_JAVA_LIBRARIES)/core.art
-TARGET_CORE_IMG_LOCATION := $(ART_TARGET_TEST_OUT)/core.art
-
 # Modules to compile for core.art.
-CORE_IMG_JARS := core-oj core-libart core-icu4j okhttp bouncycastle apache-xml
+CORE_IMG_JARS := core-oj core-libart okhttp bouncycastle apache-xml
 HOST_CORE_IMG_JARS   := $(addsuffix -hostdex,$(CORE_IMG_JARS))
 TARGET_CORE_IMG_JARS := $(CORE_IMG_JARS)
 HOST_CORE_IMG_DEX_LOCATIONS   := $(foreach jar,$(HOST_CORE_IMG_JARS),  $(HOST_OUT_JAVA_LIBRARIES)/$(jar).jar)
@@ -87,25 +49,35 @@ HOST_CORE_IMG_DEX_FILES   := $(foreach jar,$(HOST_CORE_IMG_JARS),  $(call interm
 TARGET_CORE_IMG_DEX_FILES := $(foreach jar,$(TARGET_CORE_IMG_JARS),$(call intermediates-dir-for,JAVA_LIBRARIES,$(jar).com.android.art.testing, ,COMMON)/javalib.jar)
 
 # Also copy the jar files next to host boot.art image.
+# `dexpreopt_bootjars.go` uses a single source of input regardless of variants, so we should use the
+# same source for `CORE_IMG_JARS` to avoid checksum mismatches on the oat files.
 HOST_BOOT_IMAGE_JARS := $(foreach jar,$(CORE_IMG_JARS),$(HOST_OUT)/apex/com.android.art/javalib/$(jar).jar)
-$(HOST_BOOT_IMAGE_JARS): $(HOST_OUT)/apex/com.android.art/javalib/%.jar : $(HOST_OUT_JAVA_LIBRARIES)/%-hostdex.jar
+CORE_IMG_JAR_DIR := $(OUT_DIR)/soong/dexpreopt_$(TARGET_ARCH)/dex_artjars_input
+$(HOST_BOOT_IMAGE_JARS): $(HOST_OUT)/apex/com.android.art/javalib/%.jar : $(CORE_IMG_JAR_DIR)/%.jar
 	$(copy-file-to-target)
+
+# We can still use the host variant of `conscrypt` and `core-icu4j` because they don't go into the
+# primary boot image that is used in host gtests, and hence can't lead to checksum mismatches.
 HOST_BOOT_IMAGE_JARS += $(HOST_OUT)/apex/com.android.conscrypt/javalib/conscrypt.jar
 $(HOST_OUT)/apex/com.android.conscrypt/javalib/conscrypt.jar : $(HOST_OUT_JAVA_LIBRARIES)/conscrypt-hostdex.jar
 	$(copy-file-to-target)
+HOST_BOOT_IMAGE_JARS += $(HOST_OUT)/apex/com.android.i18n/javalib/core-icu4j.jar
+$(HOST_OUT)/apex/com.android.i18n/javalib/core-icu4j.jar : $(HOST_OUT_JAVA_LIBRARIES)/core-icu4j-hostdex.jar
+	$(copy-file-to-target)
 
-HOST_CORE_IMG_OUTS += $(HOST_BOOT_IMAGE_JARS) $(HOST_BOOT_IMAGE) $(2ND_HOST_BOOT_IMAGE)
+HOST_CORE_IMG_OUTS += $(HOST_BOOT_IMAGE_JARS)
 
-HOST_TEST_CORE_JARS   := $(addsuffix -hostdex,$(CORE_IMG_JARS) conscrypt)
+HOST_TEST_CORE_JARS := $(addsuffix -hostdex,$(CORE_IMG_JARS) core-icu4j conscrypt)
 ART_HOST_DEX_DEPENDENCIES := $(foreach jar,$(HOST_TEST_CORE_JARS),$(HOST_OUT_JAVA_LIBRARIES)/$(jar).jar)
-ART_TARGET_DEX_DEPENDENCIES := com.android.art.testing com.android.conscrypt
+ART_TARGET_DEX_DEPENDENCIES := com.android.art.testing com.android.conscrypt com.android.i18n
 
-ART_CORE_SHARED_LIBRARIES := libicu_jni libjavacore libopenjdk libopenjdkjvm libopenjdkjvmti
+ART_CORE_SHARED_LIBRARIES := libjavacore libopenjdk libopenjdkjvm libopenjdkjvmti libjdwp
 ART_CORE_SHARED_DEBUG_LIBRARIES := libopenjdkd libopenjdkjvmd libopenjdkjvmtid
-ART_HOST_SHARED_LIBRARY_DEPENDENCIES := $(foreach lib,$(ART_CORE_SHARED_LIBRARIES), $(ART_HOST_OUT_SHARED_LIBRARIES)/$(lib)$(ART_HOST_SHLIB_EXTENSION))
+ART_HOST_CORE_SHARED_LIBRARIES := $(ART_CORE_SHARED_LIBRARIES) libicuuc-host libicui18n-host libicu_jni
+ART_HOST_SHARED_LIBRARY_DEPENDENCIES := $(foreach lib,$(ART_HOST_CORE_SHARED_LIBRARIES), $(ART_HOST_OUT_SHARED_LIBRARIES)/$(lib)$(ART_HOST_SHLIB_EXTENSION))
 ART_HOST_SHARED_LIBRARY_DEBUG_DEPENDENCIES := $(foreach lib,$(ART_CORE_SHARED_DEBUG_LIBRARIES), $(ART_HOST_OUT_SHARED_LIBRARIES)/$(lib)$(ART_HOST_SHLIB_EXTENSION))
 ifdef HOST_2ND_ARCH
-ART_HOST_SHARED_LIBRARY_DEPENDENCIES += $(foreach lib,$(ART_CORE_SHARED_LIBRARIES), $(2ND_HOST_OUT_SHARED_LIBRARIES)/$(lib).so)
+ART_HOST_SHARED_LIBRARY_DEPENDENCIES += $(foreach lib,$(ART_HOST_CORE_SHARED_LIBRARIES), $(2ND_HOST_OUT_SHARED_LIBRARIES)/$(lib).so)
 ART_HOST_SHARED_LIBRARY_DEBUG_DEPENDENCIES += $(foreach lib,$(ART_CORE_SHARED_DEBUG_LIBRARIES), $(2ND_HOST_OUT_SHARED_LIBRARIES)/$(lib).so)
 endif
 
@@ -117,12 +89,15 @@ ifdef TARGET_2ND_ARCH
 ART_TARGET_SHARED_LIBRARY_DEBUG_DEPENDENCIES += $(foreach lib,$(ART_CORE_SHARED_DEBUG_LIBRARIES), $(2ND_TARGET_OUT_SHARED_LIBRARIES)/$(lib).so)
 endif
 
-ART_CORE_DEBUGGABLE_EXECUTABLES := \
+ART_CORE_DEBUGGABLE_EXECUTABLES_COMMON := \
     dex2oat \
     dexoptanalyzer \
     imgdiag \
     oatdump \
     profman \
+
+ART_CORE_DEBUGGABLE_EXECUTABLES_TARGET := $(ART_CORE_DEBUGGABLE_EXECUTABLES_COMMON) odrefresh
+ART_CORE_DEBUGGABLE_EXECUTABLES_HOST := $(ART_CORE_DEBUGGABLE_EXECUTABLES_COMMON)
 
 ART_CORE_EXECUTABLES := \
     dalvikvm \
@@ -132,29 +107,37 @@ ART_CORE_EXECUTABLES := \
 # for each module
 ART_TARGET_EXECUTABLES :=
 ifneq ($(ART_BUILD_TARGET_NDEBUG),false)
-ART_TARGET_EXECUTABLES += $(foreach name,$(ART_CORE_EXECUTABLES) $(ART_CORE_DEBUGGABLE_EXECUTABLES),$(name)-target)
+ART_TARGET_EXECUTABLES += $(foreach name,$(ART_CORE_EXECUTABLES) $(ART_CORE_DEBUGGABLE_EXECUTABLES_TARGET),$(name)-target)
 endif
 ifneq ($(ART_BUILD_TARGET_DEBUG),false)
-ART_TARGET_EXECUTABLES += $(foreach name,$(ART_CORE_DEBUGGABLE_EXECUTABLES),$(name)d-target)
+ART_TARGET_EXECUTABLES += $(foreach name,$(ART_CORE_DEBUGGABLE_EXECUTABLES_TARGET),$(name)d-target)
 endif
 
 ART_HOST_EXECUTABLES :=
 ifneq ($(ART_BUILD_HOST_NDEBUG),false)
-ART_HOST_EXECUTABLES += $(foreach name,$(ART_CORE_EXECUTABLES) $(ART_CORE_DEBUGGABLE_EXECUTABLES),$(name)-host)
+ART_HOST_EXECUTABLES += $(foreach name,$(ART_CORE_EXECUTABLES) $(ART_CORE_DEBUGGABLE_EXECUTABLES_HOST),$(name)-host)
 endif
 ifneq ($(ART_BUILD_HOST_DEBUG),false)
-ART_HOST_EXECUTABLES += $(foreach name,$(ART_CORE_DEBUGGABLE_EXECUTABLES),$(name)d-host)
+ART_HOST_EXECUTABLES += $(foreach name,$(ART_CORE_DEBUGGABLE_EXECUTABLES_HOST),$(name)d-host)
 endif
 
 # Release ART APEX, included by default in "user" builds.
-RELEASE_ART_APEX := com.android.art.release
+RELEASE_ART_APEX := com.android.art
 # Debug ART APEX, included by default in "userdebug" and "eng"
 # builds and used in ART device benchmarking.
 DEBUG_ART_APEX := com.android.art.debug
 # Testing ART APEX, used in ART device testing.
 TESTING_ART_APEX := com.android.art.testing
 
-# Conscrypt APEX
+RUNTIME_APEX := com.android.runtime
 CONSCRYPT_APEX := com.android.conscrypt
+I18N_APEX := com.android.i18n
+STATSD_APEX := art_fake_com.android.os.statsd
+TZDATA_APEX := com.android.tzdata
+
+# A phony file to create the ICU data file for host.
+HOST_I18N_DATA := $(HOST_OUT)/$(I18N_APEX)/timestamp
+# A phony file to create the tz data file for host.
+HOST_TZDATA_DATA := $(HOST_OUT)/$(TZDATA_APEX)/timestamp
 
 endif # ART_ANDROID_COMMON_PATH_MK

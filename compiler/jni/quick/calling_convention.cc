@@ -19,6 +19,7 @@
 #include <android-base/logging.h>
 
 #include "arch/instruction_set.h"
+#include "indirect_reference_table.h"
 
 #ifdef ART_ENABLE_CODEGEN_arm
 #include "jni/quick/arm/calling_convention_arm.h"
@@ -26,6 +27,10 @@
 
 #ifdef ART_ENABLE_CODEGEN_arm64
 #include "jni/quick/arm64/calling_convention_arm64.h"
+#endif
+
+#ifdef ART_ENABLE_CODEGEN_riscv64
+#include "jni/quick/riscv64/calling_convention_riscv64.h"
 #endif
 
 #ifdef ART_ENABLE_CODEGEN_x86
@@ -36,7 +41,7 @@
 #include "jni/quick/x86_64/calling_convention_x86_64.h"
 #endif
 
-namespace art {
+namespace art HIDDEN {
 
 // Managed runtime calling convention
 
@@ -44,7 +49,7 @@ std::unique_ptr<ManagedRuntimeCallingConvention> ManagedRuntimeCallingConvention
     ArenaAllocator* allocator,
     bool is_static,
     bool is_synchronized,
-    const char* shorty,
+    std::string_view shorty,
     InstructionSet instruction_set) {
   switch (instruction_set) {
 #ifdef ART_ENABLE_CODEGEN_arm
@@ -60,6 +65,12 @@ std::unique_ptr<ManagedRuntimeCallingConvention> ManagedRuntimeCallingConvention
           new (allocator) arm64::Arm64ManagedRuntimeCallingConvention(
               is_static, is_synchronized, shorty));
 #endif
+#ifdef ART_ENABLE_CODEGEN_riscv64
+    case InstructionSet::kRiscv64:
+      return std::unique_ptr<ManagedRuntimeCallingConvention>(
+          new (allocator) riscv64::Riscv64ManagedRuntimeCallingConvention(
+              is_static, is_synchronized, shorty));
+#endif
 #ifdef ART_ENABLE_CODEGEN_x86
     case InstructionSet::kX86:
       return std::unique_ptr<ManagedRuntimeCallingConvention>(
@@ -73,6 +84,10 @@ std::unique_ptr<ManagedRuntimeCallingConvention> ManagedRuntimeCallingConvention
               is_static, is_synchronized, shorty));
 #endif
     default:
+      UNUSED(allocator);
+      UNUSED(is_static);
+      UNUSED(is_synchronized);
+      UNUSED(shorty);
       LOG(FATAL) << "Unknown InstructionSet: " << instruction_set;
       UNREACHABLE();
   }
@@ -109,7 +124,7 @@ bool ManagedRuntimeCallingConvention::IsCurrentArgPossiblyNull() {
 }
 
 size_t ManagedRuntimeCallingConvention::CurrentParamSize() {
-  return ParamSize(itr_args_);
+  return ParamSize(itr_args_, /*reference_size=*/ sizeof(mirror::HeapReference<mirror::Object>));
 }
 
 bool ManagedRuntimeCallingConvention::IsCurrentParamAReference() {
@@ -133,8 +148,9 @@ bool ManagedRuntimeCallingConvention::IsCurrentParamALong() {
 std::unique_ptr<JniCallingConvention> JniCallingConvention::Create(ArenaAllocator* allocator,
                                                                    bool is_static,
                                                                    bool is_synchronized,
+                                                                   bool is_fast_native,
                                                                    bool is_critical_native,
-                                                                   const char* shorty,
+                                                                   std::string_view shorty,
                                                                    InstructionSet instruction_set) {
   switch (instruction_set) {
 #ifdef ART_ENABLE_CODEGEN_arm
@@ -142,27 +158,39 @@ std::unique_ptr<JniCallingConvention> JniCallingConvention::Create(ArenaAllocato
     case InstructionSet::kThumb2:
       return std::unique_ptr<JniCallingConvention>(
           new (allocator) arm::ArmJniCallingConvention(
-              is_static, is_synchronized, is_critical_native, shorty));
+              is_static, is_synchronized, is_fast_native, is_critical_native, shorty));
 #endif
 #ifdef ART_ENABLE_CODEGEN_arm64
     case InstructionSet::kArm64:
       return std::unique_ptr<JniCallingConvention>(
           new (allocator) arm64::Arm64JniCallingConvention(
-              is_static, is_synchronized, is_critical_native, shorty));
+              is_static, is_synchronized, is_fast_native, is_critical_native, shorty));
+#endif
+#ifdef ART_ENABLE_CODEGEN_riscv64
+    case InstructionSet::kRiscv64:
+      return std::unique_ptr<JniCallingConvention>(
+          new (allocator) riscv64::Riscv64JniCallingConvention(
+              is_static, is_synchronized, is_fast_native, is_critical_native, shorty));
 #endif
 #ifdef ART_ENABLE_CODEGEN_x86
     case InstructionSet::kX86:
       return std::unique_ptr<JniCallingConvention>(
           new (allocator) x86::X86JniCallingConvention(
-              is_static, is_synchronized, is_critical_native, shorty));
+              is_static, is_synchronized, is_fast_native, is_critical_native, shorty));
 #endif
 #ifdef ART_ENABLE_CODEGEN_x86_64
     case InstructionSet::kX86_64:
       return std::unique_ptr<JniCallingConvention>(
           new (allocator) x86_64::X86_64JniCallingConvention(
-              is_static, is_synchronized, is_critical_native, shorty));
+              is_static, is_synchronized, is_fast_native, is_critical_native, shorty));
 #endif
     default:
+      UNUSED(allocator);
+      UNUSED(is_static);
+      UNUSED(is_synchronized);
+      UNUSED(is_fast_native);
+      UNUSED(is_critical_native);
+      UNUSED(shorty);
       LOG(FATAL) << "Unknown InstructionSet: " << instruction_set;
       UNREACHABLE();
   }
@@ -172,33 +200,11 @@ size_t JniCallingConvention::ReferenceCount() const {
   return NumReferenceArgs() + (IsStatic() ? 1 : 0);
 }
 
-FrameOffset JniCallingConvention::SavedLocalReferenceCookieOffset() const {
-  size_t references_size = handle_scope_pointer_size_ * ReferenceCount();  // size excluding header
-  return FrameOffset(HandleReferencesOffset().Int32Value() + references_size);
-}
-
-FrameOffset JniCallingConvention::ReturnValueSaveLocation() const {
-  if (LIKELY(HasHandleScope())) {
-    // Initial offset already includes the displacement.
-    // -- Remove the additional local reference cookie offset if we don't have a handle scope.
-    const size_t saved_local_reference_cookie_offset =
-        SavedLocalReferenceCookieOffset().Int32Value();
-    // Segment state is 4 bytes long
-    const size_t segment_state_size = 4;
-    return FrameOffset(saved_local_reference_cookie_offset + segment_state_size);
-  } else {
-    // Include only the initial Method* as part of the offset.
-    CHECK_LT(displacement_.SizeValue(),
-             static_cast<size_t>(std::numeric_limits<int32_t>::max()));
-    return FrameOffset(displacement_.Int32Value() + static_cast<size_t>(frame_pointer_size_));
-  }
-}
-
 bool JniCallingConvention::HasNext() {
   if (IsCurrentArgExtraForJni()) {
     return true;
   } else {
-    unsigned int arg_pos = GetIteratorPositionWithinShorty();
+    size_t arg_pos = GetIteratorPositionWithinShorty();
     return arg_pos < NumArgs();
   }
 }
@@ -230,7 +236,7 @@ bool JniCallingConvention::IsCurrentParamAReference() {
                               &return_value)) {
     return return_value;
   } else {
-    int arg_pos = GetIteratorPositionWithinShorty();
+    size_t arg_pos = GetIteratorPositionWithinShorty();
     return IsParamAReference(arg_pos);
   }
 }
@@ -252,7 +258,7 @@ bool JniCallingConvention::IsCurrentParamAFloatOrDouble() {
                               &return_value)) {
     return return_value;
   } else {
-    int arg_pos = GetIteratorPositionWithinShorty();
+    size_t arg_pos = GetIteratorPositionWithinShorty();
     return IsParamAFloatOrDouble(arg_pos);
   }
 }
@@ -266,7 +272,7 @@ bool JniCallingConvention::IsCurrentParamADouble() {
                               &return_value)) {
     return return_value;
   } else {
-    int arg_pos = GetIteratorPositionWithinShorty();
+    size_t arg_pos = GetIteratorPositionWithinShorty();
     return IsParamADouble(arg_pos);
   }
 }
@@ -280,27 +286,18 @@ bool JniCallingConvention::IsCurrentParamALong() {
                               &return_value)) {
     return return_value;
   } else {
-    int arg_pos = GetIteratorPositionWithinShorty();
+    size_t arg_pos = GetIteratorPositionWithinShorty();
     return IsParamALong(arg_pos);
   }
-}
-
-// Return position of handle scope entry holding reference at the current iterator
-// position
-FrameOffset JniCallingConvention::CurrentParamHandleScopeEntryOffset() {
-  CHECK(IsCurrentParamAReference());
-  CHECK_LT(HandleScopeLinkOffset(), HandleScopeNumRefsOffset());
-  int result = HandleReferencesOffset().Int32Value() + itr_refs_ * handle_scope_pointer_size_;
-  CHECK_GT(result, HandleScopeNumRefsOffset().Int32Value());
-  return FrameOffset(result);
 }
 
 size_t JniCallingConvention::CurrentParamSize() const {
   if (IsCurrentArgExtraForJni()) {
     return static_cast<size_t>(frame_pointer_size_);  // JNIEnv or jobject/jclass
   } else {
-    int arg_pos = GetIteratorPositionWithinShorty();
-    return ParamSize(arg_pos);
+    size_t arg_pos = GetIteratorPositionWithinShorty();
+    // References are converted to `jobject` for the native call. Pass `frame_pointer_size_`.
+    return ParamSize(arg_pos, /*reference_size=*/ static_cast<size_t>(frame_pointer_size_));
   }
 }
 
@@ -325,7 +322,7 @@ bool JniCallingConvention::HasSelfClass() const {
   }
 }
 
-unsigned int JniCallingConvention::GetIteratorPositionWithinShorty() const {
+size_t JniCallingConvention::GetIteratorPositionWithinShorty() const {
   // We need to subtract out the extra JNI arguments if we want to use this iterator position
   // with the inherited CallingConvention member functions, which rely on scanning the shorty.
   // Note that our shorty does *not* include the JNIEnv, jclass/jobject parameters.

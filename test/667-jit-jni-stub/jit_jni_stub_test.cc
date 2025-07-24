@@ -25,17 +25,6 @@
 
 namespace art {
 
-// Local class declared as a friend of JitCodeCache so that we can access its internals.
-class JitJniStubTestHelper {
- public:
-  static bool isNextJitGcFull(Thread* self) REQUIRES_SHARED(Locks::mutator_lock_) {
-    CHECK(Runtime::Current()->GetJit() != nullptr);
-    jit::JitCodeCache* cache = Runtime::Current()->GetJit()->GetCodeCache();
-    MutexLock mu(self, *Locks::jit_lock_);
-    return cache->ShouldDoFullCollection();
-  }
-};
-
 // Calls through to a static method with signature "()V".
 extern "C" JNIEXPORT
 void Java_Main_callThrough(JNIEnv* env, jclass, jclass klass, jstring methodName) {
@@ -50,14 +39,22 @@ extern "C" JNIEXPORT
 void Java_Main_jitGc(JNIEnv*, jclass) {
   CHECK(Runtime::Current()->GetJit() != nullptr);
   jit::JitCodeCache* cache = Runtime::Current()->GetJit()->GetCodeCache();
-  ScopedObjectAccess soa(Thread::Current());
-  cache->GarbageCollectCache(Thread::Current());
+  Thread* self = Thread::Current();
+  {
+    ScopedObjectAccess soa(self);
+    cache->InvalidateAllCompiledCode();
+  }
+  cache->DoCollection(self);
+  // Run a second time in case the first run was a no-op due to a concurrent JIT
+  // GC from the JIT thread.
+  cache->DoCollection(self);
 }
 
 extern "C" JNIEXPORT
 jboolean Java_Main_isNextJitGcFull(JNIEnv*, jclass) {
-  ScopedObjectAccess soa(Thread::Current());
-  return JitJniStubTestHelper::isNextJitGcFull(soa.Self());
+  // Because we invalidate all compiled code above, we currently always do a
+  // full GC.
+  return true;
 }
 
 }  // namespace art

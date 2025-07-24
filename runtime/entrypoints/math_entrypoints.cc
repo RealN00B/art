@@ -14,11 +14,9 @@
  * limitations under the License.
  */
 
-#include "math_entrypoints.h"
-
 #include "entrypoint_utils-inl.h"
 
-namespace art {
+namespace art HIDDEN {
 
 extern "C" double art_l2d(int64_t l) {
   return static_cast<double>(l);

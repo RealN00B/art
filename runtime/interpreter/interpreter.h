@@ -18,10 +18,11 @@
 #define ART_RUNTIME_INTERPRETER_INTERPRETER_H_
 
 #include "base/locks.h"
+#include "base/macros.h"
 #include "dex/dex_file.h"
 #include "obj_ptr.h"
 
-namespace art {
+namespace art HIDDEN {
 namespace mirror {
 class Object;
 }  // namespace mirror
@@ -64,10 +65,8 @@ void ArtInterpreterToInterpreterBridge(Thread* self,
                                        JValue* result)
     REQUIRES_SHARED(Locks::mutator_lock_);
 
-// One-time sanity check.
+// One-time check of assembler constants.
 void CheckInterpreterAsmConstants();
-
-void InitInterpreterTls(Thread* self);
 
 // Returns true if the previous frame has the ForceRetryInstruction bit set. This is required for
 // ForPopFrame to work correctly since that will cause the java function return with null/0 which

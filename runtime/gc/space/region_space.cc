@@ -24,7 +24,7 @@
 #include "mirror/object-inl.h"
 #include "thread_list.h"
 
-namespace art {
+namespace art HIDDEN {
 namespace gc {
 namespace space {
 
@@ -36,7 +36,7 @@ static constexpr uint kEvacuateLivePercentThreshold = 75U;
 static constexpr bool kProtectClearedRegions = kIsDebugBuild;
 
 // Wether we poison memory areas occupied by dead objects in unevacuated regions.
-static constexpr bool kPoisonDeadObjectsInUnevacuatedRegions = true;
+static constexpr bool kPoisonDeadObjectsInUnevacuatedRegions = kIsDebugBuild;
 
 // Special 32-bit value used to poison memory areas occupied by dead
 // objects in unevacuated regions. Dereferencing this value is expected
@@ -110,6 +110,7 @@ RegionSpace::RegionSpace(const std::string& name, MemMap&& mem_map, bool use_gen
       use_generational_cc_(use_generational_cc),
       time_(1U),
       num_regions_(mem_map_.Size() / kRegionSize),
+      madvise_time_(0U),
       num_non_free_regions_(0U),
       num_evac_regions_(0U),
       max_peak_num_non_free_regions_(0U),
@@ -222,71 +223,52 @@ inline bool RegionSpace::Region::ShouldBeEvacuated(EvacMode evac_mode) {
   DCHECK(GetUseGenerationalCC() || (evac_mode != kEvacModeNewlyAllocated));
   DCHECK((IsAllocated() || IsLarge()) && IsInToSpace());
   // The region should be evacuated if:
-  // - the evacuation is forced (`evac_mode == kEvacModeForceAll`); or
+  // - the evacuation is forced (!large && `evac_mode == kEvacModeForceAll`); or
   // - the region was allocated after the start of the previous GC (newly allocated region); or
-  // - the live ratio is below threshold (`kEvacuateLivePercentThreshold`).
+  // - !large and the live ratio is below threshold (`kEvacuateLivePercentThreshold`).
+  if (IsLarge()) {
+    // It makes no sense to evacuate in the large case, since the region only contains zero or
+    // one object. If the regions is completely empty, we'll reclaim it anyhow. If its one object
+    // is live, we would just be moving around region-aligned memory.
+    return false;
+  }
   if (UNLIKELY(evac_mode == kEvacModeForceAll)) {
     return true;
   }
-  bool result = false;
+  DCHECK(IsAllocated());
   if (is_newly_allocated_) {
     // Invariant: newly allocated regions have an undefined live bytes count.
     DCHECK_EQ(live_bytes_, static_cast<size_t>(-1));
-    if (IsAllocated()) {
-      // We always evacuate newly-allocated non-large regions as we
-      // believe they contain many dead objects (a very simple form of
-      // the generational hypothesis, even before the Sticky-Bit CC
-      // approach).
-      //
-      // TODO: Verify that assertion by collecting statistics on the
-      // number/proportion of live objects in newly allocated regions
-      // in RegionSpace::ClearFromSpace.
-      //
-      // Note that a side effect of evacuating a newly-allocated
-      // non-large region is that the "newly allocated" status will
-      // later be removed, as its live objects will be copied to an
-      // evacuation region, which won't be marked as "newly
-      // allocated" (see RegionSpace::AllocateRegion).
-      result = true;
-    } else {
-      DCHECK(IsLarge());
-      // We never want to evacuate a large region (and the associated
-      // tail regions), except if:
-      // - we are forced to do so (see the `kEvacModeForceAll` case
-      //   above); or
-      // - we know that the (sole) object contained in this region is
-      //   dead (see the corresponding logic below, in the
-      //   `kEvacModeLivePercentNewlyAllocated` case).
-      // For a newly allocated region (i.e. allocated since the
-      // previous GC started), we don't have any liveness information
-      // (the live bytes count is -1 -- also note this region has been
-      // a to-space one between the time of its allocation and now),
-      // so we prefer not to evacuate it.
-      result = false;
-    }
+    // We always evacuate newly-allocated non-large regions as we
+    // believe they contain many dead objects (a very simple form of
+    // the generational hypothesis, even before the Sticky-Bit CC
+    // approach).
+    //
+    // TODO: Verify that assertion by collecting statistics on the
+    // number/proportion of live objects in newly allocated regions
+    // in RegionSpace::ClearFromSpace.
+    //
+    // Note that a side effect of evacuating a newly-allocated
+    // non-large region is that the "newly allocated" status will
+    // later be removed, as its live objects will be copied to an
+    // evacuation region, which won't be marked as "newly
+    // allocated" (see RegionSpace::AllocateRegion).
+    return true;
   } else if (evac_mode == kEvacModeLivePercentNewlyAllocated) {
     bool is_live_percent_valid = (live_bytes_ != static_cast<size_t>(-1));
     if (is_live_percent_valid) {
       DCHECK(IsInToSpace());
-      DCHECK(!IsLargeTail());
       DCHECK_NE(live_bytes_, static_cast<size_t>(-1));
       DCHECK_LE(live_bytes_, BytesAllocated());
       const size_t bytes_allocated = RoundUp(BytesAllocated(), kRegionSize);
       DCHECK_LE(live_bytes_, bytes_allocated);
-      if (IsAllocated()) {
-        // Side node: live_percent == 0 does not necessarily mean
-        // there's no live objects due to rounding (there may be a
-        // few).
-        result = (live_bytes_ * 100U < kEvacuateLivePercentThreshold * bytes_allocated);
-      } else {
-        DCHECK(IsLarge());
-        result = (live_bytes_ == 0U);
-      }
-    } else {
-      result = false;
+      // Side node: live_percent == 0 does not necessarily mean
+      // there's no live objects due to rounding (there may be a
+      // few).
+      return live_bytes_ * 100U < kEvacuateLivePercentThreshold * bytes_allocated;
     }
   }
-  return result;
+  return false;
 }
 
 void RegionSpace::ZeroLiveBytesForLargeObject(mirror::Object* obj) {
@@ -411,16 +393,30 @@ void RegionSpace::SetFromSpace(accounting::ReadBarrierTable* rb_table,
   evac_region_ = &full_region_;
 }
 
-static void ZeroAndProtectRegion(uint8_t* begin, uint8_t* end) {
-  ZeroAndReleasePages(begin, end - begin);
+static void ZeroAndProtectRegion(uint8_t* begin, uint8_t* end, bool release_eagerly) {
+  ZeroMemory(begin, end - begin, release_eagerly);
   if (kProtectClearedRegions) {
     CheckedCall(mprotect, __FUNCTION__, begin, end - begin, PROT_NONE);
   }
 }
 
+void RegionSpace::ReleaseFreeRegions() {
+  MutexLock mu(Thread::Current(), region_lock_);
+  for (size_t i = 0u; i < num_regions_; ++i) {
+    if (regions_[i].IsFree()) {
+      uint8_t* begin = regions_[i].Begin();
+      DCHECK_ALIGNED_PARAM(begin, gPageSize);
+      DCHECK_ALIGNED_PARAM(regions_[i].End(), gPageSize);
+      bool res = madvise(begin, regions_[i].End() - begin, MADV_DONTNEED);
+      CHECK_NE(res, -1) << "madvise failed";
+    }
+  }
+}
+
 void RegionSpace::ClearFromSpace(/* out */ uint64_t* cleared_bytes,
                                  /* out */ uint64_t* cleared_objects,
-                                 const bool clear_bitmap) {
+                                 const bool clear_bitmap,
+                                 const bool release_eagerly) {
   DCHECK(cleared_bytes != nullptr);
   DCHECK(cleared_objects != nullptr);
   *cleared_bytes = 0;
@@ -499,8 +495,13 @@ void RegionSpace::ClearFromSpace(/* out */ uint64_t* cleared_bytes,
   }
 
   // Madvise the memory ranges.
+  uint64_t start_time = NanoTime();
   for (const auto &iter : madvise_list) {
-    ZeroAndProtectRegion(iter.first, iter.second);
+    ZeroAndProtectRegion(iter.first, iter.second, release_eagerly);
+  }
+  madvise_time_ += NanoTime() - start_time;
+
+  for (const auto &iter : madvise_list) {
     if (clear_bitmap) {
       GetLiveBitmap()->ClearRange(
           reinterpret_cast<mirror::Object*>(iter.first),
@@ -716,44 +717,61 @@ void RegionSpace::PoisonDeadObjectsInUnevacuatedRegion(Region* r) {
   }
 }
 
-void RegionSpace::LogFragmentationAllocFailure(std::ostream& os,
-                                               size_t /* failed_alloc_bytes */) {
+bool RegionSpace::LogFragmentationAllocFailure(std::ostream& os,
+                                               size_t failed_alloc_bytes) {
   size_t max_contiguous_allocation = 0;
   MutexLock mu(Thread::Current(), region_lock_);
+
   if (current_region_->End() - current_region_->Top() > 0) {
     max_contiguous_allocation = current_region_->End() - current_region_->Top();
   }
-  if (num_non_free_regions_ * 2 < num_regions_) {
-    // We reserve half of the regions for evaluation only. If we
-    // occupy more than half the regions, do not report the free
-    // regions as available.
-    size_t max_contiguous_free_regions = 0;
-    size_t num_contiguous_free_regions = 0;
-    bool prev_free_region = false;
-    for (size_t i = 0; i < num_regions_; ++i) {
-      Region* r = &regions_[i];
-      if (r->IsFree()) {
-        if (!prev_free_region) {
-          CHECK_EQ(num_contiguous_free_regions, 0U);
-          prev_free_region = true;
-        }
-        ++num_contiguous_free_regions;
-      } else {
-        if (prev_free_region) {
-          CHECK_NE(num_contiguous_free_regions, 0U);
-          max_contiguous_free_regions = std::max(max_contiguous_free_regions,
-                                                 num_contiguous_free_regions);
-          num_contiguous_free_regions = 0U;
-          prev_free_region = false;
-        }
+
+  size_t max_contiguous_free_regions = 0;
+  size_t num_contiguous_free_regions = 0;
+  bool prev_free_region = false;
+  for (size_t i = 0; i < num_regions_; ++i) {
+    Region* r = &regions_[i];
+    if (r->IsFree()) {
+      if (!prev_free_region) {
+        CHECK_EQ(num_contiguous_free_regions, 0U);
+        prev_free_region = true;
       }
+      ++num_contiguous_free_regions;
+    } else if (prev_free_region) {
+      CHECK_NE(num_contiguous_free_regions, 0U);
+      max_contiguous_free_regions = std::max(max_contiguous_free_regions,
+                                             num_contiguous_free_regions);
+      num_contiguous_free_regions = 0U;
+      prev_free_region = false;
     }
-    max_contiguous_allocation = std::max(max_contiguous_allocation,
-                                         max_contiguous_free_regions * kRegionSize);
   }
-  os << "; failed due to fragmentation (largest possible contiguous allocation "
-     <<  max_contiguous_allocation << " bytes)";
+  max_contiguous_allocation = std::max(max_contiguous_allocation,
+                                       max_contiguous_free_regions * kRegionSize);
+
+  // Calculate how many regions are available for allocations as we have to ensure
+  // that enough regions are left for evacuation.
+  size_t regions_free_for_alloc = num_regions_ / 2 - num_non_free_regions_;
+
+  max_contiguous_allocation = std::min(max_contiguous_allocation,
+                                       regions_free_for_alloc * kRegionSize);
+  if (failed_alloc_bytes > max_contiguous_allocation) {
+    // Region space does not normally fragment in the conventional sense. However we can run out
+    // of region space prematurely if we have many threads, each with a partially committed TLAB.
+    // The whole TLAB uses up region address space, but we only count the section that was
+    // actually given to the thread so far as allocated. For unlikely allocation request sequences
+    // involving largish objects that don't qualify for large objects space, we may also be unable
+    // to fully utilize entire TLABs, and thus generate enough actual fragmentation to get
+    // here. This appears less likely, since we usually reuse sufficiently large TLAB "tails"
+    // that are no longer needed.
+    os << "; failed due to fragmentation (largest possible contiguous allocation "
+       << max_contiguous_allocation << " bytes). Number of " << PrettySize(kRegionSize)
+       << " sized free regions are: " << regions_free_for_alloc
+       << ". Likely cause: (1) Too much memory in use, and "
+       << "(2) many threads or many larger objects of the wrong kind";
+    return true;
+  }
   // Caller's job to print failed_alloc_bytes.
+  return false;
 }
 
 void RegionSpace::Clear() {
@@ -1008,7 +1026,7 @@ void RegionSpace::Region::Clear(bool zero_and_release_pages) {
   alloc_time_ = 0;
   live_bytes_ = static_cast<size_t>(-1);
   if (zero_and_release_pages) {
-    ZeroAndProtectRegion(begin_, end_);
+    ZeroAndProtectRegion(begin_, end_, /* release_eagerly= */ true);
   }
   is_newly_allocated_ = false;
   is_a_tlab_ = false;
@@ -1037,7 +1055,7 @@ RegionSpace::Region* RegionSpace::AllocateRegion(bool for_evac) {
       r->Unfree(this, time_);
       if (use_generational_cc_) {
         // TODO: Add an explanation for this assertion.
-        DCHECK(!for_evac || !r->is_newly_allocated_);
+        DCHECK_IMPLIES(for_evac, !r->is_newly_allocated_);
       }
       if (for_evac) {
         ++num_evac_regions_;

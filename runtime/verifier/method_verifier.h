@@ -24,22 +24,20 @@
 #include <android-base/logging.h>
 
 #include "base/arena_allocator.h"
+#include "base/arena_containers.h"
 #include "base/macros.h"
-#include "base/scoped_arena_containers.h"
 #include "base/value_object.h"
 #include "dex/code_item_accessors.h"
 #include "dex/dex_file_types.h"
 #include "dex/method_reference.h"
 #include "handle.h"
 #include "instruction_flags.h"
-#include "reg_type_cache.h"
 #include "register_line.h"
 #include "verifier_enums.h"
 
-namespace art {
+namespace art HIDDEN {
 
 class ClassLinker;
-class CompilerCallbacks;
 class DexFile;
 class Instruction;
 struct ReferenceMap2Visitor;
@@ -52,52 +50,34 @@ struct CodeItem;
 }  // namespace dex
 
 namespace mirror {
+class ClassLoader;
 class DexCache;
 }  // namespace mirror
 
 namespace verifier {
 
 class MethodVerifier;
-class RegisterLine;
-using RegisterLineArenaUniquePtr = std::unique_ptr<RegisterLine, RegisterLineArenaDelete>;
 class RegType;
+class RegTypeCache;
 struct ScopedNewLine;
-
-// We don't need to store the register data for many instructions, because we either only need
-// it at branch points (for verification) or GC points and branches (for verification +
-// type-precise register analysis).
-enum RegisterTrackingMode {
-  kTrackRegsBranches,
-  kTrackCompilerInterestPoints,
-  kTrackRegsAll,
-};
-
-// A class used by the verifier to tell users about what options need to be set for given methods.
-class VerifierCallback {
- public:
-  virtual ~VerifierCallback() {}
-  virtual void SetDontCompile(ArtMethod* method, bool value)
-      REQUIRES_SHARED(Locks::mutator_lock_) = 0;
-  virtual void SetMustCountLocks(ArtMethod* method, bool value)
-      REQUIRES_SHARED(Locks::mutator_lock_) = 0;
-};
+class VerifierDeps;
 
 // A mapping from a dex pc to the register line statuses as they are immediately prior to the
 // execution of that instruction.
 class PcToRegisterLineTable {
  public:
-  explicit PcToRegisterLineTable(ScopedArenaAllocator& allocator);
+  explicit PcToRegisterLineTable(ArenaAllocator& allocator);
   ~PcToRegisterLineTable();
 
   // Initialize the RegisterTable. Every instruction address can have a different set of information
   // about what's in which register, but for verification purposes we only need to store it at
   // branch target addresses (because we merge into that).
-  void Init(RegisterTrackingMode mode,
-            InstructionFlags* flags,
+  void Init(InstructionFlags* flags,
             uint32_t insns_size,
             uint16_t registers_size,
-            ScopedArenaAllocator& allocator,
-            RegTypeCache* reg_types);
+            ArenaAllocator& allocator,
+            RegTypeCache* reg_types,
+            uint32_t interesting_dex_pc);
 
   bool IsInitialized() const {
     return !register_lines_.empty();
@@ -108,7 +88,7 @@ class PcToRegisterLineTable {
   }
 
  private:
-  ScopedArenaVector<RegisterLineArenaUniquePtr> register_lines_;
+  ArenaVector<RegisterLineArenaUniquePtr> register_lines_;
 
   DISALLOW_COPY_AND_ASSIGN(PcToRegisterLineTable);
 };
@@ -116,31 +96,34 @@ class PcToRegisterLineTable {
 // The verifier
 class MethodVerifier {
  public:
-  static MethodVerifier* VerifyMethodAndDump(Thread* self,
-                                             VariableIndentationOutputStream* vios,
-                                             uint32_t method_idx,
-                                             const DexFile* dex_file,
-                                             Handle<mirror::DexCache> dex_cache,
-                                             Handle<mirror::ClassLoader> class_loader,
-                                             const dex::ClassDef& class_def,
-                                             const dex::CodeItem* code_item, ArtMethod* method,
-                                             uint32_t method_access_flags,
-                                             uint32_t api_level)
+  EXPORT static void VerifyMethodAndDump(Thread* self,
+                                         VariableIndentationOutputStream* vios,
+                                         uint32_t method_idx,
+                                         const DexFile* dex_file,
+                                         Handle<mirror::DexCache> dex_cache,
+                                         Handle<mirror::ClassLoader> class_loader,
+                                         const dex::ClassDef& class_def,
+                                         const dex::CodeItem* code_item,
+                                         uint32_t method_access_flags,
+                                         uint32_t api_level)
       REQUIRES_SHARED(Locks::mutator_lock_);
 
-  // Calculates the verification information for every instruction of the given method. The given
-  // dex-cache and class-loader will be used for lookups. No classes will be loaded. If verification
-  // fails hard nullptr will be returned. This should only be used if one needs to examine what the
-  // verifier believes about the registers of a given method.
-  static MethodVerifier* CalculateVerificationInfo(Thread* self,
-                                                   ArtMethod* method,
-                                                   Handle<mirror::DexCache> dex_cache,
-                                                   Handle<mirror::ClassLoader> class_loader)
+  // Calculates the type information at the given `dex_pc`.
+  // No classes will be loaded.
+  EXPORT static MethodVerifier* CalculateVerificationInfo(Thread* self,
+                                                          RegTypeCache* reg_types,
+                                                          ArtMethod* method,
+                                                          Handle<mirror::DexCache> dex_cache,
+                                                          uint32_t dex_pc)
       REQUIRES_SHARED(Locks::mutator_lock_);
 
   const DexFile& GetDexFile() const {
     DCHECK(dex_file_ != nullptr);
     return *dex_file_;
+  }
+
+  const dex::ClassDef& GetClassDef() const {
+    return class_def_;
   }
 
   RegTypeCache* GetRegTypeCache() {
@@ -173,17 +156,8 @@ class MethodVerifier {
                                uint32_t api_level)
       REQUIRES_SHARED(Locks::mutator_lock_);
 
-  static void Init(ClassLinker* class_linker) REQUIRES_SHARED(Locks::mutator_lock_);
-  static void Shutdown();
-
   virtual ~MethodVerifier();
 
-  static void VisitStaticRoots(RootVisitor* visitor)
-      REQUIRES_SHARED(Locks::mutator_lock_);
-  void VisitRoots(RootVisitor* visitor, const RootInfo& roots)
-      REQUIRES_SHARED(Locks::mutator_lock_);
-
-  // Accessors used by the compiler via CompilerCallback
   const CodeItemDataAccessor& CodeItem() const {
     return code_item_accessor_;
   }
@@ -191,37 +165,37 @@ class MethodVerifier {
   ALWAYS_INLINE const InstructionFlags& GetInstructionFlags(size_t index) const;
 
   MethodReference GetMethodReference() const;
-  bool HasCheckCasts() const;
   bool HasFailures() const;
   bool HasInstructionThatWillThrow() const {
-    return flags_.have_any_pending_runtime_throw_failure_;
+    return (encountered_failure_types_ & VERIFY_ERROR_RUNTIME_THROW) != 0;
   }
 
-  virtual const RegType& ResolveCheckedClass(dex::TypeIndex class_idx)
-      REQUIRES_SHARED(Locks::mutator_lock_) = 0;
-
-  uint32_t GetEncounteredFailureTypes() {
+  uint32_t GetEncounteredFailureTypes() const {
     return encountered_failure_types_;
   }
 
-  ClassLinker* GetClassLinker() {
-    return class_linker_;
-  }
+  ClassLinker* GetClassLinker() const;
 
   bool IsAotMode() const {
-    return flags_.aot_mode_;
+    return const_flags_.aot_mode_;
+  }
+
+  bool CanLoadClasses() const {
+    return const_flags_.can_load_classes_;
+  }
+
+  VerifierDeps* GetVerifierDeps() const {
+    return verifier_deps_;
   }
 
  protected:
   MethodVerifier(Thread* self,
-                 ClassLinker* class_linker,
                  ArenaPool* arena_pool,
-                 const DexFile* dex_file,
+                 RegTypeCache* reg_types,
+                 VerifierDeps* verifier_deps,
+                 const dex::ClassDef& class_def,
                  const dex::CodeItem* code_item,
                  uint32_t dex_method_idx,
-                 bool can_load_classes,
-                 bool allow_thread_suspension,
-                 bool allow_soft_failures,
                  bool aot_mode)
       REQUIRES_SHARED(Locks::mutator_lock_);
 
@@ -247,21 +221,15 @@ class MethodVerifier {
    *      for code flow problems.
    */
   static FailureData VerifyMethod(Thread* self,
-                                  ClassLinker* class_linker,
                                   ArenaPool* arena_pool,
+                                  RegTypeCache* reg_types,
+                                  VerifierDeps* verifier_deps,
                                   uint32_t method_idx,
-                                  const DexFile* dex_file,
                                   Handle<mirror::DexCache> dex_cache,
-                                  Handle<mirror::ClassLoader> class_loader,
                                   const dex::ClassDef& class_def_idx,
                                   const dex::CodeItem* code_item,
-                                  ArtMethod* method,
                                   uint32_t method_access_flags,
-                                  CompilerCallbacks* callbacks,
-                                  VerifierCallback* verifier_callback,
-                                  bool allow_soft_failures,
                                   HardFailLogMode log_level,
-                                  bool need_precise_constants,
                                   uint32_t api_level,
                                   bool aot_mode,
                                   std::string* hard_failure_msg)
@@ -269,24 +237,43 @@ class MethodVerifier {
 
   template <bool kVerifierDebug>
   static FailureData VerifyMethod(Thread* self,
-                                  ClassLinker* class_linker,
                                   ArenaPool* arena_pool,
+                                  RegTypeCache* reg_types,
+                                  VerifierDeps* verifier_deps,
                                   uint32_t method_idx,
-                                  const DexFile* dex_file,
                                   Handle<mirror::DexCache> dex_cache,
-                                  Handle<mirror::ClassLoader> class_loader,
                                   const dex::ClassDef& class_def_idx,
                                   const dex::CodeItem* code_item,
-                                  ArtMethod* method,
                                   uint32_t method_access_flags,
-                                  CompilerCallbacks* callbacks,
-                                  VerifierCallback* verifier_callback,
-                                  bool allow_soft_failures,
                                   HardFailLogMode log_level,
-                                  bool need_precise_constants,
                                   uint32_t api_level,
                                   bool aot_mode,
                                   std::string* hard_failure_msg)
+      REQUIRES_SHARED(Locks::mutator_lock_);
+
+  /*
+   * Get the "this" pointer from a non-static method invocation. This returns the RegType so the
+   * caller can decide whether it needs the reference to be initialized or not.
+   *
+   * The argument count is in vA, and the first argument is in vC, for both "simple" and "range"
+   * versions. We just need to make sure vA is >= 1 and then return vC.
+   */
+  const RegType& GetInvocationThis(const Instruction* inst)
+      REQUIRES_SHARED(Locks::mutator_lock_);
+
+  // Can a variable with type `lhs` be assigned a value with type `rhs`?
+  // Note: Object and interface types may always be assigned to one another, see
+  // comment on `ClassJoin()`.
+  bool IsAssignableFrom(const RegType& lhs, const RegType& rhs) const
+      REQUIRES_SHARED(Locks::mutator_lock_);
+
+  // Can a variable with type `lhs` be assigned a value with type `rhs`?
+  // Variant of IsAssignableFrom that doesn't allow assignment to an interface from an Object.
+  bool IsStrictlyAssignableFrom(const RegType& lhs, const RegType& rhs) const
+      REQUIRES_SHARED(Locks::mutator_lock_);
+
+  // Implementation helper for `IsAssignableFrom()` and `IsStrictlyAssignableFrom()`.
+  bool AssignableFrom(const RegType& lhs, const RegType& rhs, bool strict) const
       REQUIRES_SHARED(Locks::mutator_lock_);
 
   // For VerifierDepsTest. TODO: Refactor.
@@ -295,30 +282,33 @@ class MethodVerifier {
   // has an irrecoverable corruption.
   virtual bool Verify() REQUIRES_SHARED(Locks::mutator_lock_) = 0;
   static MethodVerifier* CreateVerifier(Thread* self,
-                                        const DexFile* dex_file,
+                                        RegTypeCache* reg_types,
+                                        VerifierDeps* verifier_deps,
                                         Handle<mirror::DexCache> dex_cache,
-                                        Handle<mirror::ClassLoader> class_loader,
                                         const dex::ClassDef& class_def,
                                         const dex::CodeItem* code_item,
                                         uint32_t method_idx,
-                                        ArtMethod* method,
                                         uint32_t access_flags,
-                                        bool can_load_classes,
-                                        bool allow_soft_failures,
-                                        bool need_precise_constants,
                                         bool verify_to_dump,
-                                        bool allow_thread_suspension,
                                         uint32_t api_level)
       REQUIRES_SHARED(Locks::mutator_lock_);
+
+  virtual bool PotentiallyMarkRuntimeThrow() = 0;
+
+  std::ostringstream& InfoMessages() {
+    if (!info_messages_.has_value()) {
+      info_messages_.emplace();
+    }
+    return info_messages_.value();
+  }
 
   // The thread we're verifying on.
   Thread* const self_;
 
   // Arena allocator.
-  ArenaStack arena_stack_;
-  ScopedArenaAllocator allocator_;
+  ArenaAllocator allocator_;
 
-  RegTypeCache reg_types_;
+  RegTypeCache& reg_types_;  // TODO: Change to a pointer in a separate CL.
 
   PcToRegisterLineTable reg_table_;
 
@@ -332,8 +322,9 @@ class MethodVerifier {
   // Storage for the register status we're saving for later.
   RegisterLineArenaUniquePtr saved_line_;
 
-  const uint32_t dex_method_idx_;  // The method we're working on.
-  const DexFile* const dex_file_;  // The dex file containing the method.
+  const uint32_t dex_method_idx_;   // The method we're working on.
+  const DexFile* const dex_file_;   // The dex file containing the method.
+  const dex::ClassDef& class_def_;  // The class being verified.
   const CodeItemDataAccessor code_item_accessor_;
 
   // Instruction widths and flags, one entry per code unit.
@@ -344,6 +335,7 @@ class MethodVerifier {
   std::vector<VerifyError> failures_;
   // Error messages associated with failures.
   std::vector<std::ostringstream*> failure_messages_;
+
   struct {
     // Is there a pending hard failure?
     bool have_pending_hard_failure_ : 1;
@@ -354,43 +346,32 @@ class MethodVerifier {
     // instructions that would hard fail the verification.
     // Note: this flag is reset after processing each instruction.
     bool have_pending_runtime_throw_failure_ : 1;
-
-    // Is there a pending experimental failure?
-    bool have_pending_experimental_failure_ : 1;
-
-    // A version of the above that is not reset and thus captures if there were *any* throw
-    // failures.
-    bool have_any_pending_runtime_throw_failure_ : 1;
-
-    // Verify in AoT mode?
-    bool aot_mode_ : 1;
   } flags_;
 
-  // Info message log use primarily for verifier diagnostics.
-  std::ostringstream info_messages_;
+  struct {
+    // Verify in AoT mode?
+    bool aot_mode_ : 1;
+
+    // Whether the `MethodVerifer` can load classes.
+    bool can_load_classes_ : 1;
+  } const const_flags_;
 
   // Bitset of the encountered failure types. Bits are according to the values in VerifyError.
   uint32_t encountered_failure_types_;
 
-  const bool can_load_classes_;
+  // Info message log use primarily for verifier diagnostics.
+  std::optional<std::ostringstream> info_messages_;
 
-  // Converts soft failures to hard failures when false. Only false when the compiler isn't
-  // running and the verifier is called from the class linker.
-  const bool allow_soft_failures_;
-
-  // Indicates the method being verified contains at least one check-cast or aput-object
-  // instruction. Aput-object operations implicitly check for array-store exceptions, similar to
-  // check-cast.
-  bool has_check_casts_;
-
-  // Classlinker to use when resolving.
-  ClassLinker* class_linker_;
+  // The verifier deps object we are going to report type assigability
+  // constraints to. Can be null for runtime verification.
+  VerifierDeps* verifier_deps_;
 
   // Link, for the method verifier root linked list.
   MethodVerifier* link_;
 
   friend class art::Thread;
   friend class ClassVerifier;
+  friend class RegisterLineTest;
   friend class VerifierDepsTest;
 
   DISALLOW_COPY_AND_ASSIGN(MethodVerifier);

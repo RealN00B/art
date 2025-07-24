@@ -28,7 +28,7 @@
 #include "mirror/class.h"
 #include "mirror/object-readbarrier-inl.h"
 
-namespace art {
+namespace art HIDDEN {
 namespace gc {
 namespace collector {
 
@@ -129,7 +129,7 @@ inline mirror::Object* ConcurrentCopying::Mark(Thread* const self,
                                                mirror::Object* holder,
                                                MemberOffset offset) {
   // Cannot have `kNoUnEvac` when Generational CC collection is disabled.
-  DCHECK(!kNoUnEvac || use_generational_cc_);
+  DCHECK_IMPLIES(kNoUnEvac, use_generational_cc_);
   if (from_ref == nullptr) {
     return nullptr;
   }
@@ -224,8 +224,7 @@ inline mirror::Object* ConcurrentCopying::MarkFromReadBarrier(mirror::Object* fr
   return ret;
 }
 
-inline mirror::Object* ConcurrentCopying::GetFwdPtr(mirror::Object* from_ref) {
-  DCHECK(region_space_->IsInFromSpace(from_ref));
+inline mirror::Object* ConcurrentCopying::GetFwdPtrUnchecked(mirror::Object* from_ref) {
   LockWord lw = from_ref->GetLockWord(false);
   if (lw.GetState() == LockWord::kForwardingAddress) {
     mirror::Object* fwd_ptr = reinterpret_cast<mirror::Object*>(lw.ForwardingAddress());
@@ -234,6 +233,11 @@ inline mirror::Object* ConcurrentCopying::GetFwdPtr(mirror::Object* from_ref) {
   } else {
     return nullptr;
   }
+}
+
+inline mirror::Object* ConcurrentCopying::GetFwdPtr(mirror::Object* from_ref) {
+  DCHECK(region_space_->IsInFromSpace(from_ref));
+  return GetFwdPtrUnchecked(from_ref);
 }
 
 inline bool ConcurrentCopying::IsMarkedInUnevacFromSpace(mirror::Object* from_ref) {

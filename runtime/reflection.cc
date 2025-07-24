@@ -17,8 +17,8 @@
 #include "reflection-inl.h"
 
 #include "art_field-inl.h"
-#include "art_method-inl.h"
-#include "base/enums.h"
+#include "art_method-alloc-inl.h"
+#include "base/pointer_size.h"
 #include "class_linker.h"
 #include "common_throws.h"
 #include "dex/dex_file-inl.h"
@@ -34,9 +34,9 @@
 #include "scoped_thread_state_change-inl.h"
 #include "stack_reference.h"
 #include "thread-inl.h"
-#include "well_known_classes.h"
+#include "well_known_classes-inl.h"
 
-namespace art {
+namespace art HIDDEN {
 namespace {
 
 using android::base::StringPrintf;
@@ -259,15 +259,15 @@ class ArgArray {
         }
       }
 
-#define DO_FIRST_ARG(match_descriptor, get_fn, append) { \
+#define DO_FIRST_ARG(boxed, get_fn, append) { \
           if (LIKELY(arg != nullptr && \
-              arg->GetClass()->DescriptorEquals(match_descriptor))) { \
+                     arg->GetClass() == WellKnownClasses::java_lang_##boxed)) { \
             ArtField* primitive_field = arg->GetClass()->GetInstanceField(0); \
             append(primitive_field-> get_fn(arg.Get()));
 
-#define DO_ARG(match_descriptor, get_fn, append) \
+#define DO_ARG(boxed, get_fn, append) \
           } else if (LIKELY(arg != nullptr && \
-                            arg->GetClass<>()->DescriptorEquals(match_descriptor))) { \
+                            arg->GetClass() == WellKnownClasses::java_lang_##boxed)) { \
             ArtField* primitive_field = arg->GetClass()->GetInstanceField(0); \
             append(primitive_field-> get_fn(arg.Get()));
 
@@ -293,54 +293,54 @@ class ArgArray {
           Append(arg.Get());
           break;
         case 'Z':
-          DO_FIRST_ARG("Ljava/lang/Boolean;", GetBoolean, Append)
+          DO_FIRST_ARG(Boolean, GetBoolean, Append)
           DO_FAIL("boolean")
           break;
         case 'B':
-          DO_FIRST_ARG("Ljava/lang/Byte;", GetByte, Append)
+          DO_FIRST_ARG(Byte, GetByte, Append)
           DO_FAIL("byte")
           break;
         case 'C':
-          DO_FIRST_ARG("Ljava/lang/Character;", GetChar, Append)
+          DO_FIRST_ARG(Character, GetChar, Append)
           DO_FAIL("char")
           break;
         case 'S':
-          DO_FIRST_ARG("Ljava/lang/Short;", GetShort, Append)
-          DO_ARG("Ljava/lang/Byte;", GetByte, Append)
+          DO_FIRST_ARG(Short, GetShort, Append)
+          DO_ARG(Byte, GetByte, Append)
           DO_FAIL("short")
           break;
         case 'I':
-          DO_FIRST_ARG("Ljava/lang/Integer;", GetInt, Append)
-          DO_ARG("Ljava/lang/Character;", GetChar, Append)
-          DO_ARG("Ljava/lang/Short;", GetShort, Append)
-          DO_ARG("Ljava/lang/Byte;", GetByte, Append)
+          DO_FIRST_ARG(Integer, GetInt, Append)
+          DO_ARG(Character, GetChar, Append)
+          DO_ARG(Short, GetShort, Append)
+          DO_ARG(Byte, GetByte, Append)
           DO_FAIL("int")
           break;
         case 'J':
-          DO_FIRST_ARG("Ljava/lang/Long;", GetLong, AppendWide)
-          DO_ARG("Ljava/lang/Integer;", GetInt, AppendWide)
-          DO_ARG("Ljava/lang/Character;", GetChar, AppendWide)
-          DO_ARG("Ljava/lang/Short;", GetShort, AppendWide)
-          DO_ARG("Ljava/lang/Byte;", GetByte, AppendWide)
+          DO_FIRST_ARG(Long, GetLong, AppendWide)
+          DO_ARG(Integer, GetInt, AppendWide)
+          DO_ARG(Character, GetChar, AppendWide)
+          DO_ARG(Short, GetShort, AppendWide)
+          DO_ARG(Byte, GetByte, AppendWide)
           DO_FAIL("long")
           break;
         case 'F':
-          DO_FIRST_ARG("Ljava/lang/Float;", GetFloat, AppendFloat)
-          DO_ARG("Ljava/lang/Long;", GetLong, AppendFloat)
-          DO_ARG("Ljava/lang/Integer;", GetInt, AppendFloat)
-          DO_ARG("Ljava/lang/Character;", GetChar, AppendFloat)
-          DO_ARG("Ljava/lang/Short;", GetShort, AppendFloat)
-          DO_ARG("Ljava/lang/Byte;", GetByte, AppendFloat)
+          DO_FIRST_ARG(Float, GetFloat, AppendFloat)
+          DO_ARG(Long, GetLong, AppendFloat)
+          DO_ARG(Integer, GetInt, AppendFloat)
+          DO_ARG(Character, GetChar, AppendFloat)
+          DO_ARG(Short, GetShort, AppendFloat)
+          DO_ARG(Byte, GetByte, AppendFloat)
           DO_FAIL("float")
           break;
         case 'D':
-          DO_FIRST_ARG("Ljava/lang/Double;", GetDouble, AppendDouble)
-          DO_ARG("Ljava/lang/Float;", GetFloat, AppendDouble)
-          DO_ARG("Ljava/lang/Long;", GetLong, AppendDouble)
-          DO_ARG("Ljava/lang/Integer;", GetInt, AppendDouble)
-          DO_ARG("Ljava/lang/Character;", GetChar, AppendDouble)
-          DO_ARG("Ljava/lang/Short;", GetShort, AppendDouble)
-          DO_ARG("Ljava/lang/Byte;", GetByte, AppendDouble)
+          DO_FIRST_ARG(Double, GetDouble, AppendDouble)
+          DO_ARG(Float, GetFloat, AppendDouble)
+          DO_ARG(Long, GetLong, AppendDouble)
+          DO_ARG(Integer, GetInt, AppendDouble)
+          DO_ARG(Character, GetChar, AppendDouble)
+          DO_ARG(Short, GetShort, AppendDouble)
+          DO_ARG(Byte, GetByte, AppendDouble)
           DO_FAIL("double")
           break;
 #ifndef NDEBUG
@@ -494,18 +494,27 @@ bool InvokeMethodImpl(const ScopedObjectAccessAlreadyRunnable& soa,
 
   // Wrap any exception with "Ljava/lang/reflect/InvocationTargetException;" and return early.
   if (soa.Self()->IsExceptionPending()) {
-    // If we get another exception when we are trying to wrap, then just use that instead.
-    ScopedLocalRef<jthrowable> th(soa.Env(), soa.Env()->ExceptionOccurred());
-    soa.Self()->ClearException();
-    jobject exception_instance =
-        soa.Env()->NewObject(WellKnownClasses::java_lang_reflect_InvocationTargetException,
-                             WellKnownClasses::java_lang_reflect_InvocationTargetException_init,
-                             th.get());
-    if (exception_instance == nullptr) {
-      soa.Self()->AssertPendingException();
-      return false;
+    // To abort a transaction we use a fake exception that should never be caught by the bytecode
+    // and therefore it makes no sense to wrap it.
+    if (Runtime::Current()->IsActiveTransaction() &&
+        Runtime::Current()->GetClassLinker()->IsTransactionAborted()) {
+      DCHECK(soa.Self()->GetException()->GetClass()->DescriptorEquals(
+                  "Ldalvik/system/TransactionAbortError;"))
+          << soa.Self()->GetException()->GetClass()->PrettyDescriptor();
+    } else {
+      // If we get another exception when we are trying to wrap, then just use that instead.
+      StackHandleScope<2u> hs(soa.Self());
+      Handle<mirror::Throwable> cause = hs.NewHandle(soa.Self()->GetException());
+      soa.Self()->ClearException();
+      Handle<mirror::Object> exception_instance =
+          WellKnownClasses::java_lang_reflect_InvocationTargetException_init->NewObject<'L'>(
+              hs, soa.Self(), cause);
+      if (exception_instance == nullptr) {
+        soa.Self()->AssertPendingException();
+        return false;
+      }
+      soa.Self()->SetException(exception_instance->AsThrowable());
     }
-    soa.Env()->Throw(reinterpret_cast<jthrowable>(exception_instance));
     return false;
   }
 
@@ -515,6 +524,7 @@ bool InvokeMethodImpl(const ScopedObjectAccessAlreadyRunnable& soa,
 }  // anonymous namespace
 
 template <>
+NO_STACK_PROTECTOR
 JValue InvokeWithVarArgs(const ScopedObjectAccessAlreadyRunnable& soa,
                          jobject obj,
                          ArtMethod* method,
@@ -522,11 +532,11 @@ JValue InvokeWithVarArgs(const ScopedObjectAccessAlreadyRunnable& soa,
   // We want to make sure that the stack is not within a small distance from the
   // protected region in case we are calling into a leaf function whose stack
   // check has been elided.
-  if (UNLIKELY(__builtin_frame_address(0) < soa.Self()->GetStackEnd())) {
-    ThrowStackOverflowError(soa.Self());
+  if (UNLIKELY(__builtin_frame_address(0) < soa.Self()->GetStackEnd<kNativeStackType>())) {
+    ThrowStackOverflowError<kNativeStackType>(soa.Self());
     return JValue();
   }
-  bool is_string_init = method->GetDeclaringClass()->IsStringClass() && method->IsConstructor();
+  bool is_string_init = method->IsStringConstructor();
   if (is_string_init) {
     // Replace calls to String.<init> with equivalent StringFactory call.
     method = WellKnownClasses::StringInitToStringFactory(method);
@@ -547,6 +557,7 @@ JValue InvokeWithVarArgs(const ScopedObjectAccessAlreadyRunnable& soa,
 }
 
 template <>
+NO_STACK_PROTECTOR
 JValue InvokeWithVarArgs(const ScopedObjectAccessAlreadyRunnable& soa,
                          jobject obj,
                          jmethodID mid,
@@ -563,11 +574,11 @@ JValue InvokeWithJValues(const ScopedObjectAccessAlreadyRunnable& soa,
   // We want to make sure that the stack is not within a small distance from the
   // protected region in case we are calling into a leaf function whose stack
   // check has been elided.
-  if (UNLIKELY(__builtin_frame_address(0) < soa.Self()->GetStackEnd())) {
-    ThrowStackOverflowError(soa.Self());
+  if (UNLIKELY(__builtin_frame_address(0) < soa.Self()->GetStackEnd<kNativeStackType>())) {
+    ThrowStackOverflowError<kNativeStackType>(soa.Self());
     return JValue();
   }
-  bool is_string_init = method->GetDeclaringClass()->IsStringClass() && method->IsConstructor();
+  bool is_string_init = method->IsStringConstructor();
   if (is_string_init) {
     // Replace calls to String.<init> with equivalent StringFactory call.
     method = WellKnownClasses::StringInitToStringFactory(method);
@@ -604,13 +615,13 @@ JValue InvokeVirtualOrInterfaceWithJValues(const ScopedObjectAccessAlreadyRunnab
   // We want to make sure that the stack is not within a small distance from the
   // protected region in case we are calling into a leaf function whose stack
   // check has been elided.
-  if (UNLIKELY(__builtin_frame_address(0) < soa.Self()->GetStackEnd())) {
-    ThrowStackOverflowError(soa.Self());
+  if (UNLIKELY(__builtin_frame_address(0) < soa.Self()->GetStackEnd<kNativeStackType>())) {
+    ThrowStackOverflowError<kNativeStackType>(soa.Self());
     return JValue();
   }
   ObjPtr<mirror::Object> receiver = soa.Decode<mirror::Object>(obj);
   ArtMethod* method = FindVirtualMethod(receiver, interface_method);
-  bool is_string_init = method->GetDeclaringClass()->IsStringClass() && method->IsConstructor();
+  bool is_string_init = method->IsStringConstructor();
   if (is_string_init) {
     // Replace calls to String.<init> with equivalent StringFactory call.
     method = WellKnownClasses::StringInitToStringFactory(method);
@@ -647,14 +658,14 @@ JValue InvokeVirtualOrInterfaceWithVarArgs(const ScopedObjectAccessAlreadyRunnab
   // We want to make sure that the stack is not within a small distance from the
   // protected region in case we are calling into a leaf function whose stack
   // check has been elided.
-  if (UNLIKELY(__builtin_frame_address(0) < soa.Self()->GetStackEnd())) {
-    ThrowStackOverflowError(soa.Self());
+  if (UNLIKELY(__builtin_frame_address(0) < soa.Self()->GetStackEnd<kNativeStackType>())) {
+    ThrowStackOverflowError<kNativeStackType>(soa.Self());
     return JValue();
   }
 
   ObjPtr<mirror::Object> receiver = soa.Decode<mirror::Object>(obj);
   ArtMethod* method = FindVirtualMethod(receiver, interface_method);
-  bool is_string_init = method->GetDeclaringClass()->IsStringClass() && method->IsConstructor();
+  bool is_string_init = method->IsStringConstructor();
   if (is_string_init) {
     // Replace calls to String.<init> with equivalent StringFactory call.
     method = WellKnownClasses::StringInitToStringFactory(method);
@@ -683,6 +694,7 @@ JValue InvokeVirtualOrInterfaceWithVarArgs(const ScopedObjectAccessAlreadyRunnab
   return InvokeVirtualOrInterfaceWithVarArgs(soa, obj, jni::DecodeArtMethod(mid), args);
 }
 
+template <PointerSize kPointerSize>
 jobject InvokeMethod(const ScopedObjectAccessAlreadyRunnable& soa, jobject javaMethod,
                      jobject javaReceiver, jobject javaArgs, size_t num_frames) {
   // We want to make sure that the stack is not within a small distance from the
@@ -690,7 +702,7 @@ jobject InvokeMethod(const ScopedObjectAccessAlreadyRunnable& soa, jobject javaM
   // check has been elided.
   if (UNLIKELY(__builtin_frame_address(0) <
                soa.Self()->GetStackEndForInterpreter(true))) {
-    ThrowStackOverflowError(soa.Self());
+    ThrowStackOverflowError<kNativeStackType>(soa.Self());
     return nullptr;
   }
 
@@ -725,14 +737,14 @@ jobject InvokeMethod(const ScopedObjectAccessAlreadyRunnable& soa, jobject javaM
       }
 
       // Find the actual implementation of the virtual method.
-      m = receiver->GetClass()->FindVirtualMethodForVirtualOrInterface(m, kRuntimePointerSize);
+      m = receiver->GetClass()->FindVirtualMethodForVirtualOrInterface(m, kPointerSize);
     }
   }
 
   // Get our arrays of arguments and their types, and check they're the same size.
   ObjPtr<mirror::ObjectArray<mirror::Object>> objects =
       soa.Decode<mirror::ObjectArray<mirror::Object>>(javaArgs);
-  auto* np_method = m->GetInterfaceMethodIfProxy(kRuntimePointerSize);
+  auto* np_method = m->GetInterfaceMethodIfProxy(kPointerSize);
   if (!CheckArgsForInvokeMethod(np_method, objects)) {
     return nullptr;
   }
@@ -764,6 +776,19 @@ jobject InvokeMethod(const ScopedObjectAccessAlreadyRunnable& soa, jobject javaM
   return soa.AddLocalReference<jobject>(BoxPrimitive(Primitive::GetType(shorty[0]), result));
 }
 
+template
+jobject InvokeMethod<PointerSize::k32>(const ScopedObjectAccessAlreadyRunnable& soa,
+                                       jobject javaMethod,
+                                       jobject javaReceiver,
+                                       jobject javaArgs,
+                                       size_t num_frames);
+template
+jobject InvokeMethod<PointerSize::k64>(const ScopedObjectAccessAlreadyRunnable& soa,
+                                       jobject javaMethod,
+                                       jobject javaReceiver,
+                                       jobject javaArgs,
+                                       size_t num_frames);
+
 void InvokeConstructor(const ScopedObjectAccessAlreadyRunnable& soa,
                        ArtMethod* constructor,
                        ObjPtr<mirror::Object> receiver,
@@ -772,7 +797,7 @@ void InvokeConstructor(const ScopedObjectAccessAlreadyRunnable& soa,
   // protected region in case we are calling into a leaf function whose stack
   // check has been elided.
   if (UNLIKELY(__builtin_frame_address(0) < soa.Self()->GetStackEndForInterpreter(true))) {
-    ThrowStackOverflowError(soa.Self());
+    ThrowStackOverflowError<kNativeStackType>(soa.Self());
     return;
   }
 
@@ -816,7 +841,7 @@ ObjPtr<mirror::Object> BoxPrimitive(Primitive::Type src_class, const JValue& val
     return nullptr;
   }
 
-  jmethodID m = nullptr;
+  ArtMethod* m = nullptr;
   const char* shorty;
   switch (src_class) {
   case Primitive::kPrimBoolean:
@@ -857,7 +882,7 @@ ObjPtr<mirror::Object> BoxPrimitive(Primitive::Type src_class, const JValue& val
   }
 
   ScopedObjectAccessUnchecked soa(Thread::Current());
-  DCHECK_EQ(soa.Self()->GetState(), kRunnable);
+  DCHECK_EQ(soa.Self()->GetState(), ThreadState::kRunnable);
 
   ArgArray arg_array(shorty, 2);
   JValue result;
@@ -867,11 +892,8 @@ ObjPtr<mirror::Object> BoxPrimitive(Primitive::Type src_class, const JValue& val
     arg_array.Append(value.GetI());
   }
 
-  jni::DecodeArtMethod(m)->Invoke(soa.Self(),
-                                  arg_array.GetArray(),
-                                  arg_array.GetNumBytes(),
-                                  &result,
-                                  shorty);
+  DCHECK(m->GetDeclaringClass()->IsInitialized());  // By `ClassLinker::RunRootClinits()`.
+  m->Invoke(soa.Self(), arg_array.GetArray(), arg_array.GetNumBytes(), &result, shorty);
   return result.GetL();
 }
 
@@ -931,28 +953,28 @@ static bool UnboxPrimitive(ObjPtr<mirror::Object> o,
   ObjPtr<mirror::Class> klass = o->GetClass();
   Primitive::Type primitive_type;
   ArtField* primitive_field = &klass->GetIFieldsPtr()->At(0);
-  if (klass->DescriptorEquals("Ljava/lang/Boolean;")) {
+  if (klass == WellKnownClasses::java_lang_Boolean) {
     primitive_type = Primitive::kPrimBoolean;
     boxed_value.SetZ(primitive_field->GetBoolean(o));
-  } else if (klass->DescriptorEquals("Ljava/lang/Byte;")) {
+  } else if (klass == WellKnownClasses::java_lang_Byte) {
     primitive_type = Primitive::kPrimByte;
     boxed_value.SetB(primitive_field->GetByte(o));
-  } else if (klass->DescriptorEquals("Ljava/lang/Character;")) {
+  } else if (klass == WellKnownClasses::java_lang_Character) {
     primitive_type = Primitive::kPrimChar;
     boxed_value.SetC(primitive_field->GetChar(o));
-  } else if (klass->DescriptorEquals("Ljava/lang/Float;")) {
+  } else if (klass == WellKnownClasses::java_lang_Float) {
     primitive_type = Primitive::kPrimFloat;
     boxed_value.SetF(primitive_field->GetFloat(o));
-  } else if (klass->DescriptorEquals("Ljava/lang/Double;")) {
+  } else if (klass == WellKnownClasses::java_lang_Double) {
     primitive_type = Primitive::kPrimDouble;
     boxed_value.SetD(primitive_field->GetDouble(o));
-  } else if (klass->DescriptorEquals("Ljava/lang/Integer;")) {
+  } else if (klass == WellKnownClasses::java_lang_Integer) {
     primitive_type = Primitive::kPrimInt;
     boxed_value.SetI(primitive_field->GetInt(o));
-  } else if (klass->DescriptorEquals("Ljava/lang/Long;")) {
+  } else if (klass == WellKnownClasses::java_lang_Long) {
     primitive_type = Primitive::kPrimLong;
     boxed_value.SetJ(primitive_field->GetLong(o));
-  } else if (klass->DescriptorEquals("Ljava/lang/Short;")) {
+  } else if (klass == WellKnownClasses::java_lang_Short) {
     primitive_type = Primitive::kPrimShort;
     boxed_value.SetS(primitive_field->GetShort(o));
   } else {
@@ -1045,8 +1067,8 @@ void UpdateReference(Thread* self, jobject obj, ObjPtr<mirror::Object> result) {
   IndirectRefKind kind = IndirectReferenceTable::GetIndirectRefKind(ref);
   if (kind == kLocal) {
     self->GetJniEnv()->UpdateLocal(obj, result);
-  } else if (kind == kHandleScopeOrInvalid) {
-    LOG(FATAL) << "Unsupported UpdateReference for kind kHandleScopeOrInvalid";
+  } else if (kind == kJniTransition) {
+    LOG(FATAL) << "Unsupported UpdateReference for kind kJniTransition";
   } else if (kind == kGlobal) {
     self->GetJniEnv()->GetVm()->UpdateGlobal(self, ref, result);
   } else {

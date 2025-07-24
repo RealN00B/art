@@ -52,6 +52,8 @@
 
 #include <base/strlcpy.h>
 
+#include "fd_transport.h"
+
 namespace dt_fd_forward {
 
 // Helper that puts line-number in error message.
@@ -287,6 +289,11 @@ static void SendAcceptMessage(int fd) {
   TEMP_FAILURE_RETRY(send(fd, kAcceptMessage, sizeof(kAcceptMessage), MSG_EOR));
 }
 
+static void SendHandshakeCompleteMessage(int fd) {
+  TEMP_FAILURE_RETRY(
+      send(fd, kHandshakeCompleteMessage, sizeof(kHandshakeCompleteMessage), MSG_EOR));
+}
+
 IOResult FdForwardTransport::ReceiveFdsFromSocket(bool* do_handshake) {
   union {
     cmsghdr cm;
@@ -402,6 +409,8 @@ jdwpTransportError FdForwardTransport::Accept() {
         continue;
       }
     }
+    // Tell everyone we have finished the handshake.
+    SendHandshakeCompleteMessage(close_notify_fd_);
     break;
   }
   CHECK(ChangeState(TransportState::kOpening, TransportState::kOpen));
@@ -497,14 +506,24 @@ class PacketReader {
     pkt_->type.cmd.data = ReadRemaining();
   }
 
-  template <typename T>
-  T HandleResult(IOResult res, T val, T fail) {
+  // `produceVal` is a function which produces the success value. It'd be a bit
+  // syntactically simpler to simply take a `T success`, but doing so invites
+  // the possibility of operating on uninitalized data, since we often want to
+  // either return the failure value, or return a massaged version of what we
+  // read off the wire, e.g.,
+  //
+  // ```
+  // IOResult res = transport->ReadFully(&out, sizeof(out));
+  // return HandleResult(res, fail, [&] { return SomeTransform(&out); });
+  // ```
+  template <typename T, typename Fn>
+  T HandleResult(IOResult res, T fail, Fn produceVal) {
     switch (res) {
       case IOResult::kError:
         is_err_ = true;
         return fail;
       case IOResult::kOk:
-        return val;
+        return produceVal();
       case IOResult::kEOF:
         is_eof_ = true;
         pkt_->type.cmd.len = 0;
@@ -528,7 +547,7 @@ class PacketReader {
     } else {
       out = reinterpret_cast<jbyte*>(transport_->Alloc(rem));
       IOResult res = transport_->ReadFully(out, rem);
-      jbyte* ret = HandleResult(res, out, static_cast<jbyte*>(nullptr));
+      jbyte* ret = HandleResult(res, static_cast<jbyte*>(nullptr), [&] { return out; });
       if (ret != out) {
         transport_->Free(out);
       }
@@ -542,7 +561,7 @@ class PacketReader {
     }
     jbyte out;
     IOResult res = transport_->ReadFully(&out, sizeof(out));
-    return HandleResult(res, NetworkToHost(out), static_cast<jbyte>(-1));
+    return HandleResult(res, static_cast<jbyte>(-1), [&] { return NetworkToHost(out); });
   }
 
   jshort ReadInt16() {
@@ -551,7 +570,7 @@ class PacketReader {
     }
     jshort out;
     IOResult res = transport_->ReadFully(&out, sizeof(out));
-    return HandleResult(res, NetworkToHost(out), static_cast<jshort>(-1));
+    return HandleResult(res, static_cast<jshort>(-1), [&] { return NetworkToHost(out); });
   }
 
   jint ReadInt32() {
@@ -560,7 +579,7 @@ class PacketReader {
     }
     jint out;
     IOResult res = transport_->ReadFully(&out, sizeof(out));
-    return HandleResult(res, NetworkToHost(out), -1);
+    return HandleResult(res, -1, [&] { return NetworkToHost(out); });
   }
 
   FdForwardTransport* transport_;
@@ -672,7 +691,7 @@ static jdwpTransportError ParseAddress(const std::string& addr,
 
 class JdwpTransportFunctions {
  public:
-  static jdwpTransportError GetCapabilities(jdwpTransportEnv* env ATTRIBUTE_UNUSED,
+  static jdwpTransportError GetCapabilities([[maybe_unused]] jdwpTransportEnv* env,
                                             /*out*/ JDWPTransportCapabilities* capabilities_ptr) {
     // We don't support any of the optional capabilities (can_timeout_attach, can_timeout_accept,
     // can_timeout_handshake) so just return a zeroed capabilities ptr.
@@ -684,8 +703,8 @@ class JdwpTransportFunctions {
   // Address is <sock_fd>
   static jdwpTransportError Attach(jdwpTransportEnv* env,
                                    const char* address,
-                                   jlong attach_timeout ATTRIBUTE_UNUSED,
-                                   jlong handshake_timeout ATTRIBUTE_UNUSED) {
+                                   [[maybe_unused]] jlong attach_timeout,
+                                   [[maybe_unused]] jlong handshake_timeout) {
     if (address == nullptr || *address == '\0') {
       return ERR(ILLEGAL_ARGUMENT);
     }
@@ -724,8 +743,8 @@ class JdwpTransportFunctions {
   }
 
   static jdwpTransportError Accept(jdwpTransportEnv* env,
-                                   jlong accept_timeout ATTRIBUTE_UNUSED,
-                                   jlong handshake_timeout ATTRIBUTE_UNUSED) {
+                                   [[maybe_unused]] jlong accept_timeout,
+                                   [[maybe_unused]] jlong handshake_timeout) {
     return AsFdForward(env)->Accept();
   }
 
@@ -765,11 +784,10 @@ const jdwpTransportNativeInterface_ gTransportInterface = {
   JdwpTransportFunctions::GetLastError,
 };
 
-extern "C"
-JNIEXPORT jint JNICALL jdwpTransport_OnLoad(JavaVM* vm ATTRIBUTE_UNUSED,
-                                            jdwpTransportCallback* cb,
-                                            jint version,
-                                            jdwpTransportEnv** /*out*/env) {
+extern "C" JNIEXPORT jint JNICALL jdwpTransport_OnLoad([[maybe_unused]] JavaVM* vm,
+                                                       jdwpTransportCallback* cb,
+                                                       jint version,
+                                                       jdwpTransportEnv** /*out*/ env) {
   if (version != JDWPTRANSPORT_VERSION_1_0) {
     LOG(ERROR) << "unknown version " << version;
     return JNI_EVERSION;

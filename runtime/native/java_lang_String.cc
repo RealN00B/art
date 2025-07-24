@@ -31,7 +31,7 @@
 #include "scoped_thread_state_change-inl.h"
 #include "verify_object.h"
 
-namespace art {
+namespace art HIDDEN {
 
 static jchar String_charAt(JNIEnv* env, jobject java_this, jint index) {
   ScopedFastNativeObjectAccess soa(env);
@@ -60,8 +60,7 @@ static jstring String_concat(JNIEnv* env, jobject java_this, jstring java_string
   int32_t length_this = string_this->GetLength();
   int32_t length_arg = string_arg->GetLength();
   if (length_arg > 0 && length_this > 0) {
-    ObjPtr<mirror::String> result =
-        mirror::String::AllocFromStrings(soa.Self(), string_this, string_arg);
+    ObjPtr<mirror::String> result = mirror::String::DoConcat(soa.Self(), string_this, string_arg);
     return soa.AddLocalReference<jstring>(result);
   }
   jobject string_original = (length_this == 0) ? java_string_arg : java_this;
@@ -89,6 +88,22 @@ static void String_getCharsNoCheck(JNIEnv* env, jobject java_this, jint start, j
   soa.Decode<mirror::String>(java_this)->GetChars(start, end, char_array, index);
 }
 
+static void String_fillBytesLatin1(JNIEnv* env, jobject java_this,
+                                   jbyteArray buffer, jint byteIndex) {
+  ScopedFastNativeObjectAccess soa(env);
+  StackHandleScope<1> hs(soa.Self());
+  Handle<mirror::ByteArray> byte_array(hs.NewHandle(soa.Decode<mirror::ByteArray>(buffer)));
+  soa.Decode<mirror::String>(java_this)->FillBytesLatin1(byte_array, byteIndex);
+}
+
+static void String_fillBytesUTF16(JNIEnv* env, jobject java_this,
+                                   jbyteArray buffer, jint byteIndex) {
+  ScopedFastNativeObjectAccess soa(env);
+  StackHandleScope<1> hs(soa.Self());
+  Handle<mirror::ByteArray> byte_array(hs.NewHandle(soa.Decode<mirror::ByteArray>(buffer)));
+  soa.Decode<mirror::String>(java_this)->FillBytesUTF16(byte_array, byteIndex);
+}
+
 static jstring String_intern(JNIEnv* env, jobject java_this) {
   ScopedFastNativeObjectAccess soa(env);
   ObjPtr<mirror::String> result = soa.Decode<mirror::String>(java_this)->Intern();
@@ -110,13 +125,24 @@ static jcharArray String_toCharArray(JNIEnv* env, jobject java_this) {
   return soa.AddLocalReference<jcharArray>(mirror::String::ToCharArray(s, soa.Self()));
 }
 
+static jstring String_doRepeat(JNIEnv* env, jobject java_this, jint count) {
+  ScopedFastNativeObjectAccess soa(env);
+  StackHandleScope<1> hs(soa.Self());
+  Handle<mirror::String> string = hs.NewHandle(soa.Decode<mirror::String>(java_this));
+  ObjPtr<mirror::String> result = mirror::String::DoRepeat(soa.Self(), string, count);
+  return soa.AddLocalReference<jstring>(result);
+}
+
 static JNINativeMethod gMethods[] = {
   FAST_NATIVE_METHOD(String, charAt, "(I)C"),
   FAST_NATIVE_METHOD(String, compareTo, "(Ljava/lang/String;)I"),
   FAST_NATIVE_METHOD(String, concat, "(Ljava/lang/String;)Ljava/lang/String;"),
+  FAST_NATIVE_METHOD(String, doRepeat, "(I)Ljava/lang/String;"),
   FAST_NATIVE_METHOD(String, doReplace, "(CC)Ljava/lang/String;"),
   FAST_NATIVE_METHOD(String, fastSubstring, "(II)Ljava/lang/String;"),
   FAST_NATIVE_METHOD(String, getCharsNoCheck, "(II[CI)V"),
+  FAST_NATIVE_METHOD(String, fillBytesLatin1, "([BI)V"),
+  FAST_NATIVE_METHOD(String, fillBytesUTF16, "([BI)V"),
   FAST_NATIVE_METHOD(String, intern, "()Ljava/lang/String;"),
   FAST_NATIVE_METHOD(String, toCharArray, "()[C"),
 };

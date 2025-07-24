@@ -27,8 +27,8 @@
 namespace art {
 
 inline bool ATraceEnabled() {
-  int enabled = 0;
-  if (UNLIKELY(PaletteTraceEnabled(&enabled) == PaletteStatus::kOkay && enabled != 0)) {
+  bool enabled = false;
+  if (UNLIKELY(PaletteTraceEnabled(&enabled) == PALETTE_STATUS_OK && enabled)) {
     return true;
   } else {
     return false;
@@ -60,6 +60,7 @@ class ScopedTrace {
   }
 
   explicit ScopedTrace(const std::string& name) : ScopedTrace(name.c_str()) {}
+  ScopedTrace(ScopedTrace&&) = default;
 
   ~ScopedTrace() {
     ATraceEnd();
@@ -94,9 +95,12 @@ class ScopedTraceNoStart {
   };
 };
 
+// Avoid the name clash with the one in gtest/gtest.h.
+#ifndef SCOPED_TRACE
 #define SCOPED_TRACE \
   ::art::ScopedTraceNoStart APPEND_TOKENS_AFTER_EVAL(trace, __LINE__) ; \
   (ATraceEnabled()) && ::art::ScopedTraceNoStart::ScopedTraceMessageHelper().stream()
+#endif  // SCOPED_TRACE
 
 }  // namespace art
 

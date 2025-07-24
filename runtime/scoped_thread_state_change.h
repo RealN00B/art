@@ -24,7 +24,7 @@
 #include "base/value_object.h"
 #include "thread_state.h"
 
-namespace art {
+namespace art HIDDEN {
 
 class JavaVMExt;
 class JNIEnvExt;
@@ -55,12 +55,12 @@ class ScopedThreadStateChange : public ValueObject {
   ScopedThreadStateChange() {}
 
   Thread* const self_ = nullptr;
-  const ThreadState thread_state_ = kTerminated;
+  const ThreadState thread_state_ = ThreadState::kTerminated;
 
  private:
-  void ScopedThreadChangeDestructorCheck();
+  EXPORT void ScopedThreadChangeDestructorCheck();
 
-  ThreadState old_thread_state_ = kTerminated;
+  ThreadState old_thread_state_ = ThreadState::kTerminated;
   const bool expected_has_no_thread_ = true;
 
   friend class ScopedObjectAccessUnchecked;
@@ -206,7 +206,6 @@ class ScopedThreadSuspension : public ValueObject {
   const ThreadState suspended_state_;
   DISALLOW_COPY_AND_ASSIGN(ScopedThreadSuspension);
 };
-
 
 }  // namespace art
 

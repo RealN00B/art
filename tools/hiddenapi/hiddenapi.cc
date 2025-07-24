@@ -14,26 +14,29 @@
  * limitations under the License.
  */
 
+#include <openssl/sha.h>
+
 #include <fstream>
 #include <iostream>
+#include <iterator>
 #include <map>
 #include <set>
 #include <string>
 #include <string_view>
+#include <vector>
 
 #include "android-base/stringprintf.h"
 #include "android-base/strings.h"
-
 #include "base/bit_utils.h"
 #include "base/hiddenapi_flags.h"
 #include "base/mem_map.h"
 #include "base/os.h"
 #include "base/stl_util.h"
-#include "base/string_view_cpp20.h"
 #include "base/unix_file/fd_file.h"
 #include "dex/art_dex_file_loader.h"
 #include "dex/class_accessor-inl.h"
 #include "dex/dex_file-inl.h"
+#include "dex/dex_file_structs.h"
 
 namespace art {
 namespace hiddenapi {
@@ -82,10 +85,19 @@ NO_RETURN static void Usage(const char* fmt, ...) {
   UsageError("    --api-flags=<filename>:");
   UsageError("        CSV file with signatures of methods/fields and their respective flags");
   UsageError("");
+  UsageError("    --max-hiddenapi-level=<max-target-*>:");
+  UsageError("        the maximum hidden api level for APIs. If an API was originally restricted");
+  UsageError("        to a newer sdk, turn it into a regular unsupported API instead.");
+  UsageError("        instead. The full list of valid values is in hiddenapi_flags.h");
+  UsageError("");
   UsageError("    --no-force-assign-all:");
   UsageError("        Disable check that all dex entries have been assigned a flag");
   UsageError("");
   UsageError("  Command \"list\": dump lists of public and private API");
+  UsageError("    --dependency-stub-dex=<filename>: dex file containing API stubs provided");
+  UsageError("      by other parts of the bootclasspath. These are used to resolve");
+  UsageError("      dependencies in dex files specified in --boot-dex but do not appear in");
+  UsageError("      the output");
   UsageError("    --boot-dex=<filename>: dex file which belongs to boot class path");
   UsageError("    --public-stub-classpath=<filenames>:");
   UsageError("    --system-stub-classpath=<filenames>:");
@@ -95,6 +107,10 @@ NO_RETURN static void Usage(const char* fmt, ...) {
   UsageError("        classpath. Multiple classpaths can be specified");
   UsageError("");
   UsageError("    --out-api-flags=<filename>: output file for a CSV file with API flags");
+  UsageError("    --fragment: the input is only a fragment of the whole bootclasspath and may");
+  UsageError("      not include a complete set of classes. That requires the tool to ignore");
+  UsageError("      missing classes and members. Specify --verbose to see the warnings.");
+  UsageError("    --verbose: output all warnings, even when --fragment is specified.");
   UsageError("");
 
   exit(EXIT_FAILURE);
@@ -116,14 +132,14 @@ class DexClass : public ClassAccessor {
   bool HasSuperclass() const { return dex_file_.IsTypeIndexValid(GetSuperclassIndex()); }
 
   std::string_view GetSuperclassDescriptor() const {
-    return HasSuperclass() ? dex_file_.StringByTypeIdx(GetSuperclassIndex()) : "";
+    return HasSuperclass() ? dex_file_.GetTypeDescriptorView(GetSuperclassIndex()) : "";
   }
 
   std::set<std::string_view> GetInterfaceDescriptors() const {
     std::set<std::string_view> list;
     const dex::TypeList* ifaces = dex_file_.GetInterfacesList(GetClassDef());
     for (uint32_t i = 0; ifaces != nullptr && i < ifaces->Size(); ++i) {
-      list.insert(dex_file_.StringByTypeIdx(ifaces->GetTypeItem(i).type_idx_));
+      list.insert(dex_file_.GetTypeDescriptorView(ifaces->GetTypeItem(i).type_idx_));
     }
     return list;
   }
@@ -187,7 +203,7 @@ class DexMember {
                   GetName() == other.GetName() &&
                   GetSignature() == other.GetSignature();
 
-    // Sanity checks if they do match.
+    // Soundness check that they do match.
     if (equals) {
       CHECK_EQ(IsVirtualMethod(), other.IsVirtualMethod());
     }
@@ -231,8 +247,15 @@ class DexMember {
 
 class ClassPath final {
  public:
-  ClassPath(const std::vector<std::string>& dex_paths, bool open_writable) {
-    OpenDexFiles(dex_paths, open_writable);
+  ClassPath(const std::vector<std::string>& dex_paths, bool ignore_empty) {
+    OpenDexFiles(dex_paths, ignore_empty);
+  }
+
+  template <typename Fn>
+  void ForEachDexClass(const DexFile* dex_file, Fn fn) {
+    for (ClassAccessor accessor : dex_file->GetClasses()) {
+      fn(DexClass(accessor));
+    }
   }
 
   template<typename Fn>
@@ -270,43 +293,19 @@ class ClassPath final {
   }
 
  private:
-  void OpenDexFiles(const std::vector<std::string>& dex_paths, bool open_writable) {
-    ArtDexFileLoader dex_loader;
+  void OpenDexFiles(const std::vector<std::string>& dex_paths, bool ignore_empty) {
     std::string error_msg;
 
-    if (open_writable) {
-      for (const std::string& filename : dex_paths) {
-        File fd(filename.c_str(), O_RDWR, /* check_usage= */ false);
-        CHECK_NE(fd.Fd(), -1) << "Unable to open file '" << filename << "': " << strerror(errno);
-
-        // Memory-map the dex file with MAP_SHARED flag so that changes in memory
-        // propagate to the underlying file. We run dex file verification as if
-        // the dex file was not in boot claass path to check basic assumptions,
-        // such as that at most one of public/private/protected flag is set.
-        // We do those checks here and skip them when loading the processed file
-        // into boot class path.
-        std::unique_ptr<const DexFile> dex_file(dex_loader.OpenDex(fd.Release(),
-                                                                   /* location= */ filename,
-                                                                   /* verify= */ true,
-                                                                   /* verify_checksum= */ true,
-                                                                   /* mmap_shared= */ true,
-                                                                   &error_msg));
-        CHECK(dex_file.get() != nullptr) << "Open failed for '" << filename << "' " << error_msg;
-        CHECK(dex_file->IsStandardDexFile()) << "Expected a standard dex file '" << filename << "'";
-        CHECK(dex_file->EnableWrite())
-            << "Failed to enable write permission for '" << filename << "'";
-        dex_files_.push_back(std::move(dex_file));
-      }
-    } else {
-      for (const std::string& filename : dex_paths) {
-        bool success = dex_loader.Open(filename.c_str(),
-                                       /* location= */ filename,
-                                       /* verify= */ true,
-                                       /* verify_checksum= */ true,
-                                       &error_msg,
-                                       &dex_files_);
-        CHECK(success) << "Open failed for '" << filename << "' " << error_msg;
-      }
+    for (const std::string& filename : dex_paths) {
+      DexFileLoader dex_file_loader(filename);
+      DexFileLoaderErrorCode error_code;
+      bool success = dex_file_loader.Open(/* verify= */ true,
+                                          /* verify_checksum= */ true,
+                                          /*allow_no_dex_files=*/ ignore_empty,
+                                          &error_code,
+                                          &error_msg,
+                                          &dex_files_);
+      CHECK(success) << "Open failed for '" << filename << "' " << error_msg;
     }
   }
 
@@ -439,8 +438,8 @@ class HierarchyClass final {
 
 class Hierarchy final {
  public:
-  explicit Hierarchy(ClassPath& classpath) : classpath_(classpath) {
-    BuildClassHierarchy();
+  Hierarchy(ClassPath& classpath, bool fragment, bool verbose) : classpath_(classpath) {
+    BuildClassHierarchy(fragment, verbose);
   }
 
   // Perform an operation for each member of the hierarchy which could potentially
@@ -507,7 +506,7 @@ class Hierarchy final {
     }
   }
 
-  void BuildClassHierarchy() {
+  void BuildClassHierarchy(bool fragment, bool verbose) {
     // Create one HierarchyClass entry in `classes_` per class descriptor
     // and add all DexClass objects with the same descriptor to that entry.
     classpath_.ForEachDexClass([this](const DexClass& klass) {
@@ -525,18 +524,23 @@ class Hierarchy final {
         continue;
       }
 
-      HierarchyClass* superclass = FindClass(dex_klass.GetSuperclassDescriptor());
-      CHECK(superclass != nullptr)
-          << "Superclass " << dex_klass.GetSuperclassDescriptor()
-          << " of class " << dex_klass.GetDescriptor() << " from dex file \""
-          << dex_klass.GetDexFile().GetLocation() << "\" was not found. "
-          << "Either the superclass is missing or it appears later in the classpath spec.";
-      klass.AddExtends(*superclass);
+      auto add_extends = [&](const std::string_view& extends_desc) {
+        HierarchyClass* extends = FindClass(extends_desc);
+        if (extends != nullptr) {
+          klass.AddExtends(*extends);
+        } else if (!fragment || verbose) {
+          auto severity = verbose ? ::android::base::WARNING : ::android::base::FATAL;
+          LOG(severity)
+              << "Superclass/interface " << extends_desc
+              << " of class " << dex_klass.GetDescriptor() << " from dex file \""
+              << dex_klass.GetDexFile().GetLocation() << "\" was not found. "
+              << "Either it is missing or it appears later in the classpath spec.";
+        }
+      };
 
+      add_extends(dex_klass.GetSuperclassDescriptor());
       for (const std::string_view& iface_desc : dex_klass.GetInterfaceDescriptors()) {
-        HierarchyClass* iface = FindClass(iface_desc);
-        CHECK(iface != nullptr);
-        klass.AddExtends(*iface);
+        add_extends(iface_desc);
       }
     }
   }
@@ -646,215 +650,127 @@ class HiddenapiClassDataBuilder final {
 // Edits a dex file, inserting a new HiddenapiClassData section.
 class DexFileEditor final {
  public:
-  DexFileEditor(const DexFile& old_dex, const std::vector<uint8_t>& hiddenapi_class_data)
-      : old_dex_(old_dex),
-        hiddenapi_class_data_(hiddenapi_class_data),
-        loaded_dex_header_(nullptr),
-        loaded_dex_maplist_(nullptr) {}
-
-  // Copies dex file into a backing data vector, appends the given HiddenapiClassData
-  // and updates the MapList.
-  void Encode() {
+  // Add dex file to copy to output (possibly several files for multi-dex).
+  void Add(const DexFile* dex, const std::vector<uint8_t>&& hiddenapi_data) {
     // We do not support non-standard dex encodings, e.g. compact dex.
-    CHECK(old_dex_.IsStandardDexFile());
-
-    // If there are no data to append, copy the old dex file and return.
-    if (hiddenapi_class_data_.empty()) {
-      AllocateMemory(old_dex_.Size());
-      Append(old_dex_.Begin(), old_dex_.Size(), /* update_header= */ false);
-      return;
-    }
-
-    // Find the old MapList, find its size.
-    const dex::MapList* old_map = old_dex_.GetMapList();
-    CHECK_LT(old_map->size_, std::numeric_limits<uint32_t>::max());
-
-    // Compute the size of the new dex file. We append the HiddenapiClassData,
-    // one MapItem and possibly some padding to align the new MapList.
-    CHECK(IsAligned<kMapListAlignment>(old_dex_.Size()))
-        << "End of input dex file is not 4-byte aligned, possibly because its MapList is not "
-        << "at the end of the file.";
-    size_t size_delta =
-        RoundUp(hiddenapi_class_data_.size(), kMapListAlignment) + sizeof(dex::MapItem);
-    size_t new_size = old_dex_.Size() + size_delta;
-    AllocateMemory(new_size);
-
-    // Copy the old dex file into the backing data vector. Load the copied
-    // dex file to obtain pointers to its header and MapList.
-    Append(old_dex_.Begin(), old_dex_.Size(), /* update_header= */ false);
-    ReloadDex(/* verify= */ false);
-
-    // Truncate the new dex file before the old MapList. This assumes that
-    // the MapList is the last entry in the dex file. This is currently true
-    // for our tooling.
-    // TODO: Implement the general case by zero-ing the old MapList (turning
-    // it into padding.
-    RemoveOldMapList();
-
-    // Append HiddenapiClassData.
-    size_t payload_offset = AppendHiddenapiClassData();
-
-    // Wrute new MapList with an entry for HiddenapiClassData.
-    CreateMapListWithNewItem(payload_offset);
-
-    // Check that the pre-computed size matches the actual size.
-    CHECK_EQ(offset_, new_size);
-
-    // Reload to all data structures.
-    ReloadDex(/* verify= */ false);
-
-    // Update the dex checksum.
-    UpdateChecksum();
-
-    // Run DexFileVerifier on the new dex file as a CHECK.
-    ReloadDex(/* verify= */ true);
+    CHECK(dex->IsStandardDexFile());
+    inputs_.emplace_back(dex, std::move(hiddenapi_data));
   }
 
   // Writes the edited dex file into a file.
   void WriteTo(const std::string& path) {
-    CHECK(!data_.empty());
+    CHECK_GT(inputs_.size(), 0u);
+    std::vector<uint8_t> output;
+
+    // Copy the old dex files into the backing data vector.
+    std::vector<size_t> header_offset;
+    for (size_t i = 0; i < inputs_.size(); i++) {
+      const DexFile* dex = inputs_[i].first;
+      header_offset.push_back(output.size());
+      std::copy(dex->Begin(), dex->End(), std::back_inserter(output));
+
+      // Clear the old map list (make it into padding).
+      const dex::MapList* map = dex->GetMapList();
+      size_t map_off = dex->GetHeader().map_off_;
+      size_t map_size = sizeof(map->size_) + map->size_ * sizeof(map->list_[0]);
+      CHECK_LE(map_off, output.size()) << "Map list past the end of file";
+      CHECK_EQ(map_size, output.size() - map_off) << "Map list expected at the end of file";
+      std::fill_n(output.data() + map_off, map_size, 0);
+    }
+
+    // Append the hidden api data into the backing data vector.
+    std::vector<size_t> hiddenapi_offset;
+    for (size_t i = 0; i < inputs_.size(); i++) {
+      const std::vector<uint8_t>& hiddenapi_data = inputs_[i].second;
+      output.resize(RoundUp(output.size(), kHiddenapiClassDataAlignment));  // Align.
+      hiddenapi_offset.push_back(output.size());
+      std::copy(hiddenapi_data.begin(), hiddenapi_data.end(), std::back_inserter(output));
+    }
+
+    // Append modified map lists.
+    std::vector<uint32_t> map_list_offset;
+    for (size_t i = 0; i < inputs_.size(); i++) {
+      output.resize(RoundUp(output.size(), kMapListAlignment));  // Align.
+
+      const DexFile* dex = inputs_[i].first;
+      const dex::MapList* map = dex->GetMapList();
+      std::vector<dex::MapItem> items(map->list_, map->list_ + map->size_);
+
+      // Check the header entry.
+      CHECK(!items.empty());
+      CHECK_EQ(items[0].type_, DexFile::kDexTypeHeaderItem);
+      CHECK_EQ(items[0].offset_, header_offset[i]);
+
+      // Check and remove the old map list entry (it does not have to be last).
+      auto is_map_list = [](auto it) { return it.type_ == DexFile::kDexTypeMapList; };
+      auto it = std::find_if(items.begin(), items.end(), is_map_list);
+      CHECK(it != items.end());
+      CHECK_EQ(it->offset_, dex->GetHeader().map_off_);
+      items.erase(it);
+
+      // Write new map list.
+      if (!inputs_[i].second.empty()) {
+        uint32_t payload_offset = hiddenapi_offset[i];
+        items.push_back(dex::MapItem{DexFile::kDexTypeHiddenapiClassData, 0, 1u, payload_offset});
+      }
+      map_list_offset.push_back(output.size());
+      items.push_back(dex::MapItem{DexFile::kDexTypeMapList, 0, 1u, map_list_offset.back()});
+      uint32_t item_count = items.size();
+      Append(&output, &item_count, 1);
+      Append(&output, items.data(), items.size());
+    }
+
+    // Update headers.
+    for (size_t i = 0; i < inputs_.size(); i++) {
+      uint8_t* begin = output.data() + header_offset[i];
+      auto* header = reinterpret_cast<DexFile::Header*>(begin);
+      header->map_off_ = map_list_offset[i];
+      if (i + 1 < inputs_.size()) {
+        CHECK_EQ(header->file_size_, header_offset[i + 1] - header_offset[i]);
+      } else {
+        // Extend last dex file until the end of the file.
+        header->data_size_ = output.size() - header->data_off_;
+        header->file_size_ = output.size() - header_offset[i];
+      }
+      header->SetDexContainer(header_offset[i], output.size());
+      size_t sha1_start = offsetof(DexFile::Header, file_size_);
+      SHA1(begin + sha1_start, header->file_size_ - sha1_start, header->signature_.data());
+      header->checksum_ = DexFile::CalculateChecksum(begin, header->file_size_);
+    }
+
+    // Write the output file.
+    CHECK(!output.empty());
     std::ofstream ofs(path.c_str(), std::ofstream::out | std::ofstream::binary);
-    ofs.write(reinterpret_cast<const char*>(data_.data()), data_.size());
+    ofs.write(reinterpret_cast<const char*>(output.data()), output.size());
     ofs.flush();
     CHECK(ofs.good());
     ofs.close();
+
+    ReloadDex(path.c_str());
   }
 
  private:
   static constexpr size_t kMapListAlignment = 4u;
   static constexpr size_t kHiddenapiClassDataAlignment = 4u;
 
-  void ReloadDex(bool verify) {
+  void ReloadDex(const char* filename) {
     std::string error_msg;
-    DexFileLoader loader;
-    loaded_dex_ = loader.Open(
-        data_.data(),
-        data_.size(),
-        "test_location",
-        old_dex_.GetLocationChecksum(),
-        /* oat_dex_file= */ nullptr,
-        /* verify= */ verify,
-        /* verify_checksum= */ verify,
-        &error_msg);
-    if (loaded_dex_.get() == nullptr) {
-      LOG(FATAL) << "Failed to load edited dex file: " << error_msg;
-      UNREACHABLE();
-    }
-
-    // Load the location of header and map list before we start editing the file.
-    loaded_dex_header_ = const_cast<DexFile::Header*>(&loaded_dex_->GetHeader());
-    loaded_dex_maplist_ = const_cast<dex::MapList*>(loaded_dex_->GetMapList());
+    ArtDexFileLoader loader(filename);
+    std::vector<std::unique_ptr<const DexFile>> dex_files;
+    bool ok = loader.Open(/*verify*/ true,
+                          /*verify_checksum*/ true,
+                          &error_msg,
+                          &dex_files);
+    CHECK(ok) << "Failed to load edited dex file: " << error_msg;
   }
 
-  DexFile::Header& GetHeader() const {
-    CHECK(loaded_dex_header_ != nullptr);
-    return *loaded_dex_header_;
+  template <typename T>
+  void Append(std::vector<uint8_t>* output, const T* src, size_t len) {
+    const uint8_t* ptr = reinterpret_cast<const uint8_t*>(src);
+    std::copy(ptr, ptr + len * sizeof(T), std::back_inserter(*output));
   }
 
-  dex::MapList& GetMapList() const {
-    CHECK(loaded_dex_maplist_ != nullptr);
-    return *loaded_dex_maplist_;
-  }
-
-  void AllocateMemory(size_t total_size) {
-    data_.clear();
-    data_.resize(total_size);
-    CHECK(IsAligned<kMapListAlignment>(data_.data()));
-    CHECK(IsAligned<kHiddenapiClassDataAlignment>(data_.data()));
-    offset_ = 0;
-  }
-
-  uint8_t* GetCurrentDataPtr() {
-    return data_.data() + offset_;
-  }
-
-  void UpdateDataSize(off_t delta, bool update_header) {
-    offset_ += delta;
-    if (update_header) {
-      DexFile::Header& header = GetHeader();
-      header.file_size_ += delta;
-      header.data_size_ += delta;
-    }
-  }
-
-  template<typename T>
-  T* Append(const T* src, size_t len, bool update_header = true) {
-    CHECK_LE(offset_ + len, data_.size());
-    uint8_t* dst = GetCurrentDataPtr();
-    memcpy(dst, src, len);
-    UpdateDataSize(len, update_header);
-    return reinterpret_cast<T*>(dst);
-  }
-
-  void InsertPadding(size_t alignment) {
-    size_t len = RoundUp(offset_, alignment) - offset_;
-    std::vector<uint8_t> padding(len, 0);
-    Append(padding.data(), padding.size());
-  }
-
-  void RemoveOldMapList() {
-    size_t map_size = GetMapList().Size();
-    uint8_t* map_start = reinterpret_cast<uint8_t*>(&GetMapList());
-    CHECK_EQ(map_start + map_size, GetCurrentDataPtr()) << "MapList not at the end of dex file";
-    UpdateDataSize(-static_cast<off_t>(map_size), /* update_header= */ true);
-    CHECK_EQ(map_start, GetCurrentDataPtr());
-    loaded_dex_maplist_ = nullptr;  // do not use this map list any more
-  }
-
-  void CreateMapListWithNewItem(size_t payload_offset) {
-    InsertPadding(/* alignment= */ kMapListAlignment);
-
-    size_t new_map_offset = offset_;
-    dex::MapList* map = Append(old_dex_.GetMapList(), old_dex_.GetMapList()->Size());
-
-    // Check last map entry is a pointer to itself.
-    dex::MapItem& old_item = map->list_[map->size_ - 1];
-    CHECK(old_item.type_ == DexFile::kDexTypeMapList);
-    CHECK_EQ(old_item.size_, 1u);
-    CHECK_EQ(old_item.offset_, GetHeader().map_off_);
-
-    // Create a new MapItem entry with new MapList details.
-    dex::MapItem new_item;
-    new_item.type_ = old_item.type_;
-    new_item.unused_ = 0u;  // initialize to ensure dex output is deterministic (b/119308882)
-    new_item.size_ = old_item.size_;
-    new_item.offset_ = new_map_offset;
-
-    // Update pointer in the header.
-    GetHeader().map_off_ = new_map_offset;
-
-    // Append a new MapItem and return its pointer.
-    map->size_++;
-    Append(&new_item, sizeof(dex::MapItem));
-
-    // Change penultimate entry to point to metadata.
-    old_item.type_ = DexFile::kDexTypeHiddenapiClassData;
-    old_item.size_ = 1u;  // there is only one section
-    old_item.offset_ = payload_offset;
-  }
-
-  size_t AppendHiddenapiClassData() {
-    size_t payload_offset = offset_;
-    CHECK_EQ(kMapListAlignment, kHiddenapiClassDataAlignment);
-    CHECK(IsAligned<kHiddenapiClassDataAlignment>(payload_offset))
-        << "Should not need to align the section, previous data was already aligned";
-    Append(hiddenapi_class_data_.data(), hiddenapi_class_data_.size());
-    return payload_offset;
-  }
-
-  void UpdateChecksum() {
-    GetHeader().checksum_ = loaded_dex_->CalculateChecksum();
-  }
-
-  const DexFile& old_dex_;
-  const std::vector<uint8_t>& hiddenapi_class_data_;
-
-  std::vector<uint8_t> data_;
-  size_t offset_;
-
-  std::unique_ptr<const DexFile> loaded_dex_;
-  DexFile::Header* loaded_dex_header_;
-  dex::MapList* loaded_dex_maplist_;
+  std::vector<std::pair<const DexFile*, const std::vector<uint8_t>>> inputs_;
 };
 
 class HiddenApi final {
@@ -890,14 +806,17 @@ class HiddenApi final {
         for (int i = 1; i < argc; ++i) {
           const char* raw_option = argv[i];
           const std::string_view option(raw_option);
-          if (StartsWith(option, "--input-dex=")) {
+          if (option.starts_with("--input-dex=")) {
             boot_dex_paths_.push_back(std::string(option.substr(strlen("--input-dex="))));
-          } else if (StartsWith(option, "--output-dex=")) {
+          } else if (option.starts_with("--output-dex=")) {
             output_dex_paths_.push_back(std::string(option.substr(strlen("--output-dex="))));
-          } else if (StartsWith(option, "--api-flags=")) {
+          } else if (option.starts_with("--api-flags=")) {
             api_flags_path_ = std::string(option.substr(strlen("--api-flags=")));
           } else if (option == "--no-force-assign-all") {
             force_assign_all_ = false;
+          } else if (option.starts_with("--max-hiddenapi-level=")) {
+            std::string value = std::string(option.substr(strlen("--max-hiddenapi-level=")));
+            max_hiddenapi_level_ = ApiList::FromName(value);
           } else {
             Usage("Unknown argument '%s'", raw_option);
           }
@@ -907,26 +826,35 @@ class HiddenApi final {
         for (int i = 1; i < argc; ++i) {
           const char* raw_option = argv[i];
           const std::string_view option(raw_option);
-          if (StartsWith(option, "--boot-dex=")) {
+          if (option.starts_with("--dependency-stub-dex=")) {
+            const std::string path(std::string(option.substr(strlen("--dependency-stub-dex="))));
+            dependency_stub_dex_paths_.push_back(path);
+            // Add path to the boot dex path to resolve dependencies.
+            boot_dex_paths_.push_back(path);
+          } else if (option.starts_with("--boot-dex=")) {
             boot_dex_paths_.push_back(std::string(option.substr(strlen("--boot-dex="))));
-          } else if (StartsWith(option, "--public-stub-classpath=")) {
+          } else if (option.starts_with("--public-stub-classpath=")) {
             stub_classpaths_.push_back(std::make_pair(
                 std::string(option.substr(strlen("--public-stub-classpath="))),
                 ApiStubs::Kind::kPublicApi));
-          } else if (StartsWith(option, "--system-stub-classpath=")) {
+          } else if (option.starts_with("--system-stub-classpath=")) {
             stub_classpaths_.push_back(std::make_pair(
                 std::string(option.substr(strlen("--system-stub-classpath="))),
                 ApiStubs::Kind::kSystemApi));
-          } else if (StartsWith(option, "--test-stub-classpath=")) {
+          } else if (option.starts_with("--test-stub-classpath=")) {
             stub_classpaths_.push_back(std::make_pair(
                 std::string(option.substr(strlen("--test-stub-classpath="))),
                 ApiStubs::Kind::kTestApi));
-          } else if (StartsWith(option, "--core-platform-stub-classpath=")) {
+          } else if (option.starts_with("--core-platform-stub-classpath=")) {
             stub_classpaths_.push_back(std::make_pair(
                 std::string(option.substr(strlen("--core-platform-stub-classpath="))),
                 ApiStubs::Kind::kCorePlatformApi));
-          } else if (StartsWith(option, "--out-api-flags=")) {
+          } else if (option.starts_with("--out-api-flags=")) {
             api_flags_path_ = std::string(option.substr(strlen("--out-api-flags=")));
+          } else if (option == "--fragment") {
+            fragment_ = true;
+          } else if (option == "--verbose") {
+            verbose_ = true;
           } else {
             Usage("Unknown argument '%s'", raw_option);
           }
@@ -951,40 +879,59 @@ class HiddenApi final {
     std::map<std::string, ApiList> api_list = OpenApiFile(api_flags_path_);
 
     // Iterate over input dex files and insert HiddenapiClassData sections.
+    bool max_hiddenapi_level_error = false;
     for (size_t i = 0; i < boot_dex_paths_.size(); ++i) {
       const std::string& input_path = boot_dex_paths_[i];
       const std::string& output_path = output_dex_paths_[i];
 
-      ClassPath boot_classpath({ input_path }, /* open_writable= */ false);
-      std::vector<const DexFile*> input_dex_files = boot_classpath.GetDexFiles();
-      CHECK_EQ(input_dex_files.size(), 1u);
-      const DexFile& input_dex = *input_dex_files[0];
-
-      HiddenapiClassDataBuilder builder(input_dex);
-      boot_classpath.ForEachDexClass([&](const DexClass& boot_class) {
-        builder.BeginClassDef(boot_class.GetClassDefIndex());
-        if (boot_class.GetData() != nullptr) {
-          auto fn_shared = [&](const DexMember& boot_member) {
-            auto it = api_list.find(boot_member.GetApiEntry());
-            bool api_list_found = (it != api_list.end());
-            CHECK(!force_assign_all_ || api_list_found)
-                << "Could not find hiddenapi flags for dex entry: " << boot_member.GetApiEntry();
-            builder.WriteFlags(api_list_found ? it->second : ApiList::Whitelist());
-          };
-          auto fn_field = [&](const ClassAccessor::Field& boot_field) {
-            fn_shared(DexMember(boot_class, boot_field));
-          };
-          auto fn_method = [&](const ClassAccessor::Method& boot_method) {
-            fn_shared(DexMember(boot_class, boot_method));
-          };
-          boot_class.VisitFieldsAndMethods(fn_field, fn_field, fn_method, fn_method);
-        }
-        builder.EndClassDef(boot_class.GetClassDefIndex());
-      });
-
-      DexFileEditor dex_editor(input_dex, builder.GetData());
-      dex_editor.Encode();
+      ClassPath boot_classpath({input_path}, /* ignore_empty= */ false);
+      DexFileEditor dex_editor;
+      for (const DexFile* input_dex : boot_classpath.GetDexFiles()) {
+        HiddenapiClassDataBuilder builder(*input_dex);
+        boot_classpath.ForEachDexClass(input_dex, [&](const DexClass& boot_class) {
+          builder.BeginClassDef(boot_class.GetClassDefIndex());
+          if (boot_class.GetData() != nullptr) {
+            auto fn_shared = [&](const DexMember& boot_member) {
+              auto signature = boot_member.GetApiEntry();
+              auto it = api_list.find(signature);
+              bool api_list_found = (it != api_list.end());
+              CHECK(!force_assign_all_ || api_list_found)
+                  << "Could not find hiddenapi flags for dex entry: " << signature;
+              if (api_list_found && it->second.GetIntValue() > max_hiddenapi_level_.GetIntValue()) {
+                ApiList without_domain(it->second.GetIntValue());
+                LOG(ERROR) << "Hidden api flag " << without_domain << " for member " << signature
+                           << " in " << input_path << " exceeds maximum allowable flag "
+                           << max_hiddenapi_level_;
+                max_hiddenapi_level_error = true;
+              } else {
+                builder.WriteFlags(api_list_found ? it->second : ApiList::Sdk());
+              }
+            };
+            auto fn_field = [&](const ClassAccessor::Field& boot_field) {
+              fn_shared(DexMember(boot_class, boot_field));
+            };
+            auto fn_method = [&](const ClassAccessor::Method& boot_method) {
+              fn_shared(DexMember(boot_class, boot_method));
+            };
+            boot_class.VisitFieldsAndMethods(fn_field, fn_field, fn_method, fn_method);
+          }
+          builder.EndClassDef(boot_class.GetClassDefIndex());
+        });
+        dex_editor.Add(input_dex, std::move(builder.GetData()));
+      }
       dex_editor.WriteTo(output_path);
+    }
+
+    if (max_hiddenapi_level_error) {
+      LOG(ERROR)
+          << "Some hidden API flags could not be encoded within the dex file as"
+          << " they exceed the maximum allowable level of " << max_hiddenapi_level_
+          << " which is determined by the min_sdk_version of the source Java library.\n"
+          << "The affected DEX members are reported in previous error messages.\n"
+          << "The unsupported flags are being generated from the maxTargetSdk property"
+          << " of the member's @UnsupportedAppUsage annotation.\n"
+          << "See b/172453495 and/or contact art-team@ or compat-team@ for more info.\n";
+      exit(EXIT_FAILURE);
     }
   }
 
@@ -996,6 +943,7 @@ class HiddenApi final {
     std::map<std::string, ApiList> api_flag_map;
 
     size_t line_number = 1;
+    bool errors = false;
     for (std::string line; std::getline(api_file, line); line_number++) {
       // Every line contains a comma separated list with the signature as the
       // first element and the api flags as the rest
@@ -1010,18 +958,32 @@ class HiddenApi final {
 
       ApiList membership;
 
-      bool success = ApiList::FromNames(values.begin() + 1, values.end(), &membership);
-      CHECK(success) << path << ":" << line_number
-          << ": Some flags were not recognized: " << line << kErrorHelp;
-      CHECK(membership.IsValid()) << path << ":" << line_number
-          << ": Invalid combination of flags: " << line << kErrorHelp;
+      std::vector<std::string>::iterator apiListBegin = values.begin() + 1;
+      std::vector<std::string>::iterator apiListEnd = values.end();
+      bool success = ApiList::FromNames(apiListBegin, apiListEnd, &membership);
+      if (!success) {
+        LOG(ERROR) << path << ":" << line_number
+            << ": Some flags were not recognized: " << line << kErrorHelp;
+        errors = true;
+        continue;
+      } else if (!membership.IsValid()) {
+        LOG(ERROR) << path << ":" << line_number
+            << ": Invalid combination of flags: " << line << kErrorHelp;
+        errors = true;
+        continue;
+      }
 
       api_flag_map.emplace(signature, membership);
     }
+    CHECK(!errors) << "Errors encountered while parsing file " << path;
 
     api_file.close();
     return api_flag_map;
   }
+
+  // A special flag added to the set of flags in boot_members to indicate that
+  // it should be excluded from the output.
+  static constexpr std::string_view kExcludeFromOutput{"exclude-from-output"};
 
   void ListApi() {
     if (boot_dex_paths_.empty()) {
@@ -1040,19 +1002,29 @@ class HiddenApi final {
     std::set<std::string> unresolved;
 
     // Open all dex files.
-    ClassPath boot_classpath(boot_dex_paths_, /* open_writable= */ false);
-    Hierarchy boot_hierarchy(boot_classpath);
+    ClassPath boot_classpath(boot_dex_paths_, /* ignore_empty= */ false);
+    Hierarchy boot_hierarchy(boot_classpath, fragment_, verbose_);
 
     // Mark all boot dex members private.
     boot_classpath.ForEachDexMember([&](const DexMember& boot_member) {
       boot_members[boot_member.GetApiEntry()] = {};
     });
 
-    // Resolve each SDK dex member against the framework and mark it white.
+    // Open all dependency API stub dex files.
+    ClassPath dependency_classpath(dependency_stub_dex_paths_, /* ignore_empty= */ false);
+
+    // Mark all dependency API stub dex members as coming from the dependency.
+    dependency_classpath.ForEachDexMember([&](const DexMember& boot_member) {
+      boot_members[boot_member.GetApiEntry()] = {kExcludeFromOutput};
+    });
+
+    // Resolve each SDK dex member against the framework and mark it as SDK.
     for (const auto& cp_entry : stub_classpaths_) {
-      ClassPath stub_classpath(android::base::Split(cp_entry.first, ":"),
-                               /* open_writable= */ false);
-      Hierarchy stub_hierarchy(stub_classpath);
+      // Ignore any empty stub jars as it just means that they provide no APIs
+      // for the current kind, e.g. framework-sdkextensions does not provide
+      // any public APIs.
+      ClassPath stub_classpath(android::base::Split(cp_entry.first, ":"), /*ignore_empty=*/true);
+      Hierarchy stub_hierarchy(stub_classpath, fragment_, verbose_);
       const ApiStubs::Kind stub_api = cp_entry.second;
 
       stub_classpath.ForEachDexMember(
@@ -1076,16 +1048,23 @@ class HiddenApi final {
     }
 
     // Print errors.
-    for (const std::string& str : unresolved) {
-      LOG(WARNING) << "unresolved: " << str;
+    if (!fragment_ || verbose_) {
+      for (const std::string& str : unresolved) {
+        LOG(WARNING) << "unresolved: " << str;
+      }
     }
 
     // Write into public/private API files.
     std::ofstream file_flags(api_flags_path_.c_str());
     for (const auto& entry : boot_members) {
-      if (entry.second.empty()) {
+      std::set<std::string_view> flags = entry.second;
+      if (flags.empty()) {
+        // There are no flags so it cannot be from the dependency stub API dex
+        // files so just output the signature.
         file_flags << entry.first << std::endl;
-      } else {
+      } else if (flags.find(kExcludeFromOutput) == flags.end()) {
+        // The entry has flags and is not from the dependency stub API dex so
+        // output it.
         file_flags << entry.first << ",";
         file_flags << android::base::Join(entry.second, ",") << std::endl;
       }
@@ -1100,6 +1079,10 @@ class HiddenApi final {
   // Paths to DEX files which should be processed.
   std::vector<std::string> boot_dex_paths_;
 
+  // Paths to DEX files containing API stubs provided by other parts of the
+  // boot class path which the DEX files in boot_dex_paths depend.
+  std::vector<std::string> dependency_stub_dex_paths_;
+
   // Output paths where modified DEX files should be written.
   std::vector<std::string> output_dex_paths_;
 
@@ -1110,6 +1093,20 @@ class HiddenApi final {
   // Path to CSV file containing the list of API members and their flags.
   // This could be both an input and output path.
   std::string api_flags_path_;
+
+  // Maximum allowable hidden API level that can be encoded into the dex file.
+  //
+  // By default this returns a GetIntValue() that is guaranteed to be bigger than
+  // any valid value returned by GetIntValue().
+  ApiList max_hiddenapi_level_;
+
+  // Whether the input is only a fragment of the whole bootclasspath and may
+  // not include a complete set of classes. That requires the tool to ignore missing
+  // classes and members.
+  bool fragment_ = false;
+
+  // Whether to output all warnings, even when `fragment_` is set.
+  bool verbose_ = false;
 };
 
 }  // namespace hiddenapi

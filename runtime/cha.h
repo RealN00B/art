@@ -20,13 +20,14 @@
 #include <unordered_map>
 #include <unordered_set>
 
-#include "base/enums.h"
 #include "base/locks.h"
+#include "base/macros.h"
+#include "base/pointer_size.h"
 #include "handle.h"
 #include "mirror/class.h"
-#include "oat_quick_method_header.h"
+#include "oat/oat_quick_method_header.h"
 
-namespace art {
+namespace art HIDDEN {
 
 class ArtMethod;
 class LinearAlloc;
@@ -85,8 +86,8 @@ class ClassHierarchyAnalysis {
   // as the entrypoint, we update the entrypoint to the interpreter bridge.
   // We will also deoptimize frames that are currently executing the code of
   // the method header.
-  typedef std::pair<ArtMethod*, OatQuickMethodHeader*> MethodAndMethodHeaderPair;
-  typedef std::vector<MethodAndMethodHeaderPair> ListOfDependentPairs;
+  using MethodAndMethodHeaderPair = std::pair<ArtMethod*, OatQuickMethodHeader*>;
+  using ListOfDependentPairs = std::vector<MethodAndMethodHeaderPair>;
 
   ClassHierarchyAnalysis() {}
 
@@ -126,7 +127,7 @@ class ClassHierarchyAnalysis {
 
   // Remove all of the dependencies for a linear allocator. This is called when dex cache unloading
   // occurs.
-  void RemoveDependenciesForLinearAlloc(const LinearAlloc* linear_alloc)
+  void RemoveDependenciesForLinearAlloc(Thread* self, const LinearAlloc* linear_alloc)
       REQUIRES(!Locks::cha_lock_);
 
  private:

@@ -37,6 +37,8 @@ public class AhatSnapshot implements Diffable<AhatSnapshot> {
 
   private AhatSnapshot mBaseline = this;
 
+  private AhatBitmapInstance.BitmapDumpData mBitmapDumpData = null;
+
   AhatSnapshot(SuperRoot root,
                Instances<AhatInstance> instances,
                List<AhatHeap> heaps,
@@ -49,6 +51,8 @@ public class AhatSnapshot implements Diffable<AhatSnapshot> {
     mRootSite = rootSite;
 
     AhatInstance.computeReachability(mSuperRoot, progress, mInstances.size());
+
+    mBitmapDumpData = AhatBitmapInstance.findBitmapDumpData(mSuperRoot, mInstances);
 
     for (AhatInstance inst : mInstances) {
       // Add this instance to its site.
@@ -145,7 +149,7 @@ public class AhatSnapshot implements Diffable<AhatSnapshot> {
    * Returns a list of heaps in the snapshot in canonical order.
    * <p>
    * Note: modifications to the returned list are visible to this
-   * AhatSnapshot, which is used by diff to insert place holder heaps.
+   * AhatSnapshot, which is used by diff to insert placeholder heaps.
    *
    * @return list of heaps
    */
@@ -207,5 +211,14 @@ public class AhatSnapshot implements Diffable<AhatSnapshot> {
 
   @Override public boolean isPlaceHolder() {
     return false;
+  }
+
+  /**
+   * Returns duplicated bitmaps in this snapshot
+   *
+   * @return list of duplicated bitmaps
+   */
+  public List<List<AhatBitmapInstance>> findDuplicateBitmaps() {
+    return AhatBitmapInstance.findDuplicates(mBitmapDumpData);
   }
 }

@@ -18,6 +18,7 @@
 #define ART_RUNTIME_ARCH_X86_ASM_SUPPORT_X86_H_
 
 #include "asm_support.h"
+#include "entrypoints/entrypoint_asm_constants.h"
 
 #define FRAME_SIZE_SAVE_ALL_CALLEE_SAVES 32
 #define FRAME_SIZE_SAVE_REFS_ONLY 32
@@ -25,5 +26,14 @@
 #define FRAME_SIZE_SAVE_EVERYTHING (48 + 64)
 #define FRAME_SIZE_SAVE_EVERYTHING_FOR_CLINIT FRAME_SIZE_SAVE_EVERYTHING
 #define FRAME_SIZE_SAVE_EVERYTHING_FOR_SUSPEND_CHECK FRAME_SIZE_SAVE_EVERYTHING
+#define SAVE_EVERYTHING_FRAME_EAX_OFFSET \
+    (FRAME_SIZE_SAVE_EVERYTHING - CALLEE_SAVE_EVERYTHING_NUM_CORE_SPILLS * POINTER_SIZE)
+
+// Size of Context::gprs_ + 1 so the stack pointer can be stored without being popped by pop-all.
+#define X86_LONG_JUMP_GPRS_SIZE 36
+// Size of Context::fprs_.
+#define X86_LONG_JUMP_FPRS_SIZE 64
+// Size of Context::gprs_ + Context::fprs_.
+#define X86_LONG_JUMP_CONTEXT_SIZE (X86_LONG_JUMP_GPRS_SIZE + X86_LONG_JUMP_FPRS_SIZE)
 
 #endif  // ART_RUNTIME_ARCH_X86_ASM_SUPPORT_X86_H_

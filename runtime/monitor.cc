@@ -14,12 +14,11 @@
  * limitations under the License.
  */
 
-#include "monitor-inl.h"
+#include <android-base/properties.h>
 
 #include <vector>
 
 #include "android-base/stringprintf.h"
-
 #include "art_method-inl.h"
 #include "base/logging.h"  // For VLOG.
 #include "base/mutex.h"
@@ -31,9 +30,12 @@
 #include "dex/dex_file-inl.h"
 #include "dex/dex_file_types.h"
 #include "dex/dex_instruction-inl.h"
+#include "entrypoints/entrypoint_utils-inl.h"
+#include "gc/verification-inl.h"
 #include "lock_word-inl.h"
 #include "mirror/class-inl.h"
 #include "mirror/object-inl.h"
+#include "monitor-inl.h"
 #include "object_callbacks.h"
 #include "scoped_thread_state_change-inl.h"
 #include "stack.h"
@@ -42,7 +44,9 @@
 #include "verifier/method_verifier.h"
 #include "well_known_classes.h"
 
-namespace art {
+static_assert(ART_USE_FUTEXES);
+
+namespace art HIDDEN {
 
 using android::base::StringPrintf;
 
@@ -113,6 +117,11 @@ Monitor::Monitor(Thread* self, Thread* owner, ObjPtr<mirror::Object> obj, int32_
   // with the owner unlocking the thin-lock.
   CHECK(owner == nullptr || owner == self || owner->IsSuspended());
   // The identity hash code is set for the life time of the monitor.
+
+  bool monitor_timeout_enabled = Runtime::Current()->IsMonitorTimeoutEnabled();
+  if (monitor_timeout_enabled) {
+    MaybeEnableTimeout();
+  }
 }
 
 Monitor::Monitor(Thread* self,
@@ -141,6 +150,11 @@ Monitor::Monitor(Thread* self,
   // with the owner unlocking the thin-lock.
   CHECK(owner == nullptr || owner == self || owner->IsSuspended());
   // The identity hash code is set for the life time of the monitor.
+
+  bool monitor_timeout_enabled = Runtime::Current()->IsMonitorTimeoutEnabled();
+  if (monitor_timeout_enabled) {
+    MaybeEnableTimeout();
+  }
 }
 
 int32_t Monitor::GetHashCode() {
@@ -215,7 +229,7 @@ bool Monitor::Install(Thread* self) NO_THREAD_SAFETY_ANALYSIS {
   // than what clang thread safety analysis understands.
   // Monitor is not yet public.
   Thread* owner = owner_.load(std::memory_order_relaxed);
-  CHECK(owner == nullptr || owner == self || (ART_USE_FUTEXES && owner->IsSuspended()));
+  CHECK(owner == nullptr || owner == self || owner->IsSuspended());
   // Propagate the lock state.
   LockWord lw(GetObject()->GetLockWord(false));
   switch (lw.GetState()) {
@@ -224,11 +238,7 @@ bool Monitor::Install(Thread* self) NO_THREAD_SAFETY_ANALYSIS {
       CHECK_EQ(owner->GetThreadId(), lw.ThinLockOwner());
       DCHECK_EQ(monitor_lock_.GetExclusiveOwnerTid(), 0) << " my tid = " << SafeGetTid(self);
       lock_count_ = lw.ThinLockCount();
-#if ART_USE_FUTEXES
       monitor_lock_.ExclusiveLockUncontendedFor(owner);
-#else
-      monitor_lock_.ExclusiveLock(owner);
-#endif
       DCHECK_EQ(monitor_lock_.GetExclusiveOwnerTid(), owner->GetTid())
           << " my tid = " << SafeGetTid(self);
       LockWord fat(this, lw.GCState());
@@ -240,13 +250,7 @@ bool Monitor::Install(Thread* self) NO_THREAD_SAFETY_ANALYSIS {
         }
         return true;
       } else {
-#if ART_USE_FUTEXES
         monitor_lock_.ExclusiveUnlockUncontended();
-#else
-        for (uint32_t i = 0; i <= lockCount; ++i) {
-          monitor_lock_.ExclusiveUnlock(owner);
-        }
-#endif
         return false;
       }
     }
@@ -468,7 +472,7 @@ void Monitor::Lock(Thread* self) {
     Locks::thread_list_lock_->ExclusiveLock(self);
     orig_owner = owner_.load(std::memory_order_relaxed);
     if (orig_owner != nullptr) {  // Did the owner_ give the lock up?
-      const uint32_t orig_owner_thread_id = orig_owner->GetThreadId();
+      const uint32_t orig_owner_thread_id = orig_owner->GetTid();
       GetLockOwnerInfo(&owners_method, &owners_dex_pc, orig_owner);
       std::ostringstream oss;
       std::string name;
@@ -511,7 +515,8 @@ void Monitor::Lock(Thread* self) {
   }
   self->SetMonitorEnterObject(GetObject().Ptr());
   {
-    ScopedThreadSuspension tsc(self, kBlocked);  // Change to blocked and give up mutator_lock_.
+    // Change to blocked and give up mutator_lock_.
+    ScopedThreadSuspension tsc(self, ThreadState::kBlocked);
 
     // Acquire monitor_lock_ without mutator_lock_, expecting to block this time.
     // We already tried spinning above. The shutdown procedure currently assumes we stop
@@ -823,7 +828,9 @@ void Monitor::SignalWaiterAndReleaseMonitorLock(Thread* self) {
 void Monitor::Wait(Thread* self, int64_t ms, int32_t ns,
                    bool interruptShouldThrow, ThreadState why) {
   DCHECK(self != nullptr);
-  DCHECK(why == kTimedWaiting || why == kWaiting || why == kSleeping);
+  DCHECK(why == ThreadState::kTimedWaiting ||
+         why == ThreadState::kWaiting ||
+         why == ThreadState::kSleeping);
 
   // Make sure that we hold the lock.
   if (owner_.load(std::memory_order_relaxed) != self) {
@@ -833,8 +840,8 @@ void Monitor::Wait(Thread* self, int64_t ms, int32_t ns,
 
   // We need to turn a zero-length timed wait into a regular wait because
   // Object.wait(0, 0) is defined as Object.wait(0), which is defined as Object.wait().
-  if (why == kTimedWaiting && (ms == 0 && ns == 0)) {
-    why = kWaiting;
+  if (why == ThreadState::kTimedWaiting && (ms == 0 && ns == 0)) {
+    why = ThreadState::kWaiting;
   }
 
   // Enforce the timeout range.
@@ -896,10 +903,10 @@ void Monitor::Wait(Thread* self, int64_t ms, int32_t ns,
       was_interrupted = true;
     } else {
       // Wait for a notification or a timeout to occur.
-      if (why == kWaiting) {
+      if (why == ThreadState::kWaiting) {
         self->GetWaitConditionVariable()->Wait(self);
       } else {
-        DCHECK(why == kTimedWaiting || why == kSleeping) << why;
+        DCHECK(why == ThreadState::kTimedWaiting || why == ThreadState::kSleeping) << why;
         timed_out = self->GetWaitConditionVariable()->TimedWait(self, ms, ns);
       }
       was_interrupted = self->IsInterrupted();
@@ -987,6 +994,8 @@ void Monitor::NotifyAll(Thread* self) {
 }
 
 bool Monitor::Deflate(Thread* self, ObjPtr<mirror::Object> obj) {
+  // No other relevant code is running. We should hold mutator_lock_ exclusively, but
+  // ImageWriter cheats, since it's single-threaded.
   DCHECK(obj != nullptr);
   // Don't need volatile since we only deflate with mutators suspended.
   LockWord lw(obj->GetLockWord(false));
@@ -998,7 +1007,7 @@ bool Monitor::Deflate(Thread* self, ObjPtr<mirror::Object> obj) {
     if (monitor->num_waiters_.load(std::memory_order_relaxed) > 0) {
       return false;
     }
-    if (!monitor->monitor_lock_.ExclusiveTryLock(self)) {
+    if (!monitor->monitor_lock_.ExclusiveTryLock</* check= */ false>(self)) {
       // We cannot deflate a monitor that's currently held. It's unclear whether we should if
       // we could.
       return false;
@@ -1047,8 +1056,11 @@ void Monitor::Inflate(Thread* self, Thread* owner, ObjPtr<mirror::Object> obj, i
   }
 }
 
-void Monitor::InflateThinLocked(Thread* self, Handle<mirror::Object> obj, LockWord lock_word,
-                                uint32_t hash_code) {
+void Monitor::InflateThinLocked(Thread* self,
+                                Handle<mirror::Object> obj,
+                                LockWord lock_word,
+                                uint32_t hash_code,
+                                int attempt_of_4) {
   DCHECK_EQ(lock_word.GetState(), LockWord::kThinLocked);
   uint32_t owner_thread_id = lock_word.ThinLockOwner();
   if (owner_thread_id == self->GetThreadId()) {
@@ -1058,13 +1070,11 @@ void Monitor::InflateThinLocked(Thread* self, Handle<mirror::Object> obj, LockWo
     ThreadList* thread_list = Runtime::Current()->GetThreadList();
     // Suspend the owner, inflate. First change to blocked and give up mutator_lock_.
     self->SetMonitorEnterObject(obj.Get());
-    bool timed_out;
     Thread* owner;
     {
-      ScopedThreadSuspension sts(self, kWaitingForLockInflation);
-      owner = thread_list->SuspendThreadByThreadId(owner_thread_id,
-                                                   SuspendReason::kInternal,
-                                                   &timed_out);
+      ScopedThreadSuspension sts(self, ThreadState::kWaitingForLockInflation);
+      owner = thread_list->SuspendThreadByThreadId(
+          owner_thread_id, SuspendReason::kInternal, attempt_of_4);
     }
     if (owner != nullptr) {
       // We succeeded in suspending the thread, check the lock's status didn't change.
@@ -1103,12 +1113,9 @@ ObjPtr<mirror::Object> Monitor::MonitorEnter(Thread* self,
   uint32_t thread_id = self->GetThreadId();
   size_t contention_count = 0;
   constexpr size_t kExtraSpinIters = 100;
+  int inflation_attempt = 1;
   StackHandleScope<1> hs(self);
   Handle<mirror::Object> h_obj(hs.NewHandle(obj));
-#if !ART_USE_FUTEXES
-  // In this case we cannot inflate an unowned monitor, so we sometimes defer inflation.
-  bool should_inflate = false;
-#endif
   while (true) {
     // We initially read the lockword with ordinary Java/relaxed semantics. When stronger
     // semantics are needed, we address it below. Since GetLockWord bottoms out to a relaxed load,
@@ -1119,11 +1126,6 @@ ObjPtr<mirror::Object> Monitor::MonitorEnter(Thread* self,
         // No ordering required for preceding lockword read, since we retest.
         LockWord thin_locked(LockWord::FromThinLockId(thread_id, 0, lock_word.GCState()));
         if (h_obj->CasLockWord(lock_word, thin_locked, CASMode::kWeak, std::memory_order_acquire)) {
-#if !ART_USE_FUTEXES
-          if (should_inflate) {
-            InflateThinLocked(self, h_obj, lock_word, 0);
-          }
-#endif
           AtraceMonitorLock(self, h_obj.Get(), /* is_wait= */ false);
           return h_obj.Get();  // Success!
         }
@@ -1141,7 +1143,7 @@ ObjPtr<mirror::Object> Monitor::MonitorEnter(Thread* self,
                                                           lock_word.GCState()));
             // Only this thread pays attention to the count. Thus there is no need for stronger
             // than relaxed memory ordering.
-            if (!kUseReadBarrier) {
+            if (!gUseReadBarrier) {
               h_obj->SetLockWord(thin_locked, /* as_volatile= */ false);
               AtraceMonitorLock(self, h_obj.Get(), /* is_wait= */ false);
               return h_obj.Get();  // Success!
@@ -1158,7 +1160,7 @@ ObjPtr<mirror::Object> Monitor::MonitorEnter(Thread* self,
             continue;  // Go again.
           } else {
             // We'd overflow the recursion count, so inflate the monitor.
-            InflateThinLocked(self, h_obj, lock_word, 0);
+            InflateThinLocked(self, h_obj, lock_word, 0, inflation_attempt++);
           }
         } else {
           if (trylock) {
@@ -1177,16 +1179,9 @@ ObjPtr<mirror::Object> Monitor::MonitorEnter(Thread* self,
               sched_yield();
             }
           } else {
-#if ART_USE_FUTEXES
             contention_count = 0;
             // No ordering required for initial lockword read. Install rereads it anyway.
-            InflateThinLocked(self, h_obj, lock_word, 0);
-#else
-            // Can't inflate from non-owning thread. Keep waiting. Bad for power, but this code
-            // isn't used on-device.
-            should_inflate = true;
-            usleep(10);
-#endif
+            InflateThinLocked(self, h_obj, lock_word, 0, inflation_attempt++);
           }
         }
         continue;  // Start from the beginning.
@@ -1248,7 +1243,7 @@ bool Monitor::MonitorExit(Thread* self, ObjPtr<mirror::Object> obj) {
           } else {
             new_lw = LockWord::FromDefault(lock_word.GCState());
           }
-          if (!kUseReadBarrier) {
+          if (!gUseReadBarrier) {
             DCHECK_EQ(new_lw.ReadBarrierState(), 0U);
             // TODO: This really only needs memory_order_release, but we currently have
             // no way to specify that. In fact there seem to be no legitimate uses of SetLockWord
@@ -1369,6 +1364,7 @@ void Monitor::DoNotify(Thread* self, ObjPtr<mirror::Object> obj, bool notify_all
 
 uint32_t Monitor::GetLockOwnerThreadId(ObjPtr<mirror::Object> obj) {
   DCHECK(obj != nullptr);
+  Locks::mutator_lock_->AssertSharedHeld(Thread::Current());
   LockWord lock_word = obj->GetLockWord(true);
   switch (lock_word.GetState()) {
     case LockWord::kHashCode:
@@ -1379,6 +1375,8 @@ uint32_t Monitor::GetLockOwnerThreadId(ObjPtr<mirror::Object> obj) {
       return lock_word.ThinLockOwner();
     case LockWord::kFatLocked: {
       Monitor* mon = lock_word.FatLockMonitor();
+      // Since we hold a share of the mutator lock, the obj lock cannot be deflated here.
+      // Since our caller holds a reference to obj, mon cannot be reclaimed.
       return mon->GetOwnerThreadId();
     }
     default: {
@@ -1400,9 +1398,9 @@ ThreadState Monitor::FetchState(const Thread* thread,
   ThreadState state = thread->GetState();
 
   switch (state) {
-    case kWaiting:
-    case kTimedWaiting:
-    case kSleeping:
+    case ThreadState::kWaiting:
+    case ThreadState::kTimedWaiting:
+    case ThreadState::kSleeping:
     {
       Thread* self = Thread::Current();
       MutexLock mu(self, *thread->GetWaitMutex());
@@ -1413,12 +1411,12 @@ ThreadState Monitor::FetchState(const Thread* thread,
     }
     break;
 
-    case kBlocked:
-    case kWaitingForLockInflation:
+    case ThreadState::kBlocked:
+    case ThreadState::kWaitingForLockInflation:
     {
       ObjPtr<mirror::Object> lock_object = thread->GetMonitorEnterObject();
       if (lock_object != nullptr) {
-        if (kUseReadBarrier && Thread::Current()->GetIsGcMarking()) {
+        if (gUseReadBarrier && Thread::Current()->GetIsGcMarking()) {
           // We may call Thread::Dump() in the middle of the CC thread flip and this thread's stack
           // may have not been flipped yet and "pretty_object" may be a from-space (stale) ref, in
           // which case the GetLockOwnerThreadId() call below will crash. So explicitly mark/forward
@@ -1464,9 +1462,21 @@ void Monitor::VisitLocks(StackVisitor* stack_visitor,
   // TODO: use the JNI implementation's table of explicit MonitorEnter calls and dump those too.
   if (m->IsNative()) {
     if (m->IsSynchronized()) {
-      ObjPtr<mirror::Object> jni_this =
-          stack_visitor->GetCurrentHandleScope(sizeof(void*))->GetReference(0);
-      callback(jni_this, callback_context);
+      DCHECK(!m->IsCriticalNative());
+      DCHECK(!m->IsFastNative());
+      ObjPtr<mirror::Object> lock;
+      if (m->IsStatic()) {
+        // Static methods synchronize on the declaring class object.
+        lock = m->GetDeclaringClass();
+      } else {
+        // Instance methods synchronize on the `this` object.
+        // The `this` reference is stored in the first out vreg in the caller's frame.
+        uint8_t* sp = reinterpret_cast<uint8_t*>(stack_visitor->GetCurrentQuickFrame());
+        size_t frame_size = stack_visitor->GetCurrentQuickFrameInfo().FrameSizeInBytes();
+        lock = reinterpret_cast<StackReference<mirror::Object>*>(
+            sp + frame_size + static_cast<size_t>(kRuntimePointerSize))->AsMirrorPtr();
+      }
+      callback(lock, callback_context);
     }
     return;
   }
@@ -1519,18 +1529,29 @@ void Monitor::VisitLocks(StackVisitor* stack_visitor,
       // not be optimized out.
       success = stack_visitor->GetVReg(m, dex_reg, kReferenceVReg, &value);
       if (success) {
-        ObjPtr<mirror::Object> o = reinterpret_cast<mirror::Object*>(value);
-        callback(o, callback_context);
-        break;
+        mirror::Object* mp = reinterpret_cast<mirror::Object*>(value);
+        // TODO(b/299577730) Remove the extra checks here once the underlying bug is fixed.
+        const gc::Verification* v = Runtime::Current()->GetHeap()->GetVerification();
+        if (v->IsValidObject(mp)) {
+          ObjPtr<mirror::Object> o = mp;
+          callback(o, callback_context);
+          break;
+        } else {
+          LOG(ERROR) << "Encountered bad lock object: " << std::hex << value << std::dec;
+          success = false;
+        }
       }
     }
-    DCHECK(success) << "Failed to find/read reference for monitor-enter at dex pc "
-                    << dex_lock_info.dex_pc
-                    << " in method "
-                    << m->PrettyMethod();
     if (!success) {
-      LOG(WARNING) << "Had a lock reported for dex pc " << dex_lock_info.dex_pc
-                   << " but was not able to fetch a corresponding object!";
+      LOG(ERROR) << "Failed to find/read reference for monitor-enter at dex pc "
+                 << dex_lock_info.dex_pc << " in method " << m->PrettyMethod();
+      if (kIsDebugBuild) {
+        // Crash only in debug ART builds.
+        LOG(FATAL) << "Had a lock reported for a dex pc "
+                      "but was not able to fetch a corresponding object!";
+      } else {
+        LOG(ERROR) << "Held monitor information in stack trace will be incomplete!";
+      }
     }
   }
 }
@@ -1541,7 +1562,7 @@ bool Monitor::IsValidLockWord(LockWord lock_word) {
       // Nothing to check.
       return true;
     case LockWord::kThinLocked:
-      // Basic sanity check of owner.
+      // Basic consistency check of owner.
       return lock_word.ThinLockOwner() != ThreadList::kInvalidThreadId;
     case LockWord::kFatLocked: {
       // Check the  monitor appears in the monitor list.
@@ -1610,13 +1631,13 @@ MonitorList::~MonitorList() {
 }
 
 void MonitorList::DisallowNewMonitors() {
-  CHECK(!kUseReadBarrier);
+  CHECK(!gUseReadBarrier);
   MutexLock mu(Thread::Current(), monitor_list_lock_);
   allow_new_monitors_ = false;
 }
 
 void MonitorList::AllowNewMonitors() {
-  CHECK(!kUseReadBarrier);
+  CHECK(!gUseReadBarrier);
   Thread* self = Thread::Current();
   MutexLock mu(self, monitor_list_lock_);
   allow_new_monitors_ = true;
@@ -1634,8 +1655,8 @@ void MonitorList::Add(Monitor* m) {
   MutexLock mu(self, monitor_list_lock_);
   // CMS needs this to block for concurrent reference processing because an object allocated during
   // the GC won't be marked and concurrent reference processing would incorrectly clear the JNI weak
-  // ref. But CC (kUseReadBarrier == true) doesn't because of the to-space invariant.
-  while (!kUseReadBarrier && UNLIKELY(!allow_new_monitors_)) {
+  // ref. But CC (gUseReadBarrier == true) doesn't because of the to-space invariant.
+  while (!gUseReadBarrier && UNLIKELY(!allow_new_monitors_)) {
     // Check and run the empty checkpoint before blocking so the empty checkpoint will work in the
     // presence of threads blocking for weak ref access.
     self->CheckEmptyCheckpointFromWeakRefAccess(&monitor_list_lock_);
@@ -1675,8 +1696,7 @@ class MonitorDeflateVisitor : public IsMarkedVisitor {
  public:
   MonitorDeflateVisitor() : self_(Thread::Current()), deflate_count_(0) {}
 
-  mirror::Object* IsMarked(mirror::Object* object) override
-      REQUIRES_SHARED(Locks::mutator_lock_) {
+  mirror::Object* IsMarked(mirror::Object* object) override REQUIRES(Locks::mutator_lock_) {
     if (Monitor::Deflate(self_, object)) {
       DCHECK_NE(object->GetLockWord(true).GetState(), LockWord::kFatLocked);
       ++deflate_count_;
@@ -1731,6 +1751,15 @@ MonitorInfo::MonitorInfo(ObjPtr<mirror::Object> obj) : owner_(nullptr), entry_co
       }
       break;
     }
+  }
+}
+
+void Monitor::MaybeEnableTimeout() {
+  std::string current_package = Runtime::Current()->GetProcessPackageName();
+  bool enabled_for_app = android::base::GetBoolProperty("debug.art.monitor.app", false);
+  if (current_package == "android" || enabled_for_app) {
+    monitor_lock_.setEnableMonitorTimeout();
+    monitor_lock_.setMonitorId(monitor_id_);
   }
 }
 

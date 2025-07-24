@@ -26,7 +26,7 @@
 
 using namespace vixl::aarch32;  // NOLINT(build/namespaces)
 
-namespace art {
+namespace art HIDDEN {
 namespace arm {
 
 #ifdef ___
@@ -52,7 +52,7 @@ const uint8_t* ArmVIXLAssembler::CodeBufferBaseAddress() const {
   return vixl_masm_.GetBuffer().GetStartAddress<const uint8_t*>();
 }
 
-void ArmVIXLAssembler::FinalizeInstructions(const MemoryRegion& region) {
+void ArmVIXLAssembler::CopyInstructions(const MemoryRegion& region) {
   // Copy the instructions from the buffer.
   MemoryRegion from(vixl_masm_.GetBuffer()->GetStartAddress<void*>(), CodeSize());
   region.CopyFrom(0, from);
@@ -81,9 +81,7 @@ void ArmVIXLAssembler::MaybeUnpoisonHeapReference(vixl32::Register reg) {
 }
 
 void ArmVIXLAssembler::GenerateMarkingRegisterCheck(vixl32::Register temp, int code) {
-  // The Marking Register is only used in the Baker read barrier configuration.
-  DCHECK(kEmitCompilerReadBarrier);
-  DCHECK(kUseBakerReadBarrier);
+  DCHECK(kReserveMarkingRegister);
 
   vixl32::Label mr_is_ok;
 
@@ -175,9 +173,6 @@ int32_t ArmVIXLAssembler::GetAllowedLoadOffsetBits(LoadOperandType type) {
     case kLoadWordPair:
       // We can encode imm8:'00' offset.
       return 0xff << 2;
-    default:
-      LOG(FATAL) << "UNREACHABLE";
-      UNREACHABLE();
   }
 }
 
@@ -194,9 +189,6 @@ int32_t ArmVIXLAssembler::GetAllowedStoreOffsetBits(StoreOperandType type) {
     case kStoreWordPair:
       // We can encode imm8:'00' offset.
       return 0xff << 2;
-    default:
-      LOG(FATAL) << "UNREACHABLE";
-      UNREACHABLE();
   }
 }
 
@@ -214,9 +206,6 @@ static bool CanHoldLoadOffsetThumb(LoadOperandType type, int offset) {
       return IsAbsoluteUint<10>(offset) && IsAligned<4>(offset);  // VFP addressing mode.
     case kLoadWordPair:
       return IsAbsoluteUint<10>(offset) && IsAligned<4>(offset);
-    default:
-      LOG(FATAL) << "UNREACHABLE";
-      UNREACHABLE();
   }
 }
 
@@ -232,9 +221,6 @@ static bool CanHoldStoreOffsetThumb(StoreOperandType type, int offset) {
       return IsAbsoluteUint<10>(offset) && IsAligned<4>(offset);  // VFP addressing mode.
     case kStoreWordPair:
       return IsAbsoluteUint<10>(offset) && IsAligned<4>(offset);
-    default:
-      LOG(FATAL) << "UNREACHABLE";
-      UNREACHABLE();
   }
 }
 

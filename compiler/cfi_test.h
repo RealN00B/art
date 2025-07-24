@@ -22,7 +22,8 @@
 #include <vector>
 
 #include "arch/instruction_set.h"
-#include "base/enums.h"
+#include "base/macros.h"
+#include "base/pointer_size.h"
 #include "debug/dwarf/dwarf_test.h"
 #include "disassembler.h"
 #include "dwarf/dwarf_constants.h"
@@ -30,7 +31,7 @@
 #include "gtest/gtest.h"
 #include "thread.h"
 
-namespace art {
+namespace art HIDDEN {
 
 class CFITest : public dwarf::DwarfTest {
  public:
@@ -130,7 +131,7 @@ class CFITest : public dwarf::DwarfTest {
         }
         // Use the .cfi_ prefix.
         new_line = ".cfi_" + new_line.substr(FindEndOf(new_line, "DW_CFA_"));
-        output->push_back(address + ": " + new_line);
+        output->push_back(ART_FORMAT("{}: {}", address, new_line));
       }
     }
   }

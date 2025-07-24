@@ -19,10 +19,11 @@
 
 #include <android-base/logging.h>
 
+#include "base/macros.h"
 #include "constants_arm.h"
 #include "utils/managed_register.h"
 
-namespace art {
+namespace art HIDDEN {
 namespace arm {
 
 // Values for register pairs.
@@ -264,7 +265,7 @@ std::ostream& operator<<(std::ostream& os, const ArmManagedRegister& reg);
 
 }  // namespace arm
 
-constexpr inline arm::ArmManagedRegister ManagedRegister::AsArm() const {
+constexpr arm::ArmManagedRegister ManagedRegister::AsArm() const {
   arm::ArmManagedRegister reg(id_);
   CHECK(reg.IsNoRegister() || reg.IsValidManagedRegister());
   return reg;

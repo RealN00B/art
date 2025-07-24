@@ -26,7 +26,7 @@ public class Main {
         }
 
          try {
-            testInstanceOfNull();
+            testInstanceOfNull(null);
         } catch (IllegalAccessError e) {
             System.out.println("Got expected error instanceof null");
         }
@@ -38,30 +38,50 @@ public class Main {
         }
 
         try {
+            $noinline$testCheckCast(new Object());
+        } catch (IllegalAccessError e) {
+            System.out.println("Got expected error checkcast object");
+        }
+
+        try {
             testDontGvnLoadClassWithAccessChecks(new Object());
         } catch (IllegalAccessError e) {
             System.out.println("Got expected error instanceof (keep LoadClass with access check)");
         }
+
+        InaccessibleClassProxy.testGetReferrersClass();
+        InaccessibleClassProxy.testGetReferrersClassViaAnotherClass();
+
+        // Execute again now that classes have been initialized, and entrypoints may have been
+        // updated.
+        InaccessibleClassProxy.testGetReferrersClass();
+        InaccessibleClassProxy.testGetReferrersClassViaAnotherClass();
     }
 
     /// CHECK-START: boolean Main.testInstanceOf() register (after)
-    /// CHECK: InstanceOf
+    /// CHECK: LoadClass class_name:other.InaccessibleClass
     public static boolean testInstanceOf() {
         return ic instanceof InaccessibleClass;
     }
 
-    /// CHECK-START: boolean Main.testInstanceOfNull() register (after)
-    /// CHECK: InstanceOf
-    public static boolean testInstanceOfNull() {
-        return null instanceof InaccessibleClass;
+    /// CHECK-START: boolean Main.testInstanceOfNull(java.lang.Object) register (after)
+    /// CHECK: LoadClass class_name:other.InaccessibleClass
+    public static boolean testInstanceOfNull(Object o) {
+        return o instanceof InaccessibleClass;
     }
 
     // TODO: write a test for for CheckCast with not null constant (after RTP can parse arguments).
 
     /// CHECK-START: other.InaccessibleClass Main.testCheckCastNull() register (after)
-    /// CHECK: CheckCast
+    /// CHECK: LoadClass class_name:other.InaccessibleClass
     public static InaccessibleClass testCheckCastNull() {
         return (InaccessibleClass) null;
+    }
+
+    /// CHECK-START: other.InaccessibleClass Main.$noinline$testCheckCast(java.lang.Object) register (after)
+    /// CHECK: LoadClass class_name:other.InaccessibleClass
+    public static InaccessibleClass $noinline$testCheckCast(Object o) {
+        return (InaccessibleClass) o;
     }
 
     /// CHECK-START: boolean Main.testDontGvnLoadClassWithAccessChecks(java.lang.Object) inliner (before)

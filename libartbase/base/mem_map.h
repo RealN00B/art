@@ -25,11 +25,20 @@
 #include <string>
 
 #include "android-base/thread_annotations.h"
+#include "bit_utils.h"
+#include "globals.h"
 #include "macros.h"
+
+#ifndef __BIONIC__
+#ifndef MAP_FIXED_NOREPLACE
+#define MAP_FIXED_NOREPLACE 0x100000
+#endif
+#endif  // __BIONIC__
 
 namespace art {
 
-#if defined(__LP64__) && !defined(__Fuchsia__) && (defined(__aarch64__) || defined(__APPLE__))
+#if defined(__LP64__) && !defined(__Fuchsia__) && \
+    (defined(__aarch64__) || defined(__riscv) || defined(__APPLE__))
 #define USE_ART_LOW_4G_ALLOCATOR 1
 #else
 #if defined(__LP64__) && !defined(__Fuchsia__) && !defined(__x86_64__)
@@ -127,7 +136,7 @@ class MemMap {
   // 'name' will be used -- on systems that support it -- to give the mapping
   // a name.
   //
-  // On success, returns returns a valid MemMap.  On failure, returns an invalid MemMap.
+  // On success, returns a valid MemMap. On failure, returns an invalid MemMap.
   static MemMap MapAnonymous(const char* name,
                              uint8_t* addr,
                              size_t byte_count,
@@ -137,6 +146,19 @@ class MemMap {
                              /*inout*/MemMap* reservation,
                              /*out*/std::string* error_msg,
                              bool use_debug_name = true);
+
+  // Request an aligned anonymous region, where the alignment must be higher
+  // than the runtime gPageSize. We can't directly ask for a MAP_SHARED
+  // (anonymous or otherwise) mapping to be aligned as in that case file offset
+  // is involved and could make the starting offset to be out of sync with
+  // another mapping of the same file.
+  static MemMap MapAnonymousAligned(const char* name,
+                                    size_t byte_count,
+                                    int prot,
+                                    bool low_4gb,
+                                    size_t alignment,
+                                    /*out=*/std::string* error_msg);
+
   static MemMap MapAnonymous(const char* name,
                              size_t byte_count,
                              int prot,
@@ -171,12 +193,12 @@ class MemMap {
   // This is useful when we do not have control over the code calling mmap,
   // but when we still want to keep track of it in the list.
   // The region is not considered to be owned and will not be unmmaped.
-  static MemMap MapDummy(const char* name, uint8_t* addr, size_t byte_count);
+  static MemMap MapPlaceholder(const char* name, uint8_t* addr, size_t byte_count);
 
-  // Map part of a file, taking care of non-page aligned offsets.  The
+  // Map part of a file, taking care of non-page aligned offsets. The
   // "start" offset is absolute, not relative.
   //
-  // On success, returns returns a valid MemMap.  On failure, returns an invalid MemMap.
+  // On success, returns a valid MemMap. On failure, returns an invalid MemMap.
   static MemMap MapFile(size_t byte_count,
                         int prot,
                         int flags,
@@ -198,7 +220,29 @@ class MemMap {
                             error_msg);
   }
 
-  // Map part of a file, taking care of non-page aligned offsets.  The "start" offset is absolute,
+  static MemMap MapFile(size_t byte_count,
+                        int prot,
+                        int flags,
+                        int fd,
+                        off_t start,
+                        bool low_4gb,
+                        const char* filename,
+                        bool reuse,
+                        std::string* error_msg) {
+    return MapFileAtAddress(nullptr,
+                            byte_count,
+                            prot,
+                            flags,
+                            fd,
+                            start,
+                            /*low_4gb=*/ low_4gb,
+                            filename,
+                            reuse,
+                            /*reservation=*/ nullptr,
+                            error_msg);
+  }
+
+  // Map part of a file, taking care of non-page aligned offsets. The "start" offset is absolute,
   // not relative. This version allows requesting a specific address for the base of the mapping.
   //
   // `reuse` allows re-mapping an address range from an existing mapping which retains the
@@ -209,7 +253,7 @@ class MemMap {
   // This helps improve performance of the fail case since reading and printing /proc/maps takes
   // several milliseconds in the worst case.
   //
-  // On success, returns returns a valid MemMap.  On failure, returns an invalid MemMap.
+  // On success, returns a valid MemMap. On failure, returns an invalid MemMap.
   static MemMap MapFileAtAddress(uint8_t* addr,
                                  size_t byte_count,
                                  int prot,
@@ -230,7 +274,10 @@ class MemMap {
 
   bool Protect(int prot);
 
-  void MadviseDontNeedAndZero();
+  void FillWithZero(bool release_eagerly);
+  void MadviseDontNeedAndZero() {
+    FillWithZero(/* release_eagerly= */ true);
+  }
   int MadviseDontFork();
 
   int GetProtect() const {
@@ -290,8 +337,9 @@ class MemMap {
   // exceed the size of this reservation.
   //
   // Returns a mapping owning `byte_count` bytes rounded up to entire pages
-  // with size set to the passed `byte_count`.
-  MemMap TakeReservedMemory(size_t byte_count);
+  // with size set to the passed `byte_count`. If 'reuse' is true then the caller
+  // is responsible for unmapping the taken pages.
+  MemMap TakeReservedMemory(size_t byte_count, bool reuse = false);
 
   static bool CheckNoGaps(MemMap& begin_map, MemMap& end_map)
       REQUIRES(!MemMap::mem_maps_lock_);
@@ -303,14 +351,16 @@ class MemMap {
   // time after the first call to Init and before the first call to Shutodwn.
   static void Init() REQUIRES(!MemMap::mem_maps_lock_);
   static void Shutdown() REQUIRES(!MemMap::mem_maps_lock_);
+  static bool IsInitialized();
 
   // If the map is PROT_READ, try to read each page of the map to check it is in fact readable (not
   // faulting). This is used to diagnose a bug b/19894268 where mprotect doesn't seem to be working
   // intermittently.
   void TryReadable();
 
-  // Align the map by unmapping the unaligned parts at the lower and the higher ends.
-  void AlignBy(size_t size);
+  // Align the map by unmapping the unaligned part at the lower end and if 'align_both_ends' is
+  // true, then the higher end as well.
+  void AlignBy(size_t alignment, bool align_both_ends = true);
 
   // For annotation reasons.
   static std::mutex* GetMemMapsLock() RETURN_CAPABILITY(mem_maps_lock_) {
@@ -320,6 +370,20 @@ class MemMap {
   // Reset in a forked process the MemMap whose memory has been madvised MADV_DONTFORK
   // in the parent process.
   void ResetInForkedProcess();
+
+  // 'redzone_size_ == 0' indicates that we are not using memory-tool on this mapping.
+  size_t GetRedzoneSize() const { return redzone_size_; }
+
+#ifdef ART_PAGE_SIZE_AGNOSTIC
+  static inline size_t GetPageSize() {
+    DCHECK_NE(page_size_, 0u);
+    return page_size_;
+  }
+#else
+  static constexpr size_t GetPageSize() {
+    return GetPageSizeSlow();
+  }
+#endif
 
  private:
   MemMap(const std::string& name,
@@ -383,8 +447,8 @@ class MemMap {
   size_t base_size_ = 0u;       // Length of mapping. May be changed by RemapAtEnd (ie Zygote).
   int prot_ = 0;                // Protection of the map.
 
-  // When reuse_ is true, this is just a view of an existing mapping
-  // and we do not take ownership and are not responsible for
+  // When reuse_ is true, this is a view of a mapping on which
+  // we do not take ownership and are not responsible for
   // unmapping.
   bool reuse_ = false;
 
@@ -410,6 +474,10 @@ class MemMap {
 
   static std::mutex* mem_maps_lock_;
 
+#ifdef ART_PAGE_SIZE_AGNOSTIC
+  static size_t page_size_;
+#endif
+
   friend class MemMapTest;  // To allow access to base_begin_ and base_size_.
 };
 
@@ -419,8 +487,11 @@ inline void swap(MemMap& lhs, MemMap& rhs) {
 
 std::ostream& operator<<(std::ostream& os, const MemMap& mem_map);
 
-// Zero and release pages if possible, no requirements on alignments.
-void ZeroAndReleasePages(void* address, size_t length);
+// Zero and maybe release memory if possible, no requirements on alignments.
+void ZeroMemory(void* address, size_t length, bool release_eagerly);
+inline void ZeroAndReleaseMemory(void* address, size_t length) {
+  ZeroMemory(address, length, /* release_eagerly= */ true);
+}
 
 }  // namespace art
 

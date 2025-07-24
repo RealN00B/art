@@ -16,11 +16,12 @@
 
 #include "xz_utils.h"
 
-#include <vector>
 #include <mutex>
+#include <vector>
 
 #include "base/array_ref.h"
 #include "base/bit_utils.h"
+#include "base/globals.h"
 #include "base/leb128.h"
 #include "dwarf/writer.h"
 
@@ -32,8 +33,6 @@
 
 namespace art {
 
-constexpr size_t kChunkSize = 16 * KB;
-
 static void XzInitCrc() {
   static std::once_flag crc_initialized;
   std::call_once(crc_initialized, []() {
@@ -42,14 +41,17 @@ static void XzInitCrc() {
   });
 }
 
-void XzCompress(ArrayRef<const uint8_t> src, std::vector<uint8_t>* dst, int level) {
+void XzCompress(ArrayRef<const uint8_t> src,
+                std::vector<uint8_t>* dst,
+                int level,
+                size_t block_size) {
   // Configure the compression library.
   XzInitCrc();
   CLzma2EncProps lzma2Props;
   Lzma2EncProps_Init(&lzma2Props);
   lzma2Props.lzmaProps.level = level;
   lzma2Props.lzmaProps.reduceSize = src.size();  // Size of data that will be compressed.
-  lzma2Props.blockSize = kChunkSize;
+  lzma2Props.blockSize = block_size;
   Lzma2EncProps_Normalize(&lzma2Props);
   CXzProps props;
   XzProps_Init(&props);
@@ -97,6 +99,9 @@ void XzCompress(ArrayRef<const uint8_t> src, std::vector<uint8_t>* dst, int leve
 }
 
 void XzDecompress(ArrayRef<const uint8_t> src, std::vector<uint8_t>* dst) {
+  static const size_t page_size = GetPageSizeSlow();
+  CHECK_NE(page_size, 0U);
+
   XzInitCrc();
   std::unique_ptr<CXzUnpacker> state(new CXzUnpacker());
   ISzAlloc alloc;
@@ -108,7 +113,7 @@ void XzDecompress(ArrayRef<const uint8_t> src, std::vector<uint8_t>* dst) {
   size_t dst_offset = 0;
   ECoderStatus status;
   do {
-    dst->resize(RoundUp(dst_offset + kPageSize / 4, kPageSize));
+    dst->resize(RoundUp(dst_offset + page_size / 4, page_size));
     size_t src_remaining = src.size() - src_offset;
     size_t dst_remaining = dst->size() - dst_offset;
     int return_val = XzUnpacker_Code(state.get(),

@@ -21,6 +21,7 @@
 #include "subtype_check_info.h"
 
 #include "base/locks.h"
+#include "base/macros.h"
 #include "mirror/class.h"
 #include "runtime.h"
 
@@ -219,7 +220,7 @@ constexpr bool kBitstringSubtypeCheckEnabled = false;
  * All node targets (in `src <: target`) get Assigned, and any parent of an Initialized
  * node also gets Assigned.
  */
-namespace art {
+namespace art HIDDEN {
 
 struct MockSubtypeCheck;  // Forward declaration for testing.
 
@@ -382,12 +383,12 @@ struct SubtypeCheck {
     if (UNLIKELY(!klass->HasSuperClass())) {
       // Object root always goes directly from Uninitialized -> Assigned.
 
-      const SubtypeCheckInfo root_sci = GetSubtypeCheckInfo(klass);
+      SubtypeCheckInfo root_sci = GetSubtypeCheckInfo(klass);
       if (root_sci.GetState() != SubtypeCheckInfo::kUninitialized) {
         return root_sci;  // No change needed.
       }
 
-      const SubtypeCheckInfo new_root_sci = root_sci.CreateRoot();
+      SubtypeCheckInfo new_root_sci = root_sci.CreateRoot();
       SetSubtypeCheckInfo(klass, new_root_sci);
 
       // The object root is always in the Uninitialized|Assigned state.
@@ -571,9 +572,7 @@ struct SubtypeCheck {
     DCHECK_EQ(depth, klass->Depth());
     SubtypeCheckBitsAndStatus current_bits_and_status = ReadField(klass);
 
-    const SubtypeCheckInfo current =
-        SubtypeCheckInfo::Create(current_bits_and_status.subtype_check_info_, depth);
-    return current;
+    return SubtypeCheckInfo::Create(current_bits_and_status.subtype_check_info_, depth);
   }
 
   static void SetSubtypeCheckInfo(ClassPtr klass, const SubtypeCheckInfo& new_sci)
@@ -586,7 +585,7 @@ struct SubtypeCheck {
   // Tests can inherit this class. Normal code should use static methods.
   SubtypeCheck() = default;
   SubtypeCheck(const SubtypeCheck& other) = default;
-  SubtypeCheck(SubtypeCheck&& other) = default;
+  SubtypeCheck(SubtypeCheck&& other) noexcept = default;
   ~SubtypeCheck() = default;
 
   friend struct MockSubtypeCheck;

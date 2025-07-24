@@ -22,14 +22,16 @@
 #include "base/hiddenapi_domain.h"
 #include "base/hiddenapi_flags.h"
 #include "base/locks.h"
+#include "base/macros.h"
+#include "dex/class_accessor.h"
 #include "intrinsics_enum.h"
 #include "jni/jni_internal.h"
-#include "mirror/class-inl.h"
+#include "mirror/class.h"
+#include "mirror/class_loader.h"
 #include "reflection.h"
 #include "runtime.h"
-#include "well_known_classes.h"
 
-namespace art {
+namespace art HIDDEN {
 namespace hiddenapi {
 
 // Hidden API enforcement policy
@@ -38,7 +40,7 @@ namespace hiddenapi {
 enum class EnforcementPolicy {
   kDisabled             = 0,
   kJustWarn             = 1,  // keep checks enabled, but allow everything (enables logging)
-  kEnabled              = 2,  // ban dark grey & blacklist
+  kEnabled              = 2,  // ban conditionally blocked & blocklist
   kMax = kEnabled,
 };
 
@@ -121,7 +123,7 @@ class AccessContext {
 
     if (domain == Domain::kApplication &&
         klass->ShouldSkipHiddenApiChecks() &&
-        Runtime::Current()->IsJavaDebuggable()) {
+        Runtime::Current()->IsJavaDebuggableAtInit()) {
       // Class is known, it is marked trusted and we are in debuggable mode.
       domain = ComputeDomain(/* is_trusted= */ true);
     }
@@ -159,6 +161,10 @@ class ScopedHiddenApiEnforcementPolicySetting {
 };
 
 void InitializeCorePlatformApiPrivateFields() REQUIRES(!Locks::mutator_lock_);
+
+// Walks the stack, finds the caller of this reflective call and returns
+// a hiddenapi AccessContext formed from its declaring class.
+AccessContext GetReflectionCallerAccessContext(Thread* self) REQUIRES_SHARED(Locks::mutator_lock_);
 
 // Implementation details. DO NOT ACCESS DIRECTLY.
 namespace detail {
@@ -203,13 +209,13 @@ class MemberSignature {
   void LogAccessToEventLog(uint32_t sampled_value, AccessMethod access_method, bool access_denied);
 
   // Calls back into managed code to notify VMRuntime.nonSdkApiUsageConsumer that
-  // |member| was accessed. This is usually called when an API is on the black,
-  // dark grey or light grey lists. Given that the callback can execute arbitrary
+  // |member| was accessed. This is usually called when an API is unsupported,
+  // conditionally or unconditionally blocked. Given that the callback can execute arbitrary
   // code, a call to this method can result in thread suspension.
   void NotifyHiddenApiListener(AccessMethod access_method);
 };
 
-// Locates hiddenapi flags for `field` in the corresponding dex file.
+// Locates hiddenapi flags for `member` in the corresponding dex file.
 // NB: This is an O(N) operation, linear with the number of members in the class def.
 template<typename T>
 uint32_t GetDexFlags(T* member) REQUIRES_SHARED(Locks::mutator_lock_);
@@ -241,7 +247,7 @@ ALWAYS_INLINE inline uint32_t CreateRuntimeFlags_Impl(uint32_t dex_flags) {
   ApiList api_list(dex_flags);
   DCHECK(api_list.IsValid());
 
-  if (api_list.Contains(ApiList::Whitelist())) {
+  if (api_list.Contains(ApiList::Sdk())) {
     runtime_flags |= kAccPublicApi;
   } else {
     // Only add domain-specific flags for non-public API members.
@@ -280,8 +286,10 @@ ALWAYS_INLINE inline uint32_t GetRuntimeFlags(ArtField* field)
 ALWAYS_INLINE inline uint32_t GetRuntimeFlags(ArtMethod* method)
     REQUIRES_SHARED(Locks::mutator_lock_) {
   if (UNLIKELY(method->IsIntrinsic())) {
-    switch (static_cast<Intrinsics>(method->GetIntrinsic())) {
+    switch (method->GetIntrinsic()) {
       case Intrinsics::kSystemArrayCopyChar:
+      case Intrinsics::kSystemArrayCopyByte:
+      case Intrinsics::kSystemArrayCopyInt:
       case Intrinsics::kStringGetCharsNoCheck:
       case Intrinsics::kReferenceGetReferent:
       case Intrinsics::kMemoryPeekByte:
@@ -318,58 +326,70 @@ ALWAYS_INLINE inline uint32_t GetRuntimeFlags(ArtMethod* method)
       case Intrinsics::kUnsafeLoadFence:
       case Intrinsics::kUnsafeStoreFence:
       case Intrinsics::kUnsafeFullFence:
-      case Intrinsics::kVarHandleFullFence:
-      case Intrinsics::kVarHandleAcquireFence:
-      case Intrinsics::kVarHandleReleaseFence:
-      case Intrinsics::kVarHandleLoadLoadFence:
-      case Intrinsics::kVarHandleStoreStoreFence:
-      case Intrinsics::kVarHandleCompareAndExchange:
-      case Intrinsics::kVarHandleCompareAndExchangeAcquire:
-      case Intrinsics::kVarHandleCompareAndExchangeRelease:
-      case Intrinsics::kVarHandleCompareAndSet:
-      case Intrinsics::kVarHandleGet:
-      case Intrinsics::kVarHandleGetAcquire:
-      case Intrinsics::kVarHandleGetAndAdd:
-      case Intrinsics::kVarHandleGetAndAddAcquire:
-      case Intrinsics::kVarHandleGetAndAddRelease:
-      case Intrinsics::kVarHandleGetAndBitwiseAnd:
-      case Intrinsics::kVarHandleGetAndBitwiseAndAcquire:
-      case Intrinsics::kVarHandleGetAndBitwiseAndRelease:
-      case Intrinsics::kVarHandleGetAndBitwiseOr:
-      case Intrinsics::kVarHandleGetAndBitwiseOrAcquire:
-      case Intrinsics::kVarHandleGetAndBitwiseOrRelease:
-      case Intrinsics::kVarHandleGetAndBitwiseXor:
-      case Intrinsics::kVarHandleGetAndBitwiseXorAcquire:
-      case Intrinsics::kVarHandleGetAndBitwiseXorRelease:
-      case Intrinsics::kVarHandleGetAndSet:
-      case Intrinsics::kVarHandleGetAndSetAcquire:
-      case Intrinsics::kVarHandleGetAndSetRelease:
-      case Intrinsics::kVarHandleGetOpaque:
-      case Intrinsics::kVarHandleGetVolatile:
-      case Intrinsics::kVarHandleSet:
-      case Intrinsics::kVarHandleSetOpaque:
-      case Intrinsics::kVarHandleSetRelease:
-      case Intrinsics::kVarHandleSetVolatile:
-      case Intrinsics::kVarHandleWeakCompareAndSet:
-      case Intrinsics::kVarHandleWeakCompareAndSetAcquire:
-      case Intrinsics::kVarHandleWeakCompareAndSetPlain:
-      case Intrinsics::kVarHandleWeakCompareAndSetRelease:
+      case Intrinsics::kJdkUnsafeArrayBaseOffset:
+      case Intrinsics::kJdkUnsafeCASInt:
+      case Intrinsics::kJdkUnsafeCASLong:
+      case Intrinsics::kJdkUnsafeCASObject:
+      case Intrinsics::kJdkUnsafeCompareAndSetInt:
+      case Intrinsics::kJdkUnsafeCompareAndSetLong:
+      case Intrinsics::kJdkUnsafeCompareAndSetReference:
+      case Intrinsics::kJdkUnsafeGetAndAddInt:
+      case Intrinsics::kJdkUnsafeGetAndAddLong:
+      case Intrinsics::kJdkUnsafeGetAndSetInt:
+      case Intrinsics::kJdkUnsafeGetAndSetLong:
+      case Intrinsics::kJdkUnsafeGetAndSetReference:
+      case Intrinsics::kJdkUnsafeGetLongVolatile:
+      case Intrinsics::kJdkUnsafeGetLongAcquire:
+      case Intrinsics::kJdkUnsafeGetReferenceVolatile:
+      case Intrinsics::kJdkUnsafeGetReferenceAcquire:
+      case Intrinsics::kJdkUnsafeGetVolatile:
+      case Intrinsics::kJdkUnsafeGetAcquire:
+      case Intrinsics::kJdkUnsafePutLongOrdered:
+      case Intrinsics::kJdkUnsafePutLongVolatile:
+      case Intrinsics::kJdkUnsafePutLongRelease:
+      case Intrinsics::kJdkUnsafePutObjectOrdered:
+      case Intrinsics::kJdkUnsafePutReferenceVolatile:
+      case Intrinsics::kJdkUnsafePutReferenceRelease:
+      case Intrinsics::kJdkUnsafePutOrdered:
+      case Intrinsics::kJdkUnsafePutVolatile:
+      case Intrinsics::kJdkUnsafePutRelease:
+      case Intrinsics::kJdkUnsafeLoadFence:
+      case Intrinsics::kJdkUnsafeStoreFence:
+      case Intrinsics::kJdkUnsafeFullFence:
+      case Intrinsics::kJdkUnsafeGet:
+      case Intrinsics::kJdkUnsafeGetAbsolute:
+      case Intrinsics::kJdkUnsafeGetLong:
+      case Intrinsics::kJdkUnsafeGetByte:
+      case Intrinsics::kJdkUnsafeGetReference:
+      case Intrinsics::kJdkUnsafePutLong:
+      case Intrinsics::kJdkUnsafePut:
+      case Intrinsics::kJdkUnsafePutAbsolute:
+      case Intrinsics::kJdkUnsafePutReference:
+      case Intrinsics::kJdkUnsafePutByte:
         return 0u;
       case Intrinsics::kFP16Ceil:
+      case Intrinsics::kFP16Compare:
       case Intrinsics::kFP16Floor:
       case Intrinsics::kFP16Greater:
       case Intrinsics::kFP16GreaterEquals:
       case Intrinsics::kFP16Less:
       case Intrinsics::kFP16LessEquals:
+      case Intrinsics::kFP16Min:
+      case Intrinsics::kFP16Max:
       case Intrinsics::kFP16ToFloat:
       case Intrinsics::kFP16ToHalf:
       case Intrinsics::kFP16Rint:
+      case Intrinsics::kUnsafeArrayBaseOffset:
       case Intrinsics::kUnsafeGet:
+      case Intrinsics::kUnsafeGetAbsolute:
       case Intrinsics::kUnsafeGetLong:
+      case Intrinsics::kUnsafeGetByte:
       case Intrinsics::kUnsafeGetObject:
       case Intrinsics::kUnsafePutLong:
       case Intrinsics::kUnsafePut:
+      case Intrinsics::kUnsafePutAbsolute:
       case Intrinsics::kUnsafePutObject:
+      case Intrinsics::kUnsafePutByte:
         return kAccCorePlatformApi;
       default:
         // Remaining intrinsics are public API. We DCHECK that in SetIntrinsic().
@@ -392,94 +412,10 @@ void InitializeDexFileDomain(const DexFile& dex_file, ObjPtr<mirror::ClassLoader
 // considered.
 // This function might print warnings into the log if the member is hidden.
 template<typename T>
-inline bool ShouldDenyAccessToMember(T* member,
-                                     const std::function<AccessContext()>& fn_get_access_context,
-                                     AccessMethod access_method)
-    REQUIRES_SHARED(Locks::mutator_lock_) {
-  DCHECK(member != nullptr);
-
-  // Get the runtime flags encoded in member's access flags.
-  // Note: this works for proxy methods because they inherit access flags from their
-  // respective interface methods.
-  const uint32_t runtime_flags = GetRuntimeFlags(member);
-
-  // Exit early if member is public API. This flag is also set for non-boot class
-  // path fields/methods.
-  if ((runtime_flags & kAccPublicApi) != 0) {
-    return false;
-  }
-
-  // Determine which domain the caller and callee belong to.
-  // This can be *very* expensive. This is why ShouldDenyAccessToMember
-  // should not be called on every individual access.
-  const AccessContext caller_context = fn_get_access_context();
-  const AccessContext callee_context(member->GetDeclaringClass());
-
-  // Non-boot classpath callers should have exited early.
-  DCHECK(!callee_context.IsApplicationDomain());
-
-  // Check if the caller is always allowed to access members in the callee context.
-  if (caller_context.CanAlwaysAccess(callee_context)) {
-    return false;
-  }
-
-  // Check if this is platform accessing core platform. We may warn if `member` is
-  // not part of core platform API.
-  switch (caller_context.GetDomain()) {
-    case Domain::kApplication: {
-      DCHECK(!callee_context.IsApplicationDomain());
-
-      // Exit early if access checks are completely disabled.
-      EnforcementPolicy policy = Runtime::Current()->GetHiddenApiEnforcementPolicy();
-      if (policy == EnforcementPolicy::kDisabled) {
-        return false;
-      }
-
-      // If this is a proxy method, look at the interface method instead.
-      member = detail::GetInterfaceMemberIfProxy(member);
-
-      // Decode hidden API access flags from the dex file.
-      // This is an O(N) operation scaling with the number of fields/methods
-      // in the class. Only do this on slow path and only do it once.
-      ApiList api_list(detail::GetDexFlags(member));
-      DCHECK(api_list.IsValid());
-
-      // Member is hidden and caller is not exempted. Enter slow path.
-      return detail::ShouldDenyAccessToMemberImpl(member, api_list, access_method);
-    }
-
-    case Domain::kPlatform: {
-      DCHECK(callee_context.GetDomain() == Domain::kCorePlatform);
-
-      // Member is part of core platform API. Accessing it is allowed.
-      if ((runtime_flags & kAccCorePlatformApi) != 0) {
-        return false;
-      }
-
-      // Allow access if access checks are disabled.
-      EnforcementPolicy policy = Runtime::Current()->GetCorePlatformApiEnforcementPolicy();
-      if (policy == EnforcementPolicy::kDisabled) {
-        return false;
-      }
-
-      // If this is a proxy method, look at the interface method instead.
-      member = detail::GetInterfaceMemberIfProxy(member);
-
-      // Access checks are not disabled, report the violation.
-      // This may also add kAccCorePlatformApi to the access flags of `member`
-      // so as to not warn again on next access.
-      return detail::HandleCorePlatformApiViolation(member,
-                                                    caller_context,
-                                                    access_method,
-                                                    policy);
-    }
-
-    case Domain::kCorePlatform: {
-      LOG(FATAL) << "CorePlatform domain should be allowed to access all domains";
-      UNREACHABLE();
-    }
-  }
-}
+bool ShouldDenyAccessToMember(T* member,
+                              const std::function<AccessContext()>& fn_get_access_context,
+                              AccessMethod access_method)
+    REQUIRES_SHARED(Locks::mutator_lock_);
 
 // Helper method for callers where access context can be determined beforehand.
 // Wraps AccessContext in a lambda and passes it to the real ShouldDenyAccessToMember.

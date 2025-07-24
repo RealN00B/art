@@ -398,8 +398,7 @@ jvmtiError ExtensionUtil::GetExtensionFunctions(jvmtiEnv* env,
 
   // These require index-ids and debuggable to function
   art::Runtime* runtime = art::Runtime::Current();
-  if (runtime->GetJniIdType() == art::JniIdType::kIndices &&
-      (runtime->GetInstrumentation()->IsForcedInterpretOnly() || runtime->IsJavaDebuggable())) {
+  if (runtime->GetJniIdType() == art::JniIdType::kIndices && IsFullJvmtiAvailable()) {
     // IsStructurallyModifiableClass
     error = add_extension(
         reinterpret_cast<jvmtiExtensionFunction>(Redefiner::IsStructurallyModifiableClass),
@@ -452,38 +451,6 @@ jvmtiError ExtensionUtil::GetExtensionFunctions(jvmtiEnv* env,
       return error;
     }
 
-    // StructurallyRedefineClassDirect
-    error = add_extension(
-        reinterpret_cast<jvmtiExtensionFunction>(Redefiner::StructurallyRedefineClassDirect),
-        "com.android.art.UNSAFE.class.structurally_redefine_class_direct",
-        "Temporary prototype entrypoint for redefining a single class structurally. Currently this"
-        " only supports adding new static fields to a class without any instances."
-        " ClassFileLoadHook events will NOT be triggered. This does not currently support creating"
-        " obsolete methods. This function only has rudimentary error checking. This should not be"
-        " used except for testing.",
-        {
-          { "klass", JVMTI_KIND_IN, JVMTI_TYPE_JCLASS, false },
-          { "new_def", JVMTI_KIND_IN_BUF, JVMTI_TYPE_CCHAR, false },
-          { "new_def_len", JVMTI_KIND_IN, JVMTI_TYPE_JINT, false },
-        },
-        {
-          ERR(CLASS_LOADER_UNSUPPORTED),
-          ERR(FAILS_VERIFICATION),
-          ERR(ILLEGAL_ARGUMENT),
-          ERR(INVALID_CLASS),
-          ERR(MUST_POSSESS_CAPABILITY),
-          ERR(MUST_POSSESS_CAPABILITY),
-          ERR(NULL_POINTER),
-          ERR(OUT_OF_MEMORY),
-          ERR(UNMODIFIABLE_CLASS),
-          ERR(UNSUPPORTED_REDEFINITION_HIERARCHY_CHANGED),
-          ERR(UNSUPPORTED_REDEFINITION_METHOD_ADDED),
-          ERR(UNSUPPORTED_REDEFINITION_METHOD_DELETED),
-          ERR(UNSUPPORTED_REDEFINITION_SCHEMA_CHANGED),
-        });
-    if (error != ERR(NONE)) {
-      return error;
-    }
   } else {
     LOG(INFO) << "debuggable & jni-type indices are required to implement structural "
               << "class redefinition extensions.";
@@ -506,6 +473,58 @@ jvmtiError ExtensionUtil::GetExtensionFunctions(jvmtiEnv* env,
          ERR(NULL_POINTER),
          ERR(ILLEGAL_ARGUMENT),
       });
+  if (error != ERR(NONE)) {
+    return error;
+  }
+  // GetHiddenApiEnforcementPolicy
+  error = add_extension(
+      reinterpret_cast<jvmtiExtensionFunction>(ClassUtil::GetHiddenApiEnforcementPolicy),
+      "com.android.art.misc.get_hidden_api_enforcement_policy",
+      "Gets the current hiddenapi enforcement policy. Policy values are defined in"
+      " `frameworks/base/core/java/android/content/pm/ApplicationInfo.java` as the"
+      " HIDDEN_API_ENFORCEMENT_ static fields. See the comments in `art/runtime/hidden_api.h` for"
+      " more information. This should be used with"
+      " `com.android.art.misc.set_hidden_api_enforcement_policy` in order to restore the"
+      " hidden-api state after temporarily toggling it.",
+      {
+        { "policy", JVMTI_KIND_OUT, JVMTI_TYPE_JINT, false },
+      },
+      {
+         ERR(NULL_POINTER),
+      });
+  if (error != ERR(NONE)) {
+    return error;
+  }
+  // SetHiddenApiEnforcementPolicy
+  error = add_extension(
+      reinterpret_cast<jvmtiExtensionFunction>(ClassUtil::SetHiddenApiEnforcementPolicy),
+      "com.android.art.misc.set_hidden_api_enforcement_policy",
+      "Sets the hiddenapi enforcement policy to the given value. Policy values are defined in"
+      " `frameworks/base/core/java/android/content/pm/ApplicationInfo.java` as the"
+      " HIDDEN_API_ENFORCEMENT_ static fields. See the comments in `art/runtime/hidden_api.h` for"
+      " more information. This API should always be used sparingly and in conjunction with"
+      " `com.android.art.misc.get_hidden_api_enforcement_policy` to temporarily toggle"
+      " hidden-api on and off as changes are required.",
+      {
+        { "policy", JVMTI_KIND_IN, JVMTI_TYPE_JINT, false },
+      },
+      {
+         ERR(ILLEGAL_ARGUMENT),
+      });
+  if (error != ERR(NONE)) {
+    return error;
+  }
+  // DisableHiddenApiEnforcementPolicy
+  error = add_extension(
+      reinterpret_cast<jvmtiExtensionFunction>(ClassUtil::DisableHiddenApiEnforcementPolicy),
+      "com.android.art.misc.disable_hidden_api_enforcement_policy",
+      "Sets the hiddenapi enforcement policy to disabled. This API should always be"
+      " used sparingly and in conjunction with"
+      " `com.android.art.misc.get_hidden_api_enforcement_policy` and"
+      " `com.android.art.misc.set_hidden_api_enforcement_policy` to temporarily"
+      " toggle hidden-api on and off as changes are required.",
+      {},
+      {});
   if (error != ERR(NONE)) {
     return error;
   }
@@ -599,15 +618,16 @@ jvmtiError ExtensionUtil::GetExtensionEvents(jvmtiEnv* env,
   jvmtiError error;
   error = add_extension(
       ArtJvmtiEvent::kDdmPublishChunk,
-      "com.android.art.internal.ddm.publish_chunk",
+      "com.android.art.internal.ddm.publish_chunk_safe",
       "Called when there is new ddms information that the agent or other clients can use. The"
       " agent is given the 'type' of the ddms chunk and a 'data_size' byte-buffer in 'data'."
       " The 'data' pointer is only valid for the duration of the publish_chunk event. The agent"
       " is responsible for interpreting the information present in the 'data' buffer. This is"
       " provided for backwards-compatibility support only. Agents should prefer to use relevant"
-      " JVMTI events and functions above listening for this event.",
+      " JVMTI events and functions above listening for this event. Previous publish_chunk"
+      " event was inherently unsafe since using the JNIEnv could cause deadlocks in some scenarios."
+      " The current version does not have these issues.",
       {
-        { "jni_env", JVMTI_KIND_IN_PTR, JVMTI_TYPE_JNIENV, false },
         { "type", JVMTI_KIND_IN, JVMTI_TYPE_JINT, false },
         { "data_size", JVMTI_KIND_IN, JVMTI_TYPE_JINT, false },
         { "data",  JVMTI_KIND_IN_BUF, JVMTI_TYPE_JBYTE, false },
@@ -650,8 +670,7 @@ jvmtiError ExtensionUtil::GetExtensionEvents(jvmtiEnv* env,
     return error;
   }
   art::Runtime* runtime = art::Runtime::Current();
-  if (runtime->GetJniIdType() == art::JniIdType::kIndices &&
-      (runtime->GetInstrumentation()->IsForcedInterpretOnly() || runtime->IsJavaDebuggable())) {
+  if (runtime->GetJniIdType() == art::JniIdType::kIndices && IsFullJvmtiAvailable()) {
     error = add_extension(
         ArtJvmtiEvent::kStructuralDexFileLoadHook,
         "com.android.art.class.structural_dex_file_load_hook",

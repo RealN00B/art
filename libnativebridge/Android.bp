@@ -1,9 +1,16 @@
+package {
+    // See: http://go/android-license-faq
+    // A large-scale-change added 'default_applicable_licenses' to import
+    // all of the 'license_kinds' from "art_license"
+    // to get the below license kinds:
+    //   SPDX-license-identifier-Apache-2.0
+    default_applicable_licenses: ["art_license"],
+    default_team: "trendy_team_art_mainline",
+}
+
 cc_defaults {
     name: "libnativebridge-defaults",
     defaults: ["art_defaults"],
-    cppflags: [
-        "-fvisibility=protected",
-    ],
     header_libs: [
         "jni_headers",
         "libnativebridge-headers",
@@ -16,12 +23,19 @@ cc_defaults {
 
 cc_library_headers {
     name: "libnativebridge-headers",
-
+    defaults: ["art_defaults"],
     host_supported: true,
     export_include_dirs: ["include"],
+
+    apex_available: [
+        "//apex_available:platform",
+        "com.android.art",
+        "com.android.art.debug",
+        "com.android.media",
+    ],
 }
 
-cc_library {
+art_cc_library {
     name: "libnativebridge",
     defaults: ["libnativebridge-defaults"],
     visibility: [
@@ -30,8 +44,9 @@ cc_library {
         "//frameworks/base/native/webview/loader/libwebviewchromium_loader",
     ],
     apex_available: [
-        "com.android.art.release",
+        "com.android.art",
         "com.android.art.debug",
+        "test_broken_com.android.art",
     ],
 
     host_supported: true,
@@ -47,10 +62,10 @@ cc_library {
 
     target: {
         android: {
-            version_script: "libnativebridge.map.txt",
-        },
-        linux: {
-            version_script: "libnativebridge.map.txt",
+            header_libs: [
+                "libnativeloader-headers", // For dlext_namespaces.h
+            ],
+            shared_libs: ["libdl_android"],
         },
     },
 
@@ -61,7 +76,7 @@ cc_library {
 }
 
 // TODO(b/124250621): eliminate the need for this library
-cc_library {
+cc_library_shared {
     name: "libnativebridge_lazy",
     defaults: ["libnativebridge-defaults"],
     visibility: [
@@ -70,10 +85,21 @@ cc_library {
         "//frameworks/native/opengl/libs",
         "//frameworks/native/vulkan/libvulkan",
     ],
+    apex_available: [
+        "//apex_available:platform",
+        "com.android.media",
+        "com.android.media.swcodec",
+    ],
 
     host_supported: false,
     srcs: ["native_bridge_lazy.cc"],
-    required: ["libnativebridge"],
+    runtime_libs: ["libnativebridge"],
+    shared_libs: ["liblog"],
+
+    // Apply the libnativebridge stub symbol file to the exported symbols from
+    // this shim library, to ensure that any symbols exposed here are also
+    // available as an exported API.
+    version_script: "libnativebridge.map.txt",
 }
 
 subdirs = ["tests"]

@@ -20,6 +20,8 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "base/macros.h"
+
 namespace art {
 
 static constexpr size_t KB = 1024;
@@ -34,9 +36,26 @@ static constexpr int kBitsPerIntPtrT = sizeof(intptr_t) * kBitsPerByte;
 // Required stack alignment
 static constexpr size_t kStackAlignment = 16;
 
-// System page size. We check this against sysconf(_SC_PAGE_SIZE) at runtime, but use a simple
-// compile-time constant so the compiler can generate better code.
-static constexpr int kPageSize = 4096;
+// Minimum supported page size.
+static constexpr size_t kMinPageSize = 4096;
+
+#if defined(ART_PAGE_SIZE_AGNOSTIC)
+static constexpr bool kPageSizeAgnostic = true;
+// Maximum supported page size.
+static constexpr size_t kMaxPageSize = 16384;
+#else
+static constexpr bool kPageSizeAgnostic = false;
+// Maximum supported page size.
+static constexpr size_t kMaxPageSize = kMinPageSize;
+#endif
+
+// Targets can have different page size (eg. 4kB or 16kB). Because Art can crosscompile, it needs
+// to be able to generate OAT (ELF) and other image files with alignment other than the host page
+// size. kElfSegmentAlignment needs to be equal to the largest page size supported. Effectively,
+// this is the value to be used in images files for aligning contents to page size.
+// However, it's temporarily set to 4096 now, to prevent dex2oat from creating sparse files.
+// TODO(b/378794327): Fix this.
+static constexpr size_t kElfSegmentAlignment = kMinPageSize;
 
 // Clion, clang analyzer, etc can falsely believe that "if (kIsDebugBuild)" always
 // returns the same value. By wrapping into a call to another constexpr function, we force it
@@ -71,12 +90,15 @@ static constexpr bool kIsTargetBuild = true;
 # if defined(ART_TARGET_LINUX)
 static constexpr bool kIsTargetLinux = true;
 static constexpr bool kIsTargetFuchsia = false;
+static constexpr bool kIsTargetAndroid = false;
 # elif defined(ART_TARGET_ANDROID)
 static constexpr bool kIsTargetLinux = false;
 static constexpr bool kIsTargetFuchsia = false;
+static constexpr bool kIsTargetAndroid = true;
 # elif defined(ART_TARGET_FUCHSIA)
 static constexpr bool kIsTargetLinux = false;
 static constexpr bool kIsTargetFuchsia = true;
+static constexpr bool kIsTargetAndroid = false;
 # else
 # error "Either ART_TARGET_LINUX, ART_TARGET_ANDROID or ART_TARGET_FUCHSIA " \
         "needs to be defined for target builds."
@@ -92,6 +114,7 @@ static constexpr bool kIsTargetBuild = false;
 # else
 static constexpr bool kIsTargetLinux = false;
 static constexpr bool kIsTargetFuchsia = false;
+static constexpr bool kIsTargetAndroid = false;
 # endif
 #endif
 
@@ -101,6 +124,29 @@ static constexpr bool kIsTargetFuchsia = false;
 static constexpr bool kHostStaticBuildEnabled = true;
 #else
 static constexpr bool kHostStaticBuildEnabled = false;
+#endif
+
+// Within libart, gPageSize should be used to get the page size value once Runtime is initialized.
+// For most other cases MemMap::GetPageSize() should be used instead. However, where MemMap is
+// unavailable e.g. during static initialization or another stage when MemMap isn't yet initialized,
+// or in a component which might operate without MemMap being initialized, the GetPageSizeSlow()
+// would be generally suitable. For performance-sensitive code, GetPageSizeSlow() shouldn't be used
+// without caching the value to remove repeated calls of the function.
+#ifdef ART_PAGE_SIZE_AGNOSTIC
+inline ALWAYS_INLINE size_t GetPageSizeSlow() {
+  static_assert(kPageSizeAgnostic, "The dynamic version is only for page size agnostic build");
+#ifdef __linux__
+  static const size_t page_size = sysconf(_SC_PAGE_SIZE);
+#else
+  static const size_t page_size = 4096;
+#endif
+  return page_size;
+}
+#else
+constexpr size_t GetPageSizeSlow() {
+  static_assert(!kPageSizeAgnostic, "The constexpr version is only for page size agnostic build");
+  return kMinPageSize;
+}
 #endif
 
 }  // namespace art

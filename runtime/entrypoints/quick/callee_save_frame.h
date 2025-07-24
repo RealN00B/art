@@ -19,8 +19,8 @@
 
 #include "arch/instruction_set.h"
 #include "base/callee_save_type.h"
-#include "base/enums.h"
 #include "base/locks.h"
+#include "base/pointer_size.h"
 #include "quick/quick_method_frame_info.h"
 #include "thread-inl.h"
 
@@ -28,10 +28,11 @@
 // specialize the code.
 #include "arch/arm/callee_save_frame_arm.h"
 #include "arch/arm64/callee_save_frame_arm64.h"
+#include "arch/riscv64/callee_save_frame_riscv64.h"
 #include "arch/x86/callee_save_frame_x86.h"
 #include "arch/x86_64/callee_save_frame_x86_64.h"
 
-namespace art {
+namespace art HIDDEN {
 class ArtMethod;
 
 class ScopedQuickEntrypointChecks {
@@ -73,17 +74,29 @@ struct CSFSelector;  // No definition for unspecialized callee save frame select
 
 // Note: kThumb2 is never the kRuntimeISA.
 template <>
-struct CSFSelector<InstructionSet::kArm> { using type = arm::ArmCalleeSaveFrame; };
+struct CSFSelector<InstructionSet::kArm> {
+  using type = arm::ArmCalleeSaveFrame;
+};
 template <>
-struct CSFSelector<InstructionSet::kArm64> { using type = arm64::Arm64CalleeSaveFrame; };
+struct CSFSelector<InstructionSet::kArm64> {
+  using type = arm64::Arm64CalleeSaveFrame;
+};
 template <>
-struct CSFSelector<InstructionSet::kX86> { using type = x86::X86CalleeSaveFrame; };
+struct CSFSelector<InstructionSet::kRiscv64> {
+  using type = riscv64::Riscv64CalleeSaveFrame;
+};
 template <>
-struct CSFSelector<InstructionSet::kX86_64> { using type = x86_64::X86_64CalleeSaveFrame; };
+struct CSFSelector<InstructionSet::kX86> {
+  using type = x86::X86CalleeSaveFrame;
+};
+template <>
+struct CSFSelector<InstructionSet::kX86_64> {
+  using type = x86_64::X86_64CalleeSaveFrame;
+};
 
 }  // namespace detail
 
-using RuntimeCalleeSaveFrame = detail::CSFSelector<kRuntimeISA>::type;
+using RuntimeCalleeSaveFrame = detail::CSFSelector<kRuntimeQuickCodeISA>::type;
 
 }  // namespace art
 

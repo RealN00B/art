@@ -21,9 +21,10 @@
 #include "base/bit_utils.h"
 #include "base/mem_map.h"
 #include "card_table.h"
+#include "gc/collector/mark_compact.h"
 #include "jit/jit_memory_region.h"
 
-namespace art {
+namespace art HIDDEN {
 namespace gc {
 namespace accounting {
 
@@ -32,12 +33,12 @@ Bitmap* Bitmap::CreateFromMemMap(MemMap&& mem_map, size_t num_bits) {
   return new Bitmap(std::move(mem_map), num_bits);
 }
 
-Bitmap::Bitmap(MemMap&& mem_map, size_t bitmap_size)
+Bitmap::Bitmap(MemMap&& mem_map, size_t num_bits)
     : mem_map_(std::move(mem_map)),
       bitmap_begin_(reinterpret_cast<uintptr_t*>(mem_map_.Begin())),
-      bitmap_size_(bitmap_size) {
+      bitmap_numbits_(num_bits) {
   CHECK(bitmap_begin_ != nullptr);
-  CHECK_NE(bitmap_size, 0U);
+  CHECK_NE(num_bits, 0U);
 }
 
 Bitmap::~Bitmap() {
@@ -46,7 +47,7 @@ Bitmap::~Bitmap() {
 
 MemMap Bitmap::AllocateMemMap(const std::string& name, size_t num_bits) {
   const size_t bitmap_size = RoundUp(
-      RoundUp(num_bits, kBitsPerBitmapWord) / kBitsPerBitmapWord * sizeof(uintptr_t), kPageSize);
+      RoundUp(num_bits, kBitsPerBitmapWord) / kBitsPerBitmapWord * sizeof(uintptr_t), gPageSize);
   std::string error_msg;
   MemMap mem_map = MemMap::MapAnonymous(name.c_str(),
                                         bitmap_size,
@@ -98,6 +99,7 @@ MemoryRangeBitmap<kAlignment>* MemoryRangeBitmap<kAlignment>::CreateFromMemMap(
 
 template class MemoryRangeBitmap<CardTable::kCardSize>;
 template class MemoryRangeBitmap<jit::kJitCodeAccountingBytes>;
+template class MemoryRangeBitmap<collector::MarkCompact::kAlignment>;
 
 }  // namespace accounting
 }  // namespace gc

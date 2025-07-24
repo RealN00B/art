@@ -18,22 +18,25 @@
 
 #include "code_generator.h"
 #include "common_arm.h"
+#include "instruction_simplifier.h"
 #include "instruction_simplifier_shared.h"
 #include "mirror/array-inl.h"
 #include "mirror/string.h"
 #include "nodes.h"
 
-namespace art {
+namespace art HIDDEN {
 
 using helpers::CanFitInShifterOperand;
 using helpers::HasShifterOperand;
+using helpers::IsSubRightSubLeftShl;
 
 namespace arm {
 
-class InstructionSimplifierArmVisitor : public HGraphVisitor {
+class InstructionSimplifierArmVisitor final : public HGraphVisitor {
  public:
-  InstructionSimplifierArmVisitor(HGraph* graph, OptimizingCompilerStats* stats)
-      : HGraphVisitor(graph), stats_(stats) {}
+  InstructionSimplifierArmVisitor(
+      HGraph* graph, CodeGenerator* codegen, OptimizingCompilerStats* stats)
+      : HGraphVisitor(graph), codegen_(codegen), stats_(stats) {}
 
  private:
   void RecordSimplification() {
@@ -71,11 +74,14 @@ class InstructionSimplifierArmVisitor : public HGraphVisitor {
   void VisitArraySet(HArraySet* instruction) override;
   void VisitMul(HMul* instruction) override;
   void VisitOr(HOr* instruction) override;
+  void VisitRol(HRol* instruction) override;
   void VisitShl(HShl* instruction) override;
   void VisitShr(HShr* instruction) override;
+  void VisitSub(HSub* instruction) override;
   void VisitTypeConversion(HTypeConversion* instruction) override;
   void VisitUShr(HUShr* instruction) override;
 
+  CodeGenerator* codegen_;
   OptimizingCompilerStats* stats_;
 };
 
@@ -215,7 +221,8 @@ void InstructionSimplifierArmVisitor::VisitArrayGet(HArrayGet* instruction) {
     return;
   }
 
-  if (TryExtractArrayAccessAddress(instruction,
+  if (TryExtractArrayAccessAddress(codegen_,
+                                   instruction,
                                    instruction->GetArray(),
                                    instruction->GetIndex(),
                                    data_offset)) {
@@ -236,7 +243,8 @@ void InstructionSimplifierArmVisitor::VisitArraySet(HArraySet* instruction) {
     return;
   }
 
-  if (TryExtractArrayAccessAddress(instruction,
+  if (TryExtractArrayAccessAddress(codegen_,
+                                   instruction,
                                    instruction->GetArray(),
                                    instruction->GetIndex(),
                                    data_offset)) {
@@ -256,6 +264,11 @@ void InstructionSimplifierArmVisitor::VisitOr(HOr* instruction) {
   }
 }
 
+void InstructionSimplifierArmVisitor::VisitRol(HRol* instruction) {
+  UnfoldRotateLeft(instruction);
+  RecordSimplification();
+}
+
 void InstructionSimplifierArmVisitor::VisitShl(HShl* instruction) {
   if (instruction->InputAt(1)->IsConstant()) {
     TryMergeIntoUsersShifterOperand(instruction);
@@ -265,6 +278,21 @@ void InstructionSimplifierArmVisitor::VisitShl(HShl* instruction) {
 void InstructionSimplifierArmVisitor::VisitShr(HShr* instruction) {
   if (instruction->InputAt(1)->IsConstant()) {
     TryMergeIntoUsersShifterOperand(instruction);
+  }
+}
+
+void InstructionSimplifierArmVisitor::VisitSub(HSub* instruction) {
+  if (IsSubRightSubLeftShl(instruction)) {
+    HInstruction* shl = instruction->GetRight()->InputAt(0);
+    if (shl->InputAt(1)->IsConstant() && TryReplaceSubSubWithSubAdd(instruction)) {
+      if (TryMergeIntoUsersShifterOperand(shl)) {
+        return;
+      }
+    }
+  }
+
+  if (TryMergeWithAnd(instruction)) {
+    return;
   }
 }
 
@@ -289,7 +317,7 @@ void InstructionSimplifierArmVisitor::VisitUShr(HUShr* instruction) {
 }
 
 bool InstructionSimplifierArm::Run() {
-  InstructionSimplifierArmVisitor visitor(graph_, stats_);
+  InstructionSimplifierArmVisitor visitor(graph_, codegen_, stats_);
   visitor.VisitReversePostOrder();
   return true;
 }

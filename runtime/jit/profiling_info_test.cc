@@ -14,6 +14,8 @@
  * limitations under the License.
  */
 
+#include "profiling_info.h"
+
 #include <gtest/gtest.h>
 #include <stdio.h>
 
@@ -30,9 +32,10 @@
 #include "mirror/class-inl.h"
 #include "mirror/class_loader.h"
 #include "profile/profile_compilation_info.h"
+#include "profile/profile_test_helper.h"
 #include "scoped_thread_state_change-inl.h"
 
-namespace art {
+namespace art HIDDEN {
 
 using Hotness = ProfileCompilationInfo::MethodHotness;
 
@@ -43,15 +46,14 @@ class ProfileCompilationInfoTest : public CommonRuntimeTest {
   }
 
  protected:
-  std::vector<ArtMethod*> GetVirtualMethods(jobject class_loader,
-                                            const std::string& clazz) {
+  std::vector<ArtMethod*> GetVirtualMethods(jobject class_loader, const char* clazz) {
     ClassLinker* class_linker = Runtime::Current()->GetClassLinker();
     Thread* self = Thread::Current();
     ScopedObjectAccess soa(self);
     StackHandleScope<1> hs(self);
     Handle<mirror::ClassLoader> h_loader(
         hs.NewHandle(self->DecodeJObject(class_loader)->AsClassLoader()));
-    ObjPtr<mirror::Class> klass = class_linker->FindClass(self, clazz.c_str(), h_loader);
+    ObjPtr<mirror::Class> klass = FindClass(clazz, h_loader);
 
     const auto pointer_size = class_linker->GetImagePointerSize();
     std::vector<ArtMethod*> methods;
@@ -71,6 +73,7 @@ class ProfileCompilationInfoTest : public CommonRuntimeTest {
       Hotness::Flag flags) {
     ProfileCompilationInfo info;
     std::vector<ProfileMethodInfo> profile_methods;
+    profile_methods.reserve(methods.size());
     ScopedObjectAccess soa(Thread::Current());
     for (ArtMethod* method : methods) {
       profile_methods.emplace_back(
@@ -140,7 +143,10 @@ class ProfileCompilationInfoTest : public CommonRuntimeTest {
       profile_methods_map->Put(method, pmi);
     }
 
-    if (!info.AddMethods(profile_methods, flags)
+    if (!info.AddMethods(profile_methods,
+                         flags,
+                         ProfileCompilationInfo::ProfileSampleAnnotation::kNone,
+                         /*is_test=*/ true)
         || info.GetNumberOfMethods() != profile_methods.size()) {
       return false;
     }
@@ -152,35 +158,6 @@ class ProfileCompilationInfoTest : public CommonRuntimeTest {
     used_inline_caches.emplace_back(new ProfileCompilationInfo::InlineCacheMap(
         std::less<uint16_t>(), allocator_->Adapter(kArenaAllocProfile)));
     return used_inline_caches.back().get();
-  }
-
-  ProfileCompilationInfo::OfflineProfileMethodInfo ConvertProfileMethodInfo(
-        const ProfileMethodInfo& pmi) {
-    ProfileCompilationInfo::InlineCacheMap* ic_map = CreateInlineCacheMap();
-    ProfileCompilationInfo::OfflineProfileMethodInfo offline_pmi(ic_map);
-    SafeMap<DexFile*, uint8_t> dex_map;  // dex files to profile index
-    for (const auto& inline_cache : pmi.inline_caches) {
-      ProfileCompilationInfo::DexPcData& dex_pc_data =
-          ic_map->FindOrAdd(
-              inline_cache.dex_pc, ProfileCompilationInfo::DexPcData(allocator_.get()))->second;
-      if (inline_cache.is_missing_types) {
-        dex_pc_data.SetIsMissingTypes();
-      }
-      for (const auto& class_ref : inline_cache.classes) {
-        uint8_t dex_profile_index = dex_map.FindOrAdd(const_cast<DexFile*>(class_ref.dex_file),
-                                                      static_cast<uint8_t>(dex_map.size()))->second;
-        dex_pc_data.AddClass(dex_profile_index, class_ref.TypeIndex());
-        if (dex_profile_index >= offline_pmi.dex_references.size()) {
-          // This is a new dex.
-          const std::string& dex_key = ProfileCompilationInfo::GetProfileDexFileBaseKey(
-              class_ref.dex_file->GetLocation());
-          offline_pmi.dex_references.emplace_back(dex_key,
-                                                  class_ref.dex_file->GetLocationChecksum(),
-                                                  class_ref.dex_file->NumMethodIds());
-        }
-      }
-    }
-    return offline_pmi;
   }
 
   // Cannot sizeof the actual arrays so hard code the values here.
@@ -216,7 +193,7 @@ TEST_F(ProfileCompilationInfoTest, SaveArtMethods) {
 
   // Check that what we saved is in the profile.
   ProfileCompilationInfo info1;
-  ASSERT_TRUE(info1.Load(GetFd(profile)));
+  ASSERT_TRUE(info1.Load(profile.GetFilename(), /*clear_if_invalid=*/false));
   ASSERT_EQ(info1.GetNumberOfMethods(), main_methods.size());
   {
     ScopedObjectAccess soa(self);
@@ -236,8 +213,7 @@ TEST_F(ProfileCompilationInfoTest, SaveArtMethods) {
 
   // Check that what we saved is in the profile (methods form Main and Second).
   ProfileCompilationInfo info2;
-  ASSERT_TRUE(profile.GetFile()->ResetOffset());
-  ASSERT_TRUE(info2.Load(GetFd(profile)));
+  ASSERT_TRUE(info2.Load(profile.GetFilename(), /*clear_if_invalid=*/false));
   ASSERT_EQ(info2.GetNumberOfMethods(), main_methods.size() + second_methods.size());
   {
     ScopedObjectAccess soa(self);
@@ -277,7 +253,7 @@ TEST_F(ProfileCompilationInfoTest, SaveArtMethodsWithInlineCaches) {
 
   // Check that what we saved is in the profile.
   ProfileCompilationInfo info;
-  ASSERT_TRUE(info.Load(GetFd(profile)));
+  ASSERT_TRUE(info.Load(profile.GetFilename(), /*clear_if_invalid=*/false));
   ASSERT_EQ(info.GetNumberOfMethods(), main_methods.size());
   {
     ScopedObjectAccess soa(self);
@@ -287,12 +263,10 @@ TEST_F(ProfileCompilationInfoTest, SaveArtMethodsWithInlineCaches) {
       ASSERT_TRUE(h.IsHot());
       ASSERT_TRUE(h.IsStartup());
       const ProfileMethodInfo& pmi = profile_methods_map.find(m)->second;
-      std::unique_ptr<ProfileCompilationInfo::OfflineProfileMethodInfo> offline_pmi =
-          info.GetHotMethodInfo(method_ref);
-      ASSERT_TRUE(offline_pmi != nullptr);
-      ProfileCompilationInfo::OfflineProfileMethodInfo converted_pmi =
-          ConvertProfileMethodInfo(pmi);
-      ASSERT_EQ(converted_pmi, *offline_pmi);
+      ProfileCompilationInfo::MethodHotness offline_hotness = info.GetMethodHotness(method_ref);
+      ASSERT_TRUE(offline_hotness.IsHot());
+      ASSERT_TRUE(ProfileTestHelper::EqualInlineCaches(
+                      pmi.inline_caches, method_ref.dex_file, offline_hotness, info));
     }
   }
 }

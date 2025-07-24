@@ -17,9 +17,12 @@
 #ifndef ART_COMPILER_OPTIMIZING_INSTRUCTION_SIMPLIFIER_SHARED_H_
 #define ART_COMPILER_OPTIMIZING_INSTRUCTION_SIMPLIFIER_SHARED_H_
 
+#include "base/macros.h"
 #include "nodes.h"
 
-namespace art {
+namespace art HIDDEN {
+
+class CodeGenerator;
 
 namespace helpers {
 
@@ -47,19 +50,40 @@ inline bool HasShifterOperand(HInstruction* instr, InstructionSet isa) {
   return res;
 }
 
+// Check the specified sub is the last operation of the sequence:
+//   t1 = Shl
+//   t2 = Sub(t1, *)
+//   t3 = Sub(*, t2)
+inline bool IsSubRightSubLeftShl(HSub *sub) {
+  HInstruction* right = sub->GetRight();
+  return right->IsSub() && right->AsSub()->GetLeft()->IsShl();
+}
+
 }  // namespace helpers
 
 bool TryCombineMultiplyAccumulate(HMul* mul, InstructionSet isa);
-// For bitwise operations (And/Or/Xor) with a negated input, try to use
-// a negated bitwise instruction.
-bool TryMergeNegatedInput(HBinaryOperation* op);
 
-bool TryExtractArrayAccessAddress(HInstruction* access,
+bool TryExtractArrayAccessAddress(CodeGenerator* codegen,
+                                  HInstruction* access,
                                   HInstruction* array,
                                   HInstruction* index,
                                   size_t data_offset);
 
 bool TryExtractVecArrayAccessAddress(HVecMemoryOperation* access, HInstruction* index);
+
+// Try to replace
+//   Sub(c, Sub(a, b))
+// with
+//   Add(c, Sub(b, a))
+bool TryReplaceSubSubWithSubAdd(HSub* last_sub);
+
+// ARM does not contain instruction ROL so replace
+//   ROL dest, a, distance
+// with
+//   NEG neg, distance
+//   ROR dest, a, neg
+// before GVN to give it a chance to deduplicate the instructions, if it's able.
+void UnfoldRotateLeft(HRol* rol);
 
 }  // namespace art
 

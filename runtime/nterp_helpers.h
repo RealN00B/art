@@ -17,17 +17,12 @@
 #ifndef ART_RUNTIME_NTERP_HELPERS_H_
 #define ART_RUNTIME_NTERP_HELPERS_H_
 
+#include "base/macros.h"
 #include "quick/quick_method_frame_info.h"
 
-namespace art {
+namespace art HIDDEN {
 
 class ArtMethod;
-
-/**
- * The frame size nterp will use for the given method.
- */
-size_t NterpGetFrameSize(ArtMethod* method)
-    REQUIRES_SHARED(Locks::mutator_lock_);
 
 /**
  * Returns the QuickMethodFrameInfo of the given frame corresponding to the
@@ -73,6 +68,18 @@ uint32_t NterpGetVReg(ArtMethod** frame, uint16_t vreg)
  */
 uint32_t NterpGetVRegReference(ArtMethod** frame, uint16_t vreg)
     REQUIRES_SHARED(Locks::mutator_lock_);
+
+/**
+ * Returns whether the given method can run with nterp. The instruction set can
+ * be passed for cross-compilation.
+ */
+EXPORT bool CanMethodUseNterp(ArtMethod* method, InstructionSet isa = kRuntimeQuickCodeISA)
+    REQUIRES_SHARED(Locks::mutator_lock_);
+
+/**
+ * Returns kAccNterpInvokeFastPathFlag and/or kAccNterpEntryPointFastPathFlag, if appropriate.
+ */
+uint32_t GetNterpFastPathFlags(std::string_view shorty, uint32_t access_flags, InstructionSet isa);
 
 }  // namespace art
 

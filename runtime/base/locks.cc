@@ -30,7 +30,7 @@
 #include "scoped_thread_state_change-inl.h"
 #include "thread-inl.h"
 
-namespace art {
+namespace art HIDDEN {
 
 static Atomic<Locks::ClientCallback*> safe_to_call_abort_callback(nullptr);
 
@@ -64,6 +64,7 @@ Mutex* Locks::runtime_shutdown_lock_ = nullptr;
 Mutex* Locks::runtime_thread_pool_lock_ = nullptr;
 Mutex* Locks::cha_lock_ = nullptr;
 Mutex* Locks::jit_lock_ = nullptr;
+ReaderWriterMutex* Locks::jit_mutator_lock_ = nullptr;
 Mutex* Locks::subtype_check_lock_ = nullptr;
 Mutex* Locks::thread_list_lock_ = nullptr;
 ConditionVariable* Locks::thread_exit_cond_ = nullptr;
@@ -74,6 +75,7 @@ Mutex* Locks::user_code_suspension_lock_ = nullptr;
 Uninterruptible Roles::uninterruptible_;
 ReaderWriterMutex* Locks::jni_globals_lock_ = nullptr;
 Mutex* Locks::jni_weak_globals_lock_ = nullptr;
+Mutex* Locks::dex_cache_lock_ = nullptr;
 ReaderWriterMutex* Locks::dex_lock_ = nullptr;
 Mutex* Locks::native_debug_interface_lock_ = nullptr;
 ReaderWriterMutex* Locks::jni_id_lock_ = nullptr;
@@ -91,7 +93,7 @@ static void BackOff(uint32_t i) {
     volatile uint32_t x = 0;
     const uint32_t spin_count = 10 * i;
     for (uint32_t spin = 0; spin < spin_count; ++spin) {
-      ++x;  // Volatile; hence should not be optimized away.
+      x = x + 1;  // Volatile; hence should not be optimized away.
     }
     // TODO: Consider adding x86 PAUSE and/or ARM YIELD here.
   } else if (i <= kYieldMax) {
@@ -150,6 +152,7 @@ void Locks::Init() {
     DCHECK(profiler_lock_ != nullptr);
     DCHECK(cha_lock_ != nullptr);
     DCHECK(jit_lock_ != nullptr);
+    DCHECK(jit_mutator_lock_ != nullptr);
     DCHECK(subtype_check_lock_ != nullptr);
     DCHECK(thread_list_lock_ != nullptr);
     DCHECK(thread_suspend_count_lock_ != nullptr);
@@ -215,10 +218,6 @@ void Locks::Init() {
     DCHECK(thread_list_lock_ == nullptr);
     thread_list_lock_ = new Mutex("thread list lock", current_lock_level);
 
-    UPDATE_CURRENT_LOCK_LEVEL(kJniLoadLibraryLock);
-    DCHECK(jni_libraries_lock_ == nullptr);
-    jni_libraries_lock_ = new Mutex("JNI shared libraries map lock", current_lock_level);
-
     UPDATE_CURRENT_LOCK_LEVEL(kBreakpointLock);
     DCHECK(breakpoint_lock_ == nullptr);
     breakpoint_lock_ = new ReaderWriterMutex("breakpoint lock", current_lock_level);
@@ -249,6 +248,14 @@ void Locks::Init() {
     UPDATE_CURRENT_LOCK_LEVEL(kDexLock);
     DCHECK(dex_lock_ == nullptr);
     dex_lock_ = new ReaderWriterMutex("ClassLinker dex lock", current_lock_level);
+
+    UPDATE_CURRENT_LOCK_LEVEL(kDexCacheLock);
+    DCHECK(dex_cache_lock_ == nullptr);
+    dex_cache_lock_ = new Mutex("DexCache lock", current_lock_level);
+
+    UPDATE_CURRENT_LOCK_LEVEL(kJniLoadLibraryLock);
+    DCHECK(jni_libraries_lock_ == nullptr);
+    jni_libraries_lock_ = new Mutex("JNI shared libraries map lock", current_lock_level);
 
     UPDATE_CURRENT_LOCK_LEVEL(kOatFileManagerLock);
     DCHECK(oat_file_manager_lock_ == nullptr);
@@ -311,7 +318,10 @@ void Locks::Init() {
     DCHECK(jit_lock_ == nullptr);
     jit_lock_ = new Mutex("Jit code cache", current_lock_level);
 
-    UPDATE_CURRENT_LOCK_LEVEL(kCHALock);
+    UPDATE_CURRENT_LOCK_LEVEL(kJitCodeCacheMutatorAndCHALock);
+    DCHECK(jit_mutator_lock_ == nullptr);
+    jit_mutator_lock_ = new ReaderWriterMutex("Jit code cache for mutator", current_lock_level);
+
     DCHECK(cha_lock_ == nullptr);
     cha_lock_ = new Mutex("CHA lock", current_lock_level);
 

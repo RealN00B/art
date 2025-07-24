@@ -20,7 +20,7 @@
 #include "mirror/object-inl.h"
 #include "monitor.h"
 
-namespace art {
+namespace art HIDDEN {
 
 template <typename T>
 ObjectLock<T>::ObjectLock(Thread* self, Handle<T> object) : self_(self), obj_(object) {
@@ -35,7 +35,7 @@ ObjectLock<T>::~ObjectLock() {
 
 template <typename T>
 void ObjectLock<T>::WaitIgnoringInterrupts() {
-  Monitor::Wait(self_, obj_.Get(), 0, 0, false, kWaiting);
+  Monitor::Wait(self_, obj_.Get(), 0, 0, false, ThreadState::kWaiting);
 }
 
 template <typename T>

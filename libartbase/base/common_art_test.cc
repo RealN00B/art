@@ -20,18 +20,22 @@
 #include <dlfcn.h>
 #include <fcntl.h>
 #include <ftw.h>
+#include <libgen.h>
 #include <stdlib.h>
+#include <sys/capability.h>
 #include <unistd.h>
+
 #include <cstdio>
 #include <filesystem>
+#include <functional>
+
 #include "android-base/file.h"
 #include "android-base/logging.h"
-#include "nativehelper/scoped_local_ref.h"
-
+#include "android-base/process.h"
+#include "android-base/scopeguard.h"
 #include "android-base/stringprintf.h"
 #include "android-base/strings.h"
 #include "android-base/unique_fd.h"
-
 #include "art_field-inl.h"
 #include "base/file_utils.h"
 #include "base/logging.h"
@@ -40,19 +44,22 @@
 #include "base/mutex.h"
 #include "base/os.h"
 #include "base/runtime_debug.h"
+#include "base/scoped_cap.h"
 #include "base/stl_util.h"
+#include "base/testing.h"
 #include "base/unix_file/fd_file.h"
 #include "dex/art_dex_file_loader.h"
 #include "dex/dex_file-inl.h"
 #include "dex/dex_file_loader.h"
 #include "dex/primitive.h"
 #include "gtest/gtest.h"
+#include "nativehelper/scoped_local_ref.h"
 
 namespace art {
 
 using android::base::StringPrintf;
 
-ScratchDir::ScratchDir() {
+ScratchDir::ScratchDir(bool keep_files) : keep_files_(keep_files) {
   // ANDROID_DATA needs to be set
   CHECK_NE(static_cast<char*>(nullptr), getenv("ANDROID_DATA")) <<
       "Are you subclassing RuntimeTest?";
@@ -64,15 +71,9 @@ ScratchDir::ScratchDir() {
 }
 
 ScratchDir::~ScratchDir() {
-  // Recursively delete the directory and all its content.
-  nftw(path_.c_str(), [](const char* name, const struct stat*, int type, struct FTW *) {
-    if (type == FTW_F) {
-      unlink(name);
-    } else if (type == FTW_DP) {
-      rmdir(name);
-    }
-    return 0;
-  }, 256 /* max open file descriptors */, FTW_DEPTH);
+  if (!keep_files_) {
+    std::filesystem::remove_all(path_);
+  }
 }
 
 ScratchFile::ScratchFile() {
@@ -122,10 +123,11 @@ int ScratchFile::GetFd() const {
 }
 
 void ScratchFile::Close() {
-  if (file_.get() != nullptr) {
+  if (file_ != nullptr) {
     if (file_->FlushCloseOrErase() != 0) {
       PLOG(WARNING) << "Error closing scratch file.";
     }
+    file_.reset();
   }
 }
 
@@ -138,62 +140,140 @@ void ScratchFile::Unlink() {
   CHECK_EQ(0, unlink_result);
 }
 
+// Temporarily drops all root capabilities when the test is run as root. This is a noop otherwise.
+android::base::ScopeGuard<std::function<void()>> ScopedUnroot() {
+  ScopedCap old_cap(cap_get_proc());
+  CHECK_NE(old_cap.Get(), nullptr);
+  ScopedCap new_cap(cap_dup(old_cap.Get()));
+  CHECK_NE(new_cap.Get(), nullptr);
+  CHECK_EQ(cap_clear_flag(new_cap.Get(), CAP_EFFECTIVE), 0);
+  CHECK_EQ(cap_set_proc(new_cap.Get()), 0);
+  // `old_cap` is actually not shared with anyone else, but we have to wrap it with a `shared_ptr`
+  // because `std::function` requires captures to be copyable.
+  return android::base::make_scope_guard(
+      [old_cap = std::make_shared<ScopedCap>(std::move(old_cap))]() {
+        CHECK_EQ(cap_set_proc(old_cap->Get()), 0);
+      });
+}
+
+// Temporarily drops write permission on a file/directory.
+android::base::ScopeGuard<std::function<void()>> ScopedInaccessible(const std::string& path) {
+  std::filesystem::perms old_perms = std::filesystem::status(path).permissions();
+  std::filesystem::permissions(path, std::filesystem::perms::none);
+  return android::base::make_scope_guard([=]() { std::filesystem::permissions(path, old_perms); });
+}
+
+std::string CommonArtTestImpl::GetAndroidBuildTop() {
+  CHECK(IsHost());
+  std::string android_build_top;
+
+  // Look at how we were invoked to find the expected directory.
+  std::string argv;
+  if (android::base::ReadFileToString("/proc/self/cmdline", &argv)) {
+    // /proc/self/cmdline is the programs 'argv' with elements delimited by '\0'.
+    std::filesystem::path path(argv.substr(0, argv.find('\0')));
+    path = std::filesystem::absolute(path);
+    // Walk up until we find the one of the well-known directories.
+    for (; path.parent_path() != path; path = path.parent_path()) {
+      // We are running tests from out/host/linux-x86 on developer machine.
+      if (path.filename() == std::filesystem::path("linux-x86")) {
+        android_build_top = path.parent_path().parent_path().parent_path();
+        break;
+      }
+      // We are running tests from testcases (extracted from zip) on tradefed.
+      // The first path is for remote runs and the second path for local runs.
+      if (path.filename() == std::filesystem::path("testcases") ||
+          path.filename().string().starts_with("host_testcases")) {
+        android_build_top = path.append("art_common");
+        break;
+      }
+    }
+  }
+  CHECK(!android_build_top.empty());
+
+  // Check that the expected directory matches the environment variable.
+  const char* android_build_top_from_env = getenv("ANDROID_BUILD_TOP");
+  android_build_top = std::filesystem::path(android_build_top).string();
+  CHECK(!android_build_top.empty());
+  if (android_build_top_from_env != nullptr) {
+    if (std::filesystem::weakly_canonical(android_build_top).string() !=
+        std::filesystem::weakly_canonical(android_build_top_from_env).string()) {
+      android_build_top = android_build_top_from_env;
+    }
+  } else {
+    setenv("ANDROID_BUILD_TOP", android_build_top.c_str(), /*overwrite=*/0);
+  }
+  if (android_build_top.back() != '/') {
+    android_build_top += '/';
+  }
+  return android_build_top;
+}
+
+std::string CommonArtTestImpl::GetAndroidHostOut() {
+  CHECK(IsHost());
+
+  // Check that the expected directory matches the environment variable.
+  // ANDROID_HOST_OUT is set by envsetup or unset and is the full path to host binaries/libs
+  const char* android_host_out_from_env = getenv("ANDROID_HOST_OUT");
+  // OUT_DIR is a user-settable ENV_VAR that controls where soong puts build artifacts. It can
+  // either be relative to ANDROID_BUILD_TOP or a concrete path.
+  const char* android_out_dir = getenv("OUT_DIR");
+  // Take account of OUT_DIR setting.
+  if (android_out_dir == nullptr) {
+    android_out_dir = "out";
+  }
+  std::string android_host_out;
+  if (android_out_dir[0] == '/') {
+    android_host_out = (std::filesystem::path(android_out_dir) / "host" / "linux-x86").string();
+  } else {
+    android_host_out =
+        (std::filesystem::path(GetAndroidBuildTop()) / android_out_dir / "host" / "linux-x86")
+            .string();
+  }
+  std::filesystem::path expected(android_host_out);
+  if (android_host_out_from_env != nullptr) {
+    std::filesystem::path from_env(std::filesystem::weakly_canonical(android_host_out_from_env));
+    if (std::filesystem::weakly_canonical(expected).string() != from_env.string()) {
+      LOG(WARNING) << "Execution path (" << expected << ") not below ANDROID_HOST_OUT ("
+                   << from_env << ")! Using env-var.";
+      expected = from_env;
+    }
+  } else {
+    setenv("ANDROID_HOST_OUT", android_host_out.c_str(), /*overwrite=*/0);
+  }
+  return expected.string();
+}
+
+std::string CommonArtTestImpl::GetHostBootClasspathInstallRoot() {
+  CHECK(IsHost());
+  std::string build_install_root = GetAndroidHostOut() + "/testcases/art_common/out/host/linux-x86";
+  // Look for the `apex` subdirectory as a discriminator to check the location.
+  if (OS::DirectoryExists((build_install_root + "/apex").c_str())) {
+    // This is the path where "m art-host-tests" installs support files for host
+    // tests, so use it when the tests are run in a build tree (which is the
+    // case when testing locally).
+    return build_install_root;
+  }
+  if (OS::DirectoryExists((GetAndroidRoot() + "/apex").c_str())) {
+    // This is the location for host tests in CI when the files are unzipped
+    // from art-host-tests.zip.
+    return GetAndroidRoot();
+  }
+  LOG(ERROR) << "Neither location has a boot classpath (forgot \"m art-host-tests\"?): "
+             << build_install_root << " or " << GetAndroidRoot();
+  return "<no boot classpath found>";
+}
+
 void CommonArtTestImpl::SetUpAndroidRootEnvVars() {
   if (IsHost()) {
-    // Make sure that ANDROID_BUILD_TOP is set. If not, set it from CWD.
-    const char* android_build_top_from_env = getenv("ANDROID_BUILD_TOP");
-    if (android_build_top_from_env == nullptr) {
-      // Not set by build server, so default to current directory.
-      char* cwd = getcwd(nullptr, 0);
-      setenv("ANDROID_BUILD_TOP", cwd, 1);
-      free(cwd);
-      android_build_top_from_env = getenv("ANDROID_BUILD_TOP");
-    }
-
-    const char* android_host_out_from_env = getenv("ANDROID_HOST_OUT");
-    if (android_host_out_from_env == nullptr) {
-      // Not set by build server, so default to the usual value of
-      // ANDROID_HOST_OUT.
-      std::string android_host_out;
-#if defined(__linux__)
-      // Fallback
-      android_host_out = std::string(android_build_top_from_env) + "/out/host/linux-x86";
-      // Look at how we were invoked
-      std::string argv;
-      if (android::base::ReadFileToString("/proc/self/cmdline", &argv)) {
-        // /proc/self/cmdline is the programs 'argv' with elements delimited by '\0'.
-        std::string cmdpath(argv.substr(0, argv.find('\0')));
-        std::filesystem::path path(cmdpath);
-        // If the path is relative then prepend the android_build_top_from_env to it
-        if (path.is_relative()) {
-          path = std::filesystem::path(android_build_top_from_env).append(cmdpath);
-          DCHECK(path.is_absolute()) << path;
-        }
-        // Walk up until we find the linux-x86 directory or we hit the root directory.
-        while (path.has_parent_path() && path.parent_path() != path &&
-               path.filename() != std::filesystem::path("linux-x86")) {
-          path = path.parent_path();
-        }
-        // If we found a linux-x86 directory path is now android_host_out
-        if (path.filename() == std::filesystem::path("linux-x86")) {
-          android_host_out = path.string();
-        }
-      }
-#elif defined(__APPLE__)
-      android_host_out = std::string(android_build_top_from_env) + "/out/host/darwin-x86";
-#else
-#error unsupported OS
-#endif
-      setenv("ANDROID_HOST_OUT", android_host_out.c_str(), 1);
-      android_host_out_from_env = getenv("ANDROID_HOST_OUT");
-    }
+    std::string android_host_out = GetAndroidHostOut();
 
     // Environment variable ANDROID_ROOT is set on the device, but not
     // necessarily on the host.
     const char* android_root_from_env = getenv("ANDROID_ROOT");
     if (android_root_from_env == nullptr) {
       // Use ANDROID_HOST_OUT for ANDROID_ROOT.
-      setenv("ANDROID_ROOT", android_host_out_from_env, 1);
+      setenv("ANDROID_ROOT", android_host_out.c_str(), 1);
       android_root_from_env = getenv("ANDROID_ROOT");
     }
 
@@ -203,7 +283,7 @@ void CommonArtTestImpl::SetUpAndroidRootEnvVars() {
     const char* android_i18n_root_from_env = getenv("ANDROID_I18N_ROOT");
     if (android_i18n_root_from_env == nullptr) {
       // Use ${ANDROID_I18N_OUT}/com.android.i18n for ANDROID_I18N_ROOT.
-      std::string android_i18n_root = android_host_out_from_env;
+      std::string android_i18n_root = android_host_out;
       android_i18n_root += "/com.android.i18n";
       setenv("ANDROID_I18N_ROOT", android_i18n_root.c_str(), 1);
     }
@@ -214,7 +294,7 @@ void CommonArtTestImpl::SetUpAndroidRootEnvVars() {
     const char* android_art_root_from_env = getenv("ANDROID_ART_ROOT");
     if (android_art_root_from_env == nullptr) {
       // Use ${ANDROID_HOST_OUT}/com.android.art for ANDROID_ART_ROOT.
-      std::string android_art_root = android_host_out_from_env;
+      std::string android_art_root = android_host_out;
       android_art_root += "/com.android.art";
       setenv("ANDROID_ART_ROOT", android_art_root.c_str(), 1);
     }
@@ -225,7 +305,7 @@ void CommonArtTestImpl::SetUpAndroidRootEnvVars() {
     const char* android_tzdata_root_from_env = getenv("ANDROID_TZDATA_ROOT");
     if (android_tzdata_root_from_env == nullptr) {
       // Use ${ANDROID_HOST_OUT}/com.android.tzdata for ANDROID_TZDATA_ROOT.
-      std::string android_tzdata_root = android_host_out_from_env;
+      std::string android_tzdata_root = android_host_out;
       android_tzdata_root += "/com.android.tzdata";
       setenv("ANDROID_TZDATA_ROOT", android_tzdata_root.c_str(), 1);
     }
@@ -235,7 +315,6 @@ void CommonArtTestImpl::SetUpAndroidRootEnvVars() {
 }
 
 void CommonArtTestImpl::SetUpAndroidDataDir(std::string& android_data) {
-  // On target, Cannot use /mnt/sdcard because it is mounted noexec, so use subdir of dalvik-cache
   if (IsHost()) {
     const char* tmpdir = getenv("TMPDIR");
     if (tmpdir != nullptr && tmpdir[0] != 0) {
@@ -244,7 +323,11 @@ void CommonArtTestImpl::SetUpAndroidDataDir(std::string& android_data) {
       android_data = "/tmp";
     }
   } else {
-    android_data = "/data/dalvik-cache";
+    // On target, we cannot use `/mnt/sdcard` because it is mounted `noexec`,
+    // nor `/data/dalvik-cache` as it is not accessible on `user` builds.
+    // Instead, use `/data/local/tmp`, which does not require any special
+    // permission.
+    android_data = "/data/local/tmp";
   }
   android_data += "/art-data-XXXXXX";
   if (mkdtemp(&android_data[0]) == nullptr) {
@@ -254,17 +337,35 @@ void CommonArtTestImpl::SetUpAndroidDataDir(std::string& android_data) {
 }
 
 void CommonArtTestImpl::SetUp() {
+  // Some tests clear these and when running with --no_isolate this can cause
+  // later tests to fail
+  Locks::Init();
+  MemMap::Init();
   SetUpAndroidRootEnvVars();
   SetUpAndroidDataDir(android_data_);
-  dalvik_cache_.append(android_data_.c_str());
-  dalvik_cache_.append("/dalvik-cache");
-  int mkdir_result = mkdir(dalvik_cache_.c_str(), 0700);
+
+  // Re-use the data temporary directory for /system_ext tests
+  android_system_ext_.append(android_data_);
+  android_system_ext_.append("/system_ext");
+  int mkdir_result = mkdir(android_system_ext_.c_str(), 0700);
+  ASSERT_EQ(mkdir_result, 0);
+  setenv("SYSTEM_EXT_ROOT", android_system_ext_.c_str(), 1);
+
+  std::string system_ext_framework = android_system_ext_ + "/framework";
+  mkdir_result = mkdir(system_ext_framework.c_str(), 0700);
   ASSERT_EQ(mkdir_result, 0);
 
-  static bool gSlowDebugTestFlag = false;
-  RegisterRuntimeDebugFlag(&gSlowDebugTestFlag);
-  SetRuntimeDebugFlagsEnabled(true);
-  CHECK(gSlowDebugTestFlag);
+  dalvik_cache_.append(android_data_);
+  dalvik_cache_.append("/dalvik-cache");
+  mkdir_result = mkdir(dalvik_cache_.c_str(), 0700);
+  ASSERT_EQ(mkdir_result, 0);
+
+  if (kIsDebugBuild) {
+    static bool gSlowDebugTestFlag = false;
+    RegisterRuntimeDebugFlag(&gSlowDebugTestFlag);
+    SetRuntimeDebugFlagsEnabled(true);
+    CHECK(gSlowDebugTestFlag);
+  }
 }
 
 void CommonArtTestImpl::TearDownAndroidDataDir(const std::string& android_data,
@@ -276,59 +377,20 @@ void CommonArtTestImpl::TearDownAndroidDataDir(const std::string& android_data,
   }
 }
 
-std::string CommonArtTestImpl::GetAndroidBuildTop() {
-  std::string root;
-  const char* android_build_top = getenv("ANDROID_BUILD_TOP");
-  if (android_build_top != nullptr) {
-    root = android_build_top;
-  } else {
-    // Not set by build server, so default to current directory
-    char* cwd = getcwd(nullptr, 0);
-    setenv("ANDROID_BUILD_TOP", cwd, 1);
-    root = cwd;
-    free(cwd);
-  }
-  CHECK(!root.empty());
-  if (root.back() != '/') {
-    root += '/';
-  }
-  return root;
-}
-
-// Helper - find directory with the following format:
-// ${ANDROID_BUILD_TOP}/${subdir1}/${subdir2}-${version}/${subdir3}/bin/
-std::string CommonArtTestImpl::GetAndroidToolsDir(const std::string& subdir1,
-                                                  const std::string& subdir2,
-                                                  const std::string& subdir3) {
-  std::string toolsdir = GetAndroidBuildTop() + subdir1;
-  std::string founddir;
-  DIR* dir;
-  if ((dir = opendir(toolsdir.c_str())) != nullptr) {
-    float maxversion = 0;
-    struct dirent* entry;
-    while ((entry = readdir(dir)) != nullptr) {
-      std::string format = subdir2 + "-%f";
-      float version;
-      if (std::sscanf(entry->d_name, format.c_str(), &version) == 1) {
-        if (version > maxversion) {
-          maxversion = version;
-          founddir = toolsdir + "/" + entry->d_name + "/" + subdir3 + "/bin/";
-        }
-      }
-    }
-    closedir(dir);
-  }
-
-  if (founddir.empty()) {
-    ADD_FAILURE() << "Cannot find Android tools directory.";
-  }
-  return founddir;
-}
-
-std::string CommonArtTestImpl::GetAndroidHostToolsDir() {
-  return GetAndroidToolsDir("prebuilts/gcc/linux-x86/host",
-                            "x86_64-linux-glibc2.17",
-                            "x86_64-linux");
+// Get prebuilt binary tool.
+// The paths need to be updated when Android prebuilts update.
+std::string CommonArtTestImpl::GetAndroidTool(const char* name, InstructionSet) {
+#ifndef ART_CLANG_PATH
+  UNUSED(name);
+  LOG(FATAL) << "There are no prebuilt tools available.";
+  UNREACHABLE();
+#else
+  std::string path = GetAndroidBuildTop() + ART_CLANG_PATH + "/bin/";
+  CHECK(OS::DirectoryExists(path.c_str())) << path;
+  path += name;
+  CHECK(OS::FileExists(path.c_str())) << path;
+  return path;
+#endif
 }
 
 std::string CommonArtTestImpl::GetCoreArtLocation() {
@@ -344,14 +406,9 @@ std::unique_ptr<const DexFile> CommonArtTestImpl::LoadExpectSingleDexFile(const 
   std::string error_msg;
   MemMap::Init();
   static constexpr bool kVerifyChecksum = true;
-  const ArtDexFileLoader dex_file_loader;
-  std::string filename(location);
-  if (!dex_file_loader.Open(filename.c_str(),
-                            std::string(location),
-                            /* verify= */ true,
-                            kVerifyChecksum,
-                            &error_msg,
-                            &dex_files)) {
+  std::string filename(IsHost() ? GetAndroidBuildTop() + location : location);
+  ArtDexFileLoader dex_file_loader(filename.c_str(), std::string(location));
+  if (!dex_file_loader.Open(/* verify= */ true, kVerifyChecksum, &error_msg, &dex_files)) {
     LOG(FATAL) << "Could not open .dex file '" << filename << "': " << error_msg << "\n";
     UNREACHABLE();
   }
@@ -394,63 +451,41 @@ void CommonArtTestImpl::TearDown() {
   ClearDirectory(dalvik_cache_.c_str());
   int rmdir_cache_result = rmdir(dalvik_cache_.c_str());
   ASSERT_EQ(0, rmdir_cache_result);
+  ClearDirectory(android_system_ext_.c_str(), true);
+  rmdir_cache_result = rmdir(android_system_ext_.c_str());
+  ASSERT_EQ(0, rmdir_cache_result);
   TearDownAndroidDataDir(android_data_, true);
   dalvik_cache_.clear();
-}
-
-static std::string GetDexFileName(const std::string& jar_prefix, bool host) {
-  std::string prefix(host ? GetAndroidRoot() : "");
-  const char* apexPath = (jar_prefix == "conscrypt")
-    ? kAndroidConscryptApexDefaultPath
-    : kAndroidArtApexDefaultPath;
-  return StringPrintf("%s%s/javalib/%s.jar", prefix.c_str(), apexPath, jar_prefix.c_str());
+  android_system_ext_.clear();
 }
 
 std::vector<std::string> CommonArtTestImpl::GetLibCoreModuleNames() const {
-  // Note: This must start with the CORE_IMG_JARS in Android.common_path.mk
-  // because that's what we use for compiling the core.art image.
-  // It may contain additional modules from TEST_CORE_JARS.
-  return {
-      // CORE_IMG_JARS modules.
-      "core-oj",
-      "core-libart",
-      "core-icu4j",
-      "okhttp",
-      "bouncycastle",
-      "apache-xml",
-      // Additional modules.
-      "conscrypt",
-  };
+  return art::testing::GetLibCoreModuleNames();
 }
 
 std::vector<std::string> CommonArtTestImpl::GetLibCoreDexFileNames(
     const std::vector<std::string>& modules) const {
-  std::vector<std::string> result;
-  result.reserve(modules.size());
-  for (const std::string& module : modules) {
-    result.push_back(GetDexFileName(module, IsHost()));
-  }
-  return result;
+  return art::testing::GetLibCoreDexFileNames(
+      kIsTargetBuild ? "" : GetHostBootClasspathInstallRoot(), modules);
 }
 
 std::vector<std::string> CommonArtTestImpl::GetLibCoreDexFileNames() const {
   std::vector<std::string> modules = GetLibCoreModuleNames();
-  return GetLibCoreDexFileNames(modules);
+  return art::testing::GetLibCoreDexFileNames(
+      kIsTargetBuild ? "" : GetHostBootClasspathInstallRoot(), modules);
 }
 
 std::vector<std::string> CommonArtTestImpl::GetLibCoreDexLocations(
     const std::vector<std::string>& modules) const {
-  std::vector<std::string> result = GetLibCoreDexFileNames(modules);
+  std::string prefix = "";
   if (IsHost()) {
-    // Strip the ANDROID_BUILD_TOP directory including the directory separator '/'.
-    std::string prefix = GetAndroidBuildTop();
-    for (std::string& location : result) {
-      CHECK_GT(location.size(), prefix.size());
-      CHECK_EQ(location.compare(0u, prefix.size(), prefix), 0);
-      location.erase(0u, prefix.size());
-    }
+    std::string android_root = GetAndroidRoot();
+    std::string build_top = GetAndroidBuildTop();
+    CHECK(android_root.starts_with(build_top))
+        << " android_root=" << android_root << " build_top=" << build_top;
+    prefix = android_root.substr(build_top.size());
   }
-  return result;
+  return art::testing::GetLibCoreDexFileNames(prefix, modules);
 }
 
 std::vector<std::string> CommonArtTestImpl::GetLibCoreDexLocations() const {
@@ -476,33 +511,27 @@ std::string CommonArtTestImpl::GetClassPathOption(const char* option,
 
 std::string CommonArtTestImpl::GetTestDexFileName(const char* name) const {
   CHECK(name != nullptr);
-  std::string filename;
-  if (IsHost()) {
-    filename += GetAndroidRoot() + "/framework/";
-  } else {
-    filename += ART_TARGET_NATIVETEST_DIR_STRING;
+  // The needed jar files for gtest are located next to the gtest binary itself.
+  std::string executable_dir = android::base::GetExecutableDirectory();
+  for (auto ext : {".jar", ".dex"}) {
+    std::string path = executable_dir + "/art-gtest-jars-" + name + ext;
+    if (OS::FileExists(path.c_str())) {
+      return path;
+    }
   }
-  filename += "art-gtest-";
-  filename += name;
-  filename += ".jar";
-  return filename;
+  LOG(FATAL) << "Test file " << name << " not found";
+  UNREACHABLE();
 }
 
 std::vector<std::unique_ptr<const DexFile>> CommonArtTestImpl::OpenDexFiles(const char* filename) {
   static constexpr bool kVerify = true;
   static constexpr bool kVerifyChecksum = true;
   std::string error_msg;
-  const ArtDexFileLoader dex_file_loader;
+  ArtDexFileLoader dex_file_loader(filename);
   std::vector<std::unique_ptr<const DexFile>> dex_files;
-  bool success = dex_file_loader.Open(filename,
-                                      filename,
-                                      kVerify,
-                                      kVerifyChecksum,
-                                      &error_msg,
-                                      &dex_files);
+  bool success = dex_file_loader.Open(kVerify, kVerifyChecksum, &error_msg, &dex_files);
   CHECK(success) << "Failed to open '" << filename << "': " << error_msg;
   for (auto& dex_file : dex_files) {
-    CHECK_EQ(PROT_READ, dex_file->GetPermissions());
     CHECK(dex_file->IsReadOnly());
   }
   return dex_files;
@@ -523,10 +552,35 @@ std::unique_ptr<const DexFile> CommonArtTestImpl::OpenTestDexFile(const char* na
   return OpenDexFile(GetTestDexFileName(name).c_str());
 }
 
+std::string CommonArtTestImpl::GetImageDirectory() {
+  if (IsHost()) {
+    return GetHostBootClasspathInstallRoot() + "/apex/art_boot_images/javalib";
+  }
+  // On device, the boot image is generated by `generate-boot-image`.
+  // In a standalone test, the boot image is located next to the gtest binary itself.
+  std::string path = android::base::GetExecutableDirectory() + "/art_boot_images";
+  if (OS::DirectoryExists(path.c_str())) {
+    return path;
+  }
+  // In a chroot environment prepared by scripts, the boot image is located in a predefined
+  // location on /system.
+  path = "/system/framework/art_boot_images";
+  if (OS::DirectoryExists(path.c_str())) {
+    return path;
+  }
+  // In art-target-gtest-chroot, the boot image is located in a predefined location on /data because
+  // /system is a mount point that replicates the real one on device.
+  path = "/data/local/tmp/art_boot_images";
+  if (OS::DirectoryExists(path.c_str())) {
+    return path;
+  }
+  LOG(FATAL) << "Boot image not found";
+  UNREACHABLE();
+}
+
 std::string CommonArtTestImpl::GetCoreFileLocation(const char* suffix) {
   CHECK(suffix != nullptr);
-  std::string prefix(IsHost() ? GetAndroidRoot() : "");
-  return StringPrintf("%s%s/javalib/boot.%s", prefix.c_str(), kAndroidArtApexDefaultPath, suffix);
+  return GetImageDirectory() + "/boot." + suffix;
 }
 
 std::string CommonArtTestImpl::CreateClassPath(
@@ -542,13 +596,8 @@ std::string CommonArtTestImpl::CreateClassPath(
 std::string CommonArtTestImpl::CreateClassPathWithChecksums(
     const std::vector<std::unique_ptr<const DexFile>>& dex_files) {
   CHECK(!dex_files.empty());
-  std::string classpath = dex_files[0]->GetLocation() + "*" +
-      std::to_string(dex_files[0]->GetLocationChecksum());
-  for (size_t i = 1; i < dex_files.size(); i++) {
-    classpath += ":" + dex_files[i]->GetLocation() + "*" +
-        std::to_string(dex_files[i]->GetLocationChecksum());
-  }
-  return classpath;
+  uint32_t checksum = DexFileLoader::GetMultiDexChecksum(dex_files);
+  return dex_files[0]->GetLocation() + "*" + std::to_string(checksum);
 }
 
 CommonArtTestImpl::ForkAndExecResult CommonArtTestImpl::ForkAndExec(
@@ -560,6 +609,7 @@ CommonArtTestImpl::ForkAndExecResult CommonArtTestImpl::ForkAndExec(
   result.stage = ForkAndExecResult::kLink;
 
   std::vector<const char*> c_args;
+  c_args.reserve(argv.size() + 1);
   for (const std::string& str : argv) {
     c_args.push_back(str.c_str());
   }
@@ -583,10 +633,14 @@ CommonArtTestImpl::ForkAndExecResult CommonArtTestImpl::ForkAndExec(
     return result;
   }
 
+  // Special return code for failures between fork and exec. Pick something that
+  // the command is unlikely to use.
+  constexpr int kPostForkFailure = 134;
+
   if (pid == 0) {
     if (!post_fork()) {
       LOG(ERROR) << "Failed post-fork function";
-      exit(1);
+      exit(kPostForkFailure);
       UNREACHABLE();
     }
 
@@ -598,7 +652,8 @@ CommonArtTestImpl::ForkAndExecResult CommonArtTestImpl::ForkAndExec(
     link[1].reset();
 
     execv(c_args[0], const_cast<char* const*>(c_args.data()));
-    exit(1);
+    PLOG(ERROR) << "Failed to execv " << c_args[0];
+    exit(kPostForkFailure);
     UNREACHABLE();
   }
 
@@ -619,6 +674,11 @@ CommonArtTestImpl::ForkAndExecResult CommonArtTestImpl::ForkAndExec(
   }
 
   result.stage = ForkAndExecResult::kFinished;
+
+  if (WIFEXITED(result.status_code) && WEXITSTATUS(result.status_code) == kPostForkFailure) {
+    LOG(WARNING) << "ForkAndExec likely failed between fork and exec";
+  }
+
   return result;
 }
 
@@ -628,6 +688,25 @@ CommonArtTestImpl::ForkAndExecResult CommonArtTestImpl::ForkAndExec(
     *output += std::string(buf, len);
   };
   return ForkAndExec(argv, post_fork, string_collect_fn);
+}
+
+std::vector<pid_t> GetPidByName(const std::string& process_name) {
+  std::vector<pid_t> results;
+  for (pid_t pid : android::base::AllPids{}) {
+    std::string cmdline;
+    if (!android::base::ReadFileToString(StringPrintf("/proc/%d/cmdline", pid), &cmdline)) {
+      continue;
+    }
+    // Take the first argument.
+    size_t pos = cmdline.find('\0');
+    if (pos != std::string::npos) {
+      cmdline.resize(pos);
+    }
+    if (cmdline == process_name) {
+      results.push_back(pid);
+    }
+  }
+  return results;
 }
 
 }  // namespace art

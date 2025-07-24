@@ -40,8 +40,10 @@ debug="no"
 has_variant="no"
 has_mode="no"
 mode="target"
+has_gcstress="no"
 has_timeout="no"
 has_verbose="no"
+has_jdwp_path="no"
 # The bitmap of log messages in libjdwp. See list in the help message for more
 # info on what these are. The default is 'errors | callbacks'
 verbose_level=0xC0
@@ -87,6 +89,12 @@ while true; do
   elif [[ $1 == --variant=* ]]; then
     has_variant="yes"
     shift
+  elif [[ $1 == *gcstress ]]; then
+    has_gcstress="yes"
+    shift
+  elif [[ $1 == --jdwp-path* ]]; then
+    has_jdwp_path="yes"
+    shift
   elif [[ "$1" == "" ]]; then
     break
   else
@@ -99,18 +107,32 @@ if [[ "$has_mode" = "no" ]];  then
   args+=(--mode=device)
 fi
 
-if [[ "$has_variant" = "no" ]];  then
+if [[ "$has_variant" = "no" && "$mode" != "ri" ]];  then
+  # --mode=jvm doesn't support variant option.
   args+=(--variant=X32)
+fi
+
+if [[ "$has_jdwp_path" = "no" ]]; then
+  if [[ "$mode" == "ri" ]]; then
+    if [ -z "$ANDROID_BUILD_TOP" ]; then
+      echo "Please set ANDROID_BUILD_TOP"
+      exit 1
+    fi
+    args+=(--jdwp-path  $ANDROID_BUILD_TOP/"prebuilts/jdk/jdk21/linux-x86/lib/libjdwp.so")
+  else
+    args+=(--jdwp-path  "libjdwp.so")
+  fi
 fi
 
 if [[ "$has_timeout" = "no" ]]; then
   # Double the timeout to 20 seconds
   args+=(--test-timeout-ms)
-  if [[ "$has_verbose" = "no" ]]; then
-    args+=(20000)
+  if [[ "$has_verbose" = "yes" || "$has_gcstress" = "yes" ]]; then
+    # Extra time if verbose or gcstress is set since those can be
+    # quite heavy.
+    args+=(300000)
   else
-    # Even more time if verbose is set since those can be quite heavy.
-    args+=(200000)
+    args+=(20000)
   fi
 fi
 
@@ -119,15 +141,26 @@ if [[ "$has_verbose" = "yes" ]]; then
   args+=(-Djpda.settings.debuggeeAgentExtraOptions=directlog=y,logfile=/proc/self/fd/2,logflags=$verbose_level)
 fi
 
-# We don't use full paths since it is difficult to determine them for device
-# tests and not needed due to resolution rules of dlopen.
-if [[ "$debug" = "yes" ]]; then
-  args+=(-Xplugin:libopenjdkjvmtid.so)
-else
-  args+=(-Xplugin:libopenjdkjvmti.so)
+if [[ "$mode" != "ri" ]]; then
+  # We don't use full paths since it is difficult to determine them for device
+  # tests and not needed due to resolution rules of dlopen.
+  if [[ "$debug" = "yes" ]]; then
+    args+=(-Xplugin:libopenjdkjvmtid.so)
+  else
+    args+=(-Xplugin:libopenjdkjvmti.so)
+  fi
 fi
 
-expect_path=$PWD/art/tools/external_oj_libjdwp_art_failures.txt
+expectations="--expectations $PWD/art/tools/external_oj_libjdwp_art_failures.txt"
+
+if [[ "$debug" = "yes" && "$has_gcstress" = "yes" ]]; then
+  expectations="$expectations --expectations $PWD/art/tools/external_oj_libjdwp_art_gcstress_debug_failures.txt"
+fi
+
+if [[ "${ART_USE_READ_BARRIER}" = "false" ]]; then
+  expectations="$expectations --expectations $PWD/art/tools/external_oj_libjdwp_art_no_read_barrier_failures.txt"
+fi
+
 function verbose_run() {
   echo "$@"
   env "$@"
@@ -142,7 +175,6 @@ export RUN_JDWP_TESTS_CALLED_FROM_LIBJDWP=true
 
 verbose_run ./art/tools/run-jdwp-tests.sh \
             "${args[@]}"                  \
-            --jdwp-path "libjdwp.so"      \
             --vm-arg -Djpda.settings.debuggeeAgentExtraOptions=coredump=y \
             --vm-arg -Djpda.settings.testSuiteType=libjdwp \
-            --expectations "$expect_path"
+            "$expectations"

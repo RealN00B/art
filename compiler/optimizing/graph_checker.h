@@ -21,22 +21,29 @@
 
 #include "base/arena_bit_vector.h"
 #include "base/bit_vector-inl.h"
-#include "base/scoped_arena_allocator.h"
+#include "base/macros.h"
+#include "base/scoped_arena_containers.h"
 #include "nodes.h"
 
-namespace art {
+namespace art HIDDEN {
+
+class CodeGenerator;
 
 // A control-flow graph visitor performing various checks.
-class GraphChecker : public HGraphDelegateVisitor {
+class GraphChecker final : public HGraphDelegateVisitor {
  public:
-  explicit GraphChecker(HGraph* graph, const char* dump_prefix = "art::GraphChecker: ")
-    : HGraphDelegateVisitor(graph),
-      errors_(graph->GetAllocator()->Adapter(kArenaAllocGraphChecker)),
-      dump_prefix_(dump_prefix),
-      allocator_(graph->GetArenaStack()),
-      seen_ids_(&allocator_, graph->GetCurrentInstructionId(), false, kArenaAllocGraphChecker) {
-    seen_ids_.ClearAllBits();
-  }
+  explicit GraphChecker(HGraph* graph,
+                        CodeGenerator* codegen = nullptr,
+                        const char* dump_prefix = "art::GraphChecker: ")
+      : HGraphDelegateVisitor(graph),
+        errors_(graph->GetAllocator()->Adapter(kArenaAllocGraphChecker)),
+        dump_prefix_(dump_prefix),
+        allocator_(graph->GetArenaStack()),
+        seen_ids_(&allocator_, graph->GetCurrentInstructionId(), false, kArenaAllocGraphChecker),
+        uses_per_instruction_(allocator_.Adapter(kArenaAllocGraphChecker)),
+        instructions_per_block_(allocator_.Adapter(kArenaAllocGraphChecker)),
+        phis_per_block_(allocator_.Adapter(kArenaAllocGraphChecker)),
+        codegen_(codegen) {}
 
   // Check the whole graph. The pass_change parameter indicates whether changes
   // may have occurred during the just executed pass. The default value is
@@ -49,6 +56,9 @@ class GraphChecker : public HGraphDelegateVisitor {
   void VisitInstruction(HInstruction* instruction) override;
   void VisitPhi(HPhi* phi) override;
 
+  void VisitArraySet(HArraySet* instruction) override;
+  void VisitInstanceFieldSet(HInstanceFieldSet* instruction) override;
+  void VisitStaticFieldSet(HStaticFieldSet* instruction) override;
   void VisitBinaryOperation(HBinaryOperation* op) override;
   void VisitBooleanNot(HBooleanNot* instruction) override;
   void VisitBoundType(HBoundType* instruction) override;
@@ -59,8 +69,11 @@ class GraphChecker : public HGraphDelegateVisitor {
   void VisitDeoptimize(HDeoptimize* instruction) override;
   void VisitIf(HIf* instruction) override;
   void VisitInstanceOf(HInstanceOf* check) override;
+  void VisitInvoke(HInvoke* invoke) override;
   void VisitInvokeStaticOrDirect(HInvokeStaticOrDirect* invoke) override;
+  void VisitLoadClass(HLoadClass* load) override;
   void VisitLoadException(HLoadException* load) override;
+  void VisitMonitorOperation(HMonitorOperation* monitor_operation) override;
   void VisitNeg(HNeg* instruction) override;
   void VisitPackedSwitch(HPackedSwitch* instruction) override;
   void VisitReturn(HReturn* ret) override;
@@ -68,6 +81,8 @@ class GraphChecker : public HGraphDelegateVisitor {
   void VisitSelect(HSelect* instruction) override;
   void VisitTryBoundary(HTryBoundary* try_boundary) override;
   void VisitTypeConversion(HTypeConversion* instruction) override;
+
+  void VisitVecOperation(HVecOperation* instruction) override;
 
   void CheckTypeCheckBitstringInput(HTypeCheckInstruction* check,
                                     size_t input_pos,
@@ -77,6 +92,9 @@ class GraphChecker : public HGraphDelegateVisitor {
   void HandleTypeCheckInstruction(HTypeCheckInstruction* instruction);
   void HandleLoop(HBasicBlock* loop_header);
   void HandleBooleanInput(HInstruction* instruction, size_t input_index);
+
+  template <typename GetWriteBarrierKind>
+  void CheckWriteBarrier(HInstruction* instruction, GetWriteBarrierKind&& get_write_barrier_kind);
 
   // Was the last visit of the graph valid?
   bool IsValid() const {
@@ -95,16 +113,7 @@ class GraphChecker : public HGraphDelegateVisitor {
     }
   }
 
-  // Enable/Disable the reference type info check.
-  //
-  // Return: the previous status of the check.
-  bool SetRefTypeInfoCheckEnabled(bool value = true) {
-    bool old_value = check_reference_type_info_;
-    check_reference_type_info_ = value;
-    return old_value;
-  }
-
- protected:
+ private:
   // Report a new error.
   void AddError(const std::string& error) {
     errors_.push_back(error);
@@ -115,15 +124,46 @@ class GraphChecker : public HGraphDelegateVisitor {
   // Errors encountered while checking the graph.
   ArenaVector<std::string> errors_;
 
- private:
+  void VisitReversePostOrder();
+
+  // Checks that the graph's flags are set correctly.
+  void CheckGraphFlags();
+
+  // Checks if `instruction` is in its block's instruction/phi list. To do so, it searches
+  // instructions_per_block_/phis_per_block_ which are set versions of that. If the set to
+  // check hasn't been populated yet, it does so now.
+  bool ContainedInItsBlockList(HInstruction* instruction);
+
   // String displayed before dumped errors.
   const char* const dump_prefix_;
   ScopedArenaAllocator allocator_;
   ArenaBitVector seen_ids_;
-  // Whether to perform the reference type info check for instructions which use or produce
-  // object references, e.g. HNewInstance, HLoadClass.
-  // The default value is true.
-  bool check_reference_type_info_ = true;
+
+  // As part of VisitInstruction, we verify that the instruction's input_record is present in the
+  // corresponding input's GetUses. If an instruction is used in many places (e.g. 200K+ uses), the
+  // linear search through GetUses is too slow. We can use bookkeeping to search in a set, instead
+  // of a list.
+  ScopedArenaSafeMap<int, ScopedArenaSet<const art::HUseListNode<art::HInstruction*>*>>
+      uses_per_instruction_;
+
+  // Extra bookkeeping to increase GraphChecker's speed while asking if an instruction is contained
+  // in a list of instructions/phis.
+  ScopedArenaSafeMap<HBasicBlock*, ScopedArenaHashSet<HInstruction*>> instructions_per_block_;
+  ScopedArenaSafeMap<HBasicBlock*, ScopedArenaHashSet<HInstruction*>> phis_per_block_;
+
+  // Used to access target information.
+  CodeGenerator* codegen_;
+
+  struct FlagInfo {
+    bool seen_try_boundary = false;
+    bool seen_monitor_operation = false;
+    bool seen_loop = false;
+    bool seen_irreducible_loop = false;
+    bool seen_SIMD = false;
+    bool seen_bounds_checks = false;
+    bool seen_always_throwing_invokes = false;
+  };
+  FlagInfo flag_info_;
 
   DISALLOW_COPY_AND_ASSIGN(GraphChecker);
 };

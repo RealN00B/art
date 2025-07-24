@@ -28,7 +28,7 @@
 #include <android-base/file.h>
 #include <android-base/logging.h>
 #include <android-base/stringprintf.h>
-#include <backtrace/Backtrace.h>
+#include <unwindstack/AndroidUnwinder.h>
 
 #include "base/file_utils.h"
 #include "base/logging.h"
@@ -38,7 +38,7 @@
 #include "gc/heap.h"
 #include "gc/space/image_space.h"
 #include "jit/debugger_interface.h"
-#include "oat_file.h"
+#include "oat/oat_file.h"
 #include "runtime.h"
 
 namespace art {
@@ -106,30 +106,55 @@ extern "C" JNIEXPORT jboolean JNICALL Java_Main_sigstop(JNIEnv*, jclass) {
 
 // Helper to look for a sequence in the stack trace.
 #if __linux__
-static bool CheckStack(Backtrace* bt, const std::vector<std::string>& seq) {
+static bool CheckStack(unwindstack::AndroidUnwinder& unwinder,
+                       unwindstack::AndroidUnwinderData& data,
+                       const std::vector<std::string>& seq) {
   size_t cur_search_index = 0;  // The currently active index in seq.
   CHECK_GT(seq.size(), 0U);
 
-  for (Backtrace::const_iterator it = bt->begin(); it != bt->end(); ++it) {
-    if (BacktraceMap::IsValid(it->map)) {
-      LOG(INFO) << "Got " << it->func_name << ", looking for " << seq[cur_search_index];
-      if (it->func_name.find(seq[cur_search_index]) != std::string::npos) {
+  bool ok = true;
+  for (const unwindstack::FrameData& frame : data.frames) {
+    if (frame.map_info == nullptr) {
+      printf("Error: No map_info for frame #%02zu\n", frame.num);
+      ok = false;
+      continue;
+    }
+    const std::string& function_name = frame.function_name;
+    if (cur_search_index < seq.size()) {
+      LOG(INFO) << "Got " << function_name << ", looking for " << seq[cur_search_index];
+      if (function_name.find(seq[cur_search_index]) != std::string::npos) {
         cur_search_index++;
-        if (cur_search_index == seq.size()) {
-          return true;
-        }
       }
     }
+    if (function_name == "main") {
+      break;
+    }
+#if !defined(__ANDROID__) && defined(__BIONIC__ )  // host-bionic
+    // TODO(b/182810709): Unwinding is broken on host-bionic so we expect some empty frames.
+#else
+    const std::string& lib_name = frame.map_info->name();
+    if (!kIsTargetBuild && lib_name.find("libc.so") != std::string::npos) {
+      // TODO(b/254626913): Unwinding can fail for libc on host.
+    } else if (function_name.empty()) {
+      printf("Error: No function name for frame #%02zu\n", frame.num);
+      ok = false;
+    }
+#endif
   }
 
-  printf("Cannot find %s in backtrace:\n", seq[cur_search_index].c_str());
-  for (Backtrace::const_iterator it = bt->begin(); it != bt->end(); ++it) {
-    if (BacktraceMap::IsValid(it->map)) {
-      printf("  %s\n", Backtrace::FormatFrameData(&*it).c_str());
+  if (cur_search_index < seq.size()) {
+    printf("Error: Cannot find %s\n", seq[cur_search_index].c_str());
+    ok = false;
+  }
+
+  if (!ok) {
+    printf("Backtrace:\n");
+    for (const unwindstack::FrameData& frame : data.frames) {
+      printf("  %s\n", unwinder.FormatFrame(frame).c_str());
     }
   }
 
-  return false;
+  return ok;
 }
 
 static void MoreErrorInfo(pid_t pid, bool sig_quit_on_fail) {
@@ -149,12 +174,10 @@ extern "C" JNIEXPORT jboolean JNICALL Java_Main_unwindInProcess(JNIEnv*, jclass)
 #if __linux__
   MutexLock mu(Thread::Current(), *GetNativeDebugInfoLock());  // Avoid races with the JIT thread.
 
-  std::unique_ptr<Backtrace> bt(Backtrace::Create(BACKTRACE_CURRENT_PROCESS, GetTid()));
-  if (!bt->Unwind(0, nullptr)) {
+  unwindstack::AndroidLocalUnwinder unwinder;
+  unwindstack::AndroidUnwinderData data;
+  if (!unwinder.Unwind(data)) {
     printf("Cannot unwind in process.\n");
-    return JNI_FALSE;
-  } else if (bt->NumFrames() == 0) {
-    printf("No frames for unwind in process.\n");
     return JNI_FALSE;
   }
 
@@ -169,7 +192,7 @@ extern "C" JNIEXPORT jboolean JNICALL Java_Main_unwindInProcess(JNIEnv*, jclass)
       "Main.main"                        // The Java entry method.
   };
 
-  bool result = CheckStack(bt.get(), seq);
+  bool result = CheckStack(unwinder, data, seq);
   if (!kCauseSegfault) {
     return result ? JNI_TRUE : JNI_FALSE;
   } else {
@@ -189,10 +212,10 @@ static constexpr int kSleepTimeMicroseconds = 50000;             // 0.05 seconds
 static constexpr int kMaxTotalSleepTimeMicroseconds = 10000000;  // 10 seconds
 
 // Wait for a sigstop. This code is copied from libbacktrace.
-int wait_for_sigstop(pid_t tid, int* total_sleep_time_usec, bool* detach_failed ATTRIBUTE_UNUSED) {
+int wait_for_sigstop(pid_t tid, int* total_sleep_time_usec, [[maybe_unused]] bool* detach_failed) {
   for (;;) {
     int status;
-    pid_t n = TEMP_FAILURE_RETRY(waitpid(tid, &status, __WALL | WNOHANG));
+    pid_t n = TEMP_FAILURE_RETRY(waitpid(tid, &status, __WALL | WNOHANG | WUNTRACED));
     if (n == -1) {
       PLOG(WARNING) << "waitpid failed: tid " << tid;
       break;
@@ -223,15 +246,9 @@ extern "C" JNIEXPORT jboolean JNICALL Java_Main_unwindOtherProcess(JNIEnv*, jcla
 #if __linux__
   pid_t pid = static_cast<pid_t>(pid_int);
 
-  // SEIZE is like ATTACH, but it does not stop the process (we let it stop itself).
-  if (ptrace(PTRACE_SEIZE, pid, 0, 0)) {
-    // Were not able to attach, bad.
-    printf("Failed to attach to other process.\n");
-    PLOG(ERROR) << "Failed to attach.";
-    kill(pid, SIGKILL);
-    return JNI_FALSE;
-  }
-
+  // We wait for the SIGSTOP while the child process is untraced (using
+  // `WUNTRACED` in `wait_for_sigstop()`) to avoid a SIGSEGV for implicit
+  // suspend check stopping the process because it's being traced.
   bool detach_failed = false;
   int total_sleep_time_usec = 0;
   int signal = wait_for_sigstop(pid, &total_sleep_time_usec, &detach_failed);
@@ -240,17 +257,22 @@ extern "C" JNIEXPORT jboolean JNICALL Java_Main_unwindOtherProcess(JNIEnv*, jcla
     return JNI_FALSE;
   }
 
-  std::unique_ptr<Backtrace> bt(Backtrace::Create(pid, BACKTRACE_CURRENT_THREAD));
-  bool result = true;
-  if (!bt->Unwind(0, nullptr)) {
-    printf("Cannot unwind other process.\n");
-    result = false;
-  } else if (bt->NumFrames() == 0) {
-    printf("No frames for unwind of other process.\n");
-    result = false;
+  // SEIZE is like ATTACH, but it does not stop the process (it has already stopped itself).
+  if (ptrace(PTRACE_SEIZE, pid, 0, 0)) {
+    // Were not able to attach, bad.
+    printf("Failed to attach to other process.\n");
+    PLOG(ERROR) << "Failed to attach.";
+    kill(pid, SIGKILL);
+    return JNI_FALSE;
   }
 
-  if (result) {
+  bool result = true;
+  unwindstack::AndroidRemoteUnwinder unwinder(pid);
+  unwindstack::AndroidUnwinderData data;
+  if (!unwinder.Unwind(data)) {
+    printf("Cannot unwind other process.\n");
+    result = false;
+  } else {
     // See comment in unwindInProcess for non-exact stack matching.
     // "mini-debug-info" does not include parameters to save space.
     std::vector<std::string> seq = {
@@ -260,7 +282,7 @@ extern "C" JNIEXPORT jboolean JNICALL Java_Main_unwindOtherProcess(JNIEnv*, jcla
         "Main.main"                         // The Java entry method.
     };
 
-    result = CheckStack(bt.get(), seq);
+    result = CheckStack(unwinder, data, seq);
   }
 
   constexpr bool kSigQuitOnFail = true;

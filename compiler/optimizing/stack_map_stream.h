@@ -21,14 +21,17 @@
 #include "base/arena_bit_vector.h"
 #include "base/bit_table.h"
 #include "base/bit_vector-inl.h"
+#include "base/macros.h"
 #include "base/memory_region.h"
 #include "base/scoped_arena_containers.h"
 #include "base/value_object.h"
 #include "dex_register_location.h"
 #include "nodes.h"
-#include "stack_map.h"
+#include "oat/stack_map.h"
 
-namespace art {
+namespace art HIDDEN {
+
+class CodeGenerator;
 
 /**
  * Collects and builds stack maps for a method. All the stack maps
@@ -62,15 +65,20 @@ class StackMapStream : public DeletableArenaObject<kArenaAllocStackMapStream> {
                    size_t core_spill_mask,
                    size_t fp_spill_mask,
                    uint32_t num_dex_registers,
-                   bool baseline = false);
-  void EndMethod();
+                   bool baseline,
+                   bool debuggable,
+                   bool has_should_deoptimize_flag = false);
+  void EndMethod(size_t code_size);
 
-  void BeginStackMapEntry(uint32_t dex_pc,
-                          uint32_t native_pc_offset,
-                          uint32_t register_mask = 0,
-                          BitVector* sp_mask = nullptr,
-                          StackMap::Kind kind = StackMap::Kind::Default,
-                          bool needs_vreg_info = true);
+  void BeginStackMapEntry(
+      uint32_t dex_pc,
+      uint32_t native_pc_offset,
+      uint32_t register_mask = 0,
+      BitVector* sp_mask = nullptr,
+      StackMap::Kind kind = StackMap::Kind::Default,
+      bool needs_vreg_info = true,
+      const std::vector<uint32_t>& dex_pc_list_for_catch_verification = std::vector<uint32_t>());
+
   void EndStackMapEntry();
 
   void AddDexRegisterEntry(DexRegisterLocation::Kind kind, int32_t value) {
@@ -80,7 +88,8 @@ class StackMapStream : public DeletableArenaObject<kArenaAllocStackMapStream> {
   void BeginInlineInfoEntry(ArtMethod* method,
                             uint32_t dex_pc,
                             uint32_t num_dex_registers,
-                            const DexFile* outer_dex_file = nullptr);
+                            const DexFile* outer_dex_file = nullptr,
+                            const CodeGenerator* codegen = nullptr);
   void EndInlineInfoEntry();
 
   size_t GetNumberOfStackMaps() const {
@@ -101,7 +110,7 @@ class StackMapStream : public DeletableArenaObject<kArenaAllocStackMapStream> {
 
   // Invokes the callback with pointer of each BitTableBuilder field.
   template<typename Callback>
-  void ForEachBitTable(Callback callback) {
+  void ForEachBitTable(Callback&& callback) {
     size_t index = 0;
     callback(index++, &stack_maps_);
     callback(index++, &register_masks_);
@@ -116,11 +125,14 @@ class StackMapStream : public DeletableArenaObject<kArenaAllocStackMapStream> {
 
   ScopedArenaAllocator* allocator_;
   const InstructionSet instruction_set_;
+  uint32_t code_size_ = 0;
   uint32_t packed_frame_size_ = 0;
   uint32_t core_spill_mask_ = 0;
   uint32_t fp_spill_mask_ = 0;
   uint32_t num_dex_registers_ = 0;
-  bool baseline_;
+  bool baseline_ = false;
+  bool debuggable_ = false;
+  bool has_should_deoptimize_flag_ = false;
   BitTableBuilder<StackMap> stack_maps_;
   BitTableBuilder<RegisterMask> register_masks_;
   BitmapTableBuilder stack_masks_;

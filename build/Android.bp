@@ -1,3 +1,13 @@
+package {
+    // See: http://go/android-license-faq
+    // A large-scale-change added 'default_applicable_licenses' to import
+    // all of the 'license_kinds' from "art_license"
+    // to get the below license kinds:
+    //   SPDX-license-identifier-Apache-2.0
+    default_applicable_licenses: ["art_license"],
+    default_team: "trendy_team_art_mainline",
+}
+
 bootstrap_go_package {
     name: "soong-art",
     pkgPath: "android/soong/art",
@@ -20,22 +30,30 @@ bootstrap_go_package {
 
 art_clang_tidy_errors = [
     "android-cloexec-dup",
+    "android-cloexec-fopen",
     "android-cloexec-open",
     "bugprone-argument-comment",
     "bugprone-lambda-function-name",
+    "bugprone-macro-parentheses",
+    "bugprone-macro-repeated-side-effects",
     "bugprone-unused-raii", // Protect scoped things like MutexLock.
     "bugprone-unused-return-value",
+    "bugprone-use-after-move",
     "bugprone-virtual-near-miss",
+    "misc-unused-using-decls",
     "modernize-use-bool-literals",
     "modernize-use-nullptr",
-    "modernize-use-using",
     "performance-faster-string-find",
     "performance-for-range-copy",
     "performance-implicit-conversion-in-loop",
+    "performance-inefficient-string-concatenation",
+    "performance-inefficient-vector-operation",
+    "performance-no-automatic-move",
     "performance-noexcept-move-constructor",
     "performance-unnecessary-copy-initialization",
     "performance-unnecessary-value-param",
-    "misc-unused-using-decls",
+    "readability-duplicate-include",
+    "readability-redundant-string-cstr",
 ]
 
 art_clang_tidy_disabled = [
@@ -47,11 +65,15 @@ art_clang_tidy_disabled = [
     // We have lots of C-style variadic functions, and are OK with them. JNI ensures
     // that working around this warning would be extra-painful.
     "-cert-dcl50-cpp",
+    "-misc-redundant-expression",
     // "Modernization" we don't agree with.
     "-modernize-use-auto",
     "-modernize-return-braced-init-list",
     "-modernize-use-default-member-init",
     "-modernize-pass-by-value",
+    // The only two remaining offenders are art/openjdkjvmti/include/jvmti.h and
+    // libcore/ojluni/src/main/native/jvm.h, which are both external files by Oracle
+    "-modernize-use-using",
 ]
 
 art_global_defaults {
@@ -137,18 +159,11 @@ art_global_defaults {
     target: {
         android: {
             cflags: [
-                "-DART_TARGET",
-
                 // To use oprofile_android --callgraph, uncomment this and recompile with
                 //    mmma -j art
                 // "-fno-omit-frame-pointer",
                 // "-marm",
                 // "-mapcs",
-            ],
-            header_libs: [
-                // We optimize Thread::Current() with a direct TLS access. This requires access to a
-                //  platform specific Bionic header.
-                "bionic_libc_platform_headers",
             ],
         },
         linux: {
@@ -157,13 +172,12 @@ art_global_defaults {
                 // Apple, it's a pain.
                 "-Wmissing-noreturn",
             ],
+            // Don't export symbols of statically linked libziparchive.
+            // Workaround to fix ODR violations (b/264235288) in gtests.
+            // `--exclude-libs` flag is not supported on windows/darwin.
+            ldflags: ["-Wl,--exclude-libs=libziparchive.a"],
         },
         linux_bionic: {
-            header_libs: [
-                // We optimize Thread::Current() with a direct TLS access. This requires access to a
-                //  platform specific Bionic header.
-                "bionic_libc_platform_headers",
-            ],
             strip: {
                 // Do not strip art libs when building for linux-bionic.
                 // Otherwise we can't get any symbols out of crashes.
@@ -173,18 +187,35 @@ art_global_defaults {
         darwin: {
             enabled: false,
         },
+        windows: {
+            // When the module is enabled globally in the soong_config_variables
+            // stanza above, it may get enabled on windows too for some module
+            // types. Hence we need to disable it explicitly.
+            // TODO(b/172480617): Clean up with that.
+            enabled: false,
+        },
         host: {
             cflags: [
                 // Bug: 15446488. We don't omit the frame pointer to work around
                 // clang/libunwind bugs that cause SEGVs in run-test-004-ThreadStress.
                 "-fno-omit-frame-pointer",
-                // The build assumes that all our x86/x86_64 hosts (such as buildbots and developer
-                // desktops) support at least sse4.2/popcount. This firstly implies that the ART
-                // runtime binary itself may exploit these features. Secondly, this implies that
-                // the ART runtime passes these feature flags to dex2oat and JIT by calling the
-                // method InstructionSetFeatures::FromCppDefines(). Since invoking dex2oat directly
-                // does not pick up these flags, cross-compiling from a x86/x86_64 host to a
-                // x86/x86_64 target should not be affected.
+            ],
+        },
+        // The build assumes that all our x86/x86_64 hosts (such as buildbots and developer
+        // desktops) support at least sse4.2/popcount. This firstly implies that the ART
+        // runtime binary itself may exploit these features. Secondly, this implies that
+        // the ART runtime passes these feature flags to dex2oat and JIT by calling the
+        // method InstructionSetFeatures::FromCppDefines(). Since invoking dex2oat directly
+        // does not pick up these flags, cross-compiling from a x86/x86_64 host to a
+        // x86/x86_64 target should not be affected.
+        linux_x86: {
+            cflags: [
+                "-msse4.2",
+                "-mpopcnt",
+            ],
+        },
+        linux_x86_64: {
+            cflags: [
                 "-msse4.2",
                 "-mpopcnt",
             ],
@@ -198,6 +229,9 @@ art_global_defaults {
         arm64: {
             cflags: ["-DART_ENABLE_CODEGEN_arm64"],
         },
+        riscv64: {
+            cflags: ["-DART_ENABLE_CODEGEN_riscv64"],
+        },
         x86: {
             cflags: ["-DART_ENABLE_CODEGEN_x86"],
         },
@@ -207,6 +241,7 @@ art_global_defaults {
     },
 
     tidy_checks: art_clang_tidy_errors + art_clang_tidy_disabled,
+
     tidy_checks_as_errors: art_clang_tidy_errors,
 
     tidy_flags: [
@@ -223,16 +258,38 @@ art_global_defaults {
         // will still get the "real" errors.
         "-extra-arg=-Wno-unreachable-code",
     ],
+
+    min_sdk_version: "31",
 }
 
-art_debug_defaults {
+// Used to generate binaries that can be backed by transparent hugepages.
+cc_defaults {
+    name: "art_hugepage_defaults",
+    arch: {
+        arm64: {
+            ldflags: ["-z max-page-size=0x200000"],
+        },
+        riscv64: {
+            ldflags: ["-z max-page-size=0x200000"],
+        },
+        x86_64: {
+            ldflags: ["-z max-page-size=0x200000"],
+        },
+    },
+}
+
+cc_defaults {
     name: "art_debug_defaults",
+    defaults: ["art_defaults"],
     visibility: ["//art:__subpackages__"],
     cflags: [
         "-DDYNAMIC_ANNOTATIONS_ENABLED=1",
         "-DVIXL_DEBUG",
         "-UNDEBUG",
-    ],
+    ] + select(soong_config_variable("art_module", "art_debug_opt_flag"), {
+        any @ flag_val: [flag_val],
+        default: ["-Og"],
+    }),
     asflags: [
         "-UNDEBUG",
     ],
@@ -251,11 +308,11 @@ art_debug_defaults {
 
 // A version of conscrypt only for enabling the "-hostdex" version to test ART on host.
 java_library {
-    // We need our own name to not class with the conscrypt library.
+    // We need our own name to not clash with the conscrypt library.
     name: "conscrypt-host",
     installable: true,
     hostdex: true,
-    static_libs: ["conscrypt"],
+    static_libs: ["conscrypt-for-host"],
 
     // Tests and build files rely on this file to be installed as "conscrypt-hostdex",
     // therefore set a stem. Without it, the file would be installed as
@@ -265,6 +322,43 @@ java_library {
     target: {
         hostdex: {
             required: ["libjavacrypto"],
+        },
+        darwin: {
+            // required module "libjavacrypto" is disabled on darwin
+            enabled: false,
+        },
+    },
+}
+
+// A version of conscrypt only for the ART fuzzer.
+java_library {
+    name: "conscrypt-fuzzer",
+    visibility: [
+        "//art/tools/fuzzer",
+    ],
+    static_libs: ["conscrypt-for-host"],
+    stem: "conscrypt",
+    compile_dex: true,
+    sdk_version: "none",
+    system_modules: "none",
+}
+
+// A version of core-icu4j only for enabling the "-hostdex" version to test ART on host.
+java_library {
+    // We need our own name to not clash with the core-icu4j library.
+    name: "core-icu4j-host",
+    installable: true,
+    hostdex: true,
+    static_libs: ["core-icu4j-for-host"],
+
+    // Tests and build files rely on this file to be installed as "core-icu4j-hostdex",
+    // therefore set a stem. Without it, the file would be installed as
+    // "core-icu4j-host-hostdex".
+    stem: "core-icu4j",
+    sdk_version: "core_platform",
+    target: {
+        hostdex: {
+            required: ["libicu_jni"],
         },
     },
 }

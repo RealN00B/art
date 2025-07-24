@@ -16,80 +16,108 @@
 
 # Push ART artifacts and its dependencies to a chroot directory for on-device testing.
 
-if [ -t 1 ]; then
-  # Color sequences if terminal is a tty.
-  red='\033[0;31m'
-  green='\033[0;32m'
-  yellow='\033[0;33m'
-  magenta='\033[0;35m'
-  nc='\033[0m'
-fi
+set -e
 
-# Setup as root, as some actions performed here require it.
-adb root
-adb wait-for-device
+. "$(dirname $0)/buildbot-utils.sh"
+
+if [[ -z "$ART_TEST_ON_VM" ]]; then
+  # Setup as root, as some actions performed here require it.
+  adb root
+  adb wait-for-device
+fi
 
 if [[ -z "$ANDROID_BUILD_TOP" ]]; then
-  echo 'ANDROID_BUILD_TOP environment variable is empty; did you forget to run `lunch`?'
-  exit 1
+  msgfatal 'ANDROID_BUILD_TOP environment variable is empty; did you forget to run `lunch`?'
+elif [[ -z "$ANDROID_PRODUCT_OUT" ]]; then
+  msgfatal 'ANDROID_PRODUCT_OUT environment variable is empty; did you forget to run `lunch`?'
+elif [[ -z "$ART_TEST_CHROOT" ]]; then
+  msgfatal 'ART_TEST_CHROOT environment variable is empty; ' \
+      'please set it before running this script.'
 fi
 
-if [[ -z "$ANDROID_PRODUCT_OUT" ]]; then
-  echo 'ANDROID_PRODUCT_OUT environment variable is empty; did you forget to run `lunch`?'
-  exit 1
-fi
+# Sync relevant product directories
+# ---------------------------------
 
-if [[ -z "$ART_TEST_CHROOT" ]]; then
-  echo 'ART_TEST_CHROOT environment variable is empty; please set it before running this script.'
-  exit 1
-fi
+(
+  cd $ANDROID_PRODUCT_OUT
+  for dir in system/* linkerconfig data; do
+    [ -d $dir ] || continue
+    if [ $dir == system/apex ]; then
+      # We sync the APEXes later.
+      continue
+    fi
+    msginfo "Syncing $dir directory..."
+    if [[ -n "$ART_TEST_ON_VM" ]]; then
+      $ART_RSYNC_CMD -R $dir "$ART_TEST_SSH_USER@$ART_TEST_SSH_HOST:$ART_TEST_CHROOT"
+    else
+      adb shell mkdir -p "$ART_TEST_CHROOT/$dir"
+      adb push $dir "$ART_TEST_CHROOT/$(dirname $dir)"
+    fi
+  done
+)
 
-if [[ "$(build/soong/soong_ui.bash --dumpvar-mode TARGET_FLATTEN_APEX)" != "true" ]]; then
-  echo -e "${red}This script only works when  APEX packages are flattened, but the build" \
-    "configuration is set up to use non-flattened APEX packages.${nc}"
-  echo -e "${magenta}You can force APEX flattening by setting the environment variable" \
-    "\`OVERRIDE_TARGET_FLATTEN_APEX\` to \"true\" before starting the build and running this" \
-    "script.${nc}"
-  exit 1
-fi
-
-
-# `/system` "partition" synchronization.
-# --------------------------------------
-
-# Sync the system directory to the chroot.
-echo -e "${green}Syncing system directory...${nc}"
-adb shell mkdir -p "$ART_TEST_CHROOT/system"
-adb push "$ANDROID_PRODUCT_OUT/system" "$ART_TEST_CHROOT/"
 # Overwrite the default public.libraries.txt file with a smaller one that
 # contains only the public libraries pushed to the chroot directory.
-adb push "$ANDROID_BUILD_TOP/art/tools/public.libraries.buildbot.txt" \
-  "$ART_TEST_CHROOT/system/etc/public.libraries.txt"
+if [[ -n "$ART_TEST_ON_VM" ]]; then
+  $ART_RSYNC_CMD "$ANDROID_BUILD_TOP/art/tools/public.libraries.buildbot.txt" \
+    "$ART_TEST_SSH_USER@$ART_TEST_SSH_HOST:$ART_TEST_CHROOT/system/etc/public.libraries.txt"
+else
+  adb push "$ANDROID_BUILD_TOP/art/tools/public.libraries.buildbot.txt" \
+    "$ART_TEST_CHROOT/system/etc/public.libraries.txt"
+fi
 
+# Create the framework directory if it doesn't exist. Some gtests need it.
+if [[ -n "$ART_TEST_ON_VM" ]]; then
+  $ART_SSH_CMD "$ART_CHROOT_CMD mkdir -p $ART_TEST_CHROOT/system/framework"
+else
+  adb shell mkdir -p "$ART_TEST_CHROOT/system/framework"
+fi
 
 # APEX packages activation.
 # -------------------------
 
+if [[ -n "$ART_TEST_ON_VM" ]]; then
+  $ART_SSH_CMD "$ART_CHROOT_CMD mkdir -p $ART_TEST_CHROOT/apex"
+else
+  adb shell mkdir -p "$ART_TEST_CHROOT/apex"
+fi
+
 # Manually "activate" the flattened APEX $1 by syncing it to /apex/$2 in the
 # chroot. $2 defaults to $1.
-#
-# TODO: Handle the case of build targets using non-flatted APEX packages.
-# As a workaround, one can run `export OVERRIDE_TARGET_FLATTEN_APEX=true` before building
-# a target to have its APEX packages flattened.
 activate_apex() {
   local src_apex=${1}
   local dst_apex=${2:-${src_apex}}
-  echo -e "${green}Activating APEX ${src_apex} as ${dst_apex}...${nc}"
-  # We move the files from `/system/apex/${src_apex}` to `/apex/${dst_apex}` in
-  # the chroot directory, instead of simply using a symlink, as Bionic's linker
-  # relies on the real path name of a binary (e.g.
-  # `/apex/com.android.art/bin/dex2oat`) to select the linker configuration.
-  adb shell mkdir -p "$ART_TEST_CHROOT/apex"
-  adb shell rm -rf "$ART_TEST_CHROOT/apex/${dst_apex}"
-  # Use use mv instead of cp, as cp has a bug on fugu NRD90R where symbolic
-  # links get copied with odd names, eg: libcrypto.so -> /system/lib/libcrypto.soe.sort.so
-  adb shell mv "$ART_TEST_CHROOT/system/apex/${src_apex}" "$ART_TEST_CHROOT/apex/${dst_apex}" \
-    || exit 1
+
+  # Unpack the .apex or .capex file in the product directory, but if we already
+  # see a directory we assume buildbot-build.sh has already done it for us and
+  # just use it.
+  src_apex_path=$ANDROID_PRODUCT_OUT/system/apex/${src_apex}
+  if [ ! -d $src_apex_path ]; then
+    unset src_apex_file
+    if [ -f "${src_apex_path}.apex" ]; then
+      src_apex_file="${src_apex_path}.apex"
+    elif [ -f "${src_apex_path}.capex" ]; then
+      src_apex_file="${src_apex_path}.capex"
+    fi
+    if [ -z "${src_apex_file}" ]; then
+      msgerror "Failed to find .apex or .capex file to extract for ${src_apex_path}"
+      exit 1
+    fi
+    msginfo "Extracting APEX ${src_apex_file}..."
+    mkdir -p $src_apex_path
+    $ANDROID_HOST_OUT/bin/deapexer --debugfs_path $ANDROID_HOST_OUT/bin/debugfs_static \
+      --fsckerofs_path $ANDROID_HOST_OUT/bin/fsck.erofs \
+      extract ${src_apex_file} $src_apex_path
+  fi
+
+  msginfo "Activating APEX ${src_apex} as ${dst_apex}..."
+  if [[ -n "$ART_TEST_ON_VM" ]]; then
+    $ART_RSYNC_CMD $src_apex_path/* \
+      "$ART_TEST_SSH_USER@$ART_TEST_SSH_HOST:$ART_TEST_CHROOT/apex/${dst_apex}"
+  else
+    adb shell rm -rf "$ART_TEST_CHROOT/apex/${dst_apex}"
+    adb push $src_apex_path "$ART_TEST_CHROOT/apex/${dst_apex}"
+  fi
 }
 
 # "Activate" the required APEX modules.
@@ -98,35 +126,32 @@ activate_apex com.android.i18n
 activate_apex com.android.runtime
 activate_apex com.android.tzdata
 activate_apex com.android.conscrypt
+activate_apex art_fake_com.android.os.statsd com.android.os.statsd
 
-
-# Linker configuration.
-# ---------------------
-
-# Statically linked `linkerconfig` binary.
-linkerconfig_binary="/system/bin/linkerconfig"
-# Generated linker configuration file path (since Android R).
-ld_generated_config_file_path="/linkerconfig/ld.config.txt"
-# Location of the generated linker configuration file.
-ld_generated_config_file_location=$(dirname "$ld_generated_config_file_path")
-
-# Generate linker configuration files on device.
-echo -e "${green}Generating linker configuration files on device in" \
-  "\`$ld_generated_config_file_path\`${nc}..."
-adb shell chroot "$ART_TEST_CHROOT" \
-  "$linkerconfig_binary" --target "$ld_generated_config_file_location" || exit 1
-ld_generated_config_files=$(adb shell find $ART_TEST_CHROOT/linkerconfig ! -type d | sed 's/^/  /')
-echo -e "${green}Generated linker configuration files on device:${nc}"
-echo -e "${green}$ld_generated_config_files${nc}"
-
-
-# `/data` "partition" synchronization.
-# ------------------------------------
-
-# Sync the data directory to the chroot.
-echo -e "${green}Syncing data directory...${nc}"
-adb shell mkdir -p "$ART_TEST_CHROOT/data"
-adb push "$ANDROID_PRODUCT_OUT/data" "$ART_TEST_CHROOT/"
-
-# Create the framework directory if it doesn't exist. Some gtests need it.
-adb shell mkdir -p "$ART_TEST_CHROOT/system/framework"
+# Generate primary boot images on device for testing.
+for b in {32,64}; do
+  basename="generate-boot-image$b"
+  bin_on_host="$ANDROID_PRODUCT_OUT/system/bin/$basename"
+  bin_on_device="/data/local/tmp/$basename"
+  output_dir="/system/framework/art_boot_images"
+  if [ -f $bin_on_host ]; then
+    msginfo "Generating the primary boot image ($b-bit)..."
+    if [[ -n "$ART_TEST_ON_VM" ]]; then
+      $ART_RSYNC_CMD "$bin_on_host" \
+        "$ART_TEST_SSH_USER@$ART_TEST_SSH_HOST:$ART_TEST_CHROOT$bin_on_device"
+      $ART_SSH_CMD "mkdir -p $ART_TEST_CHROOT$output_dir"
+    else
+      adb push "$bin_on_host" "$ART_TEST_CHROOT$bin_on_device"
+      adb shell mkdir -p "$ART_TEST_CHROOT$output_dir"
+    fi
+    # `compiler-filter=speed-profile` is required because OatDumpTest checks the compiled code in
+    # the boot image.
+    if [[ -n "$ART_TEST_ON_VM" ]]; then
+      $ART_SSH_CMD \
+        "$ART_CHROOT_CMD $bin_on_device --output-dir=$output_dir --compiler-filter=speed-profile"
+    else
+      adb shell chroot "$ART_TEST_CHROOT" \
+        "$bin_on_device" --output-dir=$output_dir --compiler-filter=speed-profile
+    fi
+  fi
+done

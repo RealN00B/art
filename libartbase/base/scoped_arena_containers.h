@@ -18,6 +18,7 @@
 #define ART_LIBARTBASE_BASE_SCOPED_ARENA_CONTAINERS_H_
 
 #include <deque>
+#include <forward_list>
 #include <queue>
 #include <set>
 #include <type_traits>
@@ -26,6 +27,8 @@
 
 #include "arena_containers.h"  // For ArenaAllocatorAdapterKind.
 #include "dchecked_vector.h"
+#include "hash_map.h"
+#include "hash_set.h"
 #include "safe_map.h"
 #include "scoped_arena_allocator.h"
 
@@ -44,6 +47,9 @@ class ScopedArenaAllocatorAdapter;
 
 template <typename T>
 using ScopedArenaDeque = std::deque<T, ScopedArenaAllocatorAdapter<T>>;
+
+template <typename T>
+using ScopedArenaForwardList = std::forward_list<T, ScopedArenaAllocatorAdapter<T>>;
 
 template <typename T>
 using ScopedArenaQueue = std::queue<T, ScopedArenaDeque<T>>;
@@ -72,7 +78,7 @@ using ScopedArenaHashSet = HashSet<T, EmptyFn, HashFn, Pred, ScopedArenaAllocato
 
 template <typename Key,
           typename Value,
-          typename EmptyFn = DefaultEmptyFn<std::pair<Key, Value>>,
+          typename EmptyFn = DefaultMapEmptyFn<Key, Value>,
           typename HashFn = DefaultHashFn<Key>,
           typename Pred = DefaultPred<Key>>
 using ScopedArenaHashMap = HashMap<Key,
@@ -101,13 +107,13 @@ class ScopedArenaAllocatorAdapter<void>
     : private DebugStackReference, private DebugStackIndirectTopRef,
       private ArenaAllocatorAdapterKind {
  public:
-  typedef void value_type;
-  typedef void* pointer;
-  typedef const void* const_pointer;
+  using value_type    = void;
+  using pointer       = void*;
+  using const_pointer = const void*;
 
   template <typename U>
   struct rebind {
-    typedef ScopedArenaAllocatorAdapter<U> other;
+    using other = ScopedArenaAllocatorAdapter<U>;
   };
 
   explicit ScopedArenaAllocatorAdapter(ScopedArenaAllocator* allocator,
@@ -140,17 +146,17 @@ class ScopedArenaAllocatorAdapter
     : private DebugStackReference, private DebugStackIndirectTopRef,
       private ArenaAllocatorAdapterKind {
  public:
-  typedef T value_type;
-  typedef T* pointer;
-  typedef T& reference;
-  typedef const T* const_pointer;
-  typedef const T& const_reference;
-  typedef size_t size_type;
-  typedef ptrdiff_t difference_type;
+  using value_type      = T;
+  using pointer         = T*;
+  using reference       = T&;
+  using const_pointer   = const T*;
+  using const_reference = const T&;
+  using size_type       = size_t;
+  using difference_type = ptrdiff_t;
 
   template <typename U>
   struct rebind {
-    typedef ScopedArenaAllocatorAdapter<U> other;
+    using other = ScopedArenaAllocatorAdapter<U>;
   };
 
   explicit ScopedArenaAllocatorAdapter(ScopedArenaAllocator* allocator,
@@ -179,7 +185,7 @@ class ScopedArenaAllocatorAdapter
   const_pointer address(const_reference x) const { return &x; }
 
   pointer allocate(size_type n,
-                   ScopedArenaAllocatorAdapter<void>::pointer hint ATTRIBUTE_UNUSED = nullptr) {
+                   [[maybe_unused]] ScopedArenaAllocatorAdapter<void>::pointer hint = nullptr) {
     DCHECK_LE(n, max_size());
     DebugStackIndirectTopRef::CheckTop();
     return reinterpret_cast<T*>(arena_stack_->Alloc(n * sizeof(T),
@@ -227,56 +233,6 @@ inline bool operator!=(const ScopedArenaAllocatorAdapter<T>& lhs,
 inline ScopedArenaAllocatorAdapter<void> ScopedArenaAllocator::Adapter(ArenaAllocKind kind) {
   return ScopedArenaAllocatorAdapter<void>(this, kind);
 }
-
-// Special deleter that only calls the destructor. Also checks for double free errors.
-template <typename T>
-class ArenaDelete {
-  static constexpr uint8_t kMagicFill = 0xCE;
-
- protected:
-  // Used for variable sized objects such as RegisterLine.
-  ALWAYS_INLINE void ProtectMemory(T* ptr, size_t size) const {
-    if (kRunningOnMemoryTool) {
-      // Writing to the memory will fail ift we already destroyed the pointer with
-      // DestroyOnlyDelete since we make it no access.
-      memset(ptr, kMagicFill, size);
-      MEMORY_TOOL_MAKE_NOACCESS(ptr, size);
-    } else if (kIsDebugBuild) {
-      CHECK(ArenaStack::ArenaTagForAllocation(reinterpret_cast<void*>(ptr)) == ArenaFreeTag::kUsed)
-          << "Freeing invalid object " << ptr;
-      ArenaStack::ArenaTagForAllocation(reinterpret_cast<void*>(ptr)) = ArenaFreeTag::kFree;
-      // Write a magic value to try and catch use after free error.
-      memset(ptr, kMagicFill, size);
-    }
-  }
-
- public:
-  void operator()(T* ptr) const {
-    if (ptr != nullptr) {
-      ptr->~T();
-      ProtectMemory(ptr, sizeof(T));
-    }
-  }
-};
-
-// In general we lack support for arrays. We would need to call the destructor on each element,
-// which requires access to the array size. Support for that is future work.
-//
-// However, we can support trivially destructible component types, as then a destructor doesn't
-// need to be called.
-template <typename T>
-class ArenaDelete<T[]> {
- public:
-  void operator()(T* ptr ATTRIBUTE_UNUSED) const {
-    static_assert(std::is_trivially_destructible<T>::value,
-                  "ArenaUniquePtr does not support non-trivially-destructible arrays.");
-    // TODO: Implement debug checks, and MEMORY_TOOL support.
-  }
-};
-
-// Arena unique ptr that only calls the destructor of the element.
-template <typename T>
-using ArenaUniquePtr = std::unique_ptr<T, ArenaDelete<T>>;
 
 }  // namespace art
 

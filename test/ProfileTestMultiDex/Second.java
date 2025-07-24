@@ -28,12 +28,13 @@ class Second {
 
 class SubC extends Super {
   int getValue() { return 24; }
+  int getIdentity() { return 42; }
 }
 
 class TestIntrinsicOatdump {
   Integer valueOf(int i) {
     // ProfileTestMultiDex is used also for testing oatdump for apps.
-    // This is a regression test that oatdump can handle .data.bimg.rel.ro
+    // This is a regression test that oatdump can handle .data.img.rel.ro
     // entries pointing to the middle of the "boot image live objects" array.
     return Integer.valueOf(i);
   }

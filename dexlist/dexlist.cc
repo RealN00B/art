@@ -30,6 +30,7 @@
 #include <android-base/file.h>
 #include <android-base/logging.h>
 
+#include "base/mem_map.h"
 #include "dex/class_accessor-inl.h"
 #include "dex/code_item_accessors-inl.h"
 #include "dex/dex_file-inl.h"
@@ -83,8 +84,11 @@ static std::unique_ptr<char[]> descriptorToDot(const char* str) {
  * Dumps a method.
  */
 static void dumpMethod(const DexFile* pDexFile,
-                       const char* fileName, u4 idx, u4 flags ATTRIBUTE_UNUSED,
-                       const dex::CodeItem* pCode, u4 codeOffset) {
+                       const char* fileName,
+                       u4 idx,
+                       [[maybe_unused]] u4 flags,
+                       const dex::CodeItem* pCode,
+                       u4 codeOffset) {
   // Abstract and native methods don't get listed.
   if (pCode == nullptr || codeOffset == 0) {
     return;
@@ -93,8 +97,8 @@ static void dumpMethod(const DexFile* pDexFile,
 
   // Method information.
   const dex::MethodId& pMethodId = pDexFile->GetMethodId(idx);
-  const char* methodName = pDexFile->StringDataByIdx(pMethodId.name_idx_);
-  const char* classDescriptor = pDexFile->StringByTypeIdx(pMethodId.class_idx_);
+  const char* methodName = pDexFile->GetStringData(pMethodId.name_idx_);
+  const char* classDescriptor = pDexFile->GetTypeDescriptor(pMethodId.class_idx_);
   std::unique_ptr<char[]> className(descriptorToDot(classDescriptor));
   const u4 insnsOff = codeOffset + 0x10;
 
@@ -138,7 +142,7 @@ void dumpClass(const DexFile* pDexFile, u4 idx) {
 
   const char* fileName = nullptr;
   if (class_def.source_file_idx_.IsValid()) {
-    fileName = pDexFile->StringDataByIdx(class_def.source_file_idx_);
+    fileName = pDexFile->GetStringData(class_def.source_file_idx_);
   }
 
   ClassAccessor accessor(*pDexFile, class_def);
@@ -168,15 +172,10 @@ static int processFile(const char* fileName) {
   std::vector<std::unique_ptr<const DexFile>> dex_files;
   DexFileLoaderErrorCode error_code;
   std::string error_msg;
-  const DexFileLoader dex_file_loader;
-  if (!dex_file_loader.OpenAll(reinterpret_cast<const uint8_t*>(content.data()),
-                               content.size(),
-                               fileName,
-                               /*verify=*/ true,
-                               kVerifyChecksum,
-                               &error_code,
-                               &error_msg,
-                               &dex_files)) {
+  DexFileLoader dex_file_loader(
+      reinterpret_cast<const uint8_t*>(content.data()), content.size(), fileName);
+  if (!dex_file_loader.Open(
+          /*verify=*/true, kVerifyChecksum, &error_code, &error_msg, &dex_files)) {
     LOG(ERROR) << error_msg;
     return -1;
   }
@@ -281,6 +280,7 @@ int dexlistDriver(int argc, char** argv) {
 int main(int argc, char** argv) {
   // Output all logging to stderr.
   android::base::SetLogger(android::base::StderrLogger);
+  art::MemMap::Init();
 
   return art::dexlistDriver(argc, argv);
 }

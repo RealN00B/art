@@ -20,19 +20,60 @@
 #include "class_table.h"
 
 #include "base/mutex-inl.h"
+#include "dex/utf.h"
 #include "gc_root-inl.h"
 #include "mirror/class.h"
-#include "oat_file.h"
+#include "oat/oat_file.h"
 #include "obj_ptr-inl.h"
 
-namespace art {
+namespace art HIDDEN {
 
-template<class Visitor>
-void ClassTable::VisitRoots(Visitor& visitor) {
+inline ClassTable::TableSlot::TableSlot(ObjPtr<mirror::Class> klass)
+    : TableSlot(klass, klass->DescriptorHash()) {}
+
+inline uint32_t ClassTable::ClassDescriptorHash::operator()(const TableSlot& slot) const {
+  // No read barriers needed, we're reading a chain of constant references
+  // for comparison with null and retrieval of constant primitive data.
+  // See `ReadBarrierOption` and `Class::DescriptorHash()`.
+  return slot.Read<kWithoutReadBarrier>()->DescriptorHash();
+}
+
+inline uint32_t ClassTable::ClassDescriptorHash::operator()(const DescriptorHashPair& pair) const {
+  DCHECK_EQ(ComputeModifiedUtf8Hash(pair.first), pair.second);
+  return pair.second;
+}
+
+inline bool ClassTable::ClassDescriptorEquals::operator()(const TableSlot& a,
+                                                          const TableSlot& b) const {
+  // No read barrier needed, we're reading a chain of constant references
+  // for comparison with null and retrieval of constant primitive data.
+  // See ReadBarrierOption and `Class::DescriptorEquals()`.
+  if (a.Hash() != b.Hash()) {
+    DCHECK(!a.Read<kWithoutReadBarrier>()->DescriptorEquals(b.Read<kWithoutReadBarrier>()));
+    return false;
+  }
+  return a.Read<kWithoutReadBarrier>()->DescriptorEquals(b.Read<kWithoutReadBarrier>());
+}
+
+inline bool ClassTable::ClassDescriptorEquals::operator()(const TableSlot& a,
+                                                          const DescriptorHashPair& b) const {
+  // No read barrier needed, we're reading a chain of constant references for comparison
+  // with null and retrieval of constant primitive data. See ReadBarrierOption.
+  if (!a.MaskedHashEquals(b.second)) {
+    DCHECK(!a.Read<kWithoutReadBarrier>()->DescriptorEquals(b.first));
+    return false;
+  }
+  return a.Read<kWithoutReadBarrier>()->DescriptorEquals(b.first);
+}
+
+template <class Visitor>
+void ClassTable::VisitRoots(Visitor& visitor, bool skip_classes) {
   ReaderMutexLock mu(Thread::Current(), lock_);
-  for (ClassSet& class_set : classes_) {
-    for (TableSlot& table_slot : class_set) {
-      table_slot.VisitRoot(visitor);
+  if (!skip_classes) {
+    for (ClassSet& class_set : classes_) {
+      for (TableSlot& table_slot : class_set) {
+        table_slot.VisitRoot(visitor);
+      }
     }
   }
   for (GcRoot<mirror::Object>& root : strong_roots_) {
@@ -45,12 +86,14 @@ void ClassTable::VisitRoots(Visitor& visitor) {
   }
 }
 
-template<class Visitor>
-void ClassTable::VisitRoots(const Visitor& visitor) {
+template <class Visitor>
+void ClassTable::VisitRoots(const Visitor& visitor, bool skip_classes) {
   ReaderMutexLock mu(Thread::Current(), lock_);
-  for (ClassSet& class_set : classes_) {
-    for (TableSlot& table_slot : class_set) {
-      table_slot.VisitRoot(visitor);
+  if (!skip_classes) {
+    for (ClassSet& class_set : classes_) {
+      for (TableSlot& table_slot : class_set) {
+        table_slot.VisitRoot(visitor);
+      }
     }
   }
   for (GcRoot<mirror::Object>& root : strong_roots_) {
@@ -63,7 +106,56 @@ void ClassTable::VisitRoots(const Visitor& visitor) {
   }
 }
 
-template <typename Visitor, ReadBarrierOption kReadBarrierOption>
+template <class Condition, class Visitor>
+void ClassTable::VisitClassesIfConditionMet(Condition& cond, Visitor& visitor) {
+  ReaderMutexLock mu(Thread::Current(), lock_);
+  for (ClassSet& class_set : classes_) {
+    if (cond(class_set)) {
+      for (TableSlot& table_slot : class_set) {
+        table_slot.VisitRoot(visitor);
+      }
+    }
+  }
+}
+
+template <typename Visitor>
+class ClassTable::TableSlot::ClassAndRootVisitor {
+ public:
+  explicit ClassAndRootVisitor(Visitor& visitor) : visitor_(visitor) {}
+
+  void VisitRoot(mirror::CompressedReference<mirror::Object>* klass) const
+      REQUIRES_SHARED(Locks::mutator_lock_) {
+    DCHECK(!klass->IsNull());
+    // Visit roots in the klass object
+    visitor_(klass->AsMirrorPtr());
+    // Visit the GC-root holding klass' reference
+    visitor_.VisitRoot(klass);
+  }
+
+ private:
+  Visitor& visitor_;
+};
+
+template <typename Visitor>
+void ClassTable::VisitClassesAndRoots(Visitor& visitor) {
+  TableSlot::ClassAndRootVisitor class_visitor(visitor);
+  ReaderMutexLock mu(Thread::Current(), lock_);
+  for (ClassSet& class_set : classes_) {
+    for (TableSlot& table_slot : class_set) {
+      table_slot.VisitRoot(class_visitor);
+    }
+  }
+  for (GcRoot<mirror::Object>& root : strong_roots_) {
+    visitor.VisitRoot(root.AddressWithoutBarrier());
+  }
+  for (const OatFile* oat_file : oat_files_) {
+    for (GcRoot<mirror::Object>& root : oat_file->GetBssGcRoots()) {
+      visitor.VisitRootIfNonNull(root.AddressWithoutBarrier());
+    }
+  }
+}
+
+template <ReadBarrierOption kReadBarrierOption, typename Visitor>
 bool ClassTable::Visit(Visitor& visitor) {
   ReaderMutexLock mu(Thread::Current(), lock_);
   for (ClassSet& class_set : classes_) {
@@ -76,7 +168,7 @@ bool ClassTable::Visit(Visitor& visitor) {
   return true;
 }
 
-template <typename Visitor, ReadBarrierOption kReadBarrierOption>
+template <ReadBarrierOption kReadBarrierOption, typename Visitor>
 bool ClassTable::Visit(const Visitor& visitor) {
   ReaderMutexLock mu(Thread::Current(), lock_);
   for (ClassSet& class_set : classes_) {
@@ -132,7 +224,12 @@ inline uint32_t ClassTable::TableSlot::Encode(ObjPtr<mirror::Class> klass, uint3
 
 inline ClassTable::TableSlot::TableSlot(ObjPtr<mirror::Class> klass, uint32_t descriptor_hash)
     : data_(Encode(klass, MaskHash(descriptor_hash))) {
-  DCHECK_EQ(descriptor_hash, HashDescriptor(klass));
+  DCHECK_EQ(descriptor_hash, klass->DescriptorHash());
+}
+
+inline ClassTable::TableSlot::TableSlot(uint32_t ptr, uint32_t descriptor_hash)
+    : data_(ptr | MaskHash(descriptor_hash)) {
+  DCHECK_ALIGNED(ptr, kObjectAlignment);
 }
 
 template <typename Filter>
@@ -140,6 +237,18 @@ inline void ClassTable::RemoveStrongRoots(const Filter& filter) {
   WriterMutexLock mu(Thread::Current(), lock_);
   strong_roots_.erase(std::remove_if(strong_roots_.begin(), strong_roots_.end(), filter),
                       strong_roots_.end());
+}
+
+inline ObjPtr<mirror::Class> ClassTable::LookupByDescriptor(ObjPtr<mirror::Class> klass) {
+  uint32_t hash = klass->DescriptorHash();
+  std::string temp;
+  const char* descriptor = klass->GetDescriptor(&temp);
+  return Lookup(descriptor, hash);
+}
+
+inline size_t ClassTable::Size() const {
+  ReaderMutexLock mu(Thread::Current(), lock_);
+  return classes_.size();
 }
 
 }  // namespace art

@@ -66,6 +66,17 @@ constexpr size_t kMemoryToolStackGuardSizeScale = 1;
 
 #endif
 
+#if __has_feature(hwaddress_sanitizer)
+# define HWADDRESS_SANITIZER
+constexpr bool kHwAsanEnabled = true;
+// NB: The attribute also implies NO_INLINE. If inlined, the hwasan attribute would be lost.
+//     If method is also separately marked as ALWAYS_INLINE, the NO_INLINE takes precedence.
+# define ATTRIBUTE_NO_SANITIZE_HWADDRESS __attribute__((no_sanitize("hwaddress"), noinline))
+#else
+constexpr bool kHwAsanEnabled = false;
+# define ATTRIBUTE_NO_SANITIZE_HWADDRESS
+#endif
+
 }  // namespace art
 
 #endif  // ART_LIBARTBASE_BASE_MEMORY_TOOL_H_

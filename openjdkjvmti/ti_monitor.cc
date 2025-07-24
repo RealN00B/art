@@ -225,7 +225,7 @@ static JvmtiMonitor* DecodeMonitor(jrawMonitorID id) {
   return reinterpret_cast<JvmtiMonitor*>(id);
 }
 
-jvmtiError MonitorUtil::CreateRawMonitor(jvmtiEnv* env ATTRIBUTE_UNUSED,
+jvmtiError MonitorUtil::CreateRawMonitor([[maybe_unused]] jvmtiEnv* env,
                                          const char* name,
                                          jrawMonitorID* monitor_ptr) {
   if (name == nullptr || monitor_ptr == nullptr) {
@@ -238,7 +238,7 @@ jvmtiError MonitorUtil::CreateRawMonitor(jvmtiEnv* env ATTRIBUTE_UNUSED,
   return ERR(NONE);
 }
 
-jvmtiError MonitorUtil::DestroyRawMonitor(jvmtiEnv* env ATTRIBUTE_UNUSED, jrawMonitorID id) {
+jvmtiError MonitorUtil::DestroyRawMonitor([[maybe_unused]] jvmtiEnv* env, jrawMonitorID id) {
   if (id == nullptr) {
     return ERR(INVALID_MONITOR);
   }
@@ -253,7 +253,7 @@ jvmtiError MonitorUtil::DestroyRawMonitor(jvmtiEnv* env ATTRIBUTE_UNUSED, jrawMo
   return ERR(NONE);
 }
 
-jvmtiError MonitorUtil::RawMonitorEnterNoSuspend(jvmtiEnv* env ATTRIBUTE_UNUSED, jrawMonitorID id) {
+jvmtiError MonitorUtil::RawMonitorEnterNoSuspend([[maybe_unused]] jvmtiEnv* env, jrawMonitorID id) {
   if (id == nullptr) {
     return ERR(INVALID_MONITOR);
   }
@@ -266,7 +266,7 @@ jvmtiError MonitorUtil::RawMonitorEnterNoSuspend(jvmtiEnv* env ATTRIBUTE_UNUSED,
   return ERR(NONE);
 }
 
-jvmtiError MonitorUtil::RawMonitorEnter(jvmtiEnv* env ATTRIBUTE_UNUSED, jrawMonitorID id) {
+jvmtiError MonitorUtil::RawMonitorEnter([[maybe_unused]] jvmtiEnv* env, jrawMonitorID id) {
   if (id == nullptr) {
     return ERR(INVALID_MONITOR);
   }
@@ -279,7 +279,7 @@ jvmtiError MonitorUtil::RawMonitorEnter(jvmtiEnv* env ATTRIBUTE_UNUSED, jrawMoni
   return ERR(NONE);
 }
 
-jvmtiError MonitorUtil::RawMonitorExit(jvmtiEnv* env ATTRIBUTE_UNUSED, jrawMonitorID id) {
+jvmtiError MonitorUtil::RawMonitorExit([[maybe_unused]] jvmtiEnv* env, jrawMonitorID id) {
   if (id == nullptr) {
     return ERR(INVALID_MONITOR);
   }
@@ -294,7 +294,7 @@ jvmtiError MonitorUtil::RawMonitorExit(jvmtiEnv* env ATTRIBUTE_UNUSED, jrawMonit
   return ERR(NONE);
 }
 
-jvmtiError MonitorUtil::RawMonitorWait(jvmtiEnv* env ATTRIBUTE_UNUSED,
+jvmtiError MonitorUtil::RawMonitorWait([[maybe_unused]] jvmtiEnv* env,
                                        jrawMonitorID id,
                                        jlong millis) {
   if (id == nullptr) {
@@ -322,7 +322,7 @@ jvmtiError MonitorUtil::RawMonitorWait(jvmtiEnv* env ATTRIBUTE_UNUSED,
   return ERR(NONE);
 }
 
-jvmtiError MonitorUtil::RawMonitorNotify(jvmtiEnv* env ATTRIBUTE_UNUSED, jrawMonitorID id) {
+jvmtiError MonitorUtil::RawMonitorNotify([[maybe_unused]] jvmtiEnv* env, jrawMonitorID id) {
   if (id == nullptr) {
     return ERR(INVALID_MONITOR);
   }
@@ -337,7 +337,7 @@ jvmtiError MonitorUtil::RawMonitorNotify(jvmtiEnv* env ATTRIBUTE_UNUSED, jrawMon
   return ERR(NONE);
 }
 
-jvmtiError MonitorUtil::RawMonitorNotifyAll(jvmtiEnv* env ATTRIBUTE_UNUSED, jrawMonitorID id) {
+jvmtiError MonitorUtil::RawMonitorNotifyAll([[maybe_unused]] jvmtiEnv* env, jrawMonitorID id) {
   if (id == nullptr) {
     return ERR(INVALID_MONITOR);
   }
@@ -352,7 +352,7 @@ jvmtiError MonitorUtil::RawMonitorNotifyAll(jvmtiEnv* env ATTRIBUTE_UNUSED, jraw
   return ERR(NONE);
 }
 
-jvmtiError MonitorUtil::GetCurrentContendedMonitor(jvmtiEnv* env ATTRIBUTE_UNUSED,
+jvmtiError MonitorUtil::GetCurrentContendedMonitor([[maybe_unused]] jvmtiEnv* env,
                                                    jthread thread,
                                                    jobject* monitor) {
   if (monitor == nullptr) {
@@ -376,39 +376,43 @@ jvmtiError MonitorUtil::GetCurrentContendedMonitor(jvmtiEnv* env ATTRIBUTE_UNUSE
       switch (target_thread->GetState()) {
         // These three we are actually currently waiting on a monitor and have sent the appropriate
         // events (if anyone is listening).
-        case art::kBlocked:
-        case art::kTimedWaiting:
-        case art::kWaiting: {
+        case art::ThreadState::kBlocked:
+        case art::ThreadState::kTimedWaiting:
+        case art::ThreadState::kWaiting: {
           out_ = art::GcRoot<art::mirror::Object>(art::Monitor::GetContendedMonitor(target_thread));
           return;
         }
-        case art::kTerminated:
-        case art::kRunnable:
-        case art::kSleeping:
-        case art::kWaitingForLockInflation:
-        case art::kWaitingForTaskProcessor:
-        case art::kWaitingForGcToComplete:
-        case art::kWaitingForCheckPointsToRun:
-        case art::kWaitingPerformingGc:
-        case art::kWaitingForDebuggerSend:
-        case art::kWaitingForDebuggerToAttach:
-        case art::kWaitingInMainDebuggerLoop:
-        case art::kWaitingForDebuggerSuspension:
-        case art::kWaitingForJniOnLoad:
-        case art::kWaitingForSignalCatcherOutput:
-        case art::kWaitingInMainSignalCatcherLoop:
-        case art::kWaitingForDeoptimization:
-        case art::kWaitingForMethodTracingStart:
-        case art::kWaitingForVisitObjects:
-        case art::kWaitingForGetObjectsAllocated:
-        case art::kWaitingWeakGcRootRead:
-        case art::kWaitingForGcThreadFlip:
-        case art::kNativeForAbort:
-        case art::kStarting:
-        case art::kNative:
-        case art::kSuspended: {
+        case art::ThreadState::kTerminated:
+        case art::ThreadState::kRunnable:
+        case art::ThreadState::kSleeping:
+        case art::ThreadState::kWaitingForLockInflation:
+        case art::ThreadState::kWaitingForTaskProcessor:
+        case art::ThreadState::kWaitingForGcToComplete:
+        case art::ThreadState::kWaitingForCheckPointsToRun:
+        case art::ThreadState::kWaitingPerformingGc:
+        case art::ThreadState::kWaitingForDebuggerSend:
+        case art::ThreadState::kWaitingForDebuggerToAttach:
+        case art::ThreadState::kWaitingInMainDebuggerLoop:
+        case art::ThreadState::kWaitingForDebuggerSuspension:
+        case art::ThreadState::kWaitingForJniOnLoad:
+        case art::ThreadState::kWaitingForSignalCatcherOutput:
+        case art::ThreadState::kWaitingInMainSignalCatcherLoop:
+        case art::ThreadState::kWaitingForDeoptimization:
+        case art::ThreadState::kWaitingForMethodTracingStart:
+        case art::ThreadState::kWaitingForVisitObjects:
+        case art::ThreadState::kWaitingForGetObjectsAllocated:
+        case art::ThreadState::kWaitingWeakGcRootRead:
+        case art::ThreadState::kWaitingForGcThreadFlip:
+        case art::ThreadState::kNativeForAbort:
+        case art::ThreadState::kStarting:
+        case art::ThreadState::kNative:
+        case art::ThreadState::kSuspended: {
           // We aren't currently (explicitly) waiting for a monitor so just return null.
           return;
+        case art::ThreadState::kObsoleteRunnable:
+        case art::ThreadState::kInvalidState:
+          LOG(FATAL) << "UNREACHABLE";  // Obsolete or invalid value.
+          UNREACHABLE();
         }
       }
     }

@@ -18,6 +18,7 @@
 #define ART_RUNTIME_ARCH_ARM64_ASM_SUPPORT_ARM64_S_
 
 #include "asm_support_arm64.h"
+#include "interpreter/cfi_asm_support.h"
 
 // Define special registers.
 
@@ -33,23 +34,57 @@
 #define xIP1 x17
 #define wIP1 w17
 
-#if defined(USE_READ_BARRIER) && defined(USE_BAKER_READ_BARRIER)
+#ifdef RESERVE_MARKING_REGISTER
 // Marking Register, holding Thread::Current()->GetIsGcMarking().
-// Only used with the Concurrent Copying (CC) garbage
-// collector, with the Baker read barrier configuration.
 #define wMR w20
 #endif
+
+// Implicit suspend check register.
+#define xSUSPEND x21
+
+.macro CFI_EXPRESSION_BREG n, b, offset
+    .if (-0x40 <= (\offset)) && ((\offset) < 0x40)
+        CFI_EXPRESSION_BREG_1(\n, \b, \offset)
+    .elseif (-0x2000 <= (\offset)) && ((\offset) < 0x2000)
+        CFI_EXPRESSION_BREG_2(\n, \b, \offset)
+    .else
+        .error "Unsupported offset"
+    .endif
+.endm
+
+.macro CFI_DEF_CFA_BREG_PLUS_UCONST reg, offset, size
+    .if ((\size) < 0)
+        .error "Size should be positive"
+    .endif
+    .if (((\offset) < -0x40) || ((\offset) >= 0x40))
+        .error "Unsupported offset"
+    .endif
+    .if ((\size) < 0x80)
+        CFI_DEF_CFA_BREG_PLUS_UCONST_1_1(\reg, \offset, \size)
+    .elseif ((\size) < 0x4000)
+        CFI_DEF_CFA_BREG_PLUS_UCONST_1_2(\reg, \offset, \size)
+    .else
+        .error "Unsupported size"
+    .endif
+.endm
+
+.macro CFI_REMEMBER_STATE
+    .cfi_remember_state
+.endm
+
+// The spec is not clear whether the CFA is part of the saved state and tools
+// differ in the behaviour, so explicitly set the CFA to avoid any ambiguity.
+// The restored CFA state should match the CFA state during CFI_REMEMBER_STATE.
+.macro CFI_RESTORE_STATE_AND_DEF_CFA reg, offset
+    .cfi_restore_state
+    .cfi_def_cfa \reg, \offset
+.endm
 
 .macro ENTRY_ALIGNED name, alignment
     .type \name, #function
     .hidden \name  // Hide this as a global symbol, so we do not incur plt calls.
     .global \name
-    // ART-compiled functions have OatQuickMethodHeader but assembly funtions do not.
-    // Prefix the assembly code with 0xFFs, which means there is no method header.
-    .byte 0xFF, 0xFF, 0xFF, 0xFF
-    // Cache alignment for function entry.
-    // NB: 0xFF because there is a bug in balign where 0x00 creates nop instructions.
-    .balign \alignment, 0xFF
+    .balign \alignment
 \name:
     .cfi_startproc
 .endm
@@ -98,9 +133,13 @@
     .cfi_rel_offset \reg, (\offset)
 .endm
 
-.macro RESTORE_REG reg, offset
-    ldr \reg, [sp, #(\offset)]
+.macro RESTORE_REG_BASE base, reg, offset
+    ldr \reg, [\base, #(\offset)]
     .cfi_restore \reg
+.endm
+
+.macro RESTORE_REG reg, offset
+    RESTORE_REG_BASE sp, \reg, \offset
 .endm
 
 .macro SAVE_TWO_REGS_BASE base, reg1, reg2, offset
@@ -113,6 +152,13 @@
     SAVE_TWO_REGS_BASE sp, \reg1, \reg2, \offset
 .endm
 
+.macro SAVE_TWO_REGS_INCREASE_FRAME reg1, reg2, frame_adjustment
+    stp \reg1, \reg2, [sp, #-(\frame_adjustment)]!
+    .cfi_adjust_cfa_offset (\frame_adjustment)
+    .cfi_rel_offset \reg1, 0
+    .cfi_rel_offset \reg2, 8
+.endm
+
 .macro RESTORE_TWO_REGS_BASE base, reg1, reg2, offset
     ldp \reg1, \reg2, [\base, #(\offset)]
     .cfi_restore \reg1
@@ -123,13 +169,47 @@
     RESTORE_TWO_REGS_BASE sp, \reg1, \reg2, \offset
 .endm
 
+.macro RESTORE_TWO_REGS_DECREASE_FRAME reg1, reg2, frame_adjustment
+    ldp \reg1, \reg2, [sp], #(\frame_adjustment)
+    .cfi_restore \reg1
+    .cfi_restore \reg2
+    .cfi_adjust_cfa_offset -(\frame_adjustment)
+.endm
+
+#define ALL_ARGS_SIZE (/*x0-x7*/ 8 * 8 + /*d0-d7*/ 8 * 8)
+
+.macro SAVE_ALL_ARGS_INCREASE_FRAME extra_space
+    // Save register args x0-x7, d0-d7 and return address.
+    stp    x0, x1, [sp, #-(ALL_ARGS_SIZE + \extra_space)]!
+    .cfi_adjust_cfa_offset (ALL_ARGS_SIZE + \extra_space)
+    stp    x2, x3, [sp, #16]
+    stp    x4, x5, [sp, #32]
+    stp    x6, x7, [sp, #48]
+    stp    d0, d1, [sp, #64]
+    stp    d2, d3, [sp, #80]
+    stp    d4, d5, [sp, #96]
+    stp    d6, d7, [sp, #112]
+.endm
+
+.macro RESTORE_ALL_ARGS_DECREASE_FRAME extra_space
+    ldp    x2, x3, [sp, #16]
+    ldp    x4, x5, [sp, #32]
+    ldp    x6, x7, [sp, #48]
+    ldp    d0, d1, [sp, #64]
+    ldp    d2, d3, [sp, #80]
+    ldp    d4, d5, [sp, #96]
+    ldp    d6, d7, [sp, #112]
+    ldp    x0, x1, [sp], #(ALL_ARGS_SIZE + \extra_space)
+    .cfi_adjust_cfa_offset -(ALL_ARGS_SIZE + \extra_space)
+.endm
+
 .macro LOAD_RUNTIME_INSTANCE reg
-#if __has_feature(hwaddress_sanitizer) && __clang_major__ >= 10
-    adrp xIP0, :pg_hi21_nc:_ZN3art7Runtime9instance_E
+#if __has_feature(hwaddress_sanitizer)
+    adrp \reg, :pg_hi21_nc:_ZN3art7Runtime9instance_E
 #else
-    adrp xIP0, _ZN3art7Runtime9instance_E
+    adrp \reg, _ZN3art7Runtime9instance_E
 #endif
-    ldr xIP0, [xIP0, #:lo12:_ZN3art7Runtime9instance_E]
+    ldr \reg, [\reg, #:lo12:_ZN3art7Runtime9instance_E]
 .endm
 
 // Macro to refresh the Marking Register (W20).
@@ -138,9 +218,22 @@
 // entrypoints that possibly (directly or indirectly) perform a
 // suspend check (before they return).
 .macro REFRESH_MARKING_REGISTER
-#if defined(USE_READ_BARRIER) && defined(USE_BAKER_READ_BARRIER)
+#ifdef RESERVE_MARKING_REGISTER
     ldr wMR, [xSELF, #THREAD_IS_GC_MARKING_OFFSET]
 #endif
+.endm
+
+// Macro to refresh the suspend check register.
+//
+// We do not refresh `xSUSPEND` after every transition to Runnable, so there is
+// a chance that an implicit suspend check loads null to xSUSPEND but before
+// causing a SIGSEGV at the next implicit suspend check we make a runtime call
+// that performs the suspend check explicitly. This can cause a spurious fault
+// without a pending suspend check request but it should be rare and the fault
+// overhead was already expected when we triggered the suspend check, we just
+// pay the price later than expected.
+.macro REFRESH_SUSPEND_CHECK_REGISTER
+    ldr xSUSPEND, [xSELF, #THREAD_SUSPEND_TRIGGER_OFFSET]
 .endm
 
     /*
@@ -212,15 +305,16 @@
     stp d6, d7, [\base, #64]
 
     // Core args.
-    SAVE_TWO_REGS_BASE \base, x1, x2, 80
-    SAVE_TWO_REGS_BASE \base, x3, x4, 96
-    SAVE_TWO_REGS_BASE \base, x5, x6, 112
+    stp x1, x2, [\base, #80]
+    stp x3, x4, [\base, #96]
+    stp x5, x6, [\base, #112]
 
     // x7, Callee-saves.
     // Note: We could avoid saving X20 in the case of Baker read
     // barriers, as it is overwritten by REFRESH_MARKING_REGISTER
     // later; but it's not worth handling this special case.
-    SAVE_TWO_REGS_BASE \base, x7, x20, 128
+    stp x7, x20, [\base, #128]
+    .cfi_rel_offset x20, 136
     SAVE_TWO_REGS_BASE \base, x21, x22, 144
     SAVE_TWO_REGS_BASE \base, x23, x24, 160
     SAVE_TWO_REGS_BASE \base, x25, x26, 176
@@ -240,27 +334,42 @@
     ldp d6, d7, [\base, #64]
 
     // Core args.
-    RESTORE_TWO_REGS_BASE \base, x1, x2, 80
-    RESTORE_TWO_REGS_BASE \base, x3, x4, 96
-    RESTORE_TWO_REGS_BASE \base, x5, x6, 112
+    ldp x1, x2, [\base, #80]
+    ldp x3, x4, [\base, #96]
+    ldp x5, x6, [\base, #112]
 
-    // x7, Callee-saves.
+    // x7, callee-saves and LR.
     // Note: Likewise, we could avoid restoring X20 in the case of Baker
     // read barriers, as it is overwritten by REFRESH_MARKING_REGISTER
     // later; but it's not worth handling this special case.
-    RESTORE_TWO_REGS_BASE \base, x7, x20, 128
+    ldp x7, x20, [\base, #128]
+    .cfi_restore x20
     RESTORE_TWO_REGS_BASE \base, x21, x22, 144
     RESTORE_TWO_REGS_BASE \base, x23, x24, 160
     RESTORE_TWO_REGS_BASE \base, x25, x26, 176
     RESTORE_TWO_REGS_BASE \base, x27, x28, 192
-
-    // x29(callee-save) and LR.
     RESTORE_TWO_REGS_BASE \base, x29, xLR, 208
 .endm
 
 .macro RESTORE_SAVE_REFS_AND_ARGS_FRAME
     RESTORE_SAVE_REFS_AND_ARGS_FRAME_INTERNAL sp
     DECREASE_FRAME FRAME_SIZE_SAVE_REFS_AND_ARGS
+.endm
+
+.macro SAVE_ALL_CALLEE_SAVES offset
+    // FP callee-saves.
+    stp d8, d9,   [sp, #(0 + \offset)]
+    stp d10, d11, [sp, #(16 + \offset)]
+    stp d12, d13, [sp, #(32 + \offset)]
+    stp d14, d15, [sp, #(48 + \offset)]
+
+    // GP callee-saves
+    SAVE_TWO_REGS x19, x20, (64 + \offset)
+    SAVE_TWO_REGS x21, x22, (80 + \offset)
+    SAVE_TWO_REGS x23, x24, (96 + \offset)
+    SAVE_TWO_REGS x25, x26, (112 + \offset)
+    SAVE_TWO_REGS x27, x28, (128 + \offset)
+    SAVE_TWO_REGS x29, xLR, (144 + \offset)
 .endm
 
     /*
@@ -283,19 +392,7 @@
 #endif
 
     // Stack alignment filler [sp, #8].
-    // FP callee-saves.
-    stp d8, d9,   [sp, #16]
-    stp d10, d11, [sp, #32]
-    stp d12, d13, [sp, #48]
-    stp d14, d15, [sp, #64]
-
-    // GP callee-saves
-    SAVE_TWO_REGS x19, x20, 80
-    SAVE_TWO_REGS x21, x22, 96
-    SAVE_TWO_REGS x23, x24, 112
-    SAVE_TWO_REGS x25, x26, 128
-    SAVE_TWO_REGS x27, x28, 144
-    SAVE_TWO_REGS x29, xLR, 160
+    SAVE_ALL_CALLEE_SAVES 16
 
     // Store ArtMethod* Runtime::callee_save_methods_[kSaveAllCalleeSaves].
     str xIP0, [sp]
@@ -313,6 +410,7 @@
 
     // Point of no return.
     bl artDeliverPendingExceptionFromCode  // artDeliverPendingExceptionFromCode(Thread*)
+    bl art_quick_do_long_jump              // (Context*)
     brk 0  // Unreached
 .endm
 
@@ -335,6 +433,82 @@
 
 .macro RETURN_OR_DELIVER_PENDING_EXCEPTION
     RETURN_OR_DELIVER_PENDING_EXCEPTION_REG xIP0
+.endm
+
+// Locking is needed for both managed code and JNI stubs.
+.macro LOCK_OBJECT_FAST_PATH obj, slow_lock, can_be_null
+    // Use scratch registers x8-x11 as temporaries.
+    ldr    w9, [xSELF, #THREAD_ID_OFFSET]
+    .if \can_be_null
+        cbz    \obj, \slow_lock
+    .endif
+                                      // Exclusive load/store has no immediate anymore.
+    add    x8, \obj, #MIRROR_OBJECT_LOCK_WORD_OFFSET
+1:
+    ldaxr  w10, [x8]                  // Acquire needed only in most common case.
+    eor    w11, w10, w9               // Prepare the value to store if unlocked
+                                      //   (thread id, count of 0 and preserved read barrier bits),
+                                      // or prepare to compare thread id for recursive lock check
+                                      //   (lock_word.ThreadId() ^ self->ThreadId()).
+    tst    w10, #LOCK_WORD_GC_STATE_MASK_SHIFTED_TOGGLED  // Test the non-gc bits.
+    b.ne   2f                         // Check if unlocked.
+    // Unlocked case - store w11: original lock word plus thread id, preserved read barrier bits.
+    stxr   w10, w11, [x8]
+    cbnz   w10, 1b                    // If the store failed, retry.
+    ret
+2:  // w10: original lock word, w9: thread id, w11: w10 ^ w9
+                                      // Check lock word state and thread id together,
+    tst    w11, #(LOCK_WORD_STATE_MASK_SHIFTED | LOCK_WORD_THIN_LOCK_OWNER_MASK_SHIFTED)
+    b.ne   \slow_lock
+    add    w11, w10, #LOCK_WORD_THIN_LOCK_COUNT_ONE  // Increment the recursive lock count.
+    tst    w11, #LOCK_WORD_THIN_LOCK_COUNT_MASK_SHIFTED  // Test the new thin lock count.
+    b.eq   \slow_lock                 // Zero as the new count indicates overflow, go slow path.
+    stxr   w10, w11, [x8]
+    cbnz   w10, 1b                    // If the store failed, retry.
+    ret
+.endm
+
+// Unlocking is needed for both managed code and JNI stubs.
+.macro UNLOCK_OBJECT_FAST_PATH obj, slow_unlock, can_be_null
+    // Use scratch registers x8-x11 as temporaries.
+    ldr    w9, [xSELF, #THREAD_ID_OFFSET]
+    .if \can_be_null
+        cbz    \obj, \slow_unlock
+    .endif
+                                      // Exclusive load/store has no immediate anymore.
+    add    x8, \obj, #MIRROR_OBJECT_LOCK_WORD_OFFSET
+1:
+#ifndef USE_READ_BARRIER
+    ldr    w10, [x8]
+#else
+    ldxr   w10, [x8]                  // Need to use atomic instructions for read barrier.
+#endif
+    eor    w11, w10, w9               // Prepare the value to store if simply locked
+                                      //   (mostly 0s, and preserved read barrier bits),
+                                      // or prepare to compare thread id for recursive lock check
+                                      //   (lock_word.ThreadId() ^ self->ThreadId()).
+    tst    w11, #LOCK_WORD_GC_STATE_MASK_SHIFTED_TOGGLED  // Test the non-gc bits.
+    b.ne   2f                         // Locked recursively or by other thread?
+    // Transition to unlocked.
+#ifndef USE_READ_BARRIER
+    stlr   w11, [x8]
+#else
+    stlxr  w10, w11, [x8]             // Need to use atomic instructions for read barrier.
+    cbnz   w10, 1b                    // If the store failed, retry.
+#endif
+    ret
+2:
+                                      // Check lock word state and thread id together.
+    tst    w11, #(LOCK_WORD_STATE_MASK_SHIFTED | LOCK_WORD_THIN_LOCK_OWNER_MASK_SHIFTED)
+    b.ne   \slow_unlock
+    sub    w11, w10, #LOCK_WORD_THIN_LOCK_COUNT_ONE  // decrement count
+#ifndef USE_READ_BARRIER
+    str    w11, [x8]
+#else
+    stxr   w10, w11, [x8]             // Need to use atomic instructions for read barrier.
+    cbnz   w10, 1b                    // If the store failed, retry.
+#endif
+    ret
 .endm
 
 #endif  // ART_RUNTIME_ARCH_ARM64_ASM_SUPPORT_ARM64_S_

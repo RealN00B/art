@@ -20,6 +20,7 @@
 #include "monitor.h"
 
 #include "base/allocator.h"
+#include "base/macros.h"
 #ifdef __LP64__
 #include <stdint.h>
 #include "base/atomic.h"
@@ -28,7 +29,7 @@
 #include "base/stl_util.h"     // STLDeleteElements
 #endif
 
-namespace art {
+namespace art HIDDEN {
 
 // Abstraction to keep monitors small enough to fit in a lock word (32bits). On 32bit systems the
 // monitor id loses the alignment bits of the Monitor*.
@@ -189,18 +190,18 @@ class MonitorPool {
   // Size of a monitor, rounded up to a multiple of alignment.
   static constexpr size_t kAlignedMonitorSize = (sizeof(Monitor) + kMonitorAlignment - 1) &
                                                 -kMonitorAlignment;
-  // As close to a page as we can get seems a good start.
-  static constexpr size_t kChunkCapacity = kPageSize / kAlignedMonitorSize;
-  // Chunk size that is referenced in the id. We can collapse this to the actually used storage
-  // in a chunk, i.e., kChunkCapacity * kAlignedMonitorSize, but this will mean proper divisions.
-  static constexpr size_t kChunkSize = kPageSize;
+  // Size of the chunks holding the actual monitors. The bottom bits of the monitor id are the
+  // index into such a chunk. We can collapse this to the actually used storage
+  // in a chunk, i.e., kChunkCapacity * kAlignedMonitorSize, but this would mean proper divisions.
+  static constexpr size_t kChunkSize = 4096;
   static_assert(IsPowerOfTwo(kChunkSize), "kChunkSize must be power of 2");
+  static constexpr size_t kChunkCapacity = kChunkSize / kAlignedMonitorSize;
   // The number of chunks of storage that can be referenced by the initial chunk list.
   // The total number of usable monitor chunks is typically 255 times this number, so it
   // should be large enough that we don't run out. We run out of address bits if it's > 512.
   // Currently we set it a bit smaller, to save half a page per process.  We make it tiny in
   // debug builds to catch growth errors. The only value we really expect to tune.
-  static constexpr size_t kInitialChunkStorage = kIsDebugBuild ? 1U : 256U;
+  static constexpr size_t kInitialChunkStorage = kIsDebugBuild ? 8U : 256U;
   static_assert(IsPowerOfTwo(kInitialChunkStorage), "kInitialChunkStorage must be power of 2");
   // The number of lists, each containing pointers to storage chunks.
   static constexpr size_t kMaxChunkLists = 8;  //  Dictated by 3 bit index. Don't increase above 8.
@@ -215,7 +216,7 @@ class MonitorPool {
   // Array of pointers to lists (again arrays) of pointers to chunks containing monitors.
   // Zeroth entry points to a list (array) of kInitialChunkStorage pointers to chunks.
   // Each subsequent list as twice as large as the preceding one.
-  // Monitor Ids are interpreted as follows:
+  // Monitor Ids are effectively interpreted as follows:
   //     Top 3 bits (of 28): index into monitor_chunks_.
   //     Next 16 bits: index into the chunk list, i.e. monitor_chunks_[i].
   //     Last 9 bits: offset within chunk, expressed as multiple of kMonitorAlignment.
@@ -236,7 +237,7 @@ class MonitorPool {
   // ChunkListCapacity(current_chunk_list_index_).
   size_t current_chunk_list_capacity_ GUARDED_BY(Locks::allocated_monitor_ids_lock_);
 
-  typedef TrackingAllocator<uint8_t, kAllocatorTagMonitorPool> Allocator;
+  using Allocator = TrackingAllocator<uint8_t, kAllocatorTagMonitorPool>;
   Allocator allocator_;
 
   // Start of free list of monitors.

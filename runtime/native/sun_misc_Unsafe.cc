@@ -34,9 +34,9 @@
 #include "art_field-inl.h"
 #include "native_util.h"
 #include "scoped_fast_native_object_access-inl.h"
-#include "well_known_classes.h"
+#include "well_known_classes-inl.h"
 
-namespace art {
+namespace art HIDDEN {
 
 static jboolean Unsafe_compareAndSwapInt(JNIEnv* env, jobject, jobject javaObj, jlong offset,
                                          jint expectedValue, jint newValue) {
@@ -69,7 +69,7 @@ static jboolean Unsafe_compareAndSwapObject(JNIEnv* env, jobject, jobject javaOb
   ObjPtr<mirror::Object> expectedValue = soa.Decode<mirror::Object>(javaExpectedValue);
   ObjPtr<mirror::Object> newValue = soa.Decode<mirror::Object>(javaNewValue);
   // JNI must use non transactional mode.
-  if (kUseReadBarrier) {
+  if (gUseReadBarrier) {
     // Need to make sure the reference stored in the field is a to-space one before attempting the
     // CAS or the CAS could fail incorrectly.
     // Note that the read barrier load does NOT need to be volatile.
@@ -219,18 +219,18 @@ static jint Unsafe_getArrayIndexScaleForComponentType(JNIEnv* env, jclass, jclas
   return Primitive::ComponentSize(primitive_type);
 }
 
-static jint Unsafe_addressSize(JNIEnv* env ATTRIBUTE_UNUSED, jobject ob ATTRIBUTE_UNUSED) {
+static jint Unsafe_addressSize([[maybe_unused]] JNIEnv* env, [[maybe_unused]] jobject ob) {
   return sizeof(void*);
 }
 
-static jint Unsafe_pageSize(JNIEnv* env ATTRIBUTE_UNUSED, jobject ob ATTRIBUTE_UNUSED) {
+static jint Unsafe_pageSize([[maybe_unused]] JNIEnv* env, [[maybe_unused]] jobject ob) {
   return sysconf(_SC_PAGESIZE);
 }
 
 static jlong Unsafe_allocateMemory(JNIEnv* env, jobject, jlong bytes) {
   ScopedFastNativeObjectAccess soa(env);
   // bytes is nonnegative and fits into size_t
-  if (bytes < 0 || bytes != (jlong)(size_t) bytes) {
+  if (bytes < 0 || bytes != static_cast<jlong>(static_cast<size_t>(bytes))) {
     ThrowIllegalAccessException("wrong number of bytes");
     return 0;
   }
@@ -242,80 +242,84 @@ static jlong Unsafe_allocateMemory(JNIEnv* env, jobject, jlong bytes) {
   return (uintptr_t) mem;
 }
 
-static void Unsafe_freeMemory(JNIEnv* env ATTRIBUTE_UNUSED, jobject, jlong address) {
+static void Unsafe_freeMemory([[maybe_unused]] JNIEnv* env, jobject, jlong address) {
   free(reinterpret_cast<void*>(static_cast<uintptr_t>(address)));
 }
 
-static void Unsafe_setMemory(JNIEnv* env ATTRIBUTE_UNUSED, jobject, jlong address, jlong bytes, jbyte value) {
+static void Unsafe_setMemory(
+    [[maybe_unused]] JNIEnv* env, jobject, jlong address, jlong bytes, jbyte value) {
   memset(reinterpret_cast<void*>(static_cast<uintptr_t>(address)), value, bytes);
 }
 
-static jbyte Unsafe_getByteJ(JNIEnv* env ATTRIBUTE_UNUSED, jobject, jlong address) {
+static jbyte Unsafe_getByteJ([[maybe_unused]] JNIEnv* env, jobject, jlong address) {
   return *reinterpret_cast<jbyte*>(address);
 }
 
-static void Unsafe_putByteJB(JNIEnv* env ATTRIBUTE_UNUSED, jobject, jlong address, jbyte value) {
+static void Unsafe_putByteJB([[maybe_unused]] JNIEnv* env, jobject, jlong address, jbyte value) {
   *reinterpret_cast<jbyte*>(address) = value;
 }
 
-static jshort Unsafe_getShortJ(JNIEnv* env ATTRIBUTE_UNUSED, jobject, jlong address) {
+static jshort Unsafe_getShortJ([[maybe_unused]] JNIEnv* env, jobject, jlong address) {
   return *reinterpret_cast<jshort*>(address);
 }
 
-static void Unsafe_putShortJS(JNIEnv* env ATTRIBUTE_UNUSED, jobject, jlong address, jshort value) {
+static void Unsafe_putShortJS([[maybe_unused]] JNIEnv* env, jobject, jlong address, jshort value) {
   *reinterpret_cast<jshort*>(address) = value;
 }
 
-static jchar Unsafe_getCharJ(JNIEnv* env ATTRIBUTE_UNUSED, jobject, jlong address) {
+static jchar Unsafe_getCharJ([[maybe_unused]] JNIEnv* env, jobject, jlong address) {
   return *reinterpret_cast<jchar*>(address);
 }
 
-static void Unsafe_putCharJC(JNIEnv* env ATTRIBUTE_UNUSED, jobject, jlong address, jchar value) {
+static void Unsafe_putCharJC([[maybe_unused]] JNIEnv* env, jobject, jlong address, jchar value) {
   *reinterpret_cast<jchar*>(address) = value;
 }
 
-static jint Unsafe_getIntJ(JNIEnv* env ATTRIBUTE_UNUSED, jobject, jlong address) {
+static jint Unsafe_getIntJ([[maybe_unused]] JNIEnv* env, jobject, jlong address) {
   return *reinterpret_cast<jint*>(address);
 }
 
-static void Unsafe_putIntJI(JNIEnv* env ATTRIBUTE_UNUSED, jobject, jlong address, jint value) {
+static void Unsafe_putIntJI([[maybe_unused]] JNIEnv* env, jobject, jlong address, jint value) {
   *reinterpret_cast<jint*>(address) = value;
 }
 
-static jlong Unsafe_getLongJ(JNIEnv* env ATTRIBUTE_UNUSED, jobject, jlong address) {
+static jlong Unsafe_getLongJ([[maybe_unused]] JNIEnv* env, jobject, jlong address) {
   return *reinterpret_cast<jlong*>(address);
 }
 
-static void Unsafe_putLongJJ(JNIEnv* env ATTRIBUTE_UNUSED, jobject, jlong address, jlong value) {
+static void Unsafe_putLongJJ([[maybe_unused]] JNIEnv* env, jobject, jlong address, jlong value) {
   *reinterpret_cast<jlong*>(address) = value;
 }
 
-static jfloat Unsafe_getFloatJ(JNIEnv* env ATTRIBUTE_UNUSED, jobject, jlong address) {
+static jfloat Unsafe_getFloatJ([[maybe_unused]] JNIEnv* env, jobject, jlong address) {
   return *reinterpret_cast<jfloat*>(address);
 }
 
-static void Unsafe_putFloatJF(JNIEnv* env ATTRIBUTE_UNUSED, jobject, jlong address, jfloat value) {
+static void Unsafe_putFloatJF([[maybe_unused]] JNIEnv* env, jobject, jlong address, jfloat value) {
   *reinterpret_cast<jfloat*>(address) = value;
 }
-static jdouble Unsafe_getDoubleJ(JNIEnv* env ATTRIBUTE_UNUSED, jobject, jlong address) {
+static jdouble Unsafe_getDoubleJ([[maybe_unused]] JNIEnv* env, jobject, jlong address) {
   return *reinterpret_cast<jdouble*>(address);
 }
 
-static void Unsafe_putDoubleJD(JNIEnv* env ATTRIBUTE_UNUSED, jobject, jlong address, jdouble value) {
+static void Unsafe_putDoubleJD([[maybe_unused]] JNIEnv* env,
+                               jobject,
+                               jlong address,
+                               jdouble value) {
   *reinterpret_cast<jdouble*>(address) = value;
 }
 
-static void Unsafe_copyMemory(JNIEnv *env, jobject unsafe ATTRIBUTE_UNUSED, jlong src,
-                              jlong dst, jlong size) {
+static void Unsafe_copyMemory(
+    JNIEnv* env, [[maybe_unused]] jobject unsafe, jlong src, jlong dst, jlong size) {
   if (size == 0) {
     return;
   }
   // size is nonnegative and fits into size_t
-  if (size < 0 || size != (jlong)(size_t) size) {
+  if (size < 0 || size != static_cast<jlong>(static_cast<size_t>(size))) {
     ScopedFastNativeObjectAccess soa(env);
     ThrowIllegalAccessException("wrong number of bytes");
   }
-  size_t sz = (size_t)size;
+  size_t sz = static_cast<size_t>(size);
   memcpy(reinterpret_cast<void *>(dst), reinterpret_cast<void *>(src), sz);
 }
 
@@ -347,8 +351,8 @@ static void copyFromArray(jlong dstAddr,
   }
 }
 
-static void Unsafe_copyMemoryToPrimitiveArray(JNIEnv *env,
-                                              jobject unsafe ATTRIBUTE_UNUSED,
+static void Unsafe_copyMemoryToPrimitiveArray(JNIEnv* env,
+                                              [[maybe_unused]] jobject unsafe,
                                               jlong srcAddr,
                                               jobject dstObj,
                                               jlong dstOffset,
@@ -358,11 +362,11 @@ static void Unsafe_copyMemoryToPrimitiveArray(JNIEnv *env,
     return;
   }
   // size is nonnegative and fits into size_t
-  if (size < 0 || size != (jlong)(size_t) size) {
+  if (size < 0 || size != static_cast<jlong>(static_cast<size_t>(size))) {
     ThrowIllegalAccessException("wrong number of bytes");
   }
-  size_t sz = (size_t)size;
-  size_t dst_offset = (size_t)dstOffset;
+  size_t sz = static_cast<size_t>(size);
+  size_t dst_offset = static_cast<size_t>(dstOffset);
   ObjPtr<mirror::Object> dst = soa.Decode<mirror::Object>(dstObj);
   ObjPtr<mirror::Class> component_type = dst->GetClass()->GetComponentType();
   if (component_type->IsPrimitiveByte() || component_type->IsPrimitiveBoolean()) {
@@ -382,8 +386,8 @@ static void Unsafe_copyMemoryToPrimitiveArray(JNIEnv *env,
   }
 }
 
-static void Unsafe_copyMemoryFromPrimitiveArray(JNIEnv *env,
-                                                jobject unsafe ATTRIBUTE_UNUSED,
+static void Unsafe_copyMemoryFromPrimitiveArray(JNIEnv* env,
+                                                [[maybe_unused]] jobject unsafe,
                                                 jobject srcObj,
                                                 jlong srcOffset,
                                                 jlong dstAddr,
@@ -393,11 +397,11 @@ static void Unsafe_copyMemoryFromPrimitiveArray(JNIEnv *env,
     return;
   }
   // size is nonnegative and fits into size_t
-  if (size < 0 || size != (jlong)(size_t) size) {
+  if (size < 0 || size != static_cast<jlong>(static_cast<size_t>(size))) {
     ThrowIllegalAccessException("wrong number of bytes");
   }
-  size_t sz = (size_t)size;
-  size_t src_offset = (size_t)srcOffset;
+  size_t sz = static_cast<size_t>(size);
+  size_t src_offset = static_cast<size_t>(srcOffset);
   ObjPtr<mirror::Object> src = soa.Decode<mirror::Object>(srcObj);
   ObjPtr<mirror::Class> component_type = src->GetClass()->GetComponentType();
   if (component_type->IsPrimitiveByte() || component_type->IsPrimitiveBoolean()) {
@@ -521,12 +525,15 @@ static void Unsafe_park(JNIEnv* env, jobject, jboolean isAbsolute, jlong time) {
 
 static void Unsafe_unpark(JNIEnv* env, jobject, jobject jthread) {
   art::ScopedFastNativeObjectAccess soa(env);
-  if (jthread == nullptr || !env->IsInstanceOf(jthread, WellKnownClasses::java_lang_Thread)) {
+  ObjPtr<mirror::Object> mirror_thread = soa.Decode<mirror::Object>(jthread);
+  if (mirror_thread == nullptr ||
+      !mirror_thread->InstanceOf(WellKnownClasses::java_lang_Thread.Get())) {
     ThrowIllegalArgumentException("Argument to unpark() was not a Thread");
     return;
   }
-  art::MutexLock mu(soa.Self(), *art::Locks::thread_list_lock_);
-  art::Thread* thread = art::Thread::FromManagedThread(soa, jthread);
+  Thread* self = soa.Self();
+  art::MutexLock mu(self, *art::Locks::thread_list_lock_);
+  art::Thread* thread = art::Thread::FromManagedThread(self, mirror_thread);
   if (thread != nullptr) {
     thread->Unpark();
   } else {
@@ -534,10 +541,9 @@ static void Unsafe_unpark(JNIEnv* env, jobject, jobject jthread) {
     // or the thread has already terminated. Setting the field to true will be
     // respected when the thread does start, and is harmless if the thread has
     // already terminated.
-    ArtField* unparked =
-        jni::DecodeArtField(WellKnownClasses::java_lang_Thread_unparkedBeforeStart);
+    ArtField* unparked = WellKnownClasses::java_lang_Thread_unparkedBeforeStart;
     // JNI must use non transactional mode.
-    unparked->SetBoolean<false>(soa.Decode<mirror::Object>(jthread), JNI_TRUE);
+    unparked->SetBoolean<false>(mirror_thread, JNI_TRUE);
   }
 }
 

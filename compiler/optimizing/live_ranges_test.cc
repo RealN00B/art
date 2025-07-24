@@ -15,6 +15,7 @@
  */
 
 #include "base/arena_allocator.h"
+#include "base/macros.h"
 #include "builder.h"
 #include "code_generator.h"
 #include "dex/dex_file.h"
@@ -25,15 +26,18 @@
 #include "prepare_for_register_allocation.h"
 #include "ssa_liveness_analysis.h"
 
-namespace art {
+namespace art HIDDEN {
 
-class LiveRangesTest : public OptimizingUnitTest {
- public:
+class LiveRangesTest : public CommonCompilerTest, public OptimizingUnitTestHelper {
+ protected:
   HGraph* BuildGraph(const std::vector<uint16_t>& data);
+
+  std::unique_ptr<CompilerOptions> compiler_options_;
 };
 
 HGraph* LiveRangesTest::BuildGraph(const std::vector<uint16_t>& data) {
   HGraph* graph = CreateCFG(data);
+  compiler_options_ = CommonCompilerTest::CreateCompilerOptions(kRuntimeISA, "default");
   // Suspend checks implementation may change in the future, and this test relies
   // on how instructions are ordered.
   RemoveSuspendChecks(graph);

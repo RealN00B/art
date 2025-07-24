@@ -51,11 +51,11 @@
 #include "dex/dex_file_loader.h"
 #include "dex/primitive.h"
 #include "events-inl.h"
-#include "fixed_up_dex_file.h"
 #include "gc/heap-visit-objects-inl.h"
 #include "gc/heap.h"
 #include "gc_root.h"
 #include "handle.h"
+#include "hidden_api.h"
 #include "jni/jni_env_ext-inl.h"
 #include "jni/jni_internal.h"
 #include "mirror/array-alloc-inl.h"
@@ -80,7 +80,7 @@
 #include "ti_phase.h"
 #include "ti_redefine.h"
 #include "transform.h"
-#include "well_known_classes.h"
+#include "well_known_classes-inl.h"
 
 namespace openjdkjvmti {
 
@@ -113,10 +113,8 @@ static std::unique_ptr<const art::DexFile> MakeSingleDexFile(art::Thread* self,
   }
   uint32_t checksum = reinterpret_cast<const art::DexFile::Header*>(map.Begin())->checksum_;
   std::string map_name = map.GetName();
-  const art::ArtDexFileLoader dex_file_loader;
-  std::unique_ptr<const art::DexFile> dex_file(dex_file_loader.Open(map_name,
-                                                                    checksum,
-                                                                    std::move(map),
+  art::ArtDexFileLoader dex_file_loader(std::move(map), map_name);
+  std::unique_ptr<const art::DexFile> dex_file(dex_file_loader.Open(checksum,
                                                                     /*verify=*/true,
                                                                     /*verify_checksum=*/true,
                                                                     &error_msg));
@@ -164,10 +162,10 @@ struct ClassCallback : public art::ClassLoadCallback {
                       art::Handle<art::mirror::Class> klass,
                       art::Handle<art::mirror::ClassLoader> class_loader,
                       const art::DexFile& initial_dex_file,
-                      const art::dex::ClassDef& initial_class_def ATTRIBUTE_UNUSED,
-                      /*out*/art::DexFile const** final_dex_file,
-                      /*out*/art::dex::ClassDef const** final_class_def)
-      override REQUIRES_SHARED(art::Locks::mutator_lock_) {
+                      [[maybe_unused]] const art::dex::ClassDef& initial_class_def,
+                      /*out*/ art::DexFile const** final_dex_file,
+                      /*out*/ art::dex::ClassDef const** final_class_def) override
+      REQUIRES_SHARED(art::Locks::mutator_lock_) {
     bool is_enabled =
         event_handler->IsEventEnabledAnywhere(ArtJvmtiEvent::kClassFileLoadHookRetransformable) ||
         event_handler->IsEventEnabledAnywhere(ArtJvmtiEvent::kClassFileLoadHookNonRetransformable);
@@ -194,8 +192,8 @@ struct ClassCallback : public art::ClassLoadCallback {
     def.InitFirstLoad(descriptor, class_loader, initial_dex_file);
 
     // Call all non-retransformable agents.
-    Transformer::TransformSingleClassDirect<ArtJvmtiEvent::kClassFileLoadHookNonRetransformable>(
-        event_handler, self, &def);
+    Transformer::CallClassFileLoadHooksSingleClass<
+        ArtJvmtiEvent::kClassFileLoadHookNonRetransformable>(event_handler, self, &def);
 
     std::vector<unsigned char> post_non_retransform;
     if (def.IsModified()) {
@@ -205,11 +203,11 @@ struct ClassCallback : public art::ClassLoadCallback {
     }
 
     // Call all structural transformation agents.
-    Transformer::TransformSingleClassDirect<ArtJvmtiEvent::kStructuralDexFileLoadHook>(
+    Transformer::CallClassFileLoadHooksSingleClass<ArtJvmtiEvent::kStructuralDexFileLoadHook>(
         event_handler, self, &def);
     // Call all retransformable agents.
-    Transformer::TransformSingleClassDirect<ArtJvmtiEvent::kClassFileLoadHookRetransformable>(
-        event_handler, self, &def);
+    Transformer::CallClassFileLoadHooksSingleClass<
+        ArtJvmtiEvent::kClassFileLoadHookRetransformable>(event_handler, self, &def);
 
     if (def.IsModified()) {
       VLOG(class_linker) << "Changing class " << descriptor;
@@ -367,7 +365,7 @@ struct ClassCallback : public art::ClassLoadCallback {
       heap->IncrementDisableMovingGC(self);
     }
     {
-      art::ScopedThreadSuspension sts(self, art::kWaitingForVisitObjects);
+      art::ScopedThreadSuspension sts(self, art::ThreadState::kWaitingForVisitObjects);
       art::ScopedSuspendAll ssa("FixupTempClass");
 
       art::mirror::Class* input = temp_klass.Get();
@@ -389,8 +387,7 @@ struct ClassCallback : public art::ClassLoadCallback {
 
     void VisitRoots(art::mirror::Object*** roots,
                     size_t count,
-                    const art::RootInfo& info ATTRIBUTE_UNUSED)
-        override {
+                    [[maybe_unused]] const art::RootInfo& info) override {
       for (size_t i = 0; i != count; ++i) {
         if (*roots[i] == input_) {
           *roots[i] = output_;
@@ -400,8 +397,8 @@ struct ClassCallback : public art::ClassLoadCallback {
 
     void VisitRoots(art::mirror::CompressedReference<art::mirror::Object>** roots,
                     size_t count,
-                    const art::RootInfo& info ATTRIBUTE_UNUSED)
-        override REQUIRES_SHARED(art::Locks::mutator_lock_) {
+                    [[maybe_unused]] const art::RootInfo& info) override
+        REQUIRES_SHARED(art::Locks::mutator_lock_) {
       for (size_t i = 0; i != count; ++i) {
         if (roots[i]->AsMirrorPtr() == input_) {
           roots[i]->Assign(output_);
@@ -478,7 +475,7 @@ struct ClassCallback : public art::ClassLoadCallback {
 
       void operator()(art::mirror::Object* src,
                       art::MemberOffset field_offset,
-                      bool is_static ATTRIBUTE_UNUSED) const
+                      [[maybe_unused]] bool is_static) const
           REQUIRES_SHARED(art::Locks::mutator_lock_) {
         art::mirror::HeapReference<art::mirror::Object>* trg =
           src->GetFieldObjectReferenceAddr(field_offset);
@@ -489,7 +486,7 @@ struct ClassCallback : public art::ClassLoadCallback {
         }
       }
 
-      void operator()(art::ObjPtr<art::mirror::Class> klass ATTRIBUTE_UNUSED,
+      void operator()([[maybe_unused]] art::ObjPtr<art::mirror::Class> klass,
                       art::ObjPtr<art::mirror::Reference> reference) const
           REQUIRES_SHARED(art::Locks::mutator_lock_) {
         art::mirror::Object* val = reference->GetReferent();
@@ -498,13 +495,13 @@ struct ClassCallback : public art::ClassLoadCallback {
         }
       }
 
-      void VisitRoot(art::mirror::CompressedReference<art::mirror::Object>* root ATTRIBUTE_UNUSED)
-          const {
+      void VisitRoot(
+          [[maybe_unused]] art::mirror::CompressedReference<art::mirror::Object>* root) const {
         LOG(FATAL) << "Unreachable";
       }
 
       void VisitRootIfNonNull(
-          art::mirror::CompressedReference<art::mirror::Object>* root ATTRIBUTE_UNUSED) const {
+          [[maybe_unused]] art::mirror::CompressedReference<art::mirror::Object>* root) const {
         LOG(FATAL) << "Unreachable";
       }
 
@@ -625,7 +622,7 @@ jvmtiError ClassUtil::GetClassMethods(jvmtiEnv* env,
 
   if (art::kIsDebugBuild) {
     size_t count = 0;
-    for (auto& m ATTRIBUTE_UNUSED : klass->GetDeclaredMethods(art::kRuntimePointerSize)) {
+    for ([[maybe_unused]] auto& m : klass->GetDeclaredMethods(art::kRuntimePointerSize)) {
       count++;
     }
     CHECK_EQ(count, klass->NumDirectMethods() + klass->NumDeclaredVirtualMethods());
@@ -661,7 +658,7 @@ jvmtiError ClassUtil::GetImplementedInterfaces(jvmtiEnv* env,
   // spec says these should not be reported.
   if (klass->IsArrayClass()) {
     *interface_count_ptr = 0;
-    *interfaces_ptr = nullptr;  // TODO: Should we allocate a dummy here?
+    *interfaces_ptr = nullptr;  // TODO: Should we allocate a placeholder here?
     return ERR(NONE);
   }
 
@@ -749,7 +746,7 @@ jvmtiError ClassUtil::GetClassSignature(jvmtiEnv* env,
   return ERR(NONE);
 }
 
-jvmtiError ClassUtil::GetClassStatus(jvmtiEnv* env ATTRIBUTE_UNUSED,
+jvmtiError ClassUtil::GetClassStatus([[maybe_unused]] jvmtiEnv* env,
                                      jclass jklass,
                                      jint* status_ptr) {
   art::ScopedObjectAccess soa(art::Thread::Current());
@@ -800,7 +797,7 @@ static jvmtiError ClassIsT(jclass jklass, T test, jboolean* is_t_ptr) {
   return ERR(NONE);
 }
 
-jvmtiError ClassUtil::IsInterface(jvmtiEnv* env ATTRIBUTE_UNUSED,
+jvmtiError ClassUtil::IsInterface([[maybe_unused]] jvmtiEnv* env,
                                   jclass jklass,
                                   jboolean* is_interface_ptr) {
   auto test = [](art::ObjPtr<art::mirror::Class> klass) REQUIRES_SHARED(art::Locks::mutator_lock_) {
@@ -809,7 +806,7 @@ jvmtiError ClassUtil::IsInterface(jvmtiEnv* env ATTRIBUTE_UNUSED,
   return ClassIsT(jklass, test, is_interface_ptr);
 }
 
-jvmtiError ClassUtil::IsArrayClass(jvmtiEnv* env ATTRIBUTE_UNUSED,
+jvmtiError ClassUtil::IsArrayClass([[maybe_unused]] jvmtiEnv* env,
                                    jclass jklass,
                                    jboolean* is_array_class_ptr) {
   auto test = [](art::ObjPtr<art::mirror::Class> klass) REQUIRES_SHARED(art::Locks::mutator_lock_) {
@@ -836,7 +833,7 @@ static uint32_t ClassGetModifiers(art::Thread* self, art::ObjPtr<art::mirror::Cl
   return art::mirror::Class::GetInnerClassFlags(h_klass, modifiers);
 }
 
-jvmtiError ClassUtil::GetClassModifiers(jvmtiEnv* env ATTRIBUTE_UNUSED,
+jvmtiError ClassUtil::GetClassModifiers([[maybe_unused]] jvmtiEnv* env,
                                         jclass jklass,
                                         jint* modifiers_ptr) {
   art::ScopedObjectAccess soa(art::Thread::Current());
@@ -854,7 +851,7 @@ jvmtiError ClassUtil::GetClassModifiers(jvmtiEnv* env ATTRIBUTE_UNUSED,
   return ERR(NONE);
 }
 
-jvmtiError ClassUtil::GetClassLoader(jvmtiEnv* env ATTRIBUTE_UNUSED,
+jvmtiError ClassUtil::GetClassLoader([[maybe_unused]] jvmtiEnv* env,
                                      jclass jklass,
                                      jobject* classloader_ptr) {
   art::ScopedObjectAccess soa(art::Thread::Current());
@@ -927,40 +924,42 @@ jvmtiError ClassUtil::GetClassLoaderClassDescriptors(jvmtiEnv* env,
   } else if (count_ptr == nullptr || classes == nullptr) {
     return ERR(NULL_POINTER);
   }
-  art::JNIEnvExt* jnienv = self->GetJniEnv();
-  if (loader == nullptr ||
-      jnienv->IsInstanceOf(loader, art::WellKnownClasses::java_lang_BootClassLoader)) {
+  std::vector<const art::DexFile*> dex_files_storage;
+  const std::vector<const art::DexFile*>* dex_files = nullptr;
+  if (loader == nullptr) {
     // We can just get the dex files directly for the boot class path.
-    return CopyClassDescriptors(env,
-                                art::Runtime::Current()->GetClassLinker()->GetBootClassPath(),
-                                count_ptr,
-                                classes);
+    dex_files = &art::Runtime::Current()->GetClassLinker()->GetBootClassPath();
+  } else {
+    art::ScopedObjectAccess soa(self);
+    art::StackHandleScope<1> hs(self);
+    art::Handle<art::mirror::ClassLoader> class_loader(
+        hs.NewHandle(soa.Decode<art::mirror::ClassLoader>(loader)));
+    if (class_loader->InstanceOf(art::WellKnownClasses::java_lang_BootClassLoader.Get())) {
+      // We can just get the dex files directly for the boot class path.
+      dex_files = &art::Runtime::Current()->GetClassLinker()->GetBootClassPath();
+    } else if (!class_loader->InstanceOf(art::WellKnownClasses::java_lang_ClassLoader.Get())) {
+      return ERR(ILLEGAL_ARGUMENT);
+    } else if (!class_loader->InstanceOf(
+          art::WellKnownClasses::dalvik_system_BaseDexClassLoader.Get())) {
+      JVMTI_LOG(ERROR, env) << "GetClassLoaderClassDescriptors is only implemented for "
+                            << "BootClassPath and dalvik.system.BaseDexClassLoader class loaders";
+      // TODO Possibly return OK With no classes would  be better since these ones cannot have any
+      // real classes associated with them.
+      return ERR(NOT_IMPLEMENTED);
+    } else {
+      art::VisitClassLoaderDexFiles(
+          self,
+          class_loader,
+          [&](const art::DexFile* dex_file) {
+            dex_files_storage.push_back(dex_file);
+            return true;  // Continue with other dex files.
+          });
+      dex_files = &dex_files_storage;
+    }
   }
-  if (!jnienv->IsInstanceOf(loader, art::WellKnownClasses::java_lang_ClassLoader)) {
-    return ERR(ILLEGAL_ARGUMENT);
-  } else if (!jnienv->IsInstanceOf(loader,
-                                   art::WellKnownClasses::dalvik_system_BaseDexClassLoader)) {
-    JVMTI_LOG(ERROR, env) << "GetClassLoaderClassDescriptors is only implemented for "
-                          << "BootClassPath and dalvik.system.BaseDexClassLoader class loaders";
-    // TODO Possibly return OK With no classes would  be better since these ones cannot have any
-    // real classes associated with them.
-    return ERR(NOT_IMPLEMENTED);
-  }
-
-  art::ScopedObjectAccess soa(self);
-  art::StackHandleScope<1> hs(self);
-  art::Handle<art::mirror::ClassLoader> class_loader(
-      hs.NewHandle(soa.Decode<art::mirror::ClassLoader>(loader)));
-  std::vector<const art::DexFile*> dex_files;
-  art::VisitClassLoaderDexFiles(
-      soa,
-      class_loader,
-      [&](const art::DexFile* dex_file) {
-        dex_files.push_back(dex_file);
-        return true;  // Continue with other dex files.
-      });
   // We hold the loader so the dex files won't go away until after this call at worst.
-  return CopyClassDescriptors(env, dex_files, count_ptr, classes);
+  DCHECK(dex_files != nullptr);
+  return CopyClassDescriptors(env, *dex_files, count_ptr, classes);
 }
 
 jvmtiError ClassUtil::GetClassLoaderClasses(jvmtiEnv* env,
@@ -973,19 +972,17 @@ jvmtiError ClassUtil::GetClassLoaderClasses(jvmtiEnv* env,
     return ERR(NULL_POINTER);
   }
   art::Thread* self = art::Thread::Current();
-  if (!self->GetJniEnv()->IsInstanceOf(initiating_loader,
-                                       art::WellKnownClasses::java_lang_ClassLoader)) {
-    return ERR(ILLEGAL_ARGUMENT);
-  }
-  if (self->GetJniEnv()->IsInstanceOf(initiating_loader,
-                                      art::WellKnownClasses::java_lang_BootClassLoader)) {
-    // Need to use null for the BootClassLoader.
-    initiating_loader = nullptr;
-  }
-
   art::ScopedObjectAccess soa(self);
   art::ObjPtr<art::mirror::ClassLoader> class_loader =
       soa.Decode<art::mirror::ClassLoader>(initiating_loader);
+  if (class_loader == nullptr) {
+    // Keep null, meaning the boot class loader.
+  } else if (!class_loader->InstanceOf(art::WellKnownClasses::java_lang_ClassLoader.Get())) {
+    return ERR(ILLEGAL_ARGUMENT);
+  } else if (class_loader->InstanceOf(art::WellKnownClasses::java_lang_BootClassLoader.Get())) {
+    // Need to use null for the BootClassLoader.
+    class_loader = nullptr;
+  }
 
   art::ClassLinker* class_linker = art::Runtime::Current()->GetClassLinker();
 
@@ -1049,7 +1046,7 @@ jvmtiError ClassUtil::GetClassLoaderClasses(jvmtiEnv* env,
   return ERR(NONE);
 }
 
-jvmtiError ClassUtil::GetClassVersionNumbers(jvmtiEnv* env ATTRIBUTE_UNUSED,
+jvmtiError ClassUtil::GetClassVersionNumbers([[maybe_unused]] jvmtiEnv* env,
                                              jclass jklass,
                                              jint* minor_version_ptr,
                                              jint* major_version_ptr) {
@@ -1134,6 +1131,40 @@ jvmtiError ClassUtil::GetSourceDebugExtension(jvmtiEnv* env,
     return ret;
   }
   *source_debug_extension_ptr = ext_copy.release();
+  return OK;
+}
+
+jvmtiError ClassUtil::DisableHiddenApiEnforcementPolicy(jvmtiEnv* env) {
+  return SetHiddenApiEnforcementPolicy(
+      env, static_cast<jint>(art::hiddenapi::EnforcementPolicy::kDisabled));
+}
+
+jvmtiError ClassUtil::GetHiddenApiEnforcementPolicy(jvmtiEnv* env, jint* policy) {
+  if (env == nullptr) {
+    return ERR(INVALID_ENVIRONMENT);
+  } else if (art::Thread::Current() == nullptr) {
+    return ERR(UNATTACHED_THREAD);
+  } else if (policy == nullptr) {
+    return ERR(NULL_POINTER);
+  }
+  *policy = static_cast<jint>(art::Runtime::Current()->GetHiddenApiEnforcementPolicy());
+  return OK;
+}
+
+jvmtiError ClassUtil::SetHiddenApiEnforcementPolicy(jvmtiEnv* env, jint policy) {
+  if (env == nullptr) {
+    return ERR(INVALID_ENVIRONMENT);
+  } else if (art::Thread::Current() == nullptr) {
+    return ERR(UNATTACHED_THREAD);
+  } else if (policy < static_cast<jint>(art::hiddenapi::EnforcementPolicy::kDisabled) ||
+             policy > static_cast<jint>(art::hiddenapi::EnforcementPolicy::kMax)) {
+    JVMTI_LOG(INFO, env) << "Bad policy: " << policy << ", must be between "
+                         << static_cast<jint>(art::hiddenapi::EnforcementPolicy::kDisabled)
+                         << " and " << static_cast<jint>(art::hiddenapi::EnforcementPolicy::kMax);
+    return ERR(ILLEGAL_ARGUMENT);
+  }
+  art::Runtime::Current()->SetHiddenApiEnforcementPolicy(
+      static_cast<art::hiddenapi::EnforcementPolicy>(policy));
   return OK;
 }
 

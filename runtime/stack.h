@@ -17,17 +17,19 @@
 #ifndef ART_RUNTIME_STACK_H_
 #define ART_RUNTIME_STACK_H_
 
-#include <optional>
 #include <stdint.h>
+
+#include <optional>
 #include <string>
 
 #include "base/locks.h"
 #include "base/macros.h"
+#include "deoptimization_kind.h"
+#include "oat/stack_map.h"
 #include "obj_ptr.h"
 #include "quick/quick_method_frame_info.h"
-#include "stack_map.h"
 
-namespace art {
+namespace art HIDDEN {
 
 namespace mirror {
 class Object;
@@ -54,12 +56,7 @@ enum VRegKind {
   kImpreciseConstant,
   kUndefined,
 };
-std::ostream& operator<<(std::ostream& os, const VRegKind& rhs);
-
-// Size in bytes of the should_deoptimize flag on stack.
-// We just need 4 bytes for our purpose regardless of the architecture. Frame size
-// calculation will automatically do alignment for the final frame size.
-static constexpr size_t kShouldDeoptimizeFlagSize = 4;
+std::ostream& operator<<(std::ostream& os, VRegKind rhs);
 
 /*
  * Our current stack layout.
@@ -121,12 +118,12 @@ class StackVisitor {
   };
 
  protected:
-  StackVisitor(Thread* thread,
-               Context* context,
-               StackWalkKind walk_kind,
-               bool check_suspended = true);
+  EXPORT StackVisitor(Thread* thread,
+                      Context* context,
+                      StackWalkKind walk_kind,
+                      bool check_suspended = true);
 
-  bool GetRegisterIfAccessible(uint32_t reg, VRegKind kind, uint32_t* val) const
+  bool GetRegisterIfAccessible(uint32_t reg, DexRegisterLocation::Kind kind, uint32_t* val) const
       REQUIRES_SHARED(Locks::mutator_lock_);
 
  public:
@@ -137,13 +134,13 @@ class StackVisitor {
   // Return 'true' if we should continue to visit more frames, 'false' to stop.
   virtual bool VisitFrame() REQUIRES_SHARED(Locks::mutator_lock_) = 0;
 
-  enum class CountTransitions {
+  enum class EXPORT CountTransitions {
     kYes,
     kNo,
   };
 
   template <CountTransitions kCount = CountTransitions::kYes>
-  void WalkStack(bool include_transitions = false) REQUIRES_SHARED(Locks::mutator_lock_);
+  EXPORT void WalkStack(bool include_transitions = false) REQUIRES_SHARED(Locks::mutator_lock_);
 
   // Convenience helper function to walk the stack with a lambda as a visitor.
   template <CountTransitions kCountTransitions = CountTransitions::kYes,
@@ -179,11 +176,11 @@ class StackVisitor {
     return thread_;
   }
 
-  ArtMethod* GetMethod() const REQUIRES_SHARED(Locks::mutator_lock_);
+  EXPORT ArtMethod* GetMethod() const REQUIRES_SHARED(Locks::mutator_lock_);
 
   // Sets this stack frame's method pointer. This requires a full lock of the MutatorLock. This
   // doesn't work with inlined methods.
-  void SetMethod(ArtMethod* method) REQUIRES(Locks::mutator_lock_);
+  EXPORT void SetMethod(ArtMethod* method) REQUIRES(Locks::mutator_lock_);
 
   ArtMethod* GetOuterMethod() const {
     return *GetCurrentQuickFrame();
@@ -193,11 +190,18 @@ class StackVisitor {
     return cur_shadow_frame_ != nullptr;
   }
 
-  uint32_t GetDexPc(bool abort_on_failure = true) const REQUIRES_SHARED(Locks::mutator_lock_);
+  EXPORT uint32_t GetDexPc(bool abort_on_failure = true) const
+      REQUIRES_SHARED(Locks::mutator_lock_);
 
-  ObjPtr<mirror::Object> GetThisObject() const REQUIRES_SHARED(Locks::mutator_lock_);
+  // Returns a vector of the inlined dex pcs, in order from outermost to innermost but it replaces
+  // the innermost one with `handler_dex_pc`. In essence, (outermost dex pc, mid dex pc #1, ..., mid
+  // dex pc #n-1, `handler_dex_pc`).
+  std::vector<uint32_t> ComputeDexPcList(uint32_t handler_dex_pc) const
+      REQUIRES_SHARED(Locks::mutator_lock_);
 
-  size_t GetNativePcOffset() const REQUIRES_SHARED(Locks::mutator_lock_);
+  EXPORT ObjPtr<mirror::Object> GetThisObject() const REQUIRES_SHARED(Locks::mutator_lock_);
+
+  EXPORT size_t GetNativePcOffset() const REQUIRES_SHARED(Locks::mutator_lock_);
 
   // Returns the height of the stack in the managed stack frames, including transitions.
   size_t GetFrameHeight() REQUIRES_SHARED(Locks::mutator_lock_) {
@@ -224,36 +228,37 @@ class StackVisitor {
   bool GetNextMethodAndDexPc(ArtMethod** next_method, uint32_t* next_dex_pc)
       REQUIRES_SHARED(Locks::mutator_lock_);
 
-  bool GetVReg(ArtMethod* m,
-               uint16_t vreg,
-               VRegKind kind,
-               uint32_t* val,
-               std::optional<DexRegisterLocation> location =
-                   std::optional<DexRegisterLocation>()) const
-      REQUIRES_SHARED(Locks::mutator_lock_);
+  EXPORT bool GetVReg(
+      ArtMethod* m,
+      uint16_t vreg,
+      VRegKind kind,
+      uint32_t* val,
+      std::optional<DexRegisterLocation> location = std::optional<DexRegisterLocation>(),
+      bool need_full_register_list = false) const REQUIRES_SHARED(Locks::mutator_lock_);
 
-  bool GetVRegPair(ArtMethod* m, uint16_t vreg, VRegKind kind_lo, VRegKind kind_hi,
-                   uint64_t* val) const
+  EXPORT bool GetVRegPair(ArtMethod* m,
+                          uint16_t vreg,
+                          VRegKind kind_lo,
+                          VRegKind kind_hi,
+                          uint64_t* val) const REQUIRES_SHARED(Locks::mutator_lock_);
+
+  // Values will be set in debugger shadow frames. Debugger will make sure deoptimization
+  // is triggered to make the values effective.
+  EXPORT bool SetVReg(ArtMethod* m, uint16_t vreg, uint32_t new_value, VRegKind kind)
       REQUIRES_SHARED(Locks::mutator_lock_);
 
   // Values will be set in debugger shadow frames. Debugger will make sure deoptimization
   // is triggered to make the values effective.
-  bool SetVReg(ArtMethod* m, uint16_t vreg, uint32_t new_value, VRegKind kind)
+  EXPORT bool SetVRegReference(ArtMethod* m, uint16_t vreg, ObjPtr<mirror::Object> new_value)
       REQUIRES_SHARED(Locks::mutator_lock_);
 
   // Values will be set in debugger shadow frames. Debugger will make sure deoptimization
   // is triggered to make the values effective.
-  bool SetVRegReference(ArtMethod* m, uint16_t vreg, ObjPtr<mirror::Object> new_value)
-      REQUIRES_SHARED(Locks::mutator_lock_);
-
-  // Values will be set in debugger shadow frames. Debugger will make sure deoptimization
-  // is triggered to make the values effective.
-  bool SetVRegPair(ArtMethod* m,
-                   uint16_t vreg,
-                   uint64_t new_value,
-                   VRegKind kind_lo,
-                   VRegKind kind_hi)
-      REQUIRES_SHARED(Locks::mutator_lock_);
+  EXPORT bool SetVRegPair(ArtMethod* m,
+                          uint16_t vreg,
+                          uint64_t new_value,
+                          VRegKind kind_lo,
+                          VRegKind kind_hi) REQUIRES_SHARED(Locks::mutator_lock_);
 
   uintptr_t* GetGPRAddress(uint32_t reg) const;
 
@@ -266,8 +271,14 @@ class StackVisitor {
     return !current_inline_frames_.empty();
   }
 
+  size_t InlineDepth() const { return current_inline_frames_.size(); }
+
   InlineInfo GetCurrentInlinedFrame() const {
     return current_inline_frames_.back();
+  }
+
+  const BitTableRange<InlineInfo>& GetCurrentInlinedFrames() const {
+    return current_inline_frames_;
   }
 
   uintptr_t GetCurrentQuickFramePc() const {
@@ -282,15 +293,9 @@ class StackVisitor {
     return cur_shadow_frame_;
   }
 
-  HandleScope* GetCurrentHandleScope(size_t pointer_size) const {
-    ArtMethod** sp = GetCurrentQuickFrame();
-    // Skip ArtMethod*; handle scope comes next;
-    return reinterpret_cast<HandleScope*>(reinterpret_cast<uintptr_t>(sp) + pointer_size);
-  }
-
   std::string DescribeLocation() const REQUIRES_SHARED(Locks::mutator_lock_);
 
-  static size_t ComputeNumFrames(Thread* thread, StackWalkKind walk_kind)
+  EXPORT static size_t ComputeNumFrames(Thread* thread, StackWalkKind walk_kind)
       REQUIRES_SHARED(Locks::mutator_lock_);
 
   static void DescribeStack(Thread* thread) REQUIRES_SHARED(Locks::mutator_lock_);
@@ -301,14 +306,38 @@ class StackVisitor {
 
   QuickMethodFrameInfo GetCurrentQuickFrameInfo() const REQUIRES_SHARED(Locks::mutator_lock_);
 
+  void SetShouldDeoptimizeFlag(DeoptimizeFlagValue value) REQUIRES_SHARED(Locks::mutator_lock_) {
+    uint8_t* should_deoptimize_addr = GetShouldDeoptimizeFlagAddr();
+    *should_deoptimize_addr = *should_deoptimize_addr | static_cast<uint8_t>(value);
+  };
+
+  void UnsetShouldDeoptimizeFlag(DeoptimizeFlagValue value) REQUIRES_SHARED(Locks::mutator_lock_) {
+    uint8_t* should_deoptimize_addr = GetShouldDeoptimizeFlagAddr();
+    *should_deoptimize_addr = *should_deoptimize_addr & ~static_cast<uint8_t>(value);
+  };
+
+  uint8_t GetShouldDeoptimizeFlag() const REQUIRES_SHARED(Locks::mutator_lock_) {
+    return *GetShouldDeoptimizeFlagAddr();
+  }
+
+  bool ShouldForceDeoptForRedefinition() const REQUIRES_SHARED(Locks::mutator_lock_) {
+    uint8_t should_deopt_flag = GetShouldDeoptimizeFlag();
+    return (should_deopt_flag &
+            static_cast<uint8_t>(DeoptimizeFlagValue::kForceDeoptForRedefinition)) != 0;
+  }
+
+  // Return the number of dex register in the map from the outermost frame to the number of inlined
+  // frames indicated by `depth`. If `depth` is 0, grab just the registers from the outermost level.
+  // If it is greater than 0, grab as many inline frames as `depth` indicates.
+  size_t GetNumberOfRegisters(CodeInfo* code_info, int depth) const;
+
  private:
   // Private constructor known in the case that num_frames_ has already been computed.
-  StackVisitor(Thread* thread,
-               Context* context,
-               StackWalkKind walk_kind,
-               size_t num_frames,
-               bool check_suspended = true)
-      REQUIRES_SHARED(Locks::mutator_lock_);
+  EXPORT StackVisitor(Thread* thread,
+                      Context* context,
+                      StackWalkKind walk_kind,
+                      size_t num_frames,
+                      bool check_suspended = true) REQUIRES_SHARED(Locks::mutator_lock_);
 
   bool IsAccessibleRegister(uint32_t reg, bool is_float) const {
     return is_float ? IsAccessibleFPR(reg) : IsAccessibleGPR(reg);
@@ -326,27 +355,31 @@ class StackVisitor {
 
   bool GetVRegFromDebuggerShadowFrame(uint16_t vreg, VRegKind kind, uint32_t* val) const
       REQUIRES_SHARED(Locks::mutator_lock_);
-  bool GetVRegFromOptimizedCode(ArtMethod* m, uint16_t vreg, VRegKind kind,
-                                uint32_t* val) const
+  bool GetVRegFromOptimizedCode(ArtMethod* m,
+                                uint16_t vreg,
+                                VRegKind kind,
+                                uint32_t* val,
+                                bool need_full_register_list = false) const
       REQUIRES_SHARED(Locks::mutator_lock_);
 
-  bool GetVRegPairFromDebuggerShadowFrame(uint16_t vreg, VRegKind kind_lo, VRegKind kind_hi,
+  bool GetVRegPairFromDebuggerShadowFrame(uint16_t vreg,
+                                          VRegKind kind_lo,
+                                          VRegKind kind_hi,
                                           uint64_t* val) const
       REQUIRES_SHARED(Locks::mutator_lock_);
-  bool GetVRegPairFromOptimizedCode(ArtMethod* m, uint16_t vreg,
-                                    VRegKind kind_lo, VRegKind kind_hi,
+  bool GetVRegPairFromOptimizedCode(ArtMethod* m,
+                                    uint16_t vreg,
+                                    VRegKind kind_lo,
+                                    VRegKind kind_hi,
                                     uint64_t* val) const
       REQUIRES_SHARED(Locks::mutator_lock_);
-  bool GetVRegFromOptimizedCode(DexRegisterLocation location, VRegKind kind, uint32_t* val) const
-      REQUIRES_SHARED(Locks::mutator_lock_);
-  bool GetRegisterPairIfAccessible(uint32_t reg_lo, uint32_t reg_hi, VRegKind kind_lo,
-                                   uint64_t* val) const
+  bool GetVRegFromOptimizedCode(DexRegisterLocation location, uint32_t* val) const
       REQUIRES_SHARED(Locks::mutator_lock_);
 
   ShadowFrame* PrepareSetVReg(ArtMethod* m, uint16_t vreg, bool wide)
       REQUIRES_SHARED(Locks::mutator_lock_);
 
-  void SanityCheckFrame() const REQUIRES_SHARED(Locks::mutator_lock_);
+  void ValidateFrame() const REQUIRES_SHARED(Locks::mutator_lock_);
 
   ALWAYS_INLINE CodeInfo* GetCurrentInlineInfo() const;
   ALWAYS_INLINE StackMap* GetCurrentStackMap() const;
@@ -370,6 +403,8 @@ class StackVisitor {
   // Marked mutable since the cache fields are updated from const getters.
   mutable std::pair<const OatQuickMethodHeader*, CodeInfo> cur_inline_info_;
   mutable std::pair<uintptr_t, StackMap> cur_stack_map_;
+
+  uint8_t* GetShouldDeoptimizeFlagAddr() const REQUIRES_SHARED(Locks::mutator_lock_);
 
  protected:
   Context* const context_;

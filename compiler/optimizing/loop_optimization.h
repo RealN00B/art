@@ -17,6 +17,7 @@
 #ifndef ART_COMPILER_OPTIMIZING_LOOP_OPTIMIZATION_H_
 #define ART_COMPILER_OPTIMIZING_LOOP_OPTIMIZATION_H_
 
+#include "base/macros.h"
 #include "base/scoped_arena_allocator.h"
 #include "base/scoped_arena_containers.h"
 #include "induction_var_range.h"
@@ -25,10 +26,17 @@
 #include "optimization.h"
 #include "superblock_cloner.h"
 
-namespace art {
+namespace art HIDDEN {
 
 class CompilerOptions;
 class ArchNoOptsLoopHelper;
+
+// Determines whether predicated loop vectorization should be tried for ALL loops.
+#ifdef ART_FORCE_TRY_PREDICATED_SIMD
+  static constexpr bool kForceTryPredicatedSIMD = true;
+#else
+  static constexpr bool kForceTryPredicatedSIMD = false;
+#endif
 
 /**
  * Loop optimizations. Builds a loop hierarchy and applies optimizations to
@@ -47,6 +55,11 @@ class HLoopOptimization : public HOptimization {
 
   static constexpr const char* kLoopOptimizationPassName = "loop_optimization";
 
+  // The maximum number of total instructions (trip_count * instruction_count),
+  // where the optimization of removing SuspendChecks from the loop header could
+  // be performed.
+  static constexpr int64_t kMaxTotalInstRemoveSuspendCheck = 128;
+
  private:
   /**
    * A single loop inside the loop hierarchy representation.
@@ -57,12 +70,23 @@ class HLoopOptimization : public HOptimization {
           outer(nullptr),
           inner(nullptr),
           previous(nullptr),
-          next(nullptr) {}
+          next(nullptr),
+          try_catch_kind(TryCatchKind::kUnknown) {}
+
+    enum class TryCatchKind {
+      kUnknown,
+      // Either if we have a try catch in the loop, or if the loop is inside of an outer try catch,
+      // we set `kHasTryCatch`.
+      kHasTryCatch,
+      kNoTryCatch
+    };
+
     HLoopInformation* loop_info;
     LoopNode* outer;
     LoopNode* inner;
     LoopNode* previous;
     LoopNode* next;
+    TryCatchKind try_catch_kind;
   };
 
   /*
@@ -76,23 +100,26 @@ class HLoopOptimization : public HOptimization {
     kNoShr           = 1 << 3,   // no arithmetic shift right
     kNoHiBits        = 1 << 4,   // "wider" operations cannot bring in higher order bits
     kNoSignedHAdd    = 1 << 5,   // no signed halving add
-    kNoUnroundedHAdd = 1 << 6,   // no unrounded halving add
-    kNoAbs           = 1 << 7,   // no absolute value
-    kNoStringCharAt  = 1 << 8,   // no StringCharAt
-    kNoReduction     = 1 << 9,   // no reduction
-    kNoSAD           = 1 << 10,  // no sum of absolute differences (SAD)
-    kNoWideSAD       = 1 << 11,  // no sum of absolute differences (SAD) with operand widening
-    kNoDotProd       = 1 << 12,  // no dot product
+    kNoUnsignedHAdd  = 1 << 6,   // no unsigned halving add
+    kNoUnroundedHAdd = 1 << 7,   // no unrounded halving add
+    kNoAbs           = 1 << 8,   // no absolute value
+    kNoStringCharAt  = 1 << 9,   // no StringCharAt
+    kNoReduction     = 1 << 10,  // no reduction
+    kNoSAD           = 1 << 11,  // no sum of absolute differences (SAD)
+    kNoWideSAD       = 1 << 12,  // no sum of absolute differences (SAD) with operand widening
+    kNoDotProd       = 1 << 13,  // no dot product
+    kNoIfCond        = 1 << 14,  // no if condition conversion
   };
 
   /*
-   * Vectorization mode during synthesis
+   * Loop synthesis mode during vectorization
    * (sequential peeling/cleanup loop or vector loop).
    */
-  enum VectorMode {
+  enum class LoopSynthesisMode {
     kSequential,
     kVector
   };
+  friend std::ostream& operator<<(std::ostream& os, const LoopSynthesisMode& fd_logger);
 
   /*
    * Representation of a unit-stride array reference.
@@ -118,6 +145,95 @@ class HLoopOptimization : public HOptimization {
     bool is_string_char_at;  // compressed string read
   };
 
+  // This structure describes the control flow (CF) -> data flow (DF) conversion of the loop
+  // with control flow (see below) for the purpose of predicated autovectorization.
+  //
+  // Lets define "loops without control-flow" (or non-CF loops) as loops with two consecutive
+  // blocks and without the branching structure except for the loop exit. And
+  // "loop with control-flow" (or CF-loops) - all other loops.
+  //
+  // In the execution of the original CF-loop on each iteration some basic block Y will be
+  // either executed or not executed, depending on the control flow of the loop. More
+  // specifically, a block will be executed if all the conditional branches of the nodes in
+  // the control dependency graph for that block Y are taken according to the path from the loop
+  // header to that basic block.
+  //
+  // This is the key idea of CF->DF conversion: a boolean value
+  // 'ctrl_pred == cond1 && cond2 && ...' will determine whether the basic block Y will be
+  // executed, where cond_K is whether the branch of the node K in the control dependency
+  // graph upward traversal was taken in the 'right' direction.
+  //
+  // Def.: BB Y is control dependent on BB X iff
+  //   (1) there exists a directed path P from X to Y with any basic block Z in P (excluding X
+  //       and Y) post-dominated by Y and
+  //   (2) X is not post-dominated by Y.
+  //             ...
+  //              X
+  //     false /     \ true
+  //          /       \
+  //                  ...
+  //                   |
+  //                   Y
+  //                  ...
+  //
+  // When doing predicated autovectorization of a CF loop, we use the CF->DF conversion approach:
+  //  1) do the data analysis and vector operation creation as if it was a non-CF loop.
+  //  2) for each HIf block create two vector predicate setting instructions - for True and False
+  //     edges/paths.
+  //  3) assign a governing vector predicate (see comments near HVecPredSetOperation)
+  //     to each vector operation Alpha in the loop (including to those vector predicate setting
+  //     instructions created in #2); do this by:
+  //     - finding the immediate control dependent block of the instruction Alpha's block.
+  //     - choosing the True or False predicate setting instruction (created in #2) depending
+  //       on the path to the instruction.
+  //
+  // For more information check the papers:
+  //
+  //   - Allen, John R and Kennedy, Ken and Porterfield, Carrie and Warren, Joe,
+  //     “Conversion of Control Dependence to Data Dependence,” in Proceedings of the 10th ACM
+  //     SIGACT-SIGPLAN Symposium on Principles of Programming Languages, 1983, pp. 177–189.
+  //   - JEANNE FERRANTE, KARL J. OTTENSTEIN, JOE D. WARREN,
+  //     "The Program Dependence Graph and Its Use in Optimization"
+  //
+  class BlockPredicateInfo : public ArenaObject<kArenaAllocLoopOptimization> {
+   public:
+    BlockPredicateInfo() :
+        control_predicate_(nullptr),
+        true_predicate_(nullptr),
+        false_predicate_(nullptr) {}
+
+    void SetControlFlowInfo(HVecPredSetOperation* true_predicate,
+                            HVecPredSetOperation* false_predicate) {
+      DCHECK(!HasControlFlowOps());
+      true_predicate_ = true_predicate;
+      false_predicate_ = false_predicate;
+    }
+
+    bool HasControlFlowOps() const {
+      // Note: a block must have both T/F predicates set or none of them.
+      DCHECK_EQ(true_predicate_ == nullptr, false_predicate_ == nullptr);
+      return true_predicate_ != nullptr;
+    }
+
+    HVecPredSetOperation* GetControlPredicate() const { return control_predicate_; }
+    void SetControlPredicate(HVecPredSetOperation* control_predicate) {
+      control_predicate_ = control_predicate;
+    }
+
+    HVecPredSetOperation* GetTruePredicate() const { return true_predicate_; }
+    HVecPredSetOperation* GetFalsePredicate() const { return false_predicate_; }
+
+   private:
+    // Vector control predicate operation, associated with the block which will determine
+    // the active lanes for all vector operations, originated from this block.
+    HVecPredSetOperation* control_predicate_;
+
+    // Vector predicate instruction, associated with the true sucessor of the block.
+    HVecPredSetOperation* true_predicate_;
+    // Vector predicate instruction, associated with the false sucessor of the block.
+    HVecPredSetOperation* false_predicate_;
+  };
+
   //
   // Loop setup and traversal.
   //
@@ -129,6 +245,11 @@ class HLoopOptimization : public HOptimization {
   // Traverses all loops inner to outer to perform simplifications and optimizations.
   // Returns true if loops nested inside current loop (node) have changed.
   bool TraverseLoopsInnerToOuter(LoopNode* node);
+
+  // Calculates `node`'s `try_catch_kind` and sets it to:
+  // 1) kHasTryCatch if it has try catches (or if it's inside of an outer try catch)
+  // 2) kNoTryCatch otherwise.
+  void CalculateAndSetTryCatchKind(LoopNode* node);
 
   //
   // Optimization.
@@ -162,22 +283,113 @@ class HLoopOptimization : public HOptimization {
   // should be actually applied.
   bool TryFullUnrolling(LoopAnalysisInfo* analysis_info, bool generate_code = true);
 
-  // Tries to apply scalar loop peeling and unrolling.
-  bool TryPeelingAndUnrolling(LoopNode* node);
+  // Tries to remove SuspendCheck for plain loops with a low trip count. The
+  // SuspendCheck in the codegen makes sure that the thread can be interrupted
+  // during execution for GC. Not being able to do so might decrease the
+  // responsiveness of GC when a very long loop or a long recursion is being
+  // executed. However, for plain loops with a small trip count, the removal of
+  // SuspendCheck should not affect the GC's responsiveness by a large margin.
+  // Consequently, since the thread won't be interrupted for plain loops, it is
+  // assumed that the performance might increase by removing SuspendCheck.
+  bool TryToRemoveSuspendCheckFromLoopHeader(LoopAnalysisInfo* analysis_info,
+                                             bool generate_code = true);
+
+  // Tries to apply scalar loop optimizations.
+  bool TryLoopScalarOpts(LoopNode* node);
 
   //
   // Vectorization analysis and synthesis.
   //
 
-  bool ShouldVectorize(LoopNode* node, HBasicBlock* block, int64_t trip_count);
-  void Vectorize(LoopNode* node, HBasicBlock* block, HBasicBlock* exit, int64_t trip_count);
-  void GenerateNewLoop(LoopNode* node,
-                       HBasicBlock* block,
-                       HBasicBlock* new_preheader,
-                       HInstruction* lo,
-                       HInstruction* hi,
-                       HInstruction* step,
-                       uint32_t unroll);
+  // Returns whether the data flow requirements are met for vectorization.
+  //
+  //   - checks whether instructions are vectorizable for the target.
+  //   - conducts data dependence analysis for array references.
+  //   - additionally, collects info on peeling and aligment strategy.
+  bool CanVectorizeDataFlow(LoopNode* node, HBasicBlock* header, bool collect_alignment_info);
+
+  // Does the checks (common for predicated and traditional mode) for the loop.
+  bool ShouldVectorizeCommon(LoopNode* node, HPhi* main_phi, int64_t trip_count);
+
+  // Try to vectorize the loop, returns whether it was successful.
+  //
+  // There are two versions/algorithms:
+  //  - Predicated: all the vector operations have governing predicates which control
+  //    which individual vector lanes will be active (see HVecPredSetOperation for more details).
+  //    Example: vectorization using AArch64 SVE.
+  //  - Traditional: a regular mode in which all vector operations lanes are unconditionally
+  //    active.
+  //    Example: vectoriation using AArch64 NEON.
+  bool TryVectorizePredicated(LoopNode* node,
+                              HBasicBlock* body,
+                              HBasicBlock* exit,
+                              HPhi* main_phi,
+                              int64_t trip_count);
+
+  bool TryVectorizedTraditional(LoopNode* node,
+                                HBasicBlock* body,
+                                HBasicBlock* exit,
+                                HPhi* main_phi,
+                                int64_t trip_count);
+
+  // Vectorizes the loop for which all checks have been already done.
+  void VectorizePredicated(LoopNode* node,
+                           HBasicBlock* block,
+                           HBasicBlock* exit);
+  void VectorizeTraditional(LoopNode* node,
+                            HBasicBlock* block,
+                            HBasicBlock* exit,
+                            int64_t trip_count);
+
+  // Performs final steps for whole vectorization process: links reduction, removes the original
+  // scalar loop, updates loop info.
+  void FinalizeVectorization(LoopNode* node);
+
+  // Helpers that do the vector instruction synthesis for the previously created loop; create
+  // and fill the loop body with instructions.
+  //
+  // A version to generate a vector loop in predicated mode.
+  void GenerateNewLoopPredicated(LoopNode* node,
+                                 HBasicBlock* new_preheader,
+                                 HInstruction* lo,
+                                 HInstruction* hi,
+                                 HInstruction* step);
+
+  // A version to generate a vector loop in traditional mode or to generate
+  // a scalar loop for both modes.
+  void GenerateNewLoopScalarOrTraditional(LoopNode* node,
+                                          HBasicBlock* new_preheader,
+                                          HInstruction* lo,
+                                          HInstruction* hi,
+                                          HInstruction* step,
+                                          uint32_t unroll);
+
+  //
+  // Helpers for GenerateNewLoop*.
+  //
+
+  // Updates vectorization bookkeeping date for the new loop, creates and returns
+  // its main induction Phi.
+  HPhi* InitializeForNewLoop(HBasicBlock* new_preheader, HInstruction* lo);
+
+  // Finalizes reduction and induction phis' inputs for the newly created loop.
+  void FinalizePhisForNewLoop(HPhi* phi, HInstruction* lo);
+
+  // Creates empty predicate info object for each basic block and puts it into the map.
+  void PreparePredicateInfoMap(LoopNode* node);
+
+  // Set up block true/false predicates using info, collected through data flow and control
+  // dependency analysis.
+  void InitPredicateInfoMap(LoopNode* node, HVecPredSetOperation* loop_main_pred);
+
+  // Performs instruction synthesis for the loop body.
+  void GenerateNewLoopBodyOnce(LoopNode* node,
+                               DataType::Type induc_type,
+                               HInstruction* step);
+
+  // Returns whether the vector loop needs runtime disambiguation test for array refs.
+  bool NeedsArrayRefsDisambiguationTest() const { return vector_runtime_test_a_ != nullptr; }
+
   bool VectorizeDef(LoopNode* node, HInstruction* instruction, bool generate_code);
   bool VectorizeUse(LoopNode* node,
                     HInstruction* instruction,
@@ -191,7 +403,7 @@ class HLoopOptimization : public HOptimization {
   bool TrySetVectorLength(DataType::Type type, uint32_t length) {
     bool res = TrySetVectorLengthImpl(length);
     // Currently the vectorizer supports only the mode when full SIMD registers are used.
-    DCHECK(!res || (DataType::Size(type) * length == GetVectorSizeInBytes()));
+    DCHECK_IMPLIES(res, DataType::Size(type) * length == GetVectorSizeInBytes());
     return res;
   }
 
@@ -205,10 +417,10 @@ class HLoopOptimization : public HOptimization {
   void GenerateVecReductionPhi(HPhi* phi);
   void GenerateVecReductionPhiInputs(HPhi* phi, HInstruction* reduction);
   HInstruction* ReduceAndExtractIfNeeded(HInstruction* instruction);
-  void GenerateVecOp(HInstruction* org,
-                     HInstruction* opa,
-                     HInstruction* opb,
-                     DataType::Type type);
+  HInstruction* GenerateVecOp(HInstruction* org,
+                              HInstruction* opa,
+                              HInstruction* opb,
+                              DataType::Type type);
 
   // Vectorization idioms.
   bool VectorizeSaturationIdiom(LoopNode* node,
@@ -231,13 +443,17 @@ class HLoopOptimization : public HOptimization {
                              bool generate_code,
                              DataType::Type type,
                              uint64_t restrictions);
+  bool VectorizeIfCondition(LoopNode* node,
+                            HInstruction* instruction,
+                            bool generate_code,
+                            uint64_t restrictions);
 
   // Vectorization heuristics.
   Alignment ComputeAlignment(HInstruction* offset,
                              DataType::Type type,
                              bool is_string_char_at,
                              uint32_t peeling = 0);
-  void SetAlignmentStrategy(uint32_t peeling_votes[],
+  void SetAlignmentStrategy(const ScopedArenaVector<uint32_t>& peeling_votes,
                             const ArrayReference* peeling_candidate);
   uint32_t MaxNumberPeeled();
   bool IsVectorizationProfitable(int64_t trip_count);
@@ -269,6 +485,9 @@ class HLoopOptimization : public HOptimization {
                           bool collect_loop_uses);
   void RemoveDeadInstructions(const HInstructionList& list);
   bool CanRemoveCycle();  // Whether the current 'iset_' is removable.
+
+  bool IsInPredicatedVectorizationMode() const { return predicated_vectorization_mode_; }
+  void MaybeInsertInVectorExternalSet(HInstruction* instruction);
 
   // Compiler options (to query ISA features).
   const CompilerOptions* compiler_options_;
@@ -305,6 +524,9 @@ class HLoopOptimization : public HOptimization {
   // Flag that tracks if any simplifications have occurred.
   bool simplified_;
 
+  // Whether to use predicated loop vectorization (e.g. for arm64 SVE target).
+  bool predicated_vectorization_mode_;
+
   // Number of "lanes" for selected packed type.
   uint32_t vector_length_;
 
@@ -330,8 +552,24 @@ class HLoopOptimization : public HOptimization {
   // Contents reside in phase-local heap memory.
   ScopedArenaSafeMap<HInstruction*, HInstruction*>* vector_permanent_map_;
 
+  // Tracks vector operations that are inserted outside of the loop (preheader, exit)
+  // as part of vectorization (e.g. replicate scalar for loop invariants and reduce ops
+  // for loop reductions).
+  //
+  // The instructions in the set are live for the whole vectorization process of the current
+  // loop, not just during generation of a particular loop version (as the sets above).
+  //
+  // Currently the set is being only used in the predicated mode - for assigning governing
+  // predicates.
+  ScopedArenaSet<HInstruction*>* vector_external_set_;
+
+  // A mapping between a basic block of the original loop and its associated PredicateInfo.
+  //
+  // Only used in predicated loop vectorization mode.
+  ScopedArenaSafeMap<HBasicBlock*, BlockPredicateInfo*>* predicate_info_map_;
+
   // Temporary vectorization bookkeeping.
-  VectorMode vector_mode_;  // synthesis mode
+  LoopSynthesisMode synthesis_mode_;  // synthesis mode
   HBasicBlock* vector_preheader_;  // preheader of the new loop
   HBasicBlock* vector_header_;  // header of the new loop
   HBasicBlock* vector_body_;  // body of the new loop
@@ -341,6 +579,7 @@ class HLoopOptimization : public HOptimization {
   ArchNoOptsLoopHelper* arch_loop_helper_;
 
   friend class LoopOptimizationTest;
+  friend class PredicatedSimdLoopOptimizationTest;
 
   DISALLOW_COPY_AND_ASSIGN(HLoopOptimization);
 };

@@ -34,35 +34,50 @@
 #include "runtime.h"
 #include "thread-current-inl.h"
 
-namespace art {
+namespace art HIDDEN {
 
 using android::base::StringPrintf;
 
 static constexpr bool kMeasureWaitTime = false;
 
-ThreadPoolWorker::ThreadPoolWorker(ThreadPool* thread_pool, const std::string& name,
+#if defined(__BIONIC__)
+static constexpr bool kUseCustomThreadPoolStack = false;
+#else
+static constexpr bool kUseCustomThreadPoolStack = true;
+#endif
+
+ThreadPoolWorker::ThreadPoolWorker(AbstractThreadPool* thread_pool,
+                                   const std::string& name,
                                    size_t stack_size)
     : thread_pool_(thread_pool),
       name_(name) {
-  // Add an inaccessible page to catch stack overflow.
-  stack_size += kPageSize;
   std::string error_msg;
-  stack_ = MemMap::MapAnonymous(name.c_str(),
-                                stack_size,
-                                PROT_READ | PROT_WRITE,
-                                /*low_4gb=*/ false,
-                                &error_msg);
-  CHECK(stack_.IsValid()) << error_msg;
-  CHECK_ALIGNED(stack_.Begin(), kPageSize);
-  CheckedCall(mprotect,
-              "mprotect bottom page of thread pool worker stack",
-              stack_.Begin(),
-              kPageSize,
-              PROT_NONE);
+  // On Bionic, we know pthreads will give us a big-enough stack with
+  // a guard page, so don't do anything special on Bionic libc.
+  if (kUseCustomThreadPoolStack) {
+    // Add an inaccessible page to catch stack overflow.
+    stack_size += gPageSize;
+    stack_ = MemMap::MapAnonymous(name.c_str(),
+                                  stack_size,
+                                  PROT_READ | PROT_WRITE,
+                                  /*low_4gb=*/ false,
+                                  &error_msg);
+    CHECK(stack_.IsValid()) << error_msg;
+    CHECK_ALIGNED_PARAM(stack_.Begin(), gPageSize);
+    CheckedCall(mprotect,
+                "mprotect bottom page of thread pool worker stack",
+                stack_.Begin(),
+                gPageSize,
+                PROT_NONE);
+  }
   const char* reason = "new thread pool worker thread";
   pthread_attr_t attr;
   CHECK_PTHREAD_CALL(pthread_attr_init, (&attr), reason);
-  CHECK_PTHREAD_CALL(pthread_attr_setstack, (&attr, stack_.Begin(), stack_.Size()), reason);
+  if (kUseCustomThreadPoolStack) {
+    CHECK_PTHREAD_CALL(pthread_attr_setstack, (&attr, stack_.Begin(), stack_.Size()), reason);
+  } else {
+    CHECK_PTHREAD_CALL(pthread_attr_setstacksize, (&attr, stack_size), reason);
+  }
   CHECK_PTHREAD_CALL(pthread_create, (&pthread_, &attr, &Callback, this), reason);
   CHECK_PTHREAD_CALL(pthread_attr_destroy, (&attr), reason);
 }
@@ -71,16 +86,32 @@ ThreadPoolWorker::~ThreadPoolWorker() {
   CHECK_PTHREAD_CALL(pthread_join, (pthread_, nullptr), "thread pool worker shutdown");
 }
 
-void ThreadPoolWorker::SetPthreadPriority(int priority) {
+// Set the "nice" priority for tid (0 means self).
+static void SetPriorityForTid(pid_t tid, int priority) {
   CHECK_GE(priority, PRIO_MIN);
   CHECK_LE(priority, PRIO_MAX);
-#if defined(ART_TARGET_ANDROID)
-  int result = setpriority(PRIO_PROCESS, pthread_gettid_np(pthread_), priority);
+  int result = setpriority(PRIO_PROCESS, tid, priority);
   if (result != 0) {
-    PLOG(ERROR) << "Failed to setpriority to :" << priority;
+#if defined(ART_TARGET_ANDROID)
+    PLOG(WARNING) << "Failed to setpriority to :" << priority;
+#endif
+    // Setpriority may fail on host due to ulimit issues.
   }
+}
+
+void ThreadPoolWorker::SetPthreadPriority(int priority) {
+#if defined(ART_TARGET_ANDROID)
+  SetPriorityForTid(pthread_gettid_np(pthread_), priority);
 #else
   UNUSED(priority);
+#endif
+}
+
+int ThreadPoolWorker::GetPthreadPriority() {
+#if defined(ART_TARGET_ANDROID)
+  return getpriority(PRIO_PROCESS, pthread_gettid_np(pthread_));
+#else
+  return 0;
 #endif
 }
 
@@ -97,6 +128,12 @@ void ThreadPoolWorker::Run() {
 void* ThreadPoolWorker::Callback(void* arg) {
   ThreadPoolWorker* worker = reinterpret_cast<ThreadPoolWorker*>(arg);
   Runtime* runtime = Runtime::Current();
+  // Don't run callbacks for ThreadPoolWorkers. These are created for JITThreadPool and
+  // HeapThreadPool and are purely internal threads of the runtime and we don't need to run
+  // callbacks for the thread attach / detach listeners.
+  // (b/251163712) Calling callbacks for heap thread pool workers causes deadlocks in some libjdwp
+  // tests. Deadlocks happen when a GC thread is attached while libjdwp holds the event handler
+  // lock for an event that triggers an entrypoint update from deopt manager.
   CHECK(runtime->AttachCurrentThread(
       worker->name_.c_str(),
       true,
@@ -107,13 +144,18 @@ void* ThreadPoolWorker::Callback(void* arg) {
       // rely on being able to (for example) wait for all threads to finish some task. If debuggers
       // are suspending these threads that might not be possible.
       worker->thread_pool_->create_peers_ ? runtime->GetSystemThreadGroup() : nullptr,
-      worker->thread_pool_->create_peers_));
+      worker->thread_pool_->create_peers_,
+      /* should_run_callbacks= */ false));
   worker->thread_ = Thread::Current();
   // Mark thread pool workers as runtime-threads.
   worker->thread_->SetIsRuntimeThread(true);
   // Do work until its time to shut down.
   worker->Run();
-  runtime->DetachCurrentThread();
+  runtime->DetachCurrentThread(/* should_run_callbacks= */ false);
+  // On zygote fork, we wait for this thread to exit completely. Set to highest Java priority
+  // to speed that up.
+  constexpr int kJavaMaxPrioNiceness = -8;
+  SetPriorityForTid(0 /* this thread */, kJavaMaxPrioNiceness);
   return nullptr;
 }
 
@@ -130,19 +172,30 @@ void ThreadPool::RemoveAllTasks(Thread* self) {
   // The ThreadPool is responsible for calling Finalize (which usually delete
   // the task memory) on all the tasks.
   Task* task = nullptr;
-  while ((task = TryGetTask(self)) != nullptr) {
+  do {
+    {
+      MutexLock mu(self, task_queue_lock_);
+      if (tasks_.empty()) {
+        return;
+      }
+      task = tasks_.front();
+      tasks_.pop_front();
+    }
     task->Finalize();
-  }
-  MutexLock mu(self, task_queue_lock_);
-  tasks_.clear();
+  } while (true);
 }
 
-ThreadPool::ThreadPool(const char* name,
-                       size_t num_threads,
-                       bool create_peers,
-                       size_t worker_stack_size)
+ThreadPool::~ThreadPool() {
+  DeleteThreads();
+  RemoveAllTasks(Thread::Current());
+}
+
+AbstractThreadPool::AbstractThreadPool(const char* name,
+                                       size_t num_threads,
+                                       bool create_peers,
+                                       size_t worker_stack_size)
   : name_(name),
-    task_queue_lock_("task queue lock"),
+    task_queue_lock_("task queue lock", kGenericBottomLock),
     task_queue_condition_("task queue condition", task_queue_lock_),
     completion_condition_("task completion condition", task_queue_lock_),
     started_(false),
@@ -153,11 +206,9 @@ ThreadPool::ThreadPool(const char* name,
     creation_barier_(0),
     max_active_workers_(num_threads),
     create_peers_(create_peers),
-    worker_stack_size_(worker_stack_size) {
-  CreateThreads();
-}
+    worker_stack_size_(worker_stack_size) {}
 
-void ThreadPool::CreateThreads() {
+void AbstractThreadPool::CreateThreads() {
   CHECK(threads_.empty());
   Thread* self = Thread::Current();
   {
@@ -174,17 +225,17 @@ void ThreadPool::CreateThreads() {
   }
 }
 
-void ThreadPool::WaitForWorkersToBeCreated() {
+void AbstractThreadPool::WaitForWorkersToBeCreated() {
   creation_barier_.Increment(Thread::Current(), 0);
 }
 
-const std::vector<ThreadPoolWorker*>& ThreadPool::GetWorkers() {
+const std::vector<ThreadPoolWorker*>& AbstractThreadPool::GetWorkers() {
   // Wait for all the workers to be created before returning them.
   WaitForWorkersToBeCreated();
   return threads_;
 }
 
-void ThreadPool::DeleteThreads() {
+void AbstractThreadPool::DeleteThreads() {
   {
     Thread* self = Thread::Current();
     MutexLock mu(self, task_queue_lock_);
@@ -200,18 +251,13 @@ void ThreadPool::DeleteThreads() {
   STLDeleteElements(&threads_);
 }
 
-void ThreadPool::SetMaxActiveWorkers(size_t max_workers) {
+void AbstractThreadPool::SetMaxActiveWorkers(size_t max_workers) {
   MutexLock mu(Thread::Current(), task_queue_lock_);
   CHECK_LE(max_workers, GetThreadCount());
   max_active_workers_ = max_workers;
 }
 
-ThreadPool::~ThreadPool() {
-  DeleteThreads();
-  RemoveAllTasks(Thread::Current());
-}
-
-void ThreadPool::StartWorkers(Thread* self) {
+void AbstractThreadPool::StartWorkers(Thread* self) {
   MutexLock mu(self, task_queue_lock_);
   started_ = true;
   task_queue_condition_.Broadcast(self);
@@ -219,12 +265,17 @@ void ThreadPool::StartWorkers(Thread* self) {
   total_wait_time_ = 0;
 }
 
-void ThreadPool::StopWorkers(Thread* self) {
+void AbstractThreadPool::StopWorkers(Thread* self) {
   MutexLock mu(self, task_queue_lock_);
   started_ = false;
 }
 
-Task* ThreadPool::GetTask(Thread* self) {
+bool AbstractThreadPool::HasStarted(Thread* self) {
+  MutexLock mu(self, task_queue_lock_);
+  return started_;
+}
+
+Task* AbstractThreadPool::GetTask(Thread* self) {
   MutexLock mu(self, task_queue_lock_);
   while (!IsShuttingDown()) {
     const size_t thread_count = GetThreadCount();
@@ -256,7 +307,7 @@ Task* ThreadPool::GetTask(Thread* self) {
   return nullptr;
 }
 
-Task* ThreadPool::TryGetTask(Thread* self) {
+Task* AbstractThreadPool::TryGetTask(Thread* self) {
   MutexLock mu(self, task_queue_lock_);
   return TryGetTaskLocked();
 }
@@ -270,7 +321,7 @@ Task* ThreadPool::TryGetTaskLocked() {
   return nullptr;
 }
 
-void ThreadPool::Wait(Thread* self, bool do_work, bool may_hold_locks) {
+void AbstractThreadPool::Wait(Thread* self, bool do_work, bool may_hold_locks) {
   if (do_work) {
     CHECK(!create_peers_);
     Task* task = nullptr;
@@ -295,10 +346,20 @@ size_t ThreadPool::GetTaskCount(Thread* self) {
   return tasks_.size();
 }
 
-void ThreadPool::SetPthreadPriority(int priority) {
+void AbstractThreadPool::SetPthreadPriority(int priority) {
   for (ThreadPoolWorker* worker : threads_) {
     worker->SetPthreadPriority(priority);
   }
+}
+
+void AbstractThreadPool::CheckPthreadPriority(int priority) {
+#if defined(ART_TARGET_ANDROID)
+  for (ThreadPoolWorker* worker : threads_) {
+    CHECK_EQ(worker->GetPthreadPriority(), priority);
+  }
+#else
+  UNUSED(priority);
+#endif
 }
 
 }  // namespace art

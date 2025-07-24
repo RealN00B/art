@@ -23,7 +23,7 @@
 #include "base/bit_utils.h"
 #include "base/macros.h"
 
-namespace art {
+namespace art HIDDEN {
 
 class Thread;
 
@@ -47,7 +47,7 @@ class Thread;
 class ALIGNED(16) InterpreterCache {
  public:
   // Aligned since we load the whole entry in single assembly instruction.
-  typedef std::pair<const void*, size_t> Entry ALIGNED(2 * sizeof(size_t));
+  using Entry ALIGNED(2 * sizeof(size_t)) = std::pair<const void*, size_t>;
 
   // 2x size increase/decrease corresponds to ~0.5% interpreter performance change.
   // Value of 256 has around 75% cache hit rate.
@@ -60,30 +60,17 @@ class ALIGNED(16) InterpreterCache {
   }
 
   // Clear the whole cache. It requires the owning thread for DCHECKs.
-  void Clear(Thread* owning_thread);
+  EXPORT void Clear(Thread* owning_thread);
 
-  ALWAYS_INLINE bool Get(const void* key, /* out */ size_t* value) {
-    DCHECK(IsCalledFromOwningThread());
-    Entry& entry = data_[IndexOf(key)];
-    if (LIKELY(entry.first == key)) {
-      *value = entry.second;
-      return true;
-    }
-    return false;
-  }
+  ALWAYS_INLINE bool Get(Thread* self, const void* key, /* out */ size_t* value);
 
-  ALWAYS_INLINE void Set(const void* key, size_t value) {
-    DCHECK(IsCalledFromOwningThread());
-    data_[IndexOf(key)] = Entry{key, value};
-  }
+  ALWAYS_INLINE void Set(Thread* self, const void* key, size_t value);
 
   std::array<Entry, kSize>& GetArray() {
     return data_;
   }
 
  private:
-  bool IsCalledFromOwningThread();
-
   static ALWAYS_INLINE size_t IndexOf(const void* key) {
     static_assert(IsPowerOfTwo(kSize), "Size must be power of two");
     size_t index = (reinterpret_cast<uintptr_t>(key) >> 2) & (kSize - 1);

@@ -21,6 +21,7 @@
 #include "base/casts.h"
 #include "base/timing_logger.h"
 #include "dex/quick_compiler_callbacks.h"
+#include "dex/verification_results.h"
 #include "driver/compiler_driver.h"
 #include "driver/compiler_options.h"
 #include "utils/atomic_dex_ref_map-inl.h"
@@ -41,15 +42,12 @@ void CommonCompilerDriverTest::CompileAll(jobject class_loader,
   compiler_driver_->PreCompile(class_loader,
                                dex_files,
                                timings,
-                               &compiler_options_->image_classes_,
-                               verification_results_.get());
+                               &compiler_options_->image_classes_);
 
   // Verification results in the `callback_` should not be used during compilation.
   down_cast<QuickCompilerCallbacks*>(callbacks_.get())->SetVerificationResults(
       reinterpret_cast<VerificationResults*>(inaccessible_page_));
-  compiler_options_->verification_results_ = verification_results_.get();
   compiler_driver_->CompileAll(class_loader, dex_files, timings);
-  compiler_options_->verification_results_ = nullptr;
   down_cast<QuickCompilerCallbacks*>(callbacks_.get())->SetVerificationResults(
       verification_results_.get());
 
@@ -59,7 +57,6 @@ void CommonCompilerDriverTest::CompileAll(jobject class_loader,
 void CommonCompilerDriverTest::SetDexFilesForOatFile(const std::vector<const DexFile*>& dex_files) {
   compiler_options_->dex_files_for_oat_file_ = dex_files;
   compiler_driver_->compiled_classes_.AddDexFiles(dex_files);
-  compiler_driver_->dex_to_dex_compiler_.SetDexFiles(dex_files);
 }
 
 void CommonCompilerDriverTest::ReserveImageSpace() {
@@ -69,7 +66,7 @@ void CommonCompilerDriverTest::ReserveImageSpace() {
   MemMap::Init();
   image_reservation_ = MemMap::MapAnonymous("image reservation",
                                             reinterpret_cast<uint8_t*>(ART_BASE_ADDRESS),
-                                            (size_t)120 * 1024 * 1024,  // 120MB
+                                            static_cast<size_t>(120 * 1024 * 1024),  // 120MB
                                             PROT_NONE,
                                             false /* no need for 4gb flag with fixed mmap */,
                                             /*reuse=*/ false,
@@ -91,7 +88,7 @@ void CommonCompilerDriverTest::CreateCompilerDriver() {
   compiler_options_->image_classes_.swap(*GetImageClasses());
   compiler_options_->profile_compilation_info_ = GetProfileCompilationInfo();
   compiler_driver_.reset(new CompilerDriver(compiler_options_.get(),
-                                            compiler_kind_,
+                                            verification_results_.get(),
                                             number_of_threads_,
                                             /* swap_fd= */ -1));
 }
@@ -99,6 +96,7 @@ void CommonCompilerDriverTest::CreateCompilerDriver() {
 void CommonCompilerDriverTest::SetUpRuntimeOptions(RuntimeOptions* options) {
   CommonCompilerTest::SetUpRuntimeOptions(options);
 
+  verification_results_.reset(new VerificationResults());
   QuickCompilerCallbacks* callbacks =
       new QuickCompilerCallbacks(CompilerCallbacks::CallbackMode::kCompileApp);
   callbacks->SetVerificationResults(verification_results_.get());
@@ -112,17 +110,19 @@ void CommonCompilerDriverTest::SetUp() {
 
   // Note: We cannot use MemMap because some tests tear down the Runtime and destroy
   // the gMaps, so when destroying the MemMap, the test would crash.
-  inaccessible_page_ = mmap(nullptr, kPageSize, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  const size_t page_size = MemMap::GetPageSize();
+  inaccessible_page_ = mmap(nullptr, page_size, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
   CHECK(inaccessible_page_ != MAP_FAILED) << strerror(errno);
 }
 
 void CommonCompilerDriverTest::TearDown() {
   if (inaccessible_page_ != nullptr) {
-    munmap(inaccessible_page_, kPageSize);
+    munmap(inaccessible_page_, MemMap::GetPageSize());
     inaccessible_page_ = nullptr;
   }
   image_reservation_.Reset();
   compiler_driver_.reset();
+  verification_results_.reset();
 
   CommonCompilerTest::TearDown();
 }

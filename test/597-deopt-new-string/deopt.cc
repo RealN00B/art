@@ -28,28 +28,22 @@ namespace art {
 
 extern "C" JNIEXPORT void JNICALL Java_Main_deoptimizeAll(
     JNIEnv* env,
-    jclass cls ATTRIBUTE_UNUSED) {
+    [[maybe_unused]] jclass cls) {
   ScopedObjectAccess soa(env);
-  ScopedThreadSuspension sts(Thread::Current(), kWaitingForDeoptimization);
+  ScopedThreadSuspension sts(Thread::Current(), ThreadState::kWaitingForDeoptimization);
   gc::ScopedGCCriticalSection gcs(Thread::Current(),
                                   gc::kGcCauseInstrumentation,
                                   gc::kCollectorTypeInstrumentation);
   // We need to suspend mutator threads first.
   ScopedSuspendAll ssa(__FUNCTION__);
-  static bool first = true;
-  if (first) {
-    // We need to enable deoptimization once in order to call DeoptimizeEverything().
-    Runtime::Current()->GetInstrumentation()->EnableDeoptimization();
-    first = false;
-  }
   Runtime::Current()->GetInstrumentation()->DeoptimizeEverything("test");
 }
 
 extern "C" JNIEXPORT void JNICALL Java_Main_undeoptimizeAll(
     JNIEnv* env,
-    jclass cls ATTRIBUTE_UNUSED) {
+    [[maybe_unused]] jclass cls) {
   ScopedObjectAccess soa(env);
-  ScopedThreadSuspension sts(Thread::Current(), kWaitingForDeoptimization);
+  ScopedThreadSuspension sts(Thread::Current(), ThreadState::kWaitingForDeoptimization);
   gc::ScopedGCCriticalSection gcs(Thread::Current(),
                                   gc::kGcCauseInstrumentation,
                                   gc::kCollectorTypeInstrumentation);

@@ -18,9 +18,6 @@ import java.lang.reflect.Method;
 import java.lang.reflect.InvocationTargetException;
 
 public class Main {
-  // Workaround for b/18051191.
-  class Inner {}
-
   public static native void assertIsInterpreted();
   public static native void ensureJitCompiled(Class<?> cls, String methodName);
 
@@ -36,6 +33,11 @@ public class Main {
       throw new Error("Assertion failed: " + str + " != " + actual);
     }
   }
+
+  // Create an empty int[] to force loading the int[] class before compiling
+  // TestCase.deoptimizeNewInstance.
+  // This makes sure the compiler can properly type int[] and not bail.
+  static int[] emptyArray = new int[0];
 
   public static void main(String[] args) throws Throwable {
     System.loadLibrary(args[0]);
@@ -163,10 +165,7 @@ public class Main {
     }
   }
 
-  public static boolean doThrow = false;
-
   public static Object $noinline$HiddenNull() {
-    if (doThrow) { throw new Error(); }
     return null;
   }
 }

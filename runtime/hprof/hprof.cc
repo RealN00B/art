@@ -50,7 +50,7 @@
 #include "base/time_utils.h"
 #include "base/unix_file/fd_file.h"
 #include "class_linker.h"
-#include "class_root.h"
+#include "class_root-inl.h"
 #include "common_throws.h"
 #include "debugger.h"
 #include "dex/dex_file-inl.h"
@@ -68,7 +68,7 @@
 #include "scoped_thread_state_change-inl.h"
 #include "thread_list.h"
 
-namespace art {
+namespace art HIDDEN {
 
 namespace hprof {
 
@@ -237,7 +237,7 @@ class EndianOutput {
     HandleU4List(values, count);
     length_ += count * sizeof(uint32_t);
   }
-  virtual void UpdateU4(size_t offset, uint32_t new_value ATTRIBUTE_UNUSED) {
+  virtual void UpdateU4(size_t offset, [[maybe_unused]] uint32_t new_value) {
     DCHECK_LE(offset, length_ - 4);
   }
   void AddU8List(const uint64_t* values, size_t count) {
@@ -271,21 +271,16 @@ class EndianOutput {
   }
 
  protected:
-  virtual void HandleU1List(const uint8_t* values ATTRIBUTE_UNUSED,
-                            size_t count ATTRIBUTE_UNUSED) {
+  virtual void HandleU1List([[maybe_unused]] const uint8_t* values, [[maybe_unused]] size_t count) {
   }
-  virtual void HandleU1AsU2List(const uint8_t* values ATTRIBUTE_UNUSED,
-                                size_t count ATTRIBUTE_UNUSED) {
-  }
-  virtual void HandleU2List(const uint16_t* values ATTRIBUTE_UNUSED,
-                            size_t count ATTRIBUTE_UNUSED) {
-  }
-  virtual void HandleU4List(const uint32_t* values ATTRIBUTE_UNUSED,
-                            size_t count ATTRIBUTE_UNUSED) {
-  }
-  virtual void HandleU8List(const uint64_t* values ATTRIBUTE_UNUSED,
-                            size_t count ATTRIBUTE_UNUSED) {
-  }
+  virtual void HandleU1AsU2List([[maybe_unused]] const uint8_t* values,
+                                [[maybe_unused]] size_t count) {}
+  virtual void HandleU2List([[maybe_unused]] const uint16_t* values,
+                            [[maybe_unused]] size_t count) {}
+  virtual void HandleU4List([[maybe_unused]] const uint32_t* values,
+                            [[maybe_unused]] size_t count) {}
+  virtual void HandleU8List([[maybe_unused]] const uint64_t* values,
+                            [[maybe_unused]] size_t count) {}
   virtual void HandleEndRecord() {
   }
 
@@ -382,7 +377,7 @@ class EndianOutputBuffered : public EndianOutput {
     buffer_.clear();
   }
 
-  virtual void HandleFlush(const uint8_t* buffer ATTRIBUTE_UNUSED, size_t length ATTRIBUTE_UNUSED) {
+  virtual void HandleFlush([[maybe_unused]] const uint8_t* buffer, [[maybe_unused]] size_t length) {
   }
 
   std::vector<uint8_t> buffer_;
@@ -682,7 +677,7 @@ class Hprof : public SingleRootVisitor {
   }
 
   void WriteStackTraces() REQUIRES_SHARED(Locks::mutator_lock_) {
-    // Write a dummy stack trace record so the analysis tools don't freak out.
+    // Write a fake stack trace record so the analysis tools don't freak out.
     output_->StartNewRecord(HPROF_TAG_STACK_TRACE, kHprofTime);
     __ AddStackTraceSerialNumber(kHprofNullStackTrace);
     __ AddU4(kHprofNullThread);
@@ -743,7 +738,7 @@ class Hprof : public SingleRootVisitor {
     }
   }
 
-  bool DumpToDdmsBuffered(size_t overall_size ATTRIBUTE_UNUSED, size_t max_length ATTRIBUTE_UNUSED)
+  bool DumpToDdmsBuffered([[maybe_unused]] size_t overall_size, [[maybe_unused]] size_t max_length)
       REQUIRES(Locks::mutator_lock_) {
     LOG(FATAL) << "Unimplemented";
     UNREACHABLE();
@@ -1267,7 +1262,14 @@ void Hprof::DumpHeapClass(mirror::Class* klass) {
     // Strings are variable length with character data at the end like arrays.
     // This outputs the size of an empty string.
     __ AddU4(sizeof(mirror::String));
-  } else if (klass->IsArrayClass() || klass->IsPrimitive()) {
+  } else if (klass->IsArrayClass()) {
+    // Arrays are variable length with element data at the end of the header,
+    // padded to alignment. The offset to the data is the header memory size,
+    // after padding.
+    uint32_t component_size = klass->GetComponentSize();
+    uint32_t array_header_size = mirror::Array::DataOffset(component_size).Uint32Value();
+    __ AddU4(array_header_size);
+  } else if (klass->IsPrimitive()) {
     __ AddU4(0);
   } else {
     __ AddU4(klass->GetObjectSize());  // instance size

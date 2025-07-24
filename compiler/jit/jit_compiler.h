@@ -17,11 +17,13 @@
 #ifndef ART_COMPILER_JIT_JIT_COMPILER_H_
 #define ART_COMPILER_JIT_JIT_COMPILER_H_
 
+#include "base/macros.h"
 #include "base/mutex.h"
+#include "compilation_kind.h"
 
 #include "jit/jit.h"
 
-namespace art {
+namespace art HIDDEN {
 
 class ArtMethod;
 class Compiler;
@@ -40,12 +42,16 @@ class JitCompiler : public JitCompilerInterface {
 
   // Compilation entrypoint. Returns whether the compilation succeeded.
   bool CompileMethod(
-      Thread* self, JitMemoryRegion* region, ArtMethod* method, bool baseline, bool osr)
+      Thread* self, JitMemoryRegion* region, ArtMethod* method, CompilationKind kind)
       REQUIRES_SHARED(Locks::mutator_lock_) override;
 
   const CompilerOptions& GetCompilerOptions() const {
     return *compiler_options_.get();
   }
+
+  bool IsBaselineCompiler() const override;
+
+  void SetDebuggableCompilerOption(bool val) override;
 
   bool GenerateDebugInfo() override;
 
@@ -57,6 +63,8 @@ class JitCompiler : public JitCompilerInterface {
                                          ArrayRef<const void*> removed_symbols,
                                          bool compress,
                                          /*out*/ size_t* num_symbols) override;
+
+  uint32_t GetInlineMaxCodeUnits() const override;
 
  private:
   std::unique_ptr<CompilerOptions> compiler_options_;

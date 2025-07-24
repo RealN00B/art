@@ -19,7 +19,9 @@
 
 #include <iosfwd>
 
-namespace art {
+#include "base/macros.h"
+
+namespace art HIDDEN {
 namespace gc {
 
 enum WeakRootState {
@@ -33,7 +35,7 @@ enum WeakRootState {
   kWeakRootStateMarkNewRoots,
 };
 
-std::ostream& operator<<(std::ostream& os, const WeakRootState&);
+std::ostream& operator<<(std::ostream& os, WeakRootState weak_root_state);
 
 }  // namespace gc
 }  // namespace art

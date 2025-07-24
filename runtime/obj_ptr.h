@@ -27,7 +27,7 @@
 // Always inline ObjPtr methods even in debug builds.
 #define OBJPTR_INLINE __attribute__ ((always_inline))
 
-namespace art {
+namespace art HIDDEN {
 
 constexpr bool kObjPtrPoisoning = kIsDebugBuild;
 
@@ -48,15 +48,16 @@ class ObjPtr {
                 "must have a least kObjectAlignmentShift bits");
 
  public:
-  OBJPTR_INLINE ObjPtr() REQUIRES_SHARED(Locks::mutator_lock_) : reference_(0u) {}
+  OBJPTR_INLINE ObjPtr() : ObjPtr(nullptr) {}
+
+  OBJPTR_INLINE ObjPtr(std::nullptr_t)
+      : reference_(0u) {
+    DCHECK(IsNull());
+  }
 
   // Note: The following constructors allow implicit conversion. This simplifies code that uses
   //       them, e.g., for parameter passing. However, in general, implicit-conversion constructors
   //       are discouraged and detected by clang-tidy.
-
-  OBJPTR_INLINE ObjPtr(std::nullptr_t)
-      REQUIRES_SHARED(Locks::mutator_lock_)
-      : reference_(0u) {}
 
   template <typename Type,
             typename = typename std::enable_if_t<std::is_base_of_v<MirrorType, Type>>>

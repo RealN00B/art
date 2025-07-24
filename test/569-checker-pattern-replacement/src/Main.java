@@ -15,6 +15,26 @@
  */
 
 public class Main {
+  static class ExpectedError extends Error {}
+
+  public static void localStaticNopAndThrow() {
+    // Pattern matching replaces the invoke even in a block that ends with a `throw`.
+    $inline$localStaticNop();
+    throw new ExpectedError();
+  }
+
+  public static void $inline$localStaticNop() {}
+
+  /// CHECK-START: void Main.staticNopNeverInline() inliner (before)
+  /// CHECK:                          InvokeStaticOrDirect
+
+  /// CHECK-START: void Main.staticNopNeverInline() inliner (after)
+  /// CHECK:                          InvokeStaticOrDirect
+
+  public static void staticNopNeverInline() {
+    Second.staticNopNeverInline(11);
+  }
+
   /// CHECK-START: void Main.staticNop() inliner (before)
   /// CHECK:                          InvokeStaticOrDirect
 
@@ -104,6 +124,23 @@ public class Main {
 
   public static int return7(Second s) {
     return s.return7(null);
+  }
+
+  /// CHECK-START: float Main.return42f(Second) inliner (before)
+  /// CHECK:      {{f\d+}}            InvokeVirtual
+
+  /// CHECK-START: float Main.return42f(Second) inliner (before)
+  /// CHECK-NOT:                      FloatConstant 42
+
+  /// CHECK-START: float Main.return42f(Second) inliner (after)
+  /// CHECK-DAG:  <<Const42f:f\d+>>   FloatConstant 42
+  /// CHECK-DAG:                      Return [<<Const42f>>]
+
+  /// CHECK-START: float Main.return42f(Second) inliner (after)
+  /// CHECK-NOT:                      InvokeVirtual
+
+  public static float return42f(Second s) {
+    return s.return42f();
   }
 
   /// CHECK-START: java.lang.String Main.staticReturnNull() inliner (before)
@@ -209,10 +246,11 @@ public class Main {
   /// CHECK:      {{d\d+}}            InvokeVirtual
 
   /// CHECK-START: double Main.getDoubleFromParam(Second) inliner (after)
-  /// CHECK:      {{d\d+}}            InvokeVirtual
+  /// CHECK:      {{d\d+}}            InvokeStaticOrDirect
 
   /// CHECK-START: double Main.getDoubleFromParam(Second) inliner (after)
   /// CHECK-NOT:                      InstanceFieldGet
+  /// CHECK-NOT:                      InvokeVirtual
 
   public static double getDoubleFromParam(Second s) {
     return s.getInstanceDoubleFieldFromParam(s);
@@ -222,11 +260,12 @@ public class Main {
   /// CHECK:      {{i\d+}}            InvokeVirtual
 
   /// CHECK-START: int Main.getStaticInt(Second) inliner (after)
-  /// CHECK:      {{i\d+}}            InvokeVirtual
+  /// CHECK:      {{i\d+}}            InvokeStaticOrDirect
 
   /// CHECK-START: int Main.getStaticInt(Second) inliner (after)
   /// CHECK-NOT:                      InstanceFieldGet
   /// CHECK-NOT:                      StaticFieldGet
+  /// CHECK-NOT:                      InvokeVirtual
 
   public static int getStaticInt(Second s) {
     return s.getStaticIntField();
@@ -287,10 +326,11 @@ public class Main {
   /// CHECK:                          InvokeVirtual
 
   /// CHECK-START: long Main.setLongThroughParam(Second, long) inliner (after)
-  /// CHECK:                          InvokeVirtual
+  /// CHECK:                          InvokeStaticOrDirect
 
   /// CHECK-START: long Main.setLongThroughParam(Second, long) inliner (after)
   /// CHECK-NOT:                      InstanceFieldSet
+  /// CHECK-NOT:                      InvokeVirtual
 
   public static long setLongThroughParam(Second s, long value) {
     s.setInstanceLongFieldThroughParam(s, value);
@@ -301,11 +341,12 @@ public class Main {
   /// CHECK:                          InvokeVirtual
 
   /// CHECK-START: float Main.setStaticFloat(Second, float) inliner (after)
-  /// CHECK:                          InvokeVirtual
+  /// CHECK:                          InvokeStaticOrDirect
 
   /// CHECK-START: float Main.setStaticFloat(Second, float) inliner (after)
   /// CHECK-NOT:                      InstanceFieldSet
   /// CHECK-NOT:                      StaticFieldSet
+  /// CHECK-NOT:                      InvokeVirtual
 
   public static float setStaticFloat(Second s, float value) {
     s.setStaticFloatField(value);
@@ -627,8 +668,8 @@ public class Main {
   /// CHECK-DAG:                      InstanceFieldSet
   /// CHECK-NOT:                      InstanceFieldSet
 
-  public static double constructBase(int intValue, long dummy) {
-    Base b = new Base(intValue, dummy);
+  public static double constructBase(int intValue, long placeholder) {
+    Base b = new Base(intValue, placeholder);
     return b.intField + b.doubleField;
   }
 
@@ -1145,8 +1186,8 @@ public class Main {
   /// CHECK-NOT:                      ConstructorFence
   /// CHECK-NOT:                      InstanceFieldSet
 
-  public static int constructDerivedInSecondDex(long dummy) {
-    DerivedInSecondDex d = new DerivedInSecondDex(dummy);
+  public static int constructDerivedInSecondDex(long placeholder) {
+    DerivedInSecondDex d = new DerivedInSecondDex(placeholder);
     return d.intField;
   }
 
@@ -1156,19 +1197,22 @@ public class Main {
     // Replaced NOP pattern.
     staticNop();
     nop(s);
+    // Not replaced NOP pattern.
+    staticNopNeverInline();
     // Replaced "return arg" pattern.
     assertEquals("arbitrary string", staticReturnArg2("arbitrary string"));
     assertEquals(4321L, returnArg1(s, 4321L));
     // Replaced "return const" pattern.
     assertEquals(9, staticReturn9());
     assertEquals(7, return7(s));
+    assertEquals(42.0f, return42f(s));
     assertEquals(null, staticReturnNull());
     assertEquals(null, returnNull(s));
     // Replaced IGET pattern.
     assertEquals(42, getInt(s));
     assertEquals(-42.0, getDouble(s));
     assertEquals(null, getObject(s));
-    assertEquals("dummy", getString(s));
+    assertEquals("placeholder", getString(s));
     // Not replaced IGET pattern.
     assertEquals(42, staticGetInt(s));
     assertEquals(-42.0, getDoubleFromParam(s));
@@ -1198,9 +1242,9 @@ public class Main {
     assertEquals(-34.0, constructBase(19, 15.0, null));
     assertEquals(-22.5, constructBaseWith0DoubleNull(22.5));
     assertEquals(-8.0, constructBase(2, 14.0, null, null));
-    assertEquals(-64.0, constructBase(4, 28.0, null, "dummy"));
+    assertEquals(-64.0, constructBase(4, 28.0, null, "placeholder"));
     assertEquals(13.0, constructBase(24, 2.0, new Object(), null));
-    assertEquals(30.0, constructBase(11, 4.0, new Object(), "dummy"));
+    assertEquals(30.0, constructBase(11, 4.0, new Object(), "placeholder"));
     assertEquals(43.0, constructBase(43.0));
     assertEquals(0.0, constructBaseWith0d());
     assertEquals(1.0, constructBase(new Object()));
@@ -1216,9 +1260,9 @@ public class Main {
     assertEquals(-7.0, constructDerived(5, 7.0, new Object()));
     assertEquals(-4.0, constructDerived(9, 4.0, null));
     assertEquals(0.0, constructDerived(1, 9.0, null, null));
-    assertEquals(0.0, constructDerived(2, 8.0, null, "dummy"));
+    assertEquals(0.0, constructDerived(2, 8.0, null, "placeholder"));
     assertEquals(0.0, constructDerived(3, 7.0, new Object(), null));
-    assertEquals(0.0, constructDerived(4, 6.0, new Object(), "dummy"));
+    assertEquals(0.0, constructDerived(4, 6.0, new Object(), "placeholder"));
     assertEquals(17.0, constructDerived(17.0f));
     assertEquals(-5.5, constructDerived(6, -7.0, new Object(), 6.5f));
 
@@ -1237,9 +1281,20 @@ public class Main {
     assertEquals(123, constructDerivedInSecondDex(123));
     assertEquals(0, constructDerivedInSecondDexWith0());
     assertEquals(0, constructDerivedInSecondDex(7L));
+
+    try {
+      localStaticNopAndThrow();
+      throw new Error("Unreachable");
+    } catch (ExpectedError expected) {}
   }
 
   private static void assertEquals(int expected, int actual) {
+    if (expected != actual) {
+      throw new AssertionError("Wrong result: " + expected + " != " + actual);
+    }
+  }
+
+  private static void assertEquals(float expected, float actual) {
     if (expected != actual) {
       throw new AssertionError("Wrong result: " + expected + " != " + actual);
     }

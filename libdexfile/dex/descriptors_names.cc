@@ -16,6 +16,8 @@
 
 #include "descriptors_names.h"
 
+#include <algorithm>
+
 #include "android-base/stringprintf.h"
 #include "android-base/strings.h"
 
@@ -38,36 +40,52 @@ void AppendPrettyDescriptor(const char* descriptor, std::string* result) {
   // Reference or primitive?
   if (*c == 'L') {
     // "[[La/b/C;" -> "a.b.C[][]".
-    c++;  // Skip the 'L'.
+    std::string_view stripped = std::string_view(c + 1);  // Skip the 'L'...
+    if (stripped.ends_with(';')) {
+      stripped.remove_suffix(1u);  // ...and remove the semicolon.
+    }
+    // At this point, `stripped` is of the form "fully/qualified/Type".
+    // Append it to the `*result` and replace all '/'s with '.' in place.
+    size_t old_size = result->size();
+    *result += stripped;
+    std::replace(result->begin() + old_size, result->end(), '/', '.');
   } else {
     // "[[B" -> "byte[][]".
-    // To make life easier, we make primitives look like unqualified
-    // reference types.
+    std::string_view pretty_primitive;
     switch (*c) {
-      case 'B': c = "byte;"; break;
-      case 'C': c = "char;"; break;
-      case 'D': c = "double;"; break;
-      case 'F': c = "float;"; break;
-      case 'I': c = "int;"; break;
-      case 'J': c = "long;"; break;
-      case 'S': c = "short;"; break;
-      case 'Z': c = "boolean;"; break;
-      case 'V': c = "void;"; break;  // Used when decoding return types.
+      case 'B':
+        pretty_primitive = "byte";
+        break;
+      case 'C':
+        pretty_primitive = "char";
+        break;
+      case 'D':
+        pretty_primitive = "double";
+        break;
+      case 'F':
+        pretty_primitive = "float";
+        break;
+      case 'I':
+        pretty_primitive = "int";
+        break;
+      case 'J':
+        pretty_primitive = "long";
+        break;
+      case 'S':
+        pretty_primitive = "short";
+        break;
+      case 'Z':
+        pretty_primitive = "boolean";
+        break;
+      case 'V':
+        pretty_primitive = "void";
+        break;  // Used when decoding return types.
       default: result->append(descriptor); return;
     }
+    result->append(pretty_primitive);
   }
 
-  // At this point, 'c' is a string of the form "fully/qualified/Type;"
-  // or "primitive;". Rewrite the type with '.' instead of '/':
-  const char* p = c;
-  while (*p != ';') {
-    char ch = *p++;
-    if (ch == '/') {
-      ch = '.';
-    }
-    result->push_back(ch);
-  }
-  // ...and replace the semicolon with 'dim' "[]" pairs:
+  // Finally, add 'dim' "[]" pairs:
   for (size_t i = 0; i < dim; ++i) {
     result->append("[]");
   }
@@ -76,6 +94,56 @@ void AppendPrettyDescriptor(const char* descriptor, std::string* result) {
 std::string PrettyDescriptor(const char* descriptor) {
   std::string result;
   AppendPrettyDescriptor(descriptor, &result);
+  return result;
+}
+
+std::string InversePrettyDescriptor(const std::string& pretty_descriptor) {
+  std::string result;
+
+  // Used to determine the length of the descriptor without trailing "[]"s.
+  size_t l = pretty_descriptor.length();
+
+  // Determine dimensionality, and append the necessary leading '['s.
+  size_t dim = 0;
+  size_t pos = 0;
+  static const std::string array_indicator = "[]";
+  while ((pos = pretty_descriptor.find(array_indicator, pos)) != std::string::npos) {
+    if (dim == 0) {
+      l = pos;
+    }
+    ++dim;
+    pos += array_indicator.length();
+  }
+  for (size_t i = 0; i < dim; ++i) {
+    result += '[';
+  }
+
+  // temp_descriptor is now in the form of "some.pretty.Type" or "primitive".
+  std::string temp_descriptor(pretty_descriptor, 0, l);
+  if (temp_descriptor == "byte") {
+    result += 'B';
+  } else if (temp_descriptor == "char") {
+    result += 'C';
+  } else if (temp_descriptor == "double") {
+    result += 'D';
+  } else if (temp_descriptor == "float") {
+    result += 'F';
+  } else if (temp_descriptor == "int") {
+    result += 'I';
+  } else if (temp_descriptor == "long") {
+    result += 'J';
+  } else if (temp_descriptor == "short") {
+    result += 'S';
+  } else if (temp_descriptor == "boolean") {
+    result += 'Z';
+  } else if (temp_descriptor == "void") {
+    result += 'V';
+  } else {
+    result += 'L';
+    std::replace(temp_descriptor.begin(), temp_descriptor.end(), '.', '/');
+    result += temp_descriptor;
+    result += ';';
+  }
   return result;
 }
 
@@ -241,8 +309,6 @@ static bool IsValidPartOfMemberNameUtf8Slow(const char** pUtf8Ptr) {
     default:
       return true;
   }
-
-  UNREACHABLE();
 }
 
 /* Return whether the pointed-at modified-UTF-8 encoded character is

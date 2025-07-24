@@ -18,9 +18,10 @@
 
 #include "base/stl_util.h"
 #include "mirror/class-inl.h"
-#include "oat_file.h"
+#include "mirror/string-inl.h"
+#include "oat/oat_file.h"
 
-namespace art {
+namespace art HIDDEN {
 
 ClassTable::ClassTable() : lock_("Class loader classes", kClassLoaderClassesLock) {
   Runtime* const runtime = Runtime::Current();
@@ -30,49 +31,37 @@ ClassTable::ClassTable() : lock_("Class loader classes", kClassLoaderClassesLock
 
 void ClassTable::FreezeSnapshot() {
   WriterMutexLock mu(Thread::Current(), lock_);
-  classes_.push_back(ClassSet());
+  // Propagate the min/max load factor from the old active set.
+  DCHECK(!classes_.empty());
+  const ClassSet& last_set = classes_.back();
+  ClassSet new_set(last_set.GetMinLoadFactor(), last_set.GetMaxLoadFactor());
+  classes_.push_back(std::move(new_set));
 }
 
-bool ClassTable::Contains(ObjPtr<mirror::Class> klass) {
-  return LookupByDescriptor(klass) == klass;
-}
-
-ObjPtr<mirror::Class> ClassTable::LookupByDescriptor(ObjPtr<mirror::Class> klass) {
-  ReaderMutexLock mu(Thread::Current(), lock_);
-  TableSlot slot(klass);
-  for (ClassSet& class_set : classes_) {
-    auto it = class_set.find(slot);
-    if (it != class_set.end()) {
-      return it->Read();
-    }
-  }
-  return nullptr;
-}
-
-ObjPtr<mirror::Class> ClassTable::UpdateClass(const char* descriptor,
-                                              ObjPtr<mirror::Class> klass,
-                                              size_t hash) {
+ObjPtr<mirror::Class> ClassTable::UpdateClass(ObjPtr<mirror::Class> klass, size_t hash) {
   WriterMutexLock mu(Thread::Current(), lock_);
   // Should only be updating latest table.
-  DescriptorHashPair pair(descriptor, hash);
-  auto existing_it = classes_.back().FindWithHash(pair, hash);
-  if (kIsDebugBuild && existing_it == classes_.back().end()) {
+  TableSlot slot(klass, hash);
+  auto existing_it = classes_.back().FindWithHash(slot, hash);
+  if (UNLIKELY(existing_it == classes_.back().end())) {
     for (const ClassSet& class_set : classes_) {
-      if (class_set.FindWithHash(pair, hash) != class_set.end()) {
-        LOG(FATAL) << "Updating class found in frozen table " << descriptor;
+      if (class_set.FindWithHash(slot, hash) != class_set.end()) {
+        LOG(FATAL) << "Updating class found in frozen table " << klass->PrettyDescriptor();
+        UNREACHABLE();
       }
     }
-    LOG(FATAL) << "Updating class not found " << descriptor;
+    LOG(FATAL) << "Updating class not found " << klass->PrettyDescriptor();
+    UNREACHABLE();
   }
   const ObjPtr<mirror::Class> existing = existing_it->Read();
-  CHECK_NE(existing, klass) << descriptor;
-  CHECK(!existing->IsResolved()) << descriptor;
-  CHECK_EQ(klass->GetStatus(), ClassStatus::kResolving) << descriptor;
-  CHECK(!klass->IsTemp()) << descriptor;
+  CHECK_NE(existing, klass) << klass->PrettyDescriptor();
+  CHECK(!existing->IsResolved()) << klass->PrettyDescriptor();
+  CHECK_EQ(klass->GetStatus(), ClassStatus::kResolving) << klass->PrettyDescriptor();
+  CHECK(!klass->IsTemp()) << klass->PrettyDescriptor();
   VerifyObject(klass);
   // Update the element in the hash set with the new class. This is safe to do since the descriptor
   // doesn't change.
-  *existing_it = TableSlot(klass, hash);
+  *existing_it = slot;
   return existing;
 }
 
@@ -115,10 +104,15 @@ size_t ClassTable::NumReferencedNonZygoteClasses() const {
   return classes_.back().size();
 }
 
-ObjPtr<mirror::Class> ClassTable::Lookup(const char* descriptor, size_t hash) {
+ObjPtr<mirror::Class> ClassTable::Lookup(std::string_view descriptor, size_t hash) {
   DescriptorHashPair pair(descriptor, hash);
   ReaderMutexLock mu(Thread::Current(), lock_);
-  for (ClassSet& class_set : classes_) {
+  // Search from the last table, assuming that apps shall search for their own classes
+  // more often than for boot image classes. For prebuilt boot images, this also helps
+  // by searching the large table from the framework boot image extension compiled as
+  // single-image before the individual small tables from the primary boot image
+  // compiled as multi-image.
+  for (ClassSet& class_set : ReverseRange(classes_)) {
     auto it = class_set.FindWithHash(pair, hash);
     if (it != class_set.end()) {
       return it->Read();
@@ -127,97 +121,13 @@ ObjPtr<mirror::Class> ClassTable::Lookup(const char* descriptor, size_t hash) {
   return nullptr;
 }
 
-ObjPtr<mirror::Class> ClassTable::TryInsert(ObjPtr<mirror::Class> klass) {
-  TableSlot slot(klass);
-  WriterMutexLock mu(Thread::Current(), lock_);
-  for (ClassSet& class_set : classes_) {
-    auto it = class_set.find(slot);
-    if (it != class_set.end()) {
-      return it->Read();
-    }
-  }
-  classes_.back().insert(slot);
-  return klass;
-}
-
 void ClassTable::Insert(ObjPtr<mirror::Class> klass) {
-  const uint32_t hash = TableSlot::HashDescriptor(klass);
-  WriterMutexLock mu(Thread::Current(), lock_);
-  classes_.back().InsertWithHash(TableSlot(klass, hash), hash);
-}
-
-void ClassTable::CopyWithoutLocks(const ClassTable& source_table) {
-  if (kIsDebugBuild) {
-    for (ClassSet& class_set : classes_) {
-      CHECK(class_set.empty());
-    }
-  }
-  for (const ClassSet& class_set : source_table.classes_) {
-    for (const TableSlot& slot : class_set) {
-      classes_.back().insert(slot);
-    }
-  }
-}
-
-void ClassTable::InsertWithoutLocks(ObjPtr<mirror::Class> klass) {
-  const uint32_t hash = TableSlot::HashDescriptor(klass);
-  classes_.back().InsertWithHash(TableSlot(klass, hash), hash);
+  InsertWithHash(klass, klass->DescriptorHash());
 }
 
 void ClassTable::InsertWithHash(ObjPtr<mirror::Class> klass, size_t hash) {
   WriterMutexLock mu(Thread::Current(), lock_);
   classes_.back().InsertWithHash(TableSlot(klass, hash), hash);
-}
-
-bool ClassTable::Remove(const char* descriptor) {
-  DescriptorHashPair pair(descriptor, ComputeModifiedUtf8Hash(descriptor));
-  WriterMutexLock mu(Thread::Current(), lock_);
-  for (ClassSet& class_set : classes_) {
-    auto it = class_set.find(pair);
-    if (it != class_set.end()) {
-      class_set.erase(it);
-      return true;
-    }
-  }
-  return false;
-}
-
-uint32_t ClassTable::ClassDescriptorHashEquals::operator()(const TableSlot& slot)
-    const {
-  std::string temp;
-  // No read barrier needed, we're reading a chain of constant references for comparison
-  // with null and retrieval of constant primitive data. See ReadBarrierOption.
-  return ComputeModifiedUtf8Hash(slot.Read<kWithoutReadBarrier>()->GetDescriptor(&temp));
-}
-
-bool ClassTable::ClassDescriptorHashEquals::operator()(const TableSlot& a,
-                                                       const TableSlot& b) const {
-  // No read barrier needed, we're reading a chain of constant references for comparison
-  // with null and retrieval of constant primitive data. See ReadBarrierOption.
-  if (a.Hash() != b.Hash()) {
-    std::string temp;
-    DCHECK(!a.Read<kWithoutReadBarrier>()->DescriptorEquals(
-        b.Read<kWithoutReadBarrier>()->GetDescriptor(&temp)));
-    return false;
-  }
-  std::string temp;
-  return a.Read<kWithoutReadBarrier>()->DescriptorEquals(
-      b.Read<kWithoutReadBarrier>()->GetDescriptor(&temp));
-}
-
-bool ClassTable::ClassDescriptorHashEquals::operator()(const TableSlot& a,
-                                                       const DescriptorHashPair& b) const {
-  // No read barrier needed, we're reading a chain of constant references for comparison
-  // with null and retrieval of constant primitive data. See ReadBarrierOption.
-  if (!a.MaskedHashEquals(b.second)) {
-    DCHECK(!a.Read<kWithoutReadBarrier>()->DescriptorEquals(b.first));
-    return false;
-  }
-  return a.Read<kWithoutReadBarrier>()->DescriptorEquals(b.first);
-}
-
-uint32_t ClassTable::ClassDescriptorHashEquals::operator()(const DescriptorHashPair& pair) const {
-  return ComputeModifiedUtf8Hash(pair.first);
 }
 
 bool ClassTable::InsertStrongRoot(ObjPtr<mirror::Object> obj) {
@@ -255,26 +165,6 @@ bool ClassTable::InsertOatFileLocked(const OatFile* oat_file) {
   return true;
 }
 
-size_t ClassTable::WriteToMemory(uint8_t* ptr) const {
-  ReaderMutexLock mu(Thread::Current(), lock_);
-  ClassSet combined;
-  // Combine all the class sets in case there are multiple, also adjusts load factor back to
-  // default in case classes were pruned.
-  for (const ClassSet& class_set : classes_) {
-    for (const TableSlot& root : class_set) {
-      combined.insert(root);
-    }
-  }
-  const size_t ret = combined.WriteToMemory(ptr);
-  // Sanity check.
-  if (kIsDebugBuild && ptr != nullptr) {
-    size_t read_count;
-    ClassSet class_set(ptr, /*make copy*/false, &read_count);
-    class_set.Verify();
-  }
-  return ret;
-}
-
 size_t ClassTable::ReadFromMemory(uint8_t* ptr) {
   size_t read_count = 0;
   AddClassSet(ClassSet(ptr, /*make copy*/false, &read_count));
@@ -283,21 +173,18 @@ size_t ClassTable::ReadFromMemory(uint8_t* ptr) {
 
 void ClassTable::AddClassSet(ClassSet&& set) {
   WriterMutexLock mu(Thread::Current(), lock_);
-  classes_.insert(classes_.begin(), std::move(set));
+  // Insert before the last (unfrozen) table since we add new classes into the back.
+  // Keep the order of previous frozen tables unchanged, so that we can can remember
+  // the number of searched frozen tables and not search them again.
+  // TODO: Make use of this in `ClassLinker::FindClass()`.
+  DCHECK(!classes_.empty());
+  classes_.insert(classes_.end() - 1, std::move(set));
 }
 
 void ClassTable::ClearStrongRoots() {
   WriterMutexLock mu(Thread::Current(), lock_);
   oat_files_.clear();
   strong_roots_.clear();
-}
-
-ClassTable::TableSlot::TableSlot(ObjPtr<mirror::Class> klass)
-    : TableSlot(klass, HashDescriptor(klass)) {}
-
-uint32_t ClassTable::TableSlot::HashDescriptor(ObjPtr<mirror::Class> klass) {
-  std::string temp;
-  return ComputeModifiedUtf8Hash(klass->GetDescriptor(&temp));
 }
 
 }  // namespace art

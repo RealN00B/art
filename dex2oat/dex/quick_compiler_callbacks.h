@@ -33,8 +33,10 @@ class QuickCompilerCallbacks final : public CompilerCallbacks {
 
   ~QuickCompilerCallbacks() { }
 
-  void MethodVerified(verifier::MethodVerifier* verifier)
-      REQUIRES_SHARED(Locks::mutator_lock_) override;
+  ClassLinker* CreateAotClassLinker(InternTable* intern_table) override;
+
+  void AddUncompilableMethod(MethodReference ref) override;
+  void AddUncompilableClass(ClassReference ref) override;
 
   void ClassRejected(ClassReference ref) override;
 

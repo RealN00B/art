@@ -20,12 +20,11 @@
 
 #include <gtest/gtest.h>
 
-#include "common_runtime_test.h"
+#include "base/common_art_test.h"
 
-namespace art {
+namespace art HIDDEN {
 
-class VdexFileTest : public CommonRuntimeTest {
-};
+class VdexFileTest : public CommonArtTest {};
 
 TEST_F(VdexFileTest, OpenEmptyVdex) {
   // Verify we fail to open an empty vdex file.
@@ -36,12 +35,11 @@ TEST_F(VdexFileTest, OpenEmptyVdex) {
                                                   tmp.GetFilename(),
                                                   /*writable=*/false,
                                                   /*low_4gb=*/false,
-                                                  /*unquicken=*/false,
                                                   &error_msg);
   EXPECT_TRUE(vdex == nullptr);
 
   vdex = VdexFile::Open(
-      tmp.GetFilename(), /*writable=*/false, /*low_4gb=*/false, /*unquicken=*/ false, &error_msg);
+      tmp.GetFilename(), /*writable=*/false, /*low_4gb=*/false, &error_msg);
   EXPECT_TRUE(vdex == nullptr);
 }
 

@@ -12,19 +12,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-droiddoc_host {
-    name: "ahat-docs",
-    srcs: [
-        "src/main/**/*.java",
-    ],
-    custom_template: "droiddoc-templates-sdk",
-    args: "-stubpackages com.android.ahat:com.android.ahat.*",
-    check_api: {
-        current: {
-            api_file: "etc/ahat_api.txt",
-            removed_api_file: "etc/ahat_removed_api.txt",
-        },
-    },
+package {
+    // See: http://go/android-license-faq
+    // A large-scale-change added 'default_applicable_licenses' to import
+    // all of the 'license_kinds' from "art_license"
+    // to get the below license kinds:
+    //   SPDX-license-identifier-Apache-2.0
+    default_applicable_licenses: ["art_license"],
 }
 
 // --- ahat.jar ----------------
@@ -33,11 +27,16 @@ java_binary_host {
     visibility: [
         "//libcore/metrictests/memory/host",
     ],
-    wrapper: "ahat",
+    wrapper: "ahat.sh",
     srcs: ["src/main/**/*.java"],
     manifest: "etc/ahat.mf",
     java_resources: ["etc/style.css"],
+    // Use a relaxed version to allow distribution against older runtimes.
+    java_version: "11",
     javacflags: ["-Xdoclint:all/protected"],
+    static_libs: [
+        "guava",
+    ],
 }
 
 // --- ahat-test-dump.jar --------------
@@ -58,4 +57,11 @@ java_test_helper_library {
     device_supported: false,
     name: "ahat-ri-test-dump",
     srcs: ["src/ri-test-dump/**/*.java"],
+}
+
+cc_library_shared {
+    name: "libahat-test-jni",
+    srcs: ["src/test/jni/**/*.cpp"],
+    header_libs: ["jni_headers"],
+    host_supported: true,
 }

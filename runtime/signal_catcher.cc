@@ -16,8 +16,8 @@
 
 #include "signal_catcher.h"
 
-#include <csignal>
-#include <cstdlib>
+#include <android-base/file.h>
+#include <android-base/stringprintf.h>
 #include <fcntl.h>
 #include <pthread.h>
 #include <sys/stat.h>
@@ -25,12 +25,13 @@
 #include <sys/types.h>
 #include <unistd.h>
 
+#include <csignal>
+#include <cstdlib>
+#include <optional>
 #include <sstream>
 
-#include <android-base/file.h>
-#include <android-base/stringprintf.h>
-
 #include "arch/instruction_set.h"
+#include "base/debugstore.h"
 #include "base/logging.h"  // For GetCmdLine.
 #include "base/os.h"
 #include "base/time_utils.h"
@@ -45,7 +46,7 @@
 #include "thread.h"
 #include "thread_list.h"
 
-namespace art {
+namespace art HIDDEN {
 
 static void DumpCmdLine(std::ostream& os) {
 #if defined(__linux__)
@@ -89,8 +90,12 @@ SignalCatcher::~SignalCatcher() {
   // Since we know the thread is just sitting around waiting for signals
   // to arrive, send it one.
   SetHaltFlag(true);
-  CHECK_PTHREAD_CALL(pthread_kill, (pthread_, SIGQUIT), "signal catcher shutdown");
-  CHECK_PTHREAD_CALL(pthread_join, (pthread_, nullptr), "signal catcher shutdown");
+  CHECK_PTHREAD_CALL(pthread_kill,
+                     (pthread_, SIGQUIT),
+                     android::base::StringPrintf("signal catcher shutdown: %lu", pthread_));
+  CHECK_PTHREAD_CALL(pthread_join,
+                     (pthread_, nullptr),
+                     android::base::StringPrintf("signal catcher shutdown: %lu", pthread_));
 }
 
 void SignalCatcher::SetHaltFlag(bool new_value) {
@@ -104,17 +109,18 @@ bool SignalCatcher::ShouldHalt() {
 }
 
 void SignalCatcher::Output(const std::string& s) {
-  ScopedThreadStateChange tsc(Thread::Current(), kWaitingForSignalCatcherOutput);
-  PaletteStatus status = PaletteWriteCrashThreadStacks(s.data(), s.size());
-  if (status == PaletteStatus::kOkay) {
+  ScopedThreadStateChange tsc(Thread::Current(), ThreadState::kWaitingForSignalCatcherOutput);
+  palette_status_t status = PaletteWriteCrashThreadStacks(s.data(), s.size());
+  if (status == PALETTE_STATUS_OK) {
     LOG(INFO) << "Wrote stack traces to tombstoned";
   } else {
-    CHECK(status == PaletteStatus::kFailedCheckLog);
+    CHECK(status == PALETTE_STATUS_FAILED_CHECK_LOG);
     LOG(ERROR) << "Failed to write stack traces to tombstoned";
   }
 }
 
 void SignalCatcher::HandleSigQuit() {
+  sigquit_nanotime_ = NanoTime();
   Runtime* runtime = Runtime::Current();
   std::ostringstream os;
   os << "\n"
@@ -130,6 +136,8 @@ void SignalCatcher::HandleSigQuit() {
 
   os << "Build type: " << (kIsDebugBuild ? "debug" : "optimized") << "\n";
 
+  os << "Debug Store: " << DebugStoreGetString() << "\n";
+
   runtime->DumpForSigQuit(os);
 
   if ((false)) {
@@ -140,6 +148,7 @@ void SignalCatcher::HandleSigQuit() {
   }
   os << "----- end " << getpid() << " -----\n";
   Output(os.str());
+  sigquit_nanotime_ = std::nullopt;
 }
 
 void SignalCatcher::HandleSigUsr1() {
@@ -149,7 +158,7 @@ void SignalCatcher::HandleSigUsr1() {
 }
 
 int SignalCatcher::WaitForSignal(Thread* self, SignalSet& signals) {
-  ScopedThreadStateChange tsc(self, kWaitingInMainSignalCatcherLoop);
+  ScopedThreadStateChange tsc(self, ThreadState::kWaitingInMainSignalCatcherLoop);
 
   // Signals for sigwait() must be blocked but not ignored.  We
   // block signals like SIGQUIT for all threads, so the condition
@@ -177,7 +186,7 @@ void* SignalCatcher::Run(void* arg) {
                                      !runtime->IsAotCompiler()));
 
   Thread* self = Thread::Current();
-  DCHECK_NE(self->GetState(), kRunnable);
+  DCHECK_NE(self->GetState(), ThreadState::kRunnable);
   {
     MutexLock mu(self, signal_catcher->lock_);
     signal_catcher->thread_ = self;

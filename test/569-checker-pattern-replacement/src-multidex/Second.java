@@ -14,8 +14,13 @@
  * limitations under the License.
  */
 
+import dalvik.annotation.optimization.NeverInline;
+
 public final class Second {
   public static void staticNop(int unused) { }
+
+  @NeverInline
+  public static void staticNopNeverInline(int unused) { }
 
   public void nop() { }
 
@@ -33,6 +38,10 @@ public final class Second {
 
   public int return7(Object unused) {
     return 7;
+  }
+
+  public float return42f() {
+    return 42.0f;
   }
 
   public static String staticReturnNull() {
@@ -95,7 +104,7 @@ public final class Second {
   public int instanceIntField = 42;
   public double instanceDoubleField = -42.0;
   public Object instanceObjectField = null;
-  public String instanceStringField = "dummy";
+  public String instanceStringField = "placeholder";
   public long instanceLongField = 0;  // Overwritten by setters.
 
   public static int staticIntField = 4242;

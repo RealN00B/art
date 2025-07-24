@@ -23,7 +23,7 @@
 #include "base/utils.h"
 #include "side_effects_analysis.h"
 
-namespace art {
+namespace art HIDDEN {
 
 /**
  * A ValueSet holds instructions that can replace other instructions. It is updated
@@ -126,7 +126,7 @@ class ValueSet : public ArenaObject<kArenaAllocGvn> {
   // Removes all instructions in the set affected by the given side effects.
   void Kill(SideEffects side_effects) {
     DeleteAllImpureWhich([side_effects](Node* node) {
-      return node->GetInstruction()->GetSideEffects().MayDependOn(side_effects);
+      return node->GetSideEffects().MayDependOn(side_effects);
     });
   }
 
@@ -197,6 +197,21 @@ class ValueSet : public ArenaObject<kArenaAllocGvn> {
       return new (allocator) Node(instruction_, hash_code_, new_next);
     }
 
+    SideEffects GetSideEffects() const {
+      // Deoptimize is a weird instruction since it's predicated and
+      // never-return. Its side-effects are to prevent the splitting of dex
+      // instructions across it (which could cause inconsistencies once we begin
+      // interpreting again). In the context of GVN the 'perform-deopt' branch is not
+      // relevant and we only need to care about the no-op case, in which case there are
+      // no side-effects. By doing this we are able to eliminate redundant (i.e.
+      // dominated deopts with GVNd conditions) deoptimizations.
+      if (instruction_->IsDeoptimize()) {
+        return SideEffects::None();
+      } else {
+        return instruction_->GetSideEffects();
+      }
+    }
+
    private:
     HInstruction* const instruction_;
     const size_t hash_code_;
@@ -233,7 +248,7 @@ class ValueSet : public ArenaObject<kArenaAllocGvn> {
   // Iterates over buckets with impure instructions (even indices) and deletes
   // the ones on which 'cond' returns true.
   template<typename Functor>
-  void DeleteAllImpureWhich(Functor cond) {
+  void DeleteAllImpureWhich(Functor&& cond) {
     for (size_t i = 0; i < num_buckets_; i += 2) {
       Node* node = buckets_[i];
       Node* previous = nullptr;
@@ -338,16 +353,14 @@ class ValueSet : public ArenaObject<kArenaAllocGvn> {
  */
 class GlobalValueNumberer : public ValueObject {
  public:
-  GlobalValueNumberer(HGraph* graph,
-                      const SideEffectsAnalysis& side_effects)
+  GlobalValueNumberer(HGraph* graph, const SideEffectsAnalysis& side_effects)
       : graph_(graph),
         allocator_(graph->GetArenaStack()),
         side_effects_(side_effects),
         sets_(graph->GetBlocks().size(), nullptr, allocator_.Adapter(kArenaAllocGvn)),
         visited_blocks_(
-            &allocator_, graph->GetBlocks().size(), /* expandable= */ false, kArenaAllocGvn) {
-    visited_blocks_.ClearAllBits();
-  }
+            &allocator_, graph->GetBlocks().size(), /* expandable= */ false, kArenaAllocGvn),
+        did_optimization_(false) {}
 
   bool Run();
 
@@ -391,6 +404,9 @@ class GlobalValueNumberer : public ValueObject {
   // visited/unvisited Boolean.
   ArenaBitVector visited_blocks_;
 
+  // True if GVN did at least one removal.
+  bool did_optimization_;
+
   DISALLOW_COPY_AND_ASSIGN(GlobalValueNumberer);
 };
 
@@ -403,7 +419,7 @@ bool GlobalValueNumberer::Run() {
   for (HBasicBlock* block : graph_->GetReversePostOrder()) {
     VisitBasicBlock(block);
   }
-  return true;
+  return did_optimization_;
 }
 
 void GlobalValueNumberer::VisitBasicBlock(HBasicBlock* block) {
@@ -479,7 +495,10 @@ void GlobalValueNumberer::VisitBasicBlock(HBasicBlock* block) {
     //
     // BoundType is a special case example of an instruction which shouldn't be moved but can be
     // GVN'ed.
-    if (current->CanBeMoved() || current->IsBoundType()) {
+    //
+    // Deoptimize is a special case since even though we don't want to move it we can still remove
+    // it for GVN.
+    if (current->CanBeMoved() || current->IsBoundType() || current->IsDeoptimize()) {
       if (current->IsBinaryOperation() && current->AsBinaryOperation()->IsCommutative()) {
         // For commutative ops, (x op y) will be treated the same as (y op x)
         // after fixed ordering.
@@ -493,6 +512,7 @@ void GlobalValueNumberer::VisitBasicBlock(HBasicBlock* block) {
         // Or current is used by a phi, and we don't do OrderInputs() on a phi anyway.
         current->ReplaceWith(existing);
         current->GetBlock()->RemoveInstruction(current);
+        did_optimization_ = true;
       } else {
         set->Kill(current->GetSideEffects());
         set->Add(current);

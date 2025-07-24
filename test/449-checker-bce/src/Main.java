@@ -14,6 +14,8 @@
  * limitations under the License.
  */
 
+import java.util.Arrays;
+
 public class Main {
 
   /// CHECK-START: int Main.sieve(int) BCE (before)
@@ -1125,7 +1127,7 @@ public class Main {
   /// CHECK-DAG: <<Len:i\d+>> ArrayLength [<<Nul>>]         loop:none
   /// CHECK-DAG:              Equal [<<Len>>,<<Val>>]       loop:none
   /// CHECK-DAG: <<Idx:i\d+>> Phi                           loop:<<Loop:B\d+>>
-  /// CHECK-DAG:              BoundsCheck [<<Idx>>,<<Len>>] loop:<<Loop>>
+  /// CHECK-DAG:              BoundsCheck [<<Idx>>,<<Val>>] loop:<<Loop>>
   //
   /// CHECK-START: void Main.lengthAlias4(int[]) BCE (after)
   /// CHECK-NOT:              BoundsCheck
@@ -1576,7 +1578,7 @@ public class Main {
   /// CHECK-NOT: BoundsCheck
   /// CHECK: ArrayGet
 
-  /// CHECK-START: void Main.foo9(int[], boolean) instruction_simplifier$after_bce (after)
+  /// CHECK-START: void Main.foo9(int[], boolean) instruction_simplifier$before_codegen (after)
   //  Simplification removes the redundant check
   /// CHECK: Deoptimize
   /// CHECK: Deoptimize
@@ -1773,6 +1775,87 @@ public class Main {
     }
   }
 
+  // Tests `setZeroToRange` with a range of values. Checks for exceptions as well as the correctness
+  // of setting the right values to zero.
+  static void $noinline$testSetZeroToRange() {
+    for (int start = -2; start < 7; ++start) {
+      for (int len = -2; len < 7; ++len) {
+        int[] array = {1, 2, 3, 4, 5};
+        final int lower = start;
+        final int upper = start + len - 1;
+        // We expect an exception if:
+        //  * The first value is out of range, or
+        //  * The last value is more than the length of the array.
+        // Note that if `upper < 0` it means that we will only do one iteration of the do while in
+        // `setZeroToRange` so we have the exception covered with the `lower` checks.
+        final boolean expected_exception =
+                (lower < 0) || (lower >= array.length) || (upper >= array.length);
+        try {
+          $noinline$setZeroToRange(array, start, len);
+          if (expected_exception) {
+              System.out.println("Missing ArrayIndexOutOfBoundsException for start " + start
+                      + " and len " + len);
+          }
+          $noinline$checkZerosForSetZeroToRange(array, start, len);
+        } catch (ArrayIndexOutOfBoundsException e) {
+          if (!expected_exception) {
+              System.out.println("Unexpected ArrayIndexOutOfBoundsException for start " + start
+                      + " and len " + len);
+          }
+        }
+      }
+    }
+  }
+
+  // TODO(solanes): Improve the code to replace the following BoundsCheck with HDeoptimize
+  // instructions. See b/304967775 and aosp/2804075.
+
+  /// CHECK-START: void Main.$noinline$setZeroToRange(int[], int, int) BCE (before)
+  /// CHECK:     BoundsCheck
+
+  /// CHECK-START: void Main.$noinline$setZeroToRange(int[], int, int) BCE (after)
+  /// CHECK:     BoundsCheck
+
+  // Sets to `0` the values of `arr` in the range `[start, len)`.
+  static void $noinline$setZeroToRange(int[] arr, int start, int len) {
+    int charPos = start;
+    do {
+      arr[charPos++] = 0;
+    } while (charPos < start + len);
+  }
+
+  static void $noinline$checkZerosForSetZeroToRange(int[] arr, int start, int len) {
+    // Non-zeroes before zeroes.
+    int i = 0;
+    for (; i < Math.min(start, arr.length); ++i) {
+      if (arr[i] == 0) {
+        System.out.println("Expected non-zero for arr " + Arrays.toString(arr) + " before zeroes i "
+                + i + " start " + start + " and len " + len);
+      }
+    }
+
+    int bound = start + len;
+    if (bound < 1 || len < 1) {
+      // We always set one zero since it is a do-while.
+      bound = i + 1;
+    }
+
+    for (; i < Math.min(bound, arr.length); ++i) {
+      if (arr[i] != 0) {
+        System.out.println("Expected zero for arr " + Arrays.toString(arr) + " i " + i + " start "
+                + start + " and len " + len);
+      }
+    }
+
+    // Then zeroes until the end.
+    for (; i < arr.length; ++i) {
+      if (arr[i] == 0) {
+        System.out.println("Expected non-zero after zeroes for arr " + Arrays.toString(arr) + " i "
+                + i + " start " + start + " and len " + len);
+      }
+    }
+  }
+
   // Make sure this method is compiled with optimizing.
   /// CHECK-START: void Main.main(java.lang.String[]) register (after)
   /// CHECK: ParallelMove
@@ -1909,10 +1992,12 @@ public class Main {
     int i = 1;
     if (foo() + i != 100) {
       System.out.println("foo failed!");
-    };
+    }
 
     testUnknownBounds();
     new Main().testExceptionMessage();
+
+    $noinline$testSetZeroToRange();
   }
 
   public static native boolean compiledWithOptimizing();

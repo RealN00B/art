@@ -21,11 +21,9 @@
 #include "gc/allocator_type.h"
 #include "quick_entrypoints.h"
 
-namespace art {
+namespace art HIDDEN {
 
-// is_marking is only used for CC, if the GC is marking the allocation entrypoint is the marking
-// one.
-void ResetQuickAllocEntryPoints(QuickEntryPoints* qpoints, bool is_marking);
+void ResetQuickAllocEntryPoints(QuickEntryPoints* qpoints);
 
 // Runtime shutdown lock is necessary to prevent races in thread initialization. When the thread is
 // starting it doesn't hold the mutator lock until after it has been added to the thread list.

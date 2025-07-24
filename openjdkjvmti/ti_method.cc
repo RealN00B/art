@@ -39,10 +39,10 @@
 #include "arch/context.h"
 #include "art_jvmti.h"
 #include "art_method-inl.h"
-#include "base/enums.h"
 #include "base/globals.h"
 #include "base/macros.h"
 #include "base/mutex-inl.h"
+#include "base/pointer_size.h"
 #include "deopt_manager.h"
 #include "dex/code_item_accessors-inl.h"
 #include "dex/code_item_accessors.h"
@@ -63,7 +63,7 @@
 #include "mirror/object-inl.h"
 #include "mirror/object_array-inl.h"
 #include "nativehelper/scoped_local_ref.h"
-#include "oat_file.h"
+#include "oat/oat_file.h"
 #include "obj_ptr.h"
 #include "runtime.h"
 #include "runtime_callbacks.h"
@@ -79,6 +79,7 @@
 #include "ti_phase.h"
 #include "verifier/register_line-inl.h"
 #include "verifier/reg_type-inl.h"
+#include "verifier/reg_type_cache.h"
 #include "verifier/method_verifier-inl.h"
 
 namespace openjdkjvmti {
@@ -162,7 +163,7 @@ jvmtiError MethodUtil::GetBytecodes(jvmtiEnv* env,
   return OK;
 }
 
-jvmtiError MethodUtil::GetArgumentsSize(jvmtiEnv* env ATTRIBUTE_UNUSED,
+jvmtiError MethodUtil::GetArgumentsSize([[maybe_unused]] jvmtiEnv* env,
                                         jmethodID method,
                                         jint* size_ptr) {
   if (method == nullptr) {
@@ -182,7 +183,7 @@ jvmtiError MethodUtil::GetArgumentsSize(jvmtiEnv* env ATTRIBUTE_UNUSED,
   if (art_method->IsProxyMethod() || art_method->IsAbstract()) {
     // Use the shorty.
     art::ArtMethod* base_method = art_method->GetInterfaceMethodIfProxy(art::kRuntimePointerSize);
-    size_t arg_count = art::ArtMethod::NumArgRegisters(base_method->GetShorty());
+    size_t arg_count = art::ArtMethod::NumArgRegisters(base_method->GetShortyView());
     if (!base_method->IsStatic()) {
       arg_count++;
     }
@@ -190,7 +191,8 @@ jvmtiError MethodUtil::GetArgumentsSize(jvmtiEnv* env ATTRIBUTE_UNUSED,
     return ERR(NONE);
   }
 
-  DCHECK_NE(art_method->GetCodeItemOffset(), 0u);
+  DCHECK(art_method->HasCodeItem());
+  DCHECK_NE(art_method->GetCodeItem(), nullptr);
   *size_ptr = art_method->DexInstructionData().InsSize();
 
   return ERR(NONE);
@@ -248,6 +250,7 @@ jvmtiError MethodUtil::GetLocalVariableTable(jvmtiEnv* env,
     return OK;
   };
 
+  // To avoid defining visitor in the same line as the `if`. We define the lambda and use std::move.
   auto visitor = [&](const art::DexFile::LocalInfo& entry) {
     if (err != OK) {
       return;
@@ -274,16 +277,15 @@ jvmtiError MethodUtil::GetLocalVariableTable(jvmtiEnv* env,
     });
   };
 
-  if (!accessor.DecodeDebugLocalInfo(art_method->IsStatic(),
-                                     art_method->GetDexMethodIndex(),
-                                     visitor)) {
+  if (!accessor.DecodeDebugLocalInfo(
+          art_method->IsStatic(), art_method->GetDexMethodIndex(), std::move(visitor))) {
     // Something went wrong with decoding the debug information. It might as well not be there.
     return ERR(ABSENT_INFORMATION);
   }
   return release(entry_count_ptr, table_ptr);
 }
 
-jvmtiError MethodUtil::GetMaxLocals(jvmtiEnv* env ATTRIBUTE_UNUSED,
+jvmtiError MethodUtil::GetMaxLocals([[maybe_unused]] jvmtiEnv* env,
                                     jmethodID method,
                                     jint* max_ptr) {
   if (method == nullptr) {
@@ -306,7 +308,8 @@ jvmtiError MethodUtil::GetMaxLocals(jvmtiEnv* env ATTRIBUTE_UNUSED,
     return ERR(NONE);
   }
 
-  DCHECK_NE(art_method->GetCodeItemOffset(), 0u);
+  DCHECK(art_method->HasCodeItem());
+  DCHECK_NE(art_method->GetCodeItem(), nullptr);
   *max_ptr = art_method->DexInstructionData().RegistersSize();
 
   return ERR(NONE);
@@ -378,7 +381,7 @@ jvmtiError MethodUtil::GetMethodName(jvmtiEnv* env,
   return ERR(NONE);
 }
 
-jvmtiError MethodUtil::GetMethodDeclaringClass(jvmtiEnv* env ATTRIBUTE_UNUSED,
+jvmtiError MethodUtil::GetMethodDeclaringClass([[maybe_unused]] jvmtiEnv* env,
                                                jmethodID method,
                                                jclass* declaring_class_ptr) {
   if (declaring_class_ptr == nullptr) {
@@ -395,7 +398,7 @@ jvmtiError MethodUtil::GetMethodDeclaringClass(jvmtiEnv* env ATTRIBUTE_UNUSED,
   return ERR(NONE);
 }
 
-jvmtiError MethodUtil::GetMethodLocation(jvmtiEnv* env ATTRIBUTE_UNUSED,
+jvmtiError MethodUtil::GetMethodLocation([[maybe_unused]] jvmtiEnv* env,
                                          jmethodID method,
                                          jlocation* start_location_ptr,
                                          jlocation* end_location_ptr) {
@@ -420,14 +423,15 @@ jvmtiError MethodUtil::GetMethodLocation(jvmtiEnv* env ATTRIBUTE_UNUSED,
     return ERR(NONE);
   }
 
-  DCHECK_NE(art_method->GetCodeItemOffset(), 0u);
+  DCHECK(art_method->HasCodeItem());
+  DCHECK_NE(art_method->GetCodeItem(), nullptr);
   *start_location_ptr = 0;
   *end_location_ptr = art_method->DexInstructions().InsnsSizeInCodeUnits() - 1;
 
   return ERR(NONE);
 }
 
-jvmtiError MethodUtil::GetMethodModifiers(jvmtiEnv* env ATTRIBUTE_UNUSED,
+jvmtiError MethodUtil::GetMethodModifiers([[maybe_unused]] jvmtiEnv* env,
                                           jmethodID method,
                                           jint* modifiers_ptr) {
   if (modifiers_ptr == nullptr) {
@@ -504,7 +508,7 @@ jvmtiError MethodUtil::GetLineNumberTable(jvmtiEnv* env,
 }
 
 template <typename T>
-static jvmtiError IsMethodT(jvmtiEnv* env ATTRIBUTE_UNUSED,
+static jvmtiError IsMethodT([[maybe_unused]] jvmtiEnv* env,
                             jmethodID method,
                             T test,
                             jboolean* is_t_ptr) {
@@ -631,14 +635,27 @@ class CommonLocalVariableClosure : public art::Closure {
                                        /*out*/ std::string* descriptor,
                                        /*out*/ SlotType* type)
       REQUIRES_SHARED(art::Locks::mutator_lock_) {
+    art::StackHandleScope<2> hs(art::Thread::Current());
+    art::Handle<art::mirror::DexCache> dex_cache(hs.NewHandle(method->GetDexCache()));
+    art::Handle<art::mirror::ClassLoader> class_loader(hs.NewHandle(method->GetClassLoader()));
     art::Thread* self = art::Thread::Current();
-    art::StackHandleScope<2> hs(self);
+    art::Runtime* runtime = art::Runtime::Current();
+    art::ClassLinker* class_linker = runtime->GetClassLinker();
+    art::ArenaPool* arena_pool = runtime->GetArenaPool();
+    art::verifier::RegTypeCache reg_types(self,
+                                          class_linker,
+                                          arena_pool,
+                                          class_loader,
+                                          dex_cache->GetDexFile(),
+                                          /* can_load_classes= */ false,
+                                          /* can_suspend= */ false);
     std::unique_ptr<art::verifier::MethodVerifier> verifier(
         art::verifier::MethodVerifier::CalculateVerificationInfo(
             self,
+            &reg_types,
             method,
-            hs.NewHandle(method->GetDexCache()),
-            hs.NewHandle(method->GetDeclaringClass()->GetClassLoader())));
+            dex_cache,
+            dex_pc));
     if (verifier == nullptr) {
       JVMTI_LOG(WARNING, jvmti_) << "Unable to extract verification information from "
                                  << method->PrettyMethod() << " due to hard verification failures! "
@@ -749,6 +766,7 @@ jvmtiError CommonLocalVariableClosure::GetSlotType(art::ArtMethod* method,
   bool found = false;
   *type = art::Primitive::kPrimVoid;
   descriptor->clear();
+  // To avoid defining visitor in the same line as the `if`. We define the lambda and use std::move.
   auto visitor = [&](const art::DexFile::LocalInfo& entry) {
     if (!found && entry.start_address_ <= dex_pc && entry.end_address_ > dex_pc &&
         entry.reg_ == slot_) {
@@ -757,7 +775,8 @@ jvmtiError CommonLocalVariableClosure::GetSlotType(art::ArtMethod* method,
       *descriptor = entry.descriptor_;
     }
   };
-  if (!accessor.DecodeDebugLocalInfo(method->IsStatic(), method->GetDexMethodIndex(), visitor) ||
+  if (!accessor.DecodeDebugLocalInfo(
+          method->IsStatic(), method->GetDexMethodIndex(), std::move(visitor)) ||
       !found) {
     // Something went wrong with decoding the debug information. It might as well not be there.
     // Try to find the type with the verifier.
@@ -833,9 +852,9 @@ class GetLocalVariableClosure : public CommonLocalVariableClosure {
     return res;
   }
 
-  jvmtiError GetTypeErrorInner(art::ArtMethod* method ATTRIBUTE_UNUSED,
+  jvmtiError GetTypeErrorInner([[maybe_unused]] art::ArtMethod* method,
                                SlotType slot_type,
-                               const std::string& descriptor ATTRIBUTE_UNUSED)
+                               [[maybe_unused]] const std::string& descriptor)
       REQUIRES_SHARED(art::Locks::mutator_lock_) {
     switch (type_) {
       case art::Primitive::kPrimFloat:
@@ -1047,8 +1066,7 @@ class SetLocalVariableClosure : public CommonLocalVariableClosure {
           art::ObjPtr<art::mirror::Class> set_class = caller_->DecodeJObject(val_.l)->GetClass();
           art::ObjPtr<art::mirror::ClassLoader> loader =
               method->GetDeclaringClass()->GetClassLoader();
-          art::ObjPtr<art::mirror::Class> slot_class =
-              cl->LookupClass(caller_, descriptor.c_str(), loader);
+          art::ObjPtr<art::mirror::Class> slot_class = cl->LookupClass(caller_, descriptor, loader);
           DCHECK(!slot_class.IsNull()) << descriptor << " slot: " << slot_type;
           return slot_class->IsAssignableFrom(set_class) ? OK : ERR(TYPE_MISMATCH);
         }
@@ -1177,7 +1195,7 @@ class GetLocalInstanceClosure : public art::Closure {
   art::GcRoot<art::mirror::Object> val_;
 };
 
-jvmtiError MethodUtil::GetLocalInstance(jvmtiEnv* env ATTRIBUTE_UNUSED,
+jvmtiError MethodUtil::GetLocalInstance([[maybe_unused]] jvmtiEnv* env,
                                         jthread thread,
                                         jint depth,
                                         jobject* data) {

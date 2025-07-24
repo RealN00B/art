@@ -42,11 +42,9 @@ namespace {
 
 bool LoadDexFile(const std::string& dex_filename,
                  std::vector<std::unique_ptr<const DexFile>>* dex_files) {
-  const ArtDexFileLoader dex_file_loader;
+  ArtDexFileLoader dex_file_loader(dex_filename);
   std::string error_msg;
-  if (!dex_file_loader.Open(dex_filename.c_str(),
-                            dex_filename.c_str(),
-                            /* verify= */ true,
+  if (!dex_file_loader.Open(/* verify= */ true,
                             /* verify_checksum= */ true,
                             &error_msg,
                             dex_files)) {
@@ -104,7 +102,7 @@ struct MethodVerifierArgs : public CmdlineArgs {
     }
 
     std::string_view option(raw_option, raw_option_length);
-    if (StartsWith(option, "--dex-file=")) {
+    if (option.starts_with("--dex-file=")) {
       dex_filename_ = raw_option + strlen("--dex-file=");
     } else if (option == "--dex-file-verifier") {
       dex_file_verifier_ = true;
@@ -112,10 +110,10 @@ struct MethodVerifierArgs : public CmdlineArgs {
       method_verifier_verbose_ = true;
     } else if (option == "--verbose-debug") {
       method_verifier_verbose_debug_ = true;
-    } else if (StartsWith(option, "--repetitions=")) {
+    } else if (option.starts_with("--repetitions=")) {
       char* end;
       repetitions_ = strtoul(raw_option + strlen("--repetitions="), &end, 10);
-    } else if (StartsWith(option, "--api-level=")) {
+    } else if (option.starts_with("--api-level=")) {
       char* end;
       api_level_ = strtoul(raw_option + strlen("--api-level="), &end, 10);
     } else {
@@ -214,10 +212,11 @@ struct MethodVerifierMain : public CmdlineMain<MethodVerifierArgs> {
     jobject class_loader = Install(runtime, unique_dex_files, &dex_files);
     CHECK(class_loader != nullptr);
 
-    StackHandleScope<2> scope(soa.Self());
+    StackHandleScope<3> scope(soa.Self());
     Handle<mirror::ClassLoader> h_loader = scope.NewHandle(
         soa.Decode<mirror::ClassLoader>(class_loader));
     MutableHandle<mirror::Class> h_klass(scope.NewHandle<mirror::Class>(nullptr));
+    MutableHandle<mirror::DexCache> h_dex_cache(scope.NewHandle<mirror::DexCache>(nullptr));
 
     if (args_->method_verifier_verbose_) {
       gLogVerbosity.verifier = true;
@@ -235,26 +234,31 @@ struct MethodVerifierMain : public CmdlineMain<MethodVerifierArgs> {
       }
       for (const DexFile* dex_file : dex_files) {
         for (ClassAccessor accessor : dex_file->GetClasses()) {
-          const char* descriptor = accessor.GetDescriptor();
-          h_klass.Assign(class_linker->FindClass(soa.Self(), descriptor, h_loader));
+          h_klass.Assign(
+              class_linker->FindClass(soa.Self(), *dex_file, accessor.GetClassIdx(), h_loader));
           if (h_klass == nullptr || h_klass->IsErroneous()) {
             if (args_->repetitions_ == 0) {
-              LOG(ERROR) << "Warning: could not load " << descriptor;
+              LOG(ERROR) << "Warning: could not load " << accessor.GetDescriptor();
             }
             soa.Self()->ClearException();
             continue;
           }
+          h_dex_cache.Assign(h_klass->GetDexCache());
           std::string error_msg;
           verifier::FailureKind res =
             verifier::ClassVerifier::VerifyClass(soa.Self(),
-                                                 h_klass.Get(),
+                                                 /* verifier_deps= */ nullptr,
+                                                 h_dex_cache->GetDexFile(),
+                                                 h_klass,
+                                                 h_dex_cache,
+                                                 h_loader,
+                                                 *h_klass->GetClassDef(),
                                                  runtime->GetCompilerCallbacks(),
-                                                 true,
                                                  verifier::HardFailLogMode::kLogWarning,
                                                  args_->api_level_,
                                                  &error_msg);
           if (args_->repetitions_ == 0) {
-            LOG(INFO) << descriptor << ": " << res << " " << error_msg;
+            LOG(INFO) << accessor.GetDescriptor() << ": " << res << " " << error_msg;
           }
         }
       }

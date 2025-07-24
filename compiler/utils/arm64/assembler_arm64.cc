@@ -23,7 +23,7 @@
 
 using namespace vixl::aarch64;  // NOLINT(build/namespaces)
 
-namespace art {
+namespace art HIDDEN {
 namespace arm64 {
 
 #ifdef ___
@@ -54,6 +54,9 @@ static void SetVIXLCPUFeaturesFromART(vixl::aarch64::MacroAssembler* vixl_masm_,
   if (art_features->HasLSE()) {
     features->Combine(vixl::CPUFeatures::kAtomics);
   }
+  if (art_features->HasSVE()) {
+    features->Combine(vixl::CPUFeatures::kSVE);
+  }
 }
 
 Arm64Assembler::Arm64Assembler(ArenaAllocator* allocator,
@@ -76,7 +79,7 @@ const uint8_t* Arm64Assembler::CodeBufferBaseAddress() const {
   return vixl_masm_.GetBuffer().GetStartAddress<const uint8_t*>();
 }
 
-void Arm64Assembler::FinalizeInstructions(const MemoryRegion& region) {
+void Arm64Assembler::CopyInstructions(const MemoryRegion& region) {
   // Copy the instructions from the buffer.
   MemoryRegion from(vixl_masm_.GetBuffer()->GetStartAddress<void*>(), CodeSize());
   region.CopyFrom(0, from);
@@ -183,9 +186,7 @@ void Arm64Assembler::MaybeUnpoisonHeapReference(Register reg) {
 }
 
 void Arm64Assembler::GenerateMarkingRegisterCheck(Register temp, int code) {
-  // The Marking Register is only used in the Baker read barrier configuration.
-  DCHECK(kEmitCompilerReadBarrier);
-  DCHECK(kUseBakerReadBarrier);
+  DCHECK(kReserveMarkingRegister);
 
   vixl::aarch64::Register mr = reg_x(MR);  // Marking Register.
   vixl::aarch64::Register tr = reg_x(TR);  // Thread Register.

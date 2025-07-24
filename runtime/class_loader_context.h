@@ -19,26 +19,27 @@
 
 #include <string>
 #include <vector>
+#include <set>
 
 #include "arch/instruction_set.h"
 #include "base/dchecked_vector.h"
+#include "base/macros.h"
 #include "dex/dex_file.h"
 #include "handle_scope.h"
 #include "mirror/class_loader.h"
-#include "oat_file.h"
+#include "oat/oat_file.h"
 #include "scoped_thread_state_change.h"
 
-namespace art {
+namespace art HIDDEN {
 
 class DexFile;
 class OatFile;
 
 // Utility class which holds the class loader context used during compilation/verification.
-class ClassLoaderContext {
+class EXPORT ClassLoaderContext {
  public:
   enum class VerificationResult {
     kVerifies,
-    kForcedToSkipChecks,
     kMismatch,
   };
 
@@ -51,7 +52,10 @@ class ClassLoaderContext {
 
   // Special encoding used to denote a foreign ClassLoader was found when trying to encode class
   // loader contexts for each classpath element in a ClassLoader. See
-  // EncodeClassPathContextsForClassLoader. Keep in sync with PackageDexUsage in the framework.
+  // EncodeClassPathContextsForClassLoader. Keep in sync with PackageDexUsage in the framework
+  // (frameworks/base/services/core/java/com/android/server/pm/dex/PackageDexUsage.java) and
+  // DexUseManager in ART Services
+  // (art/libartservice/service/java/com/android/server/art/DexUseManager.java).
   static constexpr const char* kUnsupportedClassLoaderContextEncoding =
       "=UnsupportedClassLoaderContext=";
 
@@ -73,6 +77,11 @@ class ClassLoaderContext {
   // (Note that one dex file can contain multidexes. Each multidex will be added to the classpath
   // separately.)
   //
+  // only_read_checksums controls whether or not we only read the dex locations and the checksums
+  // from the apk instead of fully opening the dex files.
+  //
+  // This method is not thread safe.
+  //
   // Note that a "false" return could mean that either an apk/jar contained no dex files or
   // that we hit a I/O or checksum mismatch error.
   // TODO(calin): Currently there's no easy way to tell the difference.
@@ -80,9 +89,9 @@ class ClassLoaderContext {
   // TODO(calin): we're forced to complicate the flow in this class with a different
   // OpenDexFiles step because the current dex2oat flow requires the dex files be opened before
   // the class loader is created. Consider reworking the dex2oat part.
-  bool OpenDexFiles(InstructionSet isa,
-                    const std::string& classpath_dir,
-                    const std::vector<int>& context_fds = std::vector<int>());
+  bool OpenDexFiles(const std::string& classpath_dir = "",
+                    const std::vector<int>& context_fds = std::vector<int>(),
+                    bool only_read_checksums = false);
 
   // Remove the specified compilation sources from all classpaths present in this context.
   // Should only be called before the first call to OpenDexFiles().
@@ -150,16 +159,18 @@ class ClassLoaderContext {
   // Should only be called if OpenDexFiles() returned true.
   std::vector<const DexFile*> FlattenOpenedDexFiles() const;
 
-  // Return a colon-separated list of dex file locations from this class loader
-  // context after flattening.
-  std::string FlattenDexPaths() const;
+  // Return a list of dex file locations from this class loader context after flattening.
+  std::vector<std::string> FlattenDexPaths() const;
 
   // Verifies that the current context is identical to the context encoded as `context_spec`.
   // Identical means:
   //    - the number and type of the class loaders from the chain matches
   //    - the class loader from the same position have the same classpath
   //      (the order and checksum of the dex files matches)
-  // This should be called after OpenDexFiles().
+  // This should be called after OpenDexFiles() with only_read_checksums=true. There's no
+  // need to fully open the dex files if the only thing that needs to be done is to verify
+  // the context.
+  //
   // Names are only verified if verify_names is true.
   // Checksums are only verified if verify_checksums is true.
   VerificationResult VerifyClassLoaderContextMatch(const std::string& context_spec,
@@ -167,8 +178,9 @@ class ClassLoaderContext {
                                                    bool verify_checksums = true) const;
 
   // Checks if any of the given dex files is already loaded in the current class loader context.
+  // It only checks the first class loader.
   // Returns the list of duplicate dex files (empty if there are no duplicates).
-  std::vector<const DexFile*> CheckForDuplicateDexFiles(
+  std::set<const DexFile*> CheckForDuplicateDexFiles(
       const std::vector<const DexFile*>& dex_files);
 
   // Creates the class loader context from the given string.
@@ -216,6 +228,8 @@ class ClassLoaderContext {
     ClassLoaderType type;
     // Shared libraries this context has.
     std::vector<std::unique_ptr<ClassLoaderInfo>> shared_libraries;
+    // Shared libraries that will be loaded after apks code that this context has.
+    std::vector<std::unique_ptr<ClassLoaderInfo>> shared_libraries_after;
     // The list of class path elements that this loader loads.
     // Note that this list may contain relative paths.
     std::vector<std::string> classpath;
@@ -288,7 +302,8 @@ class ClassLoaderContext {
                                  Handle<mirror::ClassLoader> class_loader,
                                  Handle<mirror::ObjectArray<mirror::Object>> dex_elements,
                                  ClassLoaderInfo* child_info,
-                                 bool is_shared_library)
+                                 bool is_shared_library,
+                                 bool is_after)
     REQUIRES_SHARED(Locks::mutator_lock_);
 
   // Encodes the context as a string suitable to be passed to dex2oat or to be added to the
@@ -339,20 +354,24 @@ class ClassLoaderContext {
   // The returned format can be used when parsing a context spec.
   static const char* GetClassLoaderTypeName(ClassLoaderType type);
 
+  // Encodes the state of processing the dex files associated with the context.
+  enum ContextDexFilesState {
+    // The dex files are not opened.
+    kDexFilesNotOpened = 1,
+    // The dex checksums/locations were read from the apk/dex but the dex files were not opened.
+    kDexFilesChecksumsRead = 2,
+    // The dex files are opened (either because we called OpenDexFiles, or we used a class loader
+    // to create the context). This implies kDexFilesChecksumsRead.
+    kDexFilesOpened = 3,
+    // We failed to open the dex files or read the checksums.
+    kDexFilesOpenFailed = 4
+  };
+
   // The class loader chain.
   std::unique_ptr<ClassLoaderInfo> class_loader_chain_;
 
-  // Whether or not the class loader context should be ignored at runtime when loading the oat
-  // files. When true, dex2oat will use OatFile::kSpecialSharedLibrary as the classpath key in
-  // the oat file.
-  // TODO(calin): Can we get rid of this and cover all relevant use cases?
-  // (e.g. packages using prebuild system packages as shared libraries b/36480683)
-  bool special_shared_library_;
-
-  // Whether or not OpenDexFiles() was called.
-  bool dex_files_open_attempted_;
-  // The result of the last OpenDexFiles() operation.
-  bool dex_files_open_result_;
+  // The opening state of the dex files.
+  ContextDexFilesState dex_files_state_;
 
   // Whether or not the context owns the opened dex and oat files.
   // If true, the opened dex files will be de-allocated when the context is destructed.

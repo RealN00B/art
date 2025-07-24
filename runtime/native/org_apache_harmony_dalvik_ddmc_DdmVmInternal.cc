@@ -31,23 +31,18 @@
 #include "scoped_fast_native_object_access-inl.h"
 #include "thread_list.h"
 
-namespace art {
+namespace art HIDDEN {
 
-static Thread* GetSelf(JNIEnv* env) {
-  return static_cast<JNIEnvExt*>(env)->GetSelf();
-}
-
-static void DdmVmInternal_enableRecentAllocations(JNIEnv*, jclass, jboolean enable) {
+static void DdmVmInternal_setRecentAllocationsTrackingEnabled(JNIEnv*, jclass, jboolean enable) {
   Dbg::SetAllocTrackingEnabled(enable);
 }
 
-static jbyteArray DdmVmInternal_getRecentAllocations(JNIEnv* env, jclass) {
-  ScopedFastNativeObjectAccess soa(env);
-  return Dbg::GetRecentAllocations();
+static void DdmVmInternal_setThreadNotifyEnabled(JNIEnv*, jclass, jboolean enable) {
+  Dbg::DdmSetThreadNotification(enable);
 }
 
-static jboolean DdmVmInternal_getRecentAllocationStatus(JNIEnv*, jclass) {
-  return Runtime::Current()->GetHeap()->IsAllocTrackingEnabled();
+static Thread* GetSelf(JNIEnv* env) {
+  return static_cast<JNIEnvExt*>(env)->GetSelf();
 }
 
 /*
@@ -60,11 +55,10 @@ static jobjectArray DdmVmInternal_getStackTraceById(JNIEnv* env, jclass, jint th
   if (static_cast<uint32_t>(thin_lock_id) == self->GetThreadId()) {
     // No need to suspend ourself to build stacktrace.
     ScopedObjectAccess soa(env);
-    jobject internal_trace = self->CreateInternalStackTrace<false>(soa);
+    jobject internal_trace = soa.AddLocalReference<jobject>(self->CreateInternalStackTrace(soa));
     trace = Thread::InternalStackTraceToStackTraceElementArray(soa, internal_trace);
   } else {
     ThreadList* thread_list = Runtime::Current()->GetThreadList();
-    bool timed_out;
 
     // Check for valid thread
     if (thin_lock_id == ThreadList::kInvalidThreadId) {
@@ -72,23 +66,17 @@ static jobjectArray DdmVmInternal_getStackTraceById(JNIEnv* env, jclass, jint th
     }
 
     // Suspend thread to build stack trace.
-    Thread* thread = thread_list->SuspendThreadByThreadId(thin_lock_id,
-                                                          SuspendReason::kInternal,
-                                                          &timed_out);
+    Thread* thread = thread_list->SuspendThreadByThreadId(thin_lock_id, SuspendReason::kInternal);
     if (thread != nullptr) {
       {
         ScopedObjectAccess soa(env);
-        jobject internal_trace = thread->CreateInternalStackTrace<false>(soa);
+        jobject internal_trace =
+            soa.AddLocalReference<jobject>(thread->CreateInternalStackTrace(soa));
         trace = Thread::InternalStackTraceToStackTraceElementArray(soa, internal_trace);
       }
       // Restart suspended thread.
       bool resumed = thread_list->Resume(thread, SuspendReason::kInternal);
       DCHECK(resumed);
-    } else {
-      if (timed_out) {
-        LOG(ERROR) << "Trying to get thread's stack by id failed as the thread failed to suspend "
-            "within a generous timeout.";
-      }
     }
   }
   return trace;
@@ -114,38 +102,41 @@ static constexpr uint8_t ToJdwpThreadStatus(ThreadState state) {
     TS_WAIT     = 4,  // (in Object.wait())
   };
   switch (state) {
-    case kBlocked:
+    case ThreadState::kBlocked:
       return TS_MONITOR;
-    case kNative:
-    case kRunnable:
-    case kSuspended:
+    case ThreadState::kNative:
+    case ThreadState::kRunnable:
+    case ThreadState::kSuspended:
       return TS_RUNNING;
-    case kSleeping:
+    case ThreadState::kObsoleteRunnable:
+    case ThreadState::kInvalidState:
+      break;  // Obsolete or invalid value.
+    case ThreadState::kSleeping:
       return TS_SLEEPING;
-    case kStarting:
-    case kTerminated:
+    case ThreadState::kStarting:
+    case ThreadState::kTerminated:
       return TS_ZOMBIE;
-    case kTimedWaiting:
-    case kWaitingForTaskProcessor:
-    case kWaitingForLockInflation:
-    case kWaitingForCheckPointsToRun:
-    case kWaitingForDebuggerSend:
-    case kWaitingForDebuggerSuspension:
-    case kWaitingForDebuggerToAttach:
-    case kWaitingForDeoptimization:
-    case kWaitingForGcToComplete:
-    case kWaitingForGetObjectsAllocated:
-    case kWaitingForJniOnLoad:
-    case kWaitingForMethodTracingStart:
-    case kWaitingForSignalCatcherOutput:
-    case kWaitingForVisitObjects:
-    case kWaitingInMainDebuggerLoop:
-    case kWaitingInMainSignalCatcherLoop:
-    case kWaitingPerformingGc:
-    case kWaitingWeakGcRootRead:
-    case kWaitingForGcThreadFlip:
-    case kNativeForAbort:
-    case kWaiting:
+    case ThreadState::kTimedWaiting:
+    case ThreadState::kWaitingForTaskProcessor:
+    case ThreadState::kWaitingForLockInflation:
+    case ThreadState::kWaitingForCheckPointsToRun:
+    case ThreadState::kWaitingForDebuggerSend:
+    case ThreadState::kWaitingForDebuggerSuspension:
+    case ThreadState::kWaitingForDebuggerToAttach:
+    case ThreadState::kWaitingForDeoptimization:
+    case ThreadState::kWaitingForGcToComplete:
+    case ThreadState::kWaitingForGetObjectsAllocated:
+    case ThreadState::kWaitingForJniOnLoad:
+    case ThreadState::kWaitingForMethodTracingStart:
+    case ThreadState::kWaitingForSignalCatcherOutput:
+    case ThreadState::kWaitingForVisitObjects:
+    case ThreadState::kWaitingInMainDebuggerLoop:
+    case ThreadState::kWaitingInMainSignalCatcherLoop:
+    case ThreadState::kWaitingPerformingGc:
+    case ThreadState::kWaitingWeakGcRootRead:
+    case ThreadState::kWaitingForGcThreadFlip:
+    case ThreadState::kNativeForAbort:
+    case ThreadState::kWaiting:
       return TS_WAIT;
       // Don't add a 'default' here so the compiler can spot incompatible enum changes.
   }
@@ -214,28 +205,11 @@ static jbyteArray DdmVmInternal_getThreadStats(JNIEnv* env, jclass) {
   return result;
 }
 
-static jboolean DdmVmInternal_heapInfoNotify(JNIEnv* env, jclass, jint when) {
-  ScopedFastNativeObjectAccess soa(env);
-  return Dbg::DdmHandleHpifChunk(static_cast<Dbg::HpifWhen>(when));
-}
-
-static jboolean DdmVmInternal_heapSegmentNotify(JNIEnv*, jclass, jint when, jint what, jboolean native) {
-  return Dbg::DdmHandleHpsgNhsgChunk(static_cast<Dbg::HpsgWhen>(when), static_cast<Dbg::HpsgWhat>(what), native);
-}
-
-static void DdmVmInternal_threadNotify(JNIEnv*, jclass, jboolean enable) {
-  Dbg::DdmSetThreadNotification(enable);
-}
-
 static JNINativeMethod gMethods[] = {
-  NATIVE_METHOD(DdmVmInternal, enableRecentAllocations, "(Z)V"),
-  FAST_NATIVE_METHOD(DdmVmInternal, getRecentAllocations, "()[B"),
-  FAST_NATIVE_METHOD(DdmVmInternal, getRecentAllocationStatus, "()Z"),
+  NATIVE_METHOD(DdmVmInternal, setRecentAllocationsTrackingEnabled, "(Z)V"),
+  NATIVE_METHOD(DdmVmInternal, setThreadNotifyEnabled, "(Z)V"),
   NATIVE_METHOD(DdmVmInternal, getStackTraceById, "(I)[Ljava/lang/StackTraceElement;"),
   NATIVE_METHOD(DdmVmInternal, getThreadStats, "()[B"),
-  FAST_NATIVE_METHOD(DdmVmInternal, heapInfoNotify, "(I)Z"),
-  NATIVE_METHOD(DdmVmInternal, heapSegmentNotify, "(IIZ)Z"),
-  NATIVE_METHOD(DdmVmInternal, threadNotify, "(Z)V"),
 };
 
 void register_org_apache_harmony_dalvik_ddmc_DdmVmInternal(JNIEnv* env) {

@@ -18,6 +18,7 @@
 #define ART_COMPILER_OPTIMIZING_INSTRUCTION_BUILDER_H_
 
 #include "base/array_ref.h"
+#include "base/macros.h"
 #include "base/scoped_arena_allocator.h"
 #include "base/scoped_arena_containers.h"
 #include "data_type.h"
@@ -26,9 +27,8 @@
 #include "dex/dex_file_types.h"
 #include "handle.h"
 #include "nodes.h"
-#include "quicken_info.h"
 
-namespace art {
+namespace art HIDDEN {
 
 class ArenaBitVector;
 class ArtField;
@@ -41,7 +41,6 @@ class InstructionOperands;
 class OptimizingCompilerStats;
 class ScopedObjectAccess;
 class SsaBuilder;
-class VariableSizedHandleScope;
 
 namespace mirror {
 class Class;
@@ -59,9 +58,7 @@ class HInstructionBuilder : public ValueObject {
                       const DexCompilationUnit* dex_compilation_unit,
                       const DexCompilationUnit* outer_compilation_unit,
                       CodeGenerator* code_generator,
-                      ArrayRef<const uint8_t> interpreter_metadata,
                       OptimizingCompilerStats* compiler_stats,
-                      VariableSizedHandleScope* handles,
                       ScopedArenaAllocator* local_allocator);
 
   bool Build();
@@ -72,11 +69,8 @@ class HInstructionBuilder : public ValueObject {
   void PropagateLocalsToCatchBlocks();
   void SetLoopHeaderPhiInputs();
 
-  bool ProcessDexInstruction(const Instruction& instruction, uint32_t dex_pc, size_t quicken_index);
+  bool ProcessDexInstruction(const Instruction& instruction, uint32_t dex_pc);
   ArenaBitVector* FindNativeDebugInfoLocations();
-
-  bool CanDecodeQuickenedInfo() const;
-  uint16_t LookupQuickenedInfo(uint32_t quicken_index);
 
   HBasicBlock* FindBlockStartingAt(uint32_t dex_pc) const;
 
@@ -122,8 +116,8 @@ class HInstructionBuilder : public ValueObject {
   template<typename T>
   void Binop_22s(const Instruction& instruction, bool reverse, uint32_t dex_pc);
 
-  template<typename T> void If_21t(const Instruction& instruction, uint32_t dex_pc);
-  template<typename T> void If_22t(const Instruction& instruction, uint32_t dex_pc);
+  template<typename T, bool kCompareWithZero>
+  void If_21_22t(const Instruction& instruction, uint32_t dex_pc);
 
   void Conversion_12x(const Instruction& instruction,
                       DataType::Type input_type,
@@ -138,13 +132,15 @@ class HInstructionBuilder : public ValueObject {
                           bool second_is_lit,
                           bool is_div);
 
+  template <DataType::Type type>
+  void BuildMove(uint32_t dest_reg, uint32_t src_reg);
+
   void BuildReturn(const Instruction& instruction, DataType::Type type, uint32_t dex_pc);
 
   // Builds an instance field access node and returns whether the instruction is supported.
   bool BuildInstanceFieldAccess(const Instruction& instruction,
                                 uint32_t dex_pc,
-                                bool is_put,
-                                size_t quicken_index);
+                                bool is_put);
 
   void BuildUnresolvedStaticFieldAccess(const Instruction& instruction,
                                         uint32_t dex_pc,
@@ -205,6 +201,10 @@ class HInstructionBuilder : public ValueObject {
                               uint32_t dex_pc);
 
   // Builds a `HInstanceOf`, or a `HCheckCast` instruction.
+  void BuildTypeCheck(bool is_instance_of,
+                      HInstruction* object,
+                      dex::TypeIndex type_index,
+                      uint32_t dex_pc);
   void BuildTypeCheck(const Instruction& instruction,
                       uint8_t destination,
                       uint8_t reference,
@@ -230,7 +230,7 @@ class HInstructionBuilder : public ValueObject {
   Handle<mirror::Class> ResolveClass(ScopedObjectAccess& soa, dex::TypeIndex type_index)
       REQUIRES_SHARED(Locks::mutator_lock_);
 
-  bool LoadClassNeedsAccessCheck(ObjPtr<mirror::Class> klass)
+  bool LoadClassNeedsAccessCheck(dex::TypeIndex type_index, ObjPtr<mirror::Class> klass)
       REQUIRES_SHARED(Locks::mutator_lock_);
 
   // Builds a `HLoadMethodHandle` loading the given `method_handle_index`.
@@ -301,7 +301,6 @@ class HInstructionBuilder : public ValueObject {
 
   ArenaAllocator* const allocator_;
   HGraph* const graph_;
-  VariableSizedHandleScope* const handles_;
 
   // The dex file where the method being compiled is, and the bytecode data.
   const DexFile* const dex_file_;
@@ -324,9 +323,6 @@ class HInstructionBuilder : public ValueObject {
   // methods.
   const DexCompilationUnit* const outer_compilation_unit_;
 
-  // Original values kept after instruction quickening.
-  QuickenInfoTable quicken_info_;
-
   OptimizingCompilerStats* const compilation_stats_;
 
   ScopedArenaAllocator* const local_allocator_;
@@ -343,7 +339,7 @@ class HInstructionBuilder : public ValueObject {
   ScopedArenaVector<HBasicBlock*> loop_headers_;
 
   // Cached resolved types for the current compilation unit's DexFile.
-  // Handle<>s reference entries in the `handles_`.
+  // Handle<>s reference entries in the `graph_->GetHandleCache()`.
   ScopedArenaSafeMap<dex::TypeIndex, Handle<mirror::Class>> class_cache_;
 
   static constexpr int kDefaultNumberOfLoops = 2;

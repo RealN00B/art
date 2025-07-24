@@ -18,10 +18,9 @@
 #define ART_RUNTIME_ENTRYPOINTS_QUICK_QUICK_ENTRYPOINTS_ENUM_H_
 
 #include "quick_entrypoints.h"
-#include "quick_entrypoints_enum.h"
 #include "thread.h"
 
-namespace art {
+namespace art HIDDEN {
 
 // Define an enum for the entrypoints. Names are prepended a 'kQuick'.
 enum QuickEntrypointEnum {  // NOLINT(whitespace/braces)

@@ -14,11 +14,12 @@
  * limitations under the License.
  */
 
+#include "base/file_utils.h"
 #include "class_loader_utils.h"
 #include "jni.h"
 #include "nativehelper/scoped_utf_chars.h"
-#include "oat_file_assistant.h"
-#include "oat_file_manager.h"
+#include "oat/oat_file_assistant.h"
+#include "oat/oat_file_manager.h"
 #include "scoped_thread_state_change-inl.h"
 #include "thread.h"
 
@@ -44,7 +45,7 @@ extern "C" JNIEXPORT jboolean JNICALL Java_Main_areClassesVerified(JNIEnv*,
 
   std::vector<const DexFile*> dex_files;
   VisitClassLoaderDexFiles(
-      soa,
+      soa.Self(),
       h_loader,
       [&](const DexFile* dex_file) {
         dex_files.push_back(dex_file);
@@ -58,9 +59,9 @@ extern "C" JNIEXPORT jboolean JNICALL Java_Main_areClassesVerified(JNIEnv*,
   bool all_verified = false;
   for (const DexFile* dex_file : dex_files) {
     for (uint16_t cdef_idx = 0; cdef_idx < dex_file->NumClassDefs(); ++cdef_idx) {
-      const char* desc = dex_file->GetClassDescriptor(dex_file->GetClassDef(cdef_idx));
-      h_class.Assign(class_linker->FindClass(soa.Self(), desc, h_loader));
-      CHECK(h_class != nullptr) << "Could not find class " << desc;
+      dex::TypeIndex type_idx = dex_file->GetClassDef(cdef_idx).class_idx_;
+      h_class.Assign(class_linker->FindClass(soa.Self(), *dex_file, type_idx, h_loader));
+      CHECK(h_class != nullptr) << "Could not find class " << dex_file->GetTypeDescriptor(type_idx);
       bool is_verified = h_class->IsVerified();
       if (is_first) {
         all_verified = is_verified;
@@ -81,25 +82,27 @@ extern "C" JNIEXPORT bool JNICALL Java_Main_hasVdexFile(JNIEnv*,
   StackHandleScope<1> hs(soa.Self());
   Handle<mirror::ClassLoader> h_loader = hs.NewHandle(soa.Decode<mirror::ClassLoader>(loader));
 
-  std::vector<const DexFile::Header*> dex_headers;
+  std::vector<const DexFile*> dex_files;
   VisitClassLoaderDexFiles(
-      soa,
+      soa.Self(),
       h_loader,
       [&](const DexFile* dex_file) {
-        dex_headers.push_back(&dex_file->GetHeader());
+        dex_files.push_back(dex_file);
         return true;
       });
 
-  uint32_t location_checksum;
-  std::string dex_location;
-  std::string vdex_filename;
+  std::string dex_location = dex_files[0]->GetLocation();
+  std::string odex_filename;
   std::string error_msg;
-  return OatFileAssistant::AnonymousDexVdexLocation(dex_headers,
-                                                    kRuntimeISA,
-                                                    &location_checksum,
-                                                    &dex_location,
-                                                    &vdex_filename) &&
-         OS::FileExists(vdex_filename.c_str());
+  if (!OatFileAssistant::DexLocationToOdexFilename(dex_location,
+                                                   kRuntimeQuickCodeISA,
+                                                   &odex_filename,
+                                                   &error_msg)) {
+    LOG(WARNING) << "Could not get odex filename for " << dex_location << ": " << error_msg;
+    return false;
+  }
+
+  return OS::FileExists(GetVdexFilename(odex_filename).c_str());
 }
 
 extern "C" JNIEXPORT jboolean JNICALL Java_Main_isBackedByOatFile(JNIEnv*,
@@ -113,7 +116,7 @@ extern "C" JNIEXPORT jboolean JNICALL Java_Main_isBackedByOatFile(JNIEnv*,
   bool all_backed_by_oat = false;
 
   VisitClassLoaderDexFiles(
-      soa,
+      soa.Self(),
       h_loader,
       [&](const DexFile* dex_file) {
         bool is_backed_by_oat = (dex_file->GetOatDexFile() != nullptr);
@@ -138,7 +141,7 @@ extern "C" JNIEXPORT jboolean JNICALL Java_Main_areClassesPreverified(JNIEnv*,
 
   std::vector<const DexFile*> dex_files;
   VisitClassLoaderDexFiles(
-      soa,
+      soa.Self(),
       h_loader,
       [&](const DexFile* dex_file) {
         dex_files.push_back(dex_file);
@@ -152,13 +155,13 @@ extern "C" JNIEXPORT jboolean JNICALL Java_Main_areClassesPreverified(JNIEnv*,
   bool all_preverified = false;
   for (const DexFile* dex_file : dex_files) {
     for (uint16_t cdef_idx = 0; cdef_idx < dex_file->NumClassDefs(); ++cdef_idx) {
-      const char* desc = dex_file->GetClassDescriptor(dex_file->GetClassDef(cdef_idx));
-      h_class.Assign(class_linker->FindClass(soa.Self(), desc, h_loader));
-      CHECK(h_class != nullptr) << "Could not find class " << desc;
+      dex::TypeIndex type_idx = dex_file->GetClassDef(cdef_idx).class_idx_;
+      h_class.Assign(class_linker->FindClass(soa.Self(), *dex_file, type_idx, h_loader));
+      CHECK(h_class != nullptr) << "Could not find class " << dex_file->GetTypeDescriptor(type_idx);
 
       ClassStatus oat_file_class_status(ClassStatus::kNotReady);
       bool is_preverified = class_linker->VerifyClassUsingOatFile(
-          *dex_file, h_class.Get(), oat_file_class_status);
+          soa.Self(), *dex_file, h_class, oat_file_class_status);
 
       if (is_first) {
         all_preverified = is_preverified;

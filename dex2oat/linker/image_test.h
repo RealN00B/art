@@ -17,7 +17,7 @@
 #ifndef ART_DEX2OAT_LINKER_IMAGE_TEST_H_
 #define ART_DEX2OAT_LINKER_IMAGE_TEST_H_
 
-#include "image.h"
+#include "oat/image.h"
 
 #include <memory>
 #include <string>
@@ -48,8 +48,9 @@
 #include "linker/multi_oat_relative_patcher.h"
 #include "lock_word.h"
 #include "mirror/object-inl.h"
-#include "oat.h"
+#include "oat/oat.h"
 #include "oat_writer.h"
+#include "read_barrier_config.h"
 #include "scoped_thread_state_change-inl.h"
 #include "signal_catcher.h"
 #include "stream/buffered_output_stream.h"
@@ -63,6 +64,7 @@ static const uintptr_t kRequestedImageBase = ART_BASE_ADDRESS;
 struct CompilationHelper {
   std::vector<std::string> dex_file_locations;
   std::vector<ScratchFile> image_locations;
+  std::string extra_dex;
   std::vector<std::unique_ptr<const DexFile>> extra_dex_files;
   std::vector<ScratchFile> image_files;
   std::vector<ScratchFile> oat_files;
@@ -78,7 +80,15 @@ class ImageTest : public CommonCompilerDriverTest {
  protected:
   void SetUp() override {
     ReserveImageSpace();
-    CommonCompilerTest::SetUp();
+    CommonCompilerDriverTest::SetUp();
+  }
+
+  CompilerFilter::Filter GetCompilerFilter() const override {
+    return compiler_filter_;
+  }
+
+  void SetCompilerFilter(CompilerFilter::Filter compiler_filter) {
+    compiler_filter_ = compiler_filter;
   }
 
   void Compile(ImageHeader::StorageMode storage_mode,
@@ -86,10 +96,11 @@ class ImageTest : public CommonCompilerDriverTest {
                /*out*/ CompilationHelper& out_helper,
                const std::string& extra_dex = "",
                const std::initializer_list<std::string>& image_classes = {},
-               const std::initializer_list<std::string>& image_classes_failing_aot_clinit = {});
+               const std::initializer_list<std::string>& image_classes_failing_aot_clinit = {},
+               const std::initializer_list<std::string>& image_classes_failing_resolution = {});
 
   void SetUpRuntimeOptions(RuntimeOptions* options) override {
-    CommonCompilerTest::SetUpRuntimeOptions(options);
+    CommonCompilerDriverTest::SetUpRuntimeOptions(options);
     QuickCompilerCallbacks* new_callbacks =
         new QuickCompilerCallbacks(CompilerCallbacks::CallbackMode::kCompileBootImage);
     new_callbacks->SetVerificationResults(verification_results_.get());
@@ -117,6 +128,9 @@ class ImageTest : public CommonCompilerDriverTest {
   void DoCompile(ImageHeader::StorageMode storage_mode, /*out*/ CompilationHelper& out_helper);
 
   HashSet<std::string> image_classes_;
+
+  // By default we compile with "speed-profile" and an empty profile. This compiles only JNI stubs.
+  CompilerFilter::Filter compiler_filter_ = CompilerFilter::kSpeedProfile;
 };
 
 inline CompilationHelper::~CompilationHelper() {
@@ -149,17 +163,10 @@ inline std::vector<size_t> CompilationHelper::GetImageObjectSectionSizes() {
 inline void ImageTest::DoCompile(ImageHeader::StorageMode storage_mode,
                                  /*out*/ CompilationHelper& out_helper) {
   CompilerDriver* driver = compiler_driver_.get();
+  Runtime::Current()->AppendToBootClassPath(
+      out_helper.extra_dex, out_helper.extra_dex, out_helper.extra_dex_files);
   ClassLinker* class_linker = Runtime::Current()->GetClassLinker();
   std::vector<const DexFile*> class_path = class_linker->GetBootClassPath();
-
-  for (const std::unique_ptr<const DexFile>& dex_file : out_helper.extra_dex_files) {
-    {
-      ScopedObjectAccess soa(Thread::Current());
-      // Inject in boot class path so that the compiler driver can see it.
-      class_linker->AppendToBootClassPath(soa.Self(), dex_file.get());
-    }
-    class_path.push_back(dex_file.get());
-  }
 
   // Enable write for dex2dex.
   for (const DexFile* dex_file : class_path) {
@@ -204,10 +211,10 @@ inline void ImageTest::DoCompile(ImageHeader::StorageMode storage_mode,
     vdex_filenames.push_back(vdex_filename);
   }
 
-  std::unordered_map<const DexFile*, size_t> dex_file_to_oat_index_map;
+  HashMap<const DexFile*, size_t> dex_file_to_oat_index_map;
   size_t image_idx = 0;
   for (const DexFile* dex_file : class_path) {
-    dex_file_to_oat_index_map.emplace(dex_file, image_idx);
+    dex_file_to_oat_index_map.insert(std::make_pair(dex_file, image_idx));
     ++image_idx;
   }
   std::unique_ptr<ImageWriter> writer(new ImageWriter(*compiler_options_,
@@ -227,6 +234,10 @@ inline void ImageTest::DoCompile(ImageHeader::StorageMode storage_mode,
       SafeMap<std::string, std::string> key_value_store;
       key_value_store.Put(OatHeader::kBootClassPathKey,
                           android::base::Join(out_helper.dex_file_locations, ':'));
+      key_value_store.Put(OatHeader::kApexVersionsKey, Runtime::Current()->GetApexVersions());
+      key_value_store.Put(
+          OatHeader::kConcurrentCopying,
+          compiler_options_->EmitReadBarrier() ? OatHeader::kTrueValue : OatHeader::kFalseValue);
 
       std::vector<std::unique_ptr<ElfWriter>> elf_writers;
       std::vector<std::unique_ptr<OatWriter>> oat_writers;
@@ -235,8 +246,7 @@ inline void ImageTest::DoCompile(ImageHeader::StorageMode storage_mode,
         elf_writers.back()->Start();
         oat_writers.emplace_back(new OatWriter(*compiler_options_,
                                                &timings,
-                                               /*profile_compilation_info*/nullptr,
-                                               CompactDexLevel::kCompactDexLevelNone));
+                                               /*profile_compilation_info*/nullptr));
       }
 
       std::vector<OutputStream*> rodata;
@@ -246,10 +256,8 @@ inline void ImageTest::DoCompile(ImageHeader::StorageMode storage_mode,
       for (size_t i = 0, size = oat_writers.size(); i != size; ++i) {
         const DexFile* dex_file = class_path[i];
         rodata.push_back(elf_writers[i]->StartRoData());
-        ArrayRef<const uint8_t> raw_dex_file(
-            reinterpret_cast<const uint8_t*>(&dex_file->GetHeader()),
-            dex_file->GetHeader().file_size_);
-        oat_writers[i]->AddRawDexFileSource(raw_dex_file,
+        oat_writers[i]->AddRawDexFileSource(dex_file->GetContainer(),
+                                            dex_file->Begin(),
                                             dex_file->GetLocation().c_str(),
                                             dex_file->GetLocationChecksum());
 
@@ -276,8 +284,7 @@ inline void ImageTest::DoCompile(ImageHeader::StorageMode storage_mode,
           ASSERT_TRUE(cur_opened_dex_files.empty());
         }
       }
-      bool image_space_ok =
-          writer->PrepareImageAddressSpace(/*preload_dex_caches=*/ true, &timings);
+      bool image_space_ok = writer->PrepareImageAddressSpace(&timings);
       ASSERT_TRUE(image_space_ok);
 
       DCHECK_EQ(out_helper.vdex_files.size(), out_helper.oat_files.size());
@@ -292,19 +299,15 @@ inline void ImageTest::DoCompile(ImageHeader::StorageMode storage_mode,
                                                        rodata[i],
                                                        (i == 0u) ? &key_value_store : nullptr);
         ASSERT_TRUE(start_rodata_ok);
-        oat_writer->Initialize(driver, writer.get(), cur_dex_files);
+        oat_writer->Initialize(driver, verification_results_.get(), writer.get(), cur_dex_files);
 
-        std::unique_ptr<BufferedOutputStream> vdex_out =
-            std::make_unique<BufferedOutputStream>(
-                std::make_unique<FileOutputStream>(out_helper.vdex_files[i].GetFile()));
-        oat_writer->WriteVerifierDeps(vdex_out.get(), nullptr);
-        oat_writer->WriteQuickeningInfo(vdex_out.get());
-        oat_writer->WriteChecksumsAndVdexHeader(vdex_out.get());
+        oat_writer->FinishVdexFile(out_helper.vdex_files[i].GetFile(), /*verifier_deps=*/ nullptr);
 
         oat_writer->PrepareLayout(&patcher);
         elf_writer->PrepareDynamicSection(oat_writer->GetOatHeader().GetExecutableOffset(),
                                           oat_writer->GetCodeSize(),
-                                          oat_writer->GetDataBimgRelRoSize(),
+                                          oat_writer->GetDataImgRelRoSize(),
+                                          oat_writer->GetDataImgRelRoAppImageOffset(),
                                           oat_writer->GetBssSize(),
                                           oat_writer->GetBssMethodsOffset(),
                                           oat_writer->GetBssRootsOffset(),
@@ -324,11 +327,11 @@ inline void ImageTest::DoCompile(ImageHeader::StorageMode storage_mode,
         ASSERT_TRUE(text_ok);
         elf_writer->EndText(text);
 
-        if (oat_writer->GetDataBimgRelRoSize() != 0u) {
-          OutputStream* data_bimg_rel_ro = elf_writer->StartDataBimgRelRo();
-          bool data_bimg_rel_ro_ok = oat_writer->WriteDataBimgRelRo(data_bimg_rel_ro);
-          ASSERT_TRUE(data_bimg_rel_ro_ok);
-          elf_writer->EndDataBimgRelRo(data_bimg_rel_ro);
+        if (oat_writer->GetDataImgRelRoSize() != 0u) {
+          OutputStream* data_img_rel_ro = elf_writer->StartDataImgRelRo();
+          bool data_img_rel_ro_ok = oat_writer->WriteDataImgRelRo(data_img_rel_ro);
+          ASSERT_TRUE(data_img_rel_ro_ok);
+          elf_writer->EndDataImgRelRo(data_img_rel_ro);
         }
 
         bool header_ok = oat_writer->WriteHeader(elf_writer->GetStream());
@@ -344,20 +347,10 @@ inline void ImageTest::DoCompile(ImageHeader::StorageMode storage_mode,
       }
     }
 
-    bool success_image = writer->Write(kInvalidFd,
+    bool success_image = writer->Write(File::kInvalidFd,
                                        image_filenames,
                                        image_filenames.size());
     ASSERT_TRUE(success_image);
-
-    for (size_t i = 0, size = oat_filenames.size(); i != size; ++i) {
-      const char* oat_filename = oat_filenames[i].c_str();
-      std::unique_ptr<File> oat_file(OS::OpenFileReadWrite(oat_filename));
-      ASSERT_TRUE(oat_file != nullptr);
-      bool success_fixup = ElfWriter::Fixup(oat_file.get(), writer->GetOatDataBegin(i));
-      ASSERT_TRUE(success_fixup);
-      ASSERT_EQ(oat_file->FlushCloseOrErase(), 0) << "Could not flush and close oat file "
-                                                  << oat_filename;
-    }
   }
 }
 
@@ -367,7 +360,8 @@ inline void ImageTest::Compile(
     CompilationHelper& helper,
     const std::string& extra_dex,
     const std::initializer_list<std::string>& image_classes,
-    const std::initializer_list<std::string>& image_classes_failing_aot_clinit) {
+    const std::initializer_list<std::string>& image_classes_failing_aot_clinit,
+    const std::initializer_list<std::string>& image_classes_failing_resolution) {
   for (const std::string& image_class : image_classes_failing_aot_clinit) {
     ASSERT_TRUE(ContainsElement(image_classes, image_class));
   }
@@ -381,21 +375,24 @@ inline void ImageTest::Compile(
   compiler_options_->SetMaxImageBlockSize(max_image_block_size);
   image_classes_.clear();
   if (!extra_dex.empty()) {
+    helper.extra_dex = extra_dex;
     helper.extra_dex_files = OpenTestDexFiles(extra_dex.c_str());
   }
   DoCompile(storage_mode, helper);
   if (image_classes.begin() != image_classes.end()) {
-    // Make sure the class got initialized.
+    // Make sure all explicitly specified classes got initialized.
     ScopedObjectAccess soa(Thread::Current());
     ClassLinker* const class_linker = Runtime::Current()->GetClassLinker();
     for (const std::string& image_class : image_classes) {
       ObjPtr<mirror::Class> klass =
-          class_linker->FindSystemClass(Thread::Current(), image_class.c_str());
-      EXPECT_TRUE(klass != nullptr);
-      EXPECT_TRUE(klass->IsResolved());
-      if (ContainsElement(image_classes_failing_aot_clinit, image_class)) {
+          class_linker->LookupClass(Thread::Current(), image_class.c_str(), nullptr);
+      if (ContainsElement(image_classes_failing_resolution, image_class)) {
+        EXPECT_TRUE(klass == nullptr || klass->IsErroneousUnresolved());
+      } else  if (ContainsElement(image_classes_failing_aot_clinit, image_class)) {
+        ASSERT_TRUE(klass != nullptr) << image_class;
         EXPECT_FALSE(klass->IsInitialized());
       } else {
+        ASSERT_TRUE(klass != nullptr) << image_class;
         EXPECT_TRUE(klass->IsInitialized());
       }
     }

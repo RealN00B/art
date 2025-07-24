@@ -17,57 +17,25 @@
 #include "select_generator.h"
 
 #include "base/arena_allocator.h"
+#include "base/macros.h"
 #include "builder.h"
 #include "nodes.h"
 #include "optimizing_unit_test.h"
 #include "side_effects_analysis.h"
 
-namespace art {
+namespace art HIDDEN {
 
-class SelectGeneratorTest : public ImprovedOptimizingUnitTest {
- private:
-  void CreateParameters() override {
-    parameters_.push_back(new (GetAllocator()) HParameterValue(graph_->GetDexFile(),
-                                                               dex::TypeIndex(0),
-                                                               0,
-                                                               DataType::Type::kInt32));
-  }
-
- public:
-  void ConstructBasicGraphForSelect(HInstruction* instr) {
-    HBasicBlock* if_block = new (GetAllocator()) HBasicBlock(graph_);
-    HBasicBlock* then_block = new (GetAllocator()) HBasicBlock(graph_);
-    HBasicBlock* else_block = new (GetAllocator()) HBasicBlock(graph_);
-
-    graph_->AddBlock(if_block);
-    graph_->AddBlock(then_block);
-    graph_->AddBlock(else_block);
-
-    entry_block_->ReplaceSuccessor(return_block_, if_block);
-
-    if_block->AddSuccessor(then_block);
-    if_block->AddSuccessor(else_block);
-    then_block->AddSuccessor(return_block_);
-    else_block->AddSuccessor(return_block_);
-
-    HParameterValue* bool_param = new (GetAllocator()) HParameterValue(graph_->GetDexFile(),
-                                                                       dex::TypeIndex(0),
-                                                                       1,
-                                                                       DataType::Type::kBool);
-    entry_block_->AddInstruction(bool_param);
+class SelectGeneratorTest : public OptimizingUnitTest {
+ protected:
+  HPhi* ConstructBasicGraphForSelect(HBasicBlock* return_block, HInstruction* instr) {
+    HParameterValue* bool_param = MakeParam(DataType::Type::kBool);
     HIntConstant* const1 =  graph_->GetIntConstant(1);
 
-    if_block->AddInstruction(new (GetAllocator()) HIf(bool_param));
+    auto [if_block, then_block, else_block] = CreateDiamondPattern(return_block, bool_param);
 
-    then_block->AddInstruction(instr);
-    then_block->AddInstruction(new (GetAllocator()) HGoto());
-
-    else_block->AddInstruction(new (GetAllocator()) HGoto());
-
-    HPhi* phi = new (GetAllocator()) HPhi(GetAllocator(), 0, 0, DataType::Type::kInt32);
-    return_block_->AddPhi(phi);
-    phi->AddInput(instr);
-    phi->AddInput(const1);
+    AddOrInsertInstruction(then_block, instr);
+    HPhi* phi = MakePhi(return_block, {instr, const1});
+    return phi;
   }
 
   bool CheckGraphAndTrySelectGenerator() {
@@ -82,25 +50,25 @@ class SelectGeneratorTest : public ImprovedOptimizingUnitTest {
 
 // HDivZeroCheck might throw and should not be hoisted from the conditional to an unconditional.
 TEST_F(SelectGeneratorTest, testZeroCheck) {
-  InitGraph();
-  HDivZeroCheck* instr = new (GetAllocator()) HDivZeroCheck(parameters_[0], 0);
-  ConstructBasicGraphForSelect(instr);
+  HBasicBlock* return_block = InitEntryMainExitGraphWithReturnVoid();
+  HParameterValue* param = MakeParam(DataType::Type::kInt32);
+  HDivZeroCheck* instr = new (GetAllocator()) HDivZeroCheck(param, 0);
+  HPhi* phi = ConstructBasicGraphForSelect(return_block, instr);
 
-  ArenaVector<HInstruction*> current_locals({parameters_[0], graph_->GetIntConstant(1)},
-                                            GetAllocator()->Adapter(kArenaAllocInstruction));
-  ManuallyBuildEnvFor(instr, &current_locals);
+  ManuallyBuildEnvFor(instr, {param, graph_->GetIntConstant(1)});
 
   EXPECT_FALSE(CheckGraphAndTrySelectGenerator());
+  EXPECT_FALSE(phi->GetBlock() == nullptr);
 }
 
 // Test that SelectGenerator succeeds with HAdd.
 TEST_F(SelectGeneratorTest, testAdd) {
-  InitGraph();
-  HAdd* instr = new (GetAllocator()) HAdd(DataType::Type::kInt32,
-                                          parameters_[0],
-                                          parameters_[0], 0);
-  ConstructBasicGraphForSelect(instr);
+  HBasicBlock* return_block = InitEntryMainExitGraphWithReturnVoid();
+  HParameterValue* param = MakeParam(DataType::Type::kInt32);
+  HAdd* instr = new (GetAllocator()) HAdd(DataType::Type::kInt32, param, param, /*dex_pc=*/ 0);
+  HPhi* phi = ConstructBasicGraphForSelect(return_block, instr);
   EXPECT_TRUE(CheckGraphAndTrySelectGenerator());
+  EXPECT_TRUE(phi->GetBlock() == nullptr);
 }
 
 }  // namespace art

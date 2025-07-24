@@ -13,14 +13,52 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+package {
+    default_applicable_licenses: ["art_openjdkjvmti_license"],
+    default_team: "trendy_team_art_performance",
+}
+
+// Added automatically by a large-scale-change that took the approach of
+// 'apply every license found to every target'. While this makes sure we respect
+// every license restriction, it may not be entirely correct.
+//
+// e.g. GPL in an MIT project might only apply to the contrib/ directory.
+//
+// Please consider splitting the single license below into multiple licenses,
+// taking care not to lose any license_kind information, and overriding the
+// default license using the 'licenses: [...]' property on targets as needed.
+//
+// For unused files, consider creating a 'fileGroup' with "//visibility:private"
+// to attach the license to, and including a comment whether the files may be
+// used in the current project.
+// See: http://go/android-license-faq
+license {
+    name: "art_openjdkjvmti_license",
+    visibility: [":__subpackages__"],
+    license_kinds: [
+        "SPDX-license-identifier-Apache-2.0",
+        "SPDX-license-identifier-GPL-2.0-with-classpath-exception",
+    ],
+    license_text: [
+        "LICENSE",
+    ],
+}
+
 cc_library_headers {
     name: "libopenjdkjvmti_headers",
+    defaults: ["art_defaults"],
     visibility: ["//visibility:public"],
     header_libs: ["jni_headers"],
     host_supported: true,
     export_header_lib_headers: ["jni_headers"],
     export_include_dirs: ["include"],
     sdk_version: "current",
+
+    apex_available: [
+        "//apex_available:platform",
+        "com.android.art",
+        "com.android.art.debug",
+    ],
 }
 
 cc_defaults {
@@ -31,7 +69,6 @@ cc_defaults {
         "alloc_manager.cc",
         "deopt_manager.cc",
         "events.cc",
-        "fixed_up_dex_file.cc",
         "object_tagging.cc",
         "OpenjdkJvmTi.cc",
         "ti_allocator.cc",
@@ -74,14 +111,13 @@ art_cc_library {
     defaults: ["libopenjdkjvmti_defaults"],
     shared_libs: [
         "libart",
-        "libart-compiler",
-        "libart-dexlayout",
-        "libdexfile",
+        "libdexfile#impl",
         "libartbase",
     ],
     apex_available: [
-        "com.android.art.release",
+        "com.android.art",
         "com.android.art.debug",
+        "test_broken_com.android.art",
     ],
 }
 
@@ -93,9 +129,7 @@ art_cc_library {
     ],
     shared_libs: [
         "libartd",
-        "libartd-compiler",
-        "libartd-dexlayout",
-        "libdexfiled",
+        "libdexfiled#impl",
         "libartbased",
     ],
     apex_available: [

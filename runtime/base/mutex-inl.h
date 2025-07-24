@@ -26,16 +26,13 @@
 #include "thread.h"
 
 #if ART_USE_FUTEXES
-#include "linux/futex.h"
-#include "sys/syscall.h"
-#ifndef SYS_futex
-#define SYS_futex __NR_futex
-#endif
+#include <linux/futex.h>
+#include <sys/syscall.h>
 #endif  // ART_USE_FUTEXES
 
 #define CHECK_MUTEX_CALL(call, args) CHECK_PTHREAD_CALL(call, args, name_)
 
-namespace art {
+namespace art HIDDEN {
 
 #if ART_USE_FUTEXES
 static inline int futex(volatile int *uaddr, int op, int val, const struct timespec *timeout,
@@ -57,43 +54,49 @@ static inline pid_t SafeGetTid(const Thread* self) {
 }
 
 static inline void CheckUnattachedThread(LockLevel level) NO_THREAD_SAFETY_ANALYSIS {
-  // The check below enumerates the cases where we expect not to be able to sanity check locks
-  // on a thread. Lock checking is disabled to avoid deadlock when checking shutdown lock.
+  // The check below enumerates the cases where we expect not to be able to check the validity of
+  // locks on a thread. Lock checking is disabled to avoid deadlock when checking shutdown lock.
   // TODO: tighten this check.
-  if (kDebugLocking) {
-    CHECK(!Locks::IsSafeToCallAbortRacy() ||
-          // Used during thread creation to avoid races with runtime shutdown. Thread::Current not
-          // yet established.
-          level == kRuntimeShutdownLock ||
-          // Thread Ids are allocated/released before threads are established.
-          level == kAllocatedThreadIdsLock ||
-          // Thread LDT's are initialized without Thread::Current established.
-          level == kModifyLdtLock ||
-          // Threads are unregistered while holding the thread list lock, during this process they
-          // no longer exist and so we expect an unlock with no self.
-          level == kThreadListLock ||
-          // Ignore logging which may or may not have set up thread data structures.
-          level == kLoggingLock ||
-          // When transitioning from suspended to runnable, a daemon thread might be in
-          // a situation where the runtime is shutting down. To not crash our debug locking
-          // mechanism we just pass null Thread* to the MutexLock during that transition
-          // (see Thread::TransitionFromSuspendedToRunnable).
-          level == kThreadSuspendCountLock ||
-          // Avoid recursive death.
-          level == kAbortLock ||
-          // Locks at the absolute top of the stack can be locked at any time.
-          level == kTopLockLevel ||
-          // The unexpected signal handler may be catching signals from any thread.
-          level == kUnexpectedSignalLock) << level;
+  CHECK(!Locks::IsSafeToCallAbortRacy() ||
+        // Used during thread creation to avoid races with runtime shutdown. Thread::Current not
+        // yet established.
+        level == kRuntimeShutdownLock ||
+        // Thread Ids are allocated/released before threads are established.
+        level == kAllocatedThreadIdsLock ||
+        // Thread LDT's are initialized without Thread::Current established.
+        level == kModifyLdtLock ||
+        // Threads are unregistered while holding the thread list lock, during this process they
+        // no longer exist and so we expect an unlock with no self.
+        level == kThreadListLock ||
+        // Ignore logging which may or may not have set up thread data structures.
+        level == kLoggingLock ||
+        // When transitioning from suspended to runnable, a daemon thread might be in
+        // a situation where the runtime is shutting down. To not crash our debug locking
+        // mechanism we just pass null Thread* to the MutexLock during that transition
+        // (see Thread::TransitionFromSuspendedToRunnable).
+        level == kThreadSuspendCountLock ||
+        // Avoid recursive death.
+        level == kAbortLock ||
+        // Locks at the absolute top of the stack can be locked at any time.
+        level == kTopLockLevel ||
+        // The unexpected signal handler may be catching signals from any thread.
+        level == kUnexpectedSignalLock)
+      << level;
+}
+
+inline void BaseMutex::RegisterAsLocked(Thread* self, bool check) {
+  if (UNLIKELY(self == nullptr)) {
+    if (check) {
+      CheckUnattachedThread(level_);
+    }
+  } else {
+    RegisterAsLockedImpl(self, level_, check);
   }
 }
 
-inline void BaseMutex::RegisterAsLocked(Thread* self) {
-  if (UNLIKELY(self == nullptr)) {
-    CheckUnattachedThread(level_);
-    return;
-  }
-  LockLevel level = level_;
+inline void BaseMutex::RegisterAsLockedImpl(Thread* self, LockLevel level, bool check) {
+  DCHECK(self != nullptr);
+  DCHECK_EQ(level_, level);
   // It would be nice to avoid this condition checking in the non-debug case,
   // but that would make the various methods that check if a mutex is held not
   // work properly for thread wait locks. Since the vast majority of lock
@@ -102,7 +105,7 @@ inline void BaseMutex::RegisterAsLocked(Thread* self) {
   if (UNLIKELY(level == kThreadWaitLock) && self->GetHeldMutex(kThreadWaitLock) != nullptr) {
     level = kThreadWaitWakeLock;
   }
-  if (kDebugLocking) {
+  if (check) {
     // Check if a bad Mutex of this level or lower is held.
     bool bad_mutexes_held = false;
     // Specifically allow a kTopLockLevel lock to be gained when the current thread holds the
@@ -156,11 +159,18 @@ inline void BaseMutex::RegisterAsLocked(Thread* self) {
 
 inline void BaseMutex::RegisterAsUnlocked(Thread* self) {
   if (UNLIKELY(self == nullptr)) {
-    CheckUnattachedThread(level_);
-    return;
+    if (kDebugLocking) {
+      CheckUnattachedThread(level_);
+    }
+  } else {
+    RegisterAsUnlockedImpl(self, level_);
   }
-  if (level_ != kMonitorLock) {
-    auto level = level_;
+}
+
+inline void BaseMutex::RegisterAsUnlockedImpl(Thread* self, LockLevel level) {
+  DCHECK(self != nullptr);
+  DCHECK_EQ(level_, level);
+  if (level != kMonitorLock) {
     if (UNLIKELY(level == kThreadWaitLock) && self->GetHeldMutex(kThreadWaitWakeLock) == this) {
       level = kThreadWaitWakeLock;
     }
@@ -227,7 +237,7 @@ inline bool Mutex::IsExclusiveHeld(const Thread* self) const {
   DCHECK(self == nullptr || self == Thread::Current());
   bool result = (GetExclusiveOwnerTid() == SafeGetTid(self));
   if (kDebugLocking) {
-    // Sanity debug check that if we think it is locked we have it in our held mutexes.
+    // Debug check that if we think it is locked we have it in our held mutexes.
     if (result && self != nullptr && level_ != kMonitorLock && !gAborting) {
       if (level_ == kThreadWaitLock && self->GetHeldMutex(kThreadWaitLock) != this) {
         CHECK_EQ(self->GetHeldMutex(kThreadWaitWakeLock), this);
@@ -257,7 +267,7 @@ inline bool ReaderWriterMutex::IsExclusiveHeld(const Thread* self) const {
   DCHECK(self == nullptr || self == Thread::Current());
   bool result = (GetExclusiveOwnerTid() == SafeGetTid(self));
   if (kDebugLocking) {
-    // Sanity that if the pthread thinks we own the lock the Thread agrees.
+    // Verify that if the pthread thinks we own the lock the Thread agrees.
     if (self != nullptr && result)  {
       CHECK_EQ(self->GetHeldMutex(level_), this);
     }
@@ -292,11 +302,11 @@ inline void ReaderWriterMutex::AssertWriterHeld(const Thread* self) const {
 
 inline void MutatorMutex::TransitionFromRunnableToSuspended(Thread* self) {
   AssertSharedHeld(self);
-  RegisterAsUnlocked(self);
+  RegisterAsUnlockedImpl(self, kMutatorLock);
 }
 
 inline void MutatorMutex::TransitionFromSuspendedToRunnable(Thread* self) {
-  RegisterAsLocked(self);
+  RegisterAsLockedImpl(self, kMutatorLock, kDebugLocking);
   AssertSharedHeld(self);
 }
 

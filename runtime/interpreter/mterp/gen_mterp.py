@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 #
 # Copyright (C) 2016 The Android Open Source Project
 #
@@ -15,7 +15,7 @@
 # limitations under the License.
 
 import sys, re, os
-from cStringIO import StringIO
+from io import StringIO
 
 SCRIPT_DIR = os.path.dirname(sys.argv[0])
 # This file is included verbatim at the start of the in-memory python script.
@@ -37,9 +37,8 @@ def getOpcodeList():
   opcode_fp.close()
 
   if len(opcodes) != NUM_PACKED_OPCODES:
-    print "ERROR: found %d opcodes in Interp.h (expected %d)" \
-        % (len(opcodes), NUM_PACKED_OPCODES)
-    raise SyntaxError, "bad opcode count"
+    print("ERROR: found ", len(opcodes), " opcodes in Interp.h (expected ", NUM_PACKED_OPCODES, ")")
+    raise SyntaxError("bad opcode count")
   return opcodes
 
 indent_re = re.compile(r"^%( *)")
@@ -66,10 +65,11 @@ def generate_script(output_filename, input_filenames):
   for input_filename in sorted(input_filenames):
     lines = open(input_filename, "r").readlines()
     indent = ""
-    for line in lines:
+    for line_number, line in enumerate(lines, 1):
+      file_line = "{}:{}".format("/".join(input_filename.split("/")[-2:]), line_number)
       line = line.rstrip()
       if line.startswith("%"):
-        script.write(line.lstrip("%") + "\n")
+        script.write("{:80}  # {}\n".format(line.lstrip("%"), file_line))
         indent = indent_re.match(line).group(1)
         if line.endswith(":"):
           indent += "  "

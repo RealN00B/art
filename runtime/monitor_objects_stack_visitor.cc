@@ -20,7 +20,7 @@
 #include "read_barrier-inl.h"
 #include "thread-current-inl.h"
 
-namespace art {
+namespace art HIDDEN {
 
 bool MonitorObjectsStackVisitor::VisitFrame() {
   ArtMethod* m = GetMethod();
@@ -47,16 +47,16 @@ bool MonitorObjectsStackVisitor::VisitFrame() {
                                             &monitor_object,
                                             &lock_owner_tid);
     switch (state) {
-      case kWaiting:
-      case kTimedWaiting:
+      case ThreadState::kWaiting:
+      case ThreadState::kTimedWaiting:
         VisitWaitingObject(monitor_object, state);
         break;
-      case kSleeping:
+      case ThreadState::kSleeping:
         VisitSleepingObject(monitor_object);
         break;
 
-      case kBlocked:
-      case kWaitingForLockInflation:
+      case ThreadState::kBlocked:
+      case ThreadState::kWaitingForLockInflation:
         VisitBlockedOnObject(monitor_object, state, lock_owner_tid);
         break;
 
@@ -90,7 +90,7 @@ bool MonitorObjectsStackVisitor::VisitFrame() {
 void MonitorObjectsStackVisitor::VisitLockedObject(ObjPtr<mirror::Object> o, void* context) {
   MonitorObjectsStackVisitor* self = reinterpret_cast<MonitorObjectsStackVisitor*>(context);
   if (o != nullptr) {
-    if (kUseReadBarrier && Thread::Current()->GetIsGcMarking()) {
+    if (gUseReadBarrier && Thread::Current()->GetIsGcMarking()) {
       // We may call Thread::Dump() in the middle of the CC thread flip and this thread's stack
       // may have not been flipped yet and "o" may be a from-space (stale) ref, in which case the
       // IdentityHashCode call below will crash. So explicitly mark/forward it here.

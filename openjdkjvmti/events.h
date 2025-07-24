@@ -21,9 +21,7 @@
 #include <unordered_map>
 #include <vector>
 
-#include <android-base/logging.h>
-#include <android-base/thread_annotations.h>
-
+#include "android-base/logging.h"
 #include "android-base/thread_annotations.h"
 #include "base/macros.h"
 #include "base/mutex.h"
@@ -99,7 +97,6 @@ constexpr jint kInternalEventCount = static_cast<jint>(ArtJvmtiEvent::kMaxIntern
                                      static_cast<jint>(ArtJvmtiEvent::kMinInternalEventTypeVal) + 1;
 
 using ArtJvmtiEventDdmPublishChunk = void (*)(jvmtiEnv *jvmti_env,
-                                              JNIEnv* jni_env,
                                               jint data_type,
                                               jint data_len,
                                               const jbyte* data);

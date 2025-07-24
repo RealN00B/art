@@ -20,7 +20,9 @@
 #include <cstdint>
 #include <iosfwd>
 
-namespace art {
+#include "base/macros.h"
+
+namespace art HIDDEN {
 
 // Returns a special method that describes all callee saves being spilled to the stack.
 enum class CalleeSaveType : uint32_t {
@@ -32,7 +34,7 @@ enum class CalleeSaveType : uint32_t {
   kSaveEverythingForSuspendCheck,  // Special kSaveEverything for suspend check.
   kLastCalleeSaveType   // Value used for iteration.
 };
-std::ostream& operator<<(std::ostream& os, const CalleeSaveType& rhs);
+std::ostream& operator<<(std::ostream& os, CalleeSaveType rhs);
 
 static inline constexpr CalleeSaveType GetCanonicalCalleeSaveType(CalleeSaveType type) {
   if (type == CalleeSaveType::kSaveEverythingForClinit ||

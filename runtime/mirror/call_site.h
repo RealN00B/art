@@ -17,10 +17,11 @@
 #ifndef ART_RUNTIME_MIRROR_CALL_SITE_H_
 #define ART_RUNTIME_MIRROR_CALL_SITE_H_
 
+#include "base/macros.h"
 #include "mirror/method_handle_impl.h"
 #include "obj_ptr.h"
 
-namespace art {
+namespace art HIDDEN {
 
 struct CallSiteOffsets;
 
@@ -29,6 +30,8 @@ namespace mirror {
 // C++ mirror of java.lang.invoke.CallSite
 class MANAGED CallSite : public Object {
  public:
+  MIRROR_CLASS("Ljava/lang/invoke/CallSite;");
+
   ObjPtr<MethodHandle> GetTarget() REQUIRES_SHARED(Locks::mutator_lock_);
 
  private:

@@ -20,21 +20,22 @@
 
 #include "arch/arm64/jni_frame_arm64.h"
 #include "arch/instruction_set.h"
-#include "handle_scope-inl.h"
 #include "utils/arm64/managed_register_arm64.h"
 
-namespace art {
+namespace art HIDDEN {
 namespace arm64 {
 
-static const XRegister kXArgumentRegisters[] = {
-  X0, X1, X2, X3, X4, X5, X6, X7
+static constexpr ManagedRegister kXArgumentRegisters[] = {
+    Arm64ManagedRegister::FromXRegister(X0),
+    Arm64ManagedRegister::FromXRegister(X1),
+    Arm64ManagedRegister::FromXRegister(X2),
+    Arm64ManagedRegister::FromXRegister(X3),
+    Arm64ManagedRegister::FromXRegister(X4),
+    Arm64ManagedRegister::FromXRegister(X5),
+    Arm64ManagedRegister::FromXRegister(X6),
+    Arm64ManagedRegister::FromXRegister(X7),
 };
 static_assert(kMaxIntLikeRegisterArguments == arraysize(kXArgumentRegisters));
-
-static const WRegister kWArgumentRegisters[] = {
-  W0, W1, W2, W3, W4, W5, W6, W7
-};
-static_assert(kMaxIntLikeRegisterArguments == arraysize(kWArgumentRegisters));
 
 static const DRegister kDArgumentRegisters[] = {
   D0, D1, D2, D3, D4, D5, D6, D7
@@ -59,8 +60,8 @@ static constexpr ManagedRegister kCalleeSaveRegisters[] = {
 
     // Thread register(X19) is saved on stack.
     Arm64ManagedRegister::FromXRegister(X19),
-    Arm64ManagedRegister::FromXRegister(X20),
-    Arm64ManagedRegister::FromXRegister(X21),
+    Arm64ManagedRegister::FromXRegister(X20),  // Note: Marking register.
+    Arm64ManagedRegister::FromXRegister(X21),  // Note: Suspend check register.
     Arm64ManagedRegister::FromXRegister(X22),
     Arm64ManagedRegister::FromXRegister(X23),
     Arm64ManagedRegister::FromXRegister(X24),
@@ -141,7 +142,7 @@ static constexpr uint32_t kAapcs64FpCalleeSpillMask =
     CalculateFpCalleeSpillMask(kAapcs64CalleeSaveRegisters);
 
 // Calling convention
-static ManagedRegister ReturnRegisterForShorty(const char* shorty) {
+static ManagedRegister ReturnRegisterForShorty(std::string_view shorty) {
   if (shorty[0] == 'F') {
     return Arm64ManagedRegister::FromSRegister(S0);
   } else if (shorty[0] == 'D') {
@@ -155,15 +156,15 @@ static ManagedRegister ReturnRegisterForShorty(const char* shorty) {
   }
 }
 
-ManagedRegister Arm64ManagedRuntimeCallingConvention::ReturnRegister() {
+ManagedRegister Arm64ManagedRuntimeCallingConvention::ReturnRegister() const {
   return ReturnRegisterForShorty(GetShorty());
 }
 
-ManagedRegister Arm64JniCallingConvention::ReturnRegister() {
+ManagedRegister Arm64JniCallingConvention::ReturnRegister() const {
   return ReturnRegisterForShorty(GetShorty());
 }
 
-ManagedRegister Arm64JniCallingConvention::IntReturnRegister() {
+ManagedRegister Arm64JniCallingConvention::IntReturnRegister() const {
   return Arm64ManagedRegister::FromWRegister(W0);
 }
 
@@ -171,6 +172,10 @@ ManagedRegister Arm64JniCallingConvention::IntReturnRegister() {
 
 ManagedRegister Arm64ManagedRuntimeCallingConvention::MethodRegister() {
   return Arm64ManagedRegister::FromXRegister(X0);
+}
+
+ManagedRegister Arm64ManagedRuntimeCallingConvention::ArgumentRegisterForMethodExitHook() {
+  return Arm64ManagedRegister::FromXRegister(X4);
 }
 
 bool Arm64ManagedRuntimeCallingConvention::IsCurrentParamInRegister() {
@@ -196,12 +201,11 @@ ManagedRegister Arm64ManagedRuntimeCallingConvention::CurrentParamRegister() {
     }
   } else {
     size_t non_fp_arg_number = itr_args_ - itr_float_and_doubles_;
+    ManagedRegister x_reg = kXArgumentRegisters[/* method */ 1u + non_fp_arg_number];
     if (IsCurrentParamALong()) {
-      XRegister x_reg = kXArgumentRegisters[/* method */ 1u + non_fp_arg_number];
-      return Arm64ManagedRegister::FromXRegister(x_reg);
+      return x_reg;
     } else {
-      WRegister w_reg = kWArgumentRegisters[/* method */ 1u + non_fp_arg_number];
-      return Arm64ManagedRegister::FromWRegister(w_reg);
+      return Arm64ManagedRegister::FromWRegister(x_reg.AsArm64().AsOverlappingWRegister());
     }
   }
 }
@@ -216,10 +220,12 @@ FrameOffset Arm64ManagedRuntimeCallingConvention::CurrentParamStackOffset() {
 
 Arm64JniCallingConvention::Arm64JniCallingConvention(bool is_static,
                                                      bool is_synchronized,
+                                                     bool is_fast_native,
                                                      bool is_critical_native,
-                                                     const char* shorty)
+                                                     std::string_view shorty)
     : JniCallingConvention(is_static,
                            is_synchronized,
+                           is_fast_native,
                            is_critical_native,
                            shorty,
                            kArm64PointerSize) {
@@ -233,52 +239,61 @@ uint32_t Arm64JniCallingConvention::FpSpillMask() const {
   return is_critical_native_ ? 0u : kFpCalleeSpillMask;
 }
 
-ManagedRegister Arm64JniCallingConvention::ReturnScratchRegister() const {
-  return ManagedRegister::NoRegister();
+ArrayRef<const ManagedRegister> Arm64JniCallingConvention::CalleeSaveScratchRegisters() const {
+  DCHECK(!IsCriticalNative());
+  // Use X22-X29 from native callee saves.
+  constexpr size_t kStart = 3u;
+  constexpr size_t kLength = 8u;
+  static_assert(kAapcs64CalleeSaveRegisters[kStart].Equals(
+                    Arm64ManagedRegister::FromXRegister(X22)));
+  static_assert(kAapcs64CalleeSaveRegisters[kStart + kLength - 1u].Equals(
+                    Arm64ManagedRegister::FromXRegister(X29)));
+  static_assert((kAapcs64CoreCalleeSpillMask & ~kCoreCalleeSpillMask) == 0u);
+  return ArrayRef<const ManagedRegister>(kAapcs64CalleeSaveRegisters).SubArray(kStart, kLength);
+}
+
+ArrayRef<const ManagedRegister> Arm64JniCallingConvention::ArgumentScratchRegisters() const {
+  DCHECK(!IsCriticalNative());
+  ArrayRef<const ManagedRegister> scratch_regs(kXArgumentRegisters);
+  // Exclude return register (X0) even if unused. Using the same scratch registers helps
+  // making more JNI stubs identical for better reuse, such as deduplicating them in oat files.
+  static_assert(kXArgumentRegisters[0].Equals(Arm64ManagedRegister::FromXRegister(X0)));
+  scratch_regs = scratch_regs.SubArray(/*pos=*/ 1u);
+  DCHECK(std::none_of(scratch_regs.begin(),
+                      scratch_regs.end(),
+                      [return_reg = ReturnRegister().AsArm64()](ManagedRegister reg) {
+                        return return_reg.Overlaps(reg.AsArm64());
+                      }));
+  return scratch_regs;
 }
 
 size_t Arm64JniCallingConvention::FrameSize() const {
   if (is_critical_native_) {
     CHECK(!SpillsMethod());
     CHECK(!HasLocalReferenceSegmentState());
-    CHECK(!HasHandleScope());
-    CHECK(!SpillsReturnValue());
     return 0u;  // There is no managed frame for @CriticalNative.
   }
 
   // Method*, callee save area size, local reference segment state
-  CHECK(SpillsMethod());
+  DCHECK(SpillsMethod());
   size_t method_ptr_size = static_cast<size_t>(kFramePointerSize);
   size_t callee_save_area_size = CalleeSaveRegisters().size() * kFramePointerSize;
   size_t total_size = method_ptr_size + callee_save_area_size;
 
-  CHECK(HasLocalReferenceSegmentState());
-  total_size += sizeof(uint32_t);
-
-  CHECK(HasHandleScope());
-  total_size += HandleScope::SizeOf(kArm64PointerSize, ReferenceCount());
-
-  // Plus return value spill area size
-  CHECK(SpillsReturnValue());
-  total_size += SizeOfReturnValue();
+  DCHECK(HasLocalReferenceSegmentState());
+  // Cookie is saved in one of the spilled registers.
 
   return RoundUp(total_size, kStackAlignment);
 }
 
-size_t Arm64JniCallingConvention::OutArgSize() const {
+size_t Arm64JniCallingConvention::OutFrameSize() const {
   // Count param args, including JNIEnv* and jclass*.
   size_t all_args = NumberOfExtraArgumentsForJni() + NumArgs();
   size_t num_fp_args = NumFloatOrDoubleArgs();
   DCHECK_GE(all_args, num_fp_args);
   size_t num_non_fp_args = all_args - num_fp_args;
-  // Account for FP arguments passed through v0-v7.
-  size_t num_stack_fp_args =
-      num_fp_args - std::min(kMaxFloatOrDoubleRegisterArguments, num_fp_args);
-  // Account for other (integer and pointer) arguments passed through GPR (x0-x7).
-  size_t num_stack_non_fp_args =
-      num_non_fp_args - std::min(kMaxIntLikeRegisterArguments, num_non_fp_args);
   // The size of outgoing arguments.
-  size_t size = (num_stack_fp_args + num_stack_non_fp_args) * kFramePointerSize;
+  size_t size = GetNativeOutArgsSize(num_fp_args, num_non_fp_args);
 
   // @CriticalNative can use tail call as all managed callee saves are preserved by AAPCS64.
   static_assert((kCoreCalleeSpillMask & ~kAapcs64CoreCalleeSpillMask) == 0u);
@@ -291,7 +306,7 @@ size_t Arm64JniCallingConvention::OutArgSize() const {
   }
   size_t out_args_size = RoundUp(size, kAapcs64StackAlignment);
   if (UNLIKELY(IsCriticalNative())) {
-    DCHECK_EQ(out_args_size, GetCriticalNativeOutArgsSize(GetShorty(), NumArgs() + 1u));
+    DCHECK_EQ(out_args_size, GetCriticalNativeStubFrameSize(GetShorty()));
   }
   return out_args_size;
 }
@@ -307,7 +322,7 @@ ArrayRef<const ManagedRegister> Arm64JniCallingConvention::CalleeSaveRegisters()
       static_assert(kCalleeSaveRegisters[lr_index].Equals(
                         Arm64ManagedRegister::FromXRegister(LR)));
       return ArrayRef<const ManagedRegister>(kCalleeSaveRegisters).SubArray(
-          /*pos*/ lr_index, /*length=*/ 1u);
+          /*pos=*/ lr_index, /*length=*/ 1u);
     }
   } else {
     return ArrayRef<const ManagedRegister>(kCalleeSaveRegisters);
@@ -340,10 +355,11 @@ ManagedRegister Arm64JniCallingConvention::CurrentParamRegister() {
   } else {
     int gp_reg = itr_args_ - itr_float_and_doubles_;
     CHECK_LT(static_cast<unsigned int>(gp_reg), kMaxIntLikeRegisterArguments);
+    ManagedRegister x_reg = kXArgumentRegisters[gp_reg];
     if (IsCurrentParamALong() || IsCurrentParamAReference() || IsCurrentParamJniEnv())  {
-      return Arm64ManagedRegister::FromXRegister(kXArgumentRegisters[gp_reg]);
+      return x_reg;
     } else {
-      return Arm64ManagedRegister::FromWRegister(kWArgumentRegisters[gp_reg]);
+      return Arm64ManagedRegister::FromWRegister(x_reg.AsArm64().AsOverlappingWRegister());
     }
   }
 }
@@ -355,14 +371,14 @@ FrameOffset Arm64JniCallingConvention::CurrentParamStackOffset() {
                              static_cast<size_t>(itr_float_and_doubles_))
                   - std::min(kMaxIntLikeRegisterArguments,
                              static_cast<size_t>(itr_args_ - itr_float_and_doubles_));
-  size_t offset = displacement_.Int32Value() - OutArgSize() + (args_on_stack * kFramePointerSize);
-  CHECK_LT(offset, OutArgSize());
+  size_t offset = displacement_.Int32Value() - OutFrameSize() + (args_on_stack * kFramePointerSize);
+  CHECK_LT(offset, OutFrameSize());
   return FrameOffset(offset);
 }
 
-ManagedRegister Arm64JniCallingConvention::HiddenArgumentRegister() const {
-  CHECK(IsCriticalNative());
-  // X15 is neither managed callee-save, nor argument register, nor scratch register.
+// X15 is neither managed callee-save, nor argument register. It is suitable for use as the
+// locking argument for synchronized methods and hidden argument for @CriticalNative methods.
+static void AssertX15IsNeitherCalleeSaveNorArgumentRegister() {
   // TODO: Change to static_assert; std::none_of should be constexpr since C++20.
   DCHECK(std::none_of(kCalleeSaveRegisters,
                       kCalleeSaveRegisters + std::size(kCalleeSaveRegisters),
@@ -371,14 +387,27 @@ ManagedRegister Arm64JniCallingConvention::HiddenArgumentRegister() const {
                       }));
   DCHECK(std::none_of(kXArgumentRegisters,
                       kXArgumentRegisters + std::size(kXArgumentRegisters),
-                      [](XRegister reg) { return reg == X15; }));
+                      [](ManagedRegister arg) { return arg.AsArm64().AsXRegister() == X15; }));
+}
+
+ManagedRegister Arm64JniCallingConvention::LockingArgumentRegister() const {
+  DCHECK(!IsFastNative());
+  DCHECK(!IsCriticalNative());
+  DCHECK(IsSynchronized());
+  AssertX15IsNeitherCalleeSaveNorArgumentRegister();
+  return Arm64ManagedRegister::FromWRegister(W15);
+}
+
+ManagedRegister Arm64JniCallingConvention::HiddenArgumentRegister() const {
+  DCHECK(IsCriticalNative());
+  AssertX15IsNeitherCalleeSaveNorArgumentRegister();
   return Arm64ManagedRegister::FromXRegister(X15);
 }
 
 // Whether to use tail call (used only for @CriticalNative).
 bool Arm64JniCallingConvention::UseTailCall() const {
   CHECK(IsCriticalNative());
-  return OutArgSize() == 0u;
+  return OutFrameSize() == 0u;
 }
 
 }  // namespace arm64

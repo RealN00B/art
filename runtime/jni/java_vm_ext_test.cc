@@ -23,10 +23,14 @@
 #include "java_vm_ext.h"
 #include "runtime.h"
 
-namespace art {
+namespace art HIDDEN {
 
 class JavaVmExtTest : public CommonRuntimeTest {
  protected:
+  JavaVmExtTest() {
+    this->use_boot_image_ = true;  // Make the Runtime creation cheaper.
+  }
+
   void SetUp() override {
     CommonRuntimeTest::SetUp();
 
@@ -58,7 +62,7 @@ TEST_F(JavaVmExtTest, JNI_GetCreatedJavaVMs) {
 static bool gSmallStack = false;
 static bool gAsDaemon = false;
 
-static void* attach_current_thread_callback(void* arg ATTRIBUTE_UNUSED) {
+static void* attach_current_thread_callback([[maybe_unused]] void* arg) {
   JavaVM* vms_buf[1];
   jsize num_vms;
   JNIEnv* env;
@@ -151,7 +155,7 @@ TEST_F(JavaVmExtStackTraceTest, TestEnableDisable) {
   ASSERT_EQ(JNI_OK, ok);
 
   std::vector<jobject> global_refs_;
-  jobject local_ref = env->NewStringUTF("Dummy");
+  jobject local_ref = env->NewStringUTF("Hello");
   for (size_t i = 0; i < 2000; ++i) {
     global_refs_.push_back(env->NewGlobalRef(local_ref));
   }

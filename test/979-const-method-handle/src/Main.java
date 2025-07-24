@@ -29,7 +29,7 @@ class Main {
      * Number of iterations run to attempt to trigger JIT compilation. These tests run on ART and
      * the RI so they iterate rather than using the ART only native method ensureJitCompiled().
      */
-    private static final int ITERATIONS_FOR_JIT = 12000;
+    private static final int ITERATIONS_FOR_JIT = 30000;
 
     /** A static field updated by method handle getters and setters. */
     private static String name = "default";
@@ -68,6 +68,14 @@ class Main {
             returnType = void.class,
             parameterTypes = {LocalClass.class})
     private static MethodType methodType1() {
+        unreachable();
+        return null;
+    }
+
+    @ConstantMethodType(
+            returnType = void.class,
+            parameterTypes = {MissingType.class})
+    private static MethodType missingType() {
         unreachable();
         return null;
     }
@@ -189,6 +197,16 @@ class Main {
         return null;
     }
 
+    @ConstantMethodHandle(
+            kind = ConstantMethodHandle.STATIC_GET,
+            owner = "PrivateMember",
+            fieldOrMethodName = "privateField",
+            descriptor = "I")
+    private static MethodHandle getPrivateField() {
+        unreachable();
+        return null;
+    }
+
     private static void repeatConstMethodHandle() throws Throwable {
         System.out.println("repeatConstMethodHandle()");
         String[] values = {"A", "B", "C"};
@@ -243,5 +261,37 @@ class Main {
         System.out.println("Stack: capacity was " + stack.capacity());
         stackTrim().invokeExact(stack);
         System.out.println("Stack: capacity is " + stack.capacity());
+
+        // We used to not report in the compiler that loading a ConstMethodHandle/ConstMethodType
+        // can throw, which meant we were not catching the exception in the situation where we
+        // inline the loading.
+        try {
+          $inline$getPrivateField();
+          System.out.println("Expected IllegalAccessError");
+        } catch (IllegalAccessError e) {
+          // expected
+        }
+
+        try {
+          $inline$missingType();
+          System.out.println("Expected NoClassDefFoundError");
+        } catch (NoClassDefFoundError e) {
+          // expected
+        }
     }
+
+    public static void $inline$getPrivateField() {
+      getPrivateField();
+    }
+
+    public static void $inline$missingType() {
+      missingType();
+    }
+}
+
+class PrivateMember {
+  private static int privateField;
+}
+
+class MissingType {
 }

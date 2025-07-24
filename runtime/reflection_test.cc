@@ -20,8 +20,8 @@
 #include <limits.h>
 
 #include "art_method-inl.h"
-#include "base/enums.h"
-#include "common_compiler_test.h"
+#include "base/pointer_size.h"
+#include "common_runtime_test.h"
 #include "dex/descriptors_names.h"
 #include "jni/java_vm_ext.h"
 #include "jni/jni_internal.h"
@@ -29,13 +29,12 @@
 #include "nativehelper/scoped_local_ref.h"
 #include "scoped_thread_state_change-inl.h"
 
-namespace art {
+namespace art HIDDEN {
 
-// TODO: Convert to CommonRuntimeTest. Currently CompileDirectMethod is used in one test.
-class ReflectionTest : public CommonCompilerTest {
+class ReflectionTest : public CommonRuntimeTest {
  protected:
   void SetUp() override {
-    CommonCompilerTest::SetUp();
+    CommonRuntimeTest::SetUp();
 
     vm_ = Runtime::Current()->GetJavaVM();
 
@@ -76,7 +75,7 @@ class ReflectionTest : public CommonCompilerTest {
 
   void TearDown() override {
     CleanUpJniEnv();
-    CommonCompilerTest::TearDown();
+    CommonRuntimeTest::TearDown();
   }
 
   jclass GetPrimitiveClass(char descriptor) {
@@ -104,9 +103,7 @@ class ReflectionTest : public CommonCompilerTest {
       MakeInterpreted(class_linker_->FindSystemClass(self, "Ljava/lang/Object;"));
     }
 
-    ObjPtr<mirror::Class> c = class_linker_->FindClass(self,
-                                                       DotToDescriptor(class_name).c_str(),
-                                                       class_loader);
+    ObjPtr<mirror::Class> c = FindClass(DotToDescriptor(class_name).c_str(), class_loader);
     CHECK(c != nullptr);
     MakeInterpreted(c);
 
@@ -510,33 +507,6 @@ class ReflectionTest : public CommonCompilerTest {
   jclass ase_;
   jclass sioobe_;
 };
-
-TEST_F(ReflectionTest, StaticMainMethod) {
-  ScopedObjectAccess soa(Thread::Current());
-  jobject jclass_loader = LoadDex("Main");
-  StackHandleScope<1> hs(soa.Self());
-  Handle<mirror::ClassLoader> class_loader(
-      hs.NewHandle(soa.Decode<mirror::ClassLoader>(jclass_loader)));
-  CompileDirectMethod(class_loader, "Main", "main", "([Ljava/lang/String;)V");
-
-  ObjPtr<mirror::Class> klass = class_linker_->FindClass(soa.Self(), "LMain;", class_loader);
-  ASSERT_TRUE(klass != nullptr);
-
-  ArtMethod* method = klass->FindClassMethod("main",
-                                             "([Ljava/lang/String;)V",
-                                             kRuntimePointerSize);
-  ASSERT_TRUE(method != nullptr);
-  ASSERT_TRUE(method->IsStatic());
-
-  // Start runtime.
-  bool started = runtime_->Start();
-  CHECK(started);
-  soa.Self()->TransitionFromSuspendedToRunnable();
-
-  jvalue args[1];
-  args[0].l = nullptr;
-  InvokeWithJValues(soa, nullptr, jni::EncodeArtMethod(method), args);
-}
 
 TEST_F(ReflectionTest, StaticNopMethod) {
   InvokeNopMethod(true);

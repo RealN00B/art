@@ -129,14 +129,14 @@ class DocString {
    *
    * Nothing is printed for a size of zero.
    * Set isPlaceHolder to true to indicate that the size field corresponds to
-   * for a place holder object that should be annotated specially.
+   * for a placeholder object that should be annotated specially.
    */
   public static DocString size(long size, boolean isPlaceHolder) {
     DocString string = new DocString();
     if (isPlaceHolder) {
       string.append(DocString.removed("del"));
     } else if (size != 0) {
-      string.appendFormat("%,14d", size);
+      string.appendFormat("%,d", size);
     }
     return string;
   }
@@ -162,13 +162,13 @@ class DocString {
   public DocString appendDelta(boolean noCurrent, boolean noBaseline,
       long current, long baseline) {
     if (noCurrent) {
-      append(removed(format("%+,14d", 0 - baseline)));
+      append(removed(format("%+,d", 0 - baseline)));
     } else if (noBaseline) {
       append(added("new"));
     } else if (current > baseline) {
-      append(added(format("%+,14d", current - baseline)));
+      append(added(format("%+,d", current - baseline)));
     } else if (current < baseline) {
-      append(removed(format("%+,14d", current - baseline)));
+      append(removed(format("%+,d", current - baseline)));
     }
     return this;
   }

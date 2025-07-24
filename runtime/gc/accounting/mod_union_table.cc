@@ -32,7 +32,7 @@
 #include "space_bitmap-inl.h"
 #include "thread-current-inl.h"
 
-namespace art {
+namespace art HIDDEN {
 namespace gc {
 namespace accounting {
 
@@ -43,7 +43,7 @@ class ModUnionAddToCardSetVisitor {
 
   inline void operator()(uint8_t* card,
                          uint8_t expected_value,
-                         uint8_t new_value ATTRIBUTE_UNUSED) const {
+                         [[maybe_unused]] uint8_t new_value) const {
     if (expected_value == CardTable::kCardDirty) {
       cleared_cards_->insert(card);
     }
@@ -60,7 +60,7 @@ class ModUnionAddToCardBitmapVisitor {
 
   inline void operator()(uint8_t* card,
                          uint8_t expected_value,
-                         uint8_t new_value ATTRIBUTE_UNUSED) const {
+                         [[maybe_unused]] uint8_t new_value) const {
     if (expected_value == CardTable::kCardDirty) {
       // We want the address the card represents, not the address of the card.
       bitmap_->Set(reinterpret_cast<uintptr_t>(card_table_->AddrFromCard(card)));
@@ -78,7 +78,7 @@ class ModUnionAddToCardVectorVisitor {
       : cleared_cards_(cleared_cards) {
   }
 
-  void operator()(uint8_t* card, uint8_t expected_card, uint8_t new_card ATTRIBUTE_UNUSED) const {
+  void operator()(uint8_t* card, uint8_t expected_card, [[maybe_unused]] uint8_t new_card) const {
     if (expected_card == CardTable::kCardDirty) {
       cleared_cards_->push_back(card);
     }
@@ -100,7 +100,7 @@ class ModUnionUpdateObjectReferencesVisitor {
       contains_reference_to_other_space_(contains_reference_to_other_space) {}
 
   // Extra parameters are required since we use this same visitor signature for checking objects.
-  void operator()(mirror::Object* obj, MemberOffset offset, bool is_static ATTRIBUTE_UNUSED) const
+  void operator()(mirror::Object* obj, MemberOffset offset, [[maybe_unused]] bool is_static) const
       REQUIRES_SHARED(Locks::mutator_lock_) {
     MarkReference(obj->GetFieldObjectReferenceAddr(offset));
   }
@@ -195,7 +195,7 @@ class AddToReferenceArrayVisitor {
         has_target_reference_(has_target_reference) {}
 
   // Extra parameters are required since we use this same visitor signature for checking objects.
-  void operator()(mirror::Object* obj, MemberOffset offset, bool is_static ATTRIBUTE_UNUSED) const
+  void operator()(mirror::Object* obj, MemberOffset offset, [[maybe_unused]] bool is_static) const
       REQUIRES_SHARED(Locks::mutator_lock_) {
     mirror::HeapReference<mirror::Object>* ref_ptr = obj->GetFieldObjectReferenceAddr(offset);
     mirror::Object* ref = ref_ptr->AsMirrorPtr();
@@ -270,7 +270,7 @@ class CheckReferenceVisitor {
         references_(references) {}
 
   // Extra parameters are required since we use this same visitor signature for checking objects.
-  void operator()(mirror::Object* obj, MemberOffset offset, bool is_static ATTRIBUTE_UNUSED) const
+  void operator()(mirror::Object* obj, MemberOffset offset, [[maybe_unused]] bool is_static) const
       REQUIRES_SHARED(Locks::heap_bitmap_lock_, Locks::mutator_lock_) {
     mirror::Object* ref = obj->GetFieldObject<mirror::Object>(offset);
     if (ref != nullptr &&
@@ -388,6 +388,11 @@ void ModUnionTableReferenceCache::Dump(std::ostream& os) {
 void ModUnionTableReferenceCache::VisitObjects(ObjectCallback callback, void* arg) {
   CardTable* const card_table = heap_->GetCardTable();
   ContinuousSpaceBitmap* live_bitmap = space_->GetLiveBitmap();
+  // Use an unordered_set for constant time search of card in the second loop.
+  // We don't want to change cleared_cards_ to unordered so that traversals are
+  // sequential in address order.
+  // TODO: Optimize this.
+  std::unordered_set<const uint8_t*> card_lookup_map;
   for (uint8_t* card : cleared_cards_) {
     uintptr_t start = reinterpret_cast<uintptr_t>(card_table->AddrFromCard(card));
     uintptr_t end = start + CardTable::kCardSize;
@@ -396,10 +401,13 @@ void ModUnionTableReferenceCache::VisitObjects(ObjectCallback callback, void* ar
                                   [callback, arg](mirror::Object* obj) {
       callback(obj, arg);
     });
+    card_lookup_map.insert(card);
   }
-  // This may visit the same card twice, TODO avoid this.
   for (const auto& pair : references_) {
     const uint8_t* card = pair.first;
+    if (card_lookup_map.find(card) != card_lookup_map.end()) {
+      continue;
+    }
     uintptr_t start = reinterpret_cast<uintptr_t>(card_table->AddrFromCard(card));
     uintptr_t end = start + CardTable::kCardSize;
     live_bitmap->VisitMarkedRange(start,

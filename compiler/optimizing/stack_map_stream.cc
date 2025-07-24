@@ -17,16 +17,23 @@
 #include "stack_map_stream.h"
 
 #include <memory>
+#include <vector>
 
 #include "art_method-inl.h"
+#include "base/globals.h"
 #include "base/stl_util.h"
+#include "class_linker.h"
+#include "dex/dex_file.h"
 #include "dex/dex_file_types.h"
+#include "driver/compiler_options.h"
+#include "oat/stack_map.h"
+#include "optimizing/code_generator.h"
+#include "optimizing/nodes.h"
 #include "optimizing/optimizing_compiler.h"
 #include "runtime.h"
 #include "scoped_thread_state_change-inl.h"
-#include "stack_map.h"
 
-namespace art {
+namespace art HIDDEN {
 
 constexpr static bool kVerifyStackMaps = kIsDebugBuild;
 
@@ -43,7 +50,9 @@ void StackMapStream::BeginMethod(size_t frame_size_in_bytes,
                                  size_t core_spill_mask,
                                  size_t fp_spill_mask,
                                  uint32_t num_dex_registers,
-                                 bool baseline) {
+                                 bool baseline,
+                                 bool debuggable,
+                                 bool has_should_deoptimize_flag) {
   DCHECK(!in_method_) << "Mismatched Begin/End calls";
   in_method_ = true;
   DCHECK_EQ(packed_frame_size_, 0u) << "BeginMethod was already called";
@@ -54,6 +63,8 @@ void StackMapStream::BeginMethod(size_t frame_size_in_bytes,
   fp_spill_mask_ = fp_spill_mask;
   num_dex_registers_ = num_dex_registers;
   baseline_ = baseline;
+  debuggable_ = debuggable;
+  has_should_deoptimize_flag_ = has_should_deoptimize_flag;
 
   if (kVerifyStackMaps) {
     dchecks_.emplace_back([=](const CodeInfo& code_info) {
@@ -65,9 +76,10 @@ void StackMapStream::BeginMethod(size_t frame_size_in_bytes,
   }
 }
 
-void StackMapStream::EndMethod() {
+void StackMapStream::EndMethod(size_t code_size) {
   DCHECK(in_method_) << "Mismatched Begin/End calls";
   in_method_ = false;
+  code_size_ = code_size;
 
   // Read the stack masks now. The compiler might have updated them.
   for (size_t i = 0; i < lazy_stack_masks_.size(); i++) {
@@ -77,17 +89,35 @@ void StackMapStream::EndMethod() {
           stack_masks_.Dedup(stack_mask->GetRawStorage(), stack_mask->GetNumberOfBits());
     }
   }
+
+  if (kIsDebugBuild) {
+    uint32_t packed_code_size = StackMap::PackNativePc(code_size, instruction_set_);
+    for (size_t i = 0; i < stack_maps_.size(); i++) {
+      DCHECK_LE(stack_maps_[i][StackMap::kPackedNativePc], packed_code_size);
+    }
+  }
+
+  if (kVerifyStackMaps) {
+    dchecks_.emplace_back([=](const CodeInfo& code_info) {
+        CHECK_EQ(code_info.code_size_, code_size);
+    });
+  }
 }
 
-void StackMapStream::BeginStackMapEntry(uint32_t dex_pc,
-                                        uint32_t native_pc_offset,
-                                        uint32_t register_mask,
-                                        BitVector* stack_mask,
-                                        StackMap::Kind kind,
-                                        bool needs_vreg_info) {
+void StackMapStream::BeginStackMapEntry(
+    uint32_t dex_pc,
+    uint32_t native_pc_offset,
+    uint32_t register_mask,
+    BitVector* stack_mask,
+    StackMap::Kind kind,
+    bool needs_vreg_info,
+    const std::vector<uint32_t>& dex_pc_list_for_catch_verification) {
   DCHECK(in_method_) << "Call BeginMethod first";
   DCHECK(!in_stack_map_) << "Mismatched Begin/End calls";
   in_stack_map_ = true;
+
+  DCHECK_IMPLIES(!dex_pc_list_for_catch_verification.empty(), kind == StackMap::Kind::Catch);
+  DCHECK_IMPLIES(!dex_pc_list_for_catch_verification.empty(), kIsDebugBuild);
 
   current_stack_map_ = BitTableBuilder<StackMap>::Entry();
   current_stack_map_[StackMap::kKind] = static_cast<uint32_t>(kind);
@@ -123,17 +153,20 @@ void StackMapStream::BeginStackMapEntry(uint32_t dex_pc,
     size_t stack_map_index = stack_maps_.size();
     // Create lambda method, which will be executed at the very end to verify data.
     // Parameters and local variables will be captured(stored) by the lambda "[=]".
-    dchecks_.emplace_back([=](const CodeInfo& code_info) {
+    dchecks_.emplace_back([=, this](const CodeInfo& code_info) {
+      // The `native_pc_offset` may have been overridden using `SetStackMapNativePcOffset(.)`.
+      uint32_t final_native_pc_offset = GetStackMapNativePcOffset(stack_map_index);
       if (kind == StackMap::Kind::Default || kind == StackMap::Kind::OSR) {
-        StackMap stack_map = code_info.GetStackMapForNativePcOffset(native_pc_offset,
+        StackMap stack_map = code_info.GetStackMapForNativePcOffset(final_native_pc_offset,
                                                                     instruction_set_);
         CHECK_EQ(stack_map.Row(), stack_map_index);
       } else if (kind == StackMap::Kind::Catch) {
-        StackMap stack_map = code_info.GetCatchStackMapForDexPc(dex_pc);
+        StackMap stack_map = code_info.GetCatchStackMapForDexPc(
+            ArrayRef<const uint32_t>(dex_pc_list_for_catch_verification));
         CHECK_EQ(stack_map.Row(), stack_map_index);
       }
       StackMap stack_map = code_info.GetStackMapAt(stack_map_index);
-      CHECK_EQ(stack_map.GetNativePcOffset(instruction_set_), native_pc_offset);
+      CHECK_EQ(stack_map.GetNativePcOffset(instruction_set_), final_native_pc_offset);
       CHECK_EQ(stack_map.GetKind(), static_cast<uint32_t>(kind));
       CHECK_EQ(stack_map.GetDexPc(), dex_pc);
       CHECK_EQ(code_info.GetRegisterMaskOf(stack_map), register_mask);
@@ -181,7 +214,8 @@ void StackMapStream::EndStackMapEntry() {
 void StackMapStream::BeginInlineInfoEntry(ArtMethod* method,
                                           uint32_t dex_pc,
                                           uint32_t num_dex_registers,
-                                          const DexFile* outer_dex_file) {
+                                          const DexFile* outer_dex_file,
+                                          const CodeGenerator* codegen) {
   DCHECK(in_stack_map_) << "Call BeginStackMapEntry first";
   DCHECK(!in_inline_info_) << "Mismatched Begin/End calls";
   in_inline_info_ = true;
@@ -197,12 +231,35 @@ void StackMapStream::BeginInlineInfoEntry(ArtMethod* method,
     entry[InlineInfo::kArtMethodHi] = High32Bits(reinterpret_cast<uintptr_t>(method));
     entry[InlineInfo::kArtMethodLo] = Low32Bits(reinterpret_cast<uintptr_t>(method));
   } else {
-    if (dex_pc != static_cast<uint32_t>(-1) && kIsDebugBuild) {
+    uint32_t is_in_bootclasspath = MethodInfo::kKindNonBCP;
+    uint32_t dexfile_index = MethodInfo::kSameDexFile;
+    if (dex_pc != static_cast<uint32_t>(-1)) {
       ScopedObjectAccess soa(Thread::Current());
-      DCHECK(IsSameDexFile(*outer_dex_file, *method->GetDexFile()));
+      const DexFile* dex_file = method->GetDexFile();
+      if (!IsSameDexFile(*outer_dex_file, *dex_file)) {
+        if (method->GetDeclaringClass()->IsBootStrapClassLoaded()) {
+          ClassLinker* class_linker = Runtime::Current()->GetClassLinker();
+          const std::vector<const DexFile*>& boot_class_path = class_linker->GetBootClassPath();
+          auto it = std::find_if(
+              boot_class_path.begin(), boot_class_path.end(), [dex_file](const DexFile* df) {
+                return IsSameDexFile(*df, *dex_file);
+              });
+          is_in_bootclasspath = MethodInfo::kKindBCP;
+          dexfile_index = std::distance(boot_class_path.begin(), it);
+        } else {
+          const std::vector<const DexFile*>& dex_files =
+              codegen->GetCompilerOptions().GetDexFilesForOatFile();
+          auto it = std::find_if(dex_files.begin(), dex_files.end(), [dex_file](const DexFile* df) {
+            return IsSameDexFile(*df, *dex_file);
+          });
+          // No need to set is_in_bootclasspath since the default value works.
+          dexfile_index = std::distance(dex_files.begin(), it);
+        }
+      }
     }
     uint32_t dex_method_index = method->GetDexMethodIndex();
-    entry[InlineInfo::kMethodInfoIndex] = method_infos_.Dedup({dex_method_index});
+    entry[InlineInfo::kMethodInfoIndex] =
+        method_infos_.Dedup({dex_method_index, is_in_bootclasspath, dexfile_index});
   }
   current_inline_infos_.push_back(entry);
 
@@ -218,7 +275,28 @@ void StackMapStream::BeginInlineInfoEntry(ArtMethod* method,
       if (encode_art_method) {
         CHECK_EQ(inline_info.GetArtMethod(), method);
       } else {
-        CHECK_EQ(code_info.GetMethodIndexOf(inline_info), method->GetDexMethodIndex());
+        MethodInfo method_info = code_info.GetMethodInfoOf(inline_info);
+        CHECK_EQ(method_info.GetMethodIndex(), method->GetDexMethodIndex());
+        CHECK(method_info.GetDexFileIndexKind() == MethodInfo::kKindNonBCP ||
+              method_info.GetDexFileIndexKind() == MethodInfo::kKindBCP);
+        ScopedObjectAccess soa(Thread::Current());
+        if (inline_info.GetDexPc() != static_cast<uint32_t>(-1) &&
+            !IsSameDexFile(*outer_dex_file, *method->GetDexFile())) {
+          if (method->GetDeclaringClass()->IsBootStrapClassLoaded()) {
+            CHECK_EQ(method_info.GetDexFileIndexKind(), MethodInfo::kKindBCP);
+            ClassLinker* class_linker = Runtime::Current()->GetClassLinker();
+            const std::vector<const DexFile*>& boot_class_path = class_linker->GetBootClassPath();
+            DCHECK_LT(method_info.GetDexFileIndex(), boot_class_path.size());
+            CHECK(IsSameDexFile(*boot_class_path[method_info.GetDexFileIndex()],
+                                *method->GetDexFile()));
+          } else {
+            CHECK_EQ(method_info.GetDexFileIndexKind(), MethodInfo::kKindNonBCP);
+            const std::vector<const DexFile*>& dex_files =
+                codegen->GetCompilerOptions().GetDexFilesForOatFile();
+            DCHECK_LT(method_info.GetDexFileIndex(), dex_files.size());
+            CHECK(IsSameDexFile(*dex_files[method_info.GetDexFileIndex()], *method->GetDexFile()));
+          }
+        }
       }
     });
   }
@@ -300,8 +378,12 @@ ScopedArenaVector<uint8_t> StackMapStream::Encode() {
   DCHECK(in_stack_map_ == false) << "Mismatched Begin/End calls";
   DCHECK(in_inline_info_ == false) << "Mismatched Begin/End calls";
 
-  uint32_t flags = (inline_infos_.size() > 0) ? CodeInfo::kHasInlineInfo : 0;
+  uint32_t flags = 0;
+  flags |= (inline_infos_.size() > 0) ? CodeInfo::kHasInlineInfo : 0;
   flags |= baseline_ ? CodeInfo::kIsBaseline : 0;
+  flags |= debuggable_ ? CodeInfo::kIsDebuggable : 0;
+  flags |= has_should_deoptimize_flag_ ? CodeInfo::kHasShouldDeoptimizeFlag : 0;
+
   uint32_t bit_table_flags = 0;
   ForEachBitTable([&bit_table_flags](size_t i, auto bit_table) {
     if (bit_table->size() != 0) {  // Record which bit-tables are stored.
@@ -313,6 +395,7 @@ ScopedArenaVector<uint8_t> StackMapStream::Encode() {
   BitMemoryWriter<ScopedArenaVector<uint8_t>> out(&buffer);
   out.WriteInterleavedVarints(std::array<uint32_t, CodeInfo::kNumHeaders>{
     flags,
+    code_size_,
     packed_frame_size_,
     core_spill_mask_,
     fp_spill_mask_,
@@ -330,6 +413,10 @@ ScopedArenaVector<uint8_t> StackMapStream::Encode() {
   CodeInfo code_info(buffer.data(), &number_of_read_bits);
   CHECK_EQ(number_of_read_bits, out.NumberOfWrittenBits());
   CHECK_EQ(code_info.GetNumberOfStackMaps(), stack_maps_.size());
+  CHECK_EQ(CodeInfo::HasInlineInfo(buffer.data()), inline_infos_.size() > 0);
+  CHECK_EQ(CodeInfo::IsBaseline(buffer.data()), baseline_);
+  CHECK_EQ(CodeInfo::IsDebuggable(buffer.data()), debuggable_);
+  CHECK_EQ(CodeInfo::HasShouldDeoptimizeFlag(buffer.data()), has_should_deoptimize_flag_);
 
   // Verify all written data (usually only in debug builds).
   if (kVerifyStackMaps) {

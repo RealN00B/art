@@ -17,12 +17,13 @@
 #ifndef ART_COMPILER_OPTIMIZING_SSA_BUILDER_H_
 #define ART_COMPILER_OPTIMIZING_SSA_BUILDER_H_
 
+#include "base/macros.h"
 #include "base/scoped_arena_allocator.h"
 #include "base/scoped_arena_containers.h"
 #include "nodes.h"
 #include "optimization.h"
 
-namespace art {
+namespace art HIDDEN {
 
 /**
  * Transforms a graph into SSA form. The liveness guarantees of
@@ -51,19 +52,16 @@ class SsaBuilder : public ValueObject {
   SsaBuilder(HGraph* graph,
              Handle<mirror::ClassLoader> class_loader,
              Handle<mirror::DexCache> dex_cache,
-             VariableSizedHandleScope* handles,
              ScopedArenaAllocator* local_allocator)
       : graph_(graph),
         class_loader_(class_loader),
         dex_cache_(dex_cache),
-        handles_(handles),
         agets_fixed_(false),
         local_allocator_(local_allocator),
         ambiguous_agets_(local_allocator->Adapter(kArenaAllocGraphBuilder)),
         ambiguous_asets_(local_allocator->Adapter(kArenaAllocGraphBuilder)),
         uninitialized_strings_(local_allocator->Adapter(kArenaAllocGraphBuilder)),
         uninitialized_string_phis_(local_allocator->Adapter(kArenaAllocGraphBuilder)) {
-    graph_->InitializeInexactObjectRTI(handles);
   }
 
   GraphAnalysisResult BuildSsa();
@@ -129,7 +127,6 @@ class SsaBuilder : public ValueObject {
   HGraph* const graph_;
   Handle<mirror::ClassLoader> class_loader_;
   Handle<mirror::DexCache> dex_cache_;
-  VariableSizedHandleScope* const handles_;
 
   // True if types of ambiguous ArrayGets have been resolved.
   bool agets_fixed_;

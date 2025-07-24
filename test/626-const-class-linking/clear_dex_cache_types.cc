@@ -28,8 +28,7 @@ extern "C" JNIEXPORT void JNICALL Java_Main_nativeClearResolvedTypes(JNIEnv*, jc
   ScopedObjectAccess soa(Thread::Current());
   ObjPtr<mirror::DexCache> dex_cache = soa.Decode<mirror::Class>(cls)->GetDexCache();
   for (size_t i = 0, num_types = dex_cache->NumResolvedTypes(); i != num_types; ++i) {
-    mirror::TypeDexCachePair cleared(nullptr, mirror::TypeDexCachePair::InvalidIndexForSlot(i));
-    dex_cache->GetResolvedTypes()[i].store(cleared, std::memory_order_relaxed);
+    dex_cache->GetResolvedTypes()->Clear(i);
   }
 }
 
@@ -41,7 +40,6 @@ extern "C" JNIEXPORT void JNICALL Java_Main_nativeSkipVerification(JNIEnv*, jcla
   if (status == ClassStatus::kResolved) {
     ObjectLock<mirror::Class> lock(soa.Self(), klass);
     klass->SetStatus(klass, ClassStatus::kVerified, soa.Self());
-    klass->SetVerificationAttempted();
   } else {
     LOG(ERROR) << klass->PrettyClass() << " has unexpected status: " << status;
   }

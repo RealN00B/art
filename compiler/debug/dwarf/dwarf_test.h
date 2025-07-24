@@ -26,6 +26,7 @@
 #include <set>
 #include <string>
 
+#include "base/macros.h"
 #include "base/os.h"
 #include "base/unix_file/fd_file.h"
 #include "common_compiler_test.h"
@@ -33,7 +34,7 @@
 #include "gtest/gtest.h"
 #include "stream/file_output_stream.h"
 
-namespace art {
+namespace art HIDDEN {
 namespace dwarf {
 
 #define DW_CHECK(substring) Check(substring, false, __FILE__, __LINE__)
@@ -86,8 +87,8 @@ class DwarfTest : public CommonCompilerTest {
 
     // Read the elf file back using objdump.
     std::vector<std::string> lines;
-    std::string cmd = GetAndroidHostToolsDir();
-    cmd = cmd + "objdump " + args + " " + file.GetFilename() + " 2>&1";
+    std::string cmd = GetAndroidTool("llvm-dwarfdump");
+    cmd = cmd + " " + args + " " + file.GetFilename() + " 2>&1";
     FILE* output = popen(cmd.data(), "r");
     char buffer[1024];
     const char* line;
@@ -96,12 +97,13 @@ class DwarfTest : public CommonCompilerTest {
         printf("%s", line);
       }
       if (line[0] != '\0' && line[0] != '\n') {
-        EXPECT_TRUE(strstr(line, "objdump: Error:") == nullptr) << line;
-        EXPECT_TRUE(strstr(line, "objdump: Warning:") == nullptr) << line;
+        EXPECT_TRUE(strstr(line, "error:") == nullptr) << line;
+        EXPECT_TRUE(strstr(line, "warning:") == nullptr) << line;
         std::string str(line);
         if (str.back() == '\n') {
           str.pop_back();
         }
+        std::replace(str.begin(), str.end(), '\t', ' ');
         lines.push_back(str);
       }
     }
@@ -121,38 +123,27 @@ class DwarfTest : public CommonCompilerTest {
   void CheckObjdumpOutput(bool is64bit, const char* args) {
     std::vector<std::string> actual_lines = Objdump(is64bit, args);
     auto actual_line = actual_lines.begin();
-    for (const ExpectedLine& expected_line : expected_lines_) {
-      const std::string& substring = expected_line.substring;
-      if (actual_line == actual_lines.end()) {
-        ADD_FAILURE_AT(expected_line.at_file, expected_line.at_line) <<
-            "Expected '" << substring << "'.\n" <<
-            "Seen end of output.";
-      } else if (expected_line.next) {
-        if (actual_line->find(substring) == std::string::npos) {
-          ADD_FAILURE_AT(expected_line.at_file, expected_line.at_line) <<
-            "Expected '" << substring << "'.\n" <<
-            "Seen '" << actual_line->data() << "'.";
-        } else {
-          // printf("Found '%s' in '%s'.\n", substring.data(), actual_line->data());
-        }
-        actual_line++;
+    bool failed = false;
+    for (const ExpectedLine& expected : expected_lines_) {
+      const std::string& substring = expected.substring;
+      auto it = std::find_if(actual_line, actual_lines.end(),
+          [&](const std::string& line) { return line.find(substring) != std::string::npos; });
+      if (it == actual_lines.end()) {
+        failed = true;
+        ADD_FAILURE_AT(expected.at_file, expected.at_line) << "'" << substring << "' not found.";
       } else {
-        bool found = false;
-        for (auto it = actual_line; it < actual_lines.end(); it++) {
-          if (it->find(substring) != std::string::npos) {
-            actual_line = it;
-            found = true;
-            break;
-          }
+        if (expected.next && it != actual_line) {
+          failed = true;
+          ADD_FAILURE_AT(expected.at_file, expected.at_line)
+              << "'" << substring << "' found, but not on the immediate next line as expected.";
         }
-        if (!found) {
-          ADD_FAILURE_AT(expected_line.at_file, expected_line.at_line) <<
-            "Expected '" << substring << "'.\n" <<
-            "Not found anywhere in the rest of the output.";
-        } else {
-          // printf("Found '%s' in '%s'.\n", substring.data(), actual_line->data());
-          actual_line++;
-        }
+        actual_line = ++it;
+      }
+    }
+    if (failed) {
+      LOG(ERROR) << "objdump output:";
+      for (const std::string& it : actual_lines) {
+        LOG(ERROR) << it;
       }
     }
   }

@@ -14,13 +14,14 @@
  * limitations under the License.
  */
 
-#include <string>
-
 #include "scheduler.h"
+
+#include <string>
 
 #include "base/scoped_arena_allocator.h"
 #include "base/scoped_arena_containers.h"
 #include "data_type-inl.h"
+#include "optimizing/load_store_analysis.h"
 #include "prepare_for_register_allocation.h"
 
 #ifdef ART_ENABLE_CODEGEN_arm64
@@ -31,7 +32,7 @@
 #include "scheduler_arm.h"
 #endif
 
-namespace art {
+namespace art HIDDEN {
 
 void SchedulingGraph::AddDependency(SchedulingNode* node,
                                     SchedulingNode* dependency,
@@ -105,50 +106,19 @@ static bool IsArrayAccess(const HInstruction* instruction) {
 }
 
 static bool IsInstanceFieldAccess(const HInstruction* instruction) {
-  return instruction->IsInstanceFieldGet() ||
-         instruction->IsInstanceFieldSet() ||
-         instruction->IsUnresolvedInstanceFieldGet() ||
-         instruction->IsUnresolvedInstanceFieldSet();
+  return instruction->IsInstanceFieldGet() || instruction->IsInstanceFieldSet();
 }
 
 static bool IsStaticFieldAccess(const HInstruction* instruction) {
-  return instruction->IsStaticFieldGet() ||
-         instruction->IsStaticFieldSet() ||
-         instruction->IsUnresolvedStaticFieldGet() ||
-         instruction->IsUnresolvedStaticFieldSet();
-}
-
-static bool IsResolvedFieldAccess(const HInstruction* instruction) {
-  return instruction->IsInstanceFieldGet() ||
-         instruction->IsInstanceFieldSet() ||
-         instruction->IsStaticFieldGet() ||
-         instruction->IsStaticFieldSet();
-}
-
-static bool IsUnresolvedFieldAccess(const HInstruction* instruction) {
-  return instruction->IsUnresolvedInstanceFieldGet() ||
-         instruction->IsUnresolvedInstanceFieldSet() ||
-         instruction->IsUnresolvedStaticFieldGet() ||
-         instruction->IsUnresolvedStaticFieldSet();
+  return instruction->IsStaticFieldGet() || instruction->IsStaticFieldSet();
 }
 
 static bool IsFieldAccess(const HInstruction* instruction) {
-  return IsResolvedFieldAccess(instruction) || IsUnresolvedFieldAccess(instruction);
+  return IsInstanceFieldAccess(instruction) || IsStaticFieldAccess(instruction);
 }
 
 static const FieldInfo* GetFieldInfo(const HInstruction* instruction) {
-  if (instruction->IsInstanceFieldGet()) {
-    return &instruction->AsInstanceFieldGet()->GetFieldInfo();
-  } else if (instruction->IsInstanceFieldSet()) {
-    return &instruction->AsInstanceFieldSet()->GetFieldInfo();
-  } else if (instruction->IsStaticFieldGet()) {
-    return &instruction->AsStaticFieldGet()->GetFieldInfo();
-  } else if (instruction->IsStaticFieldSet()) {
-    return &instruction->AsStaticFieldSet()->GetFieldInfo();
-  } else {
-    LOG(FATAL) << "Unexpected field access type";
-    UNREACHABLE();
-  }
+  return &instruction->GetFieldInfo();
 }
 
 size_t SideEffectDependencyAnalysis::MemoryDependencyAnalysis::FieldAccessHeapLocation(
@@ -157,8 +127,8 @@ size_t SideEffectDependencyAnalysis::MemoryDependencyAnalysis::FieldAccessHeapLo
   DCHECK(GetFieldInfo(instr) != nullptr);
   DCHECK(heap_location_collector_ != nullptr);
 
-  size_t heap_loc = heap_location_collector_->GetFieldHeapLocation(instr->InputAt(0),
-                                                                   GetFieldInfo(instr));
+  HInstruction* ref = instr->InputAt(0);
+  size_t heap_loc = heap_location_collector_->GetFieldHeapLocation(ref, GetFieldInfo(instr));
   // This field access should be analyzed and added to HeapLocationCollector before.
   DCHECK(heap_loc != HeapLocationCollector::kHeapLocationNotFound);
 
@@ -173,12 +143,6 @@ bool SideEffectDependencyAnalysis::MemoryDependencyAnalysis::FieldAccessMayAlias
   if ((IsInstanceFieldAccess(instr1) && IsStaticFieldAccess(instr2)) ||
       (IsStaticFieldAccess(instr1) && IsInstanceFieldAccess(instr2))) {
     return false;
-  }
-
-  // If either of the field accesses is unresolved.
-  if (IsUnresolvedFieldAccess(instr1) || IsUnresolvedFieldAccess(instr2)) {
-    // Conservatively treat these two accesses may alias.
-    return true;
   }
 
   // If both fields accesses are resolved.
@@ -210,6 +174,14 @@ bool SideEffectDependencyAnalysis::MemoryDependencyAnalysis::HasMemoryDependency
     // Just simply say that those two instructions have memory dependency.
     return true;
   }
+
+  // Note: Unresolved field access instructions are currently marked as not schedulable.
+  // If we change that, we should still keep in mind that these instructions can throw and
+  // read or write volatile fields and, if static, cause class initialization and write to
+  // arbitrary heap locations, and therefore cannot be reordered with any other field or
+  // array access to preserve the observable behavior. The only exception is access to
+  // singleton members that could actually be reodered across these instructions but we
+  // currently do not analyze singletons here anyway.
 
   if (IsArrayAccess(instr1) && IsArrayAccess(instr2)) {
     return ArrayAccessMayAlias(instr1, instr2);
@@ -322,7 +294,7 @@ void SchedulingGraph::AddDependencies(SchedulingNode* instruction_node,
   }
 
   // Scheduling barrier dependencies.
-  DCHECK(!is_scheduling_barrier || contains_scheduling_barrier_);
+  DCHECK_IMPLIES(is_scheduling_barrier, contains_scheduling_barrier_);
   if (contains_scheduling_barrier_) {
     // A barrier depends on instructions after it. And instructions before the
     // barrier depend on it.
@@ -496,9 +468,9 @@ SchedulingNode* CriticalPathSchedulingNodeSelector::SelectMaterializedCondition(
   DCHECK(instruction != nullptr);
 
   if (instruction->IsIf()) {
-    condition = instruction->AsIf()->InputAt(0)->AsCondition();
+    condition = instruction->AsIf()->InputAt(0)->AsConditionOrNull();
   } else if (instruction->IsSelect()) {
-    condition = instruction->AsSelect()->GetCondition()->AsCondition();
+    condition = instruction->AsSelect()->GetCondition()->AsConditionOrNull();
   }
 
   SchedulingNode* condition_node = (condition != nullptr) ? graph.GetNode(condition) : nullptr;
@@ -559,7 +531,8 @@ void HScheduler::Schedule(HGraph* graph) {
   // We run lsa here instead of in a separate pass to better control whether we
   // should run the analysis or not.
   const HeapLocationCollector* heap_location_collector = nullptr;
-  LoadStoreAnalysis lsa(graph);
+  ScopedArenaAllocator allocator(graph->GetArenaStack());
+  LoadStoreAnalysis lsa(graph, /*stats=*/nullptr, &allocator);
   if (!only_optimize_loop_blocks_ || graph->HasLoops()) {
     lsa.Run();
     heap_location_collector = &lsa.GetHeapLocationCollector();
@@ -575,20 +548,10 @@ void HScheduler::Schedule(HGraph* graph) {
 void HScheduler::Schedule(HBasicBlock* block,
                           const HeapLocationCollector* heap_location_collector) {
   ScopedArenaAllocator allocator(block->GetGraph()->GetArenaStack());
-  ScopedArenaVector<SchedulingNode*> scheduling_nodes(allocator.Adapter(kArenaAllocScheduler));
 
   // Build the scheduling graph.
-  SchedulingGraph scheduling_graph(&allocator, heap_location_collector);
-  for (HBackwardInstructionIterator it(block->GetInstructions()); !it.Done(); it.Advance()) {
-    HInstruction* instruction = it.Current();
-    CHECK_EQ(instruction->GetBlock(), block)
-        << instruction->DebugName()
-        << " is in block " << instruction->GetBlock()->GetBlockId()
-        << ", and expected in block " << block->GetBlockId();
-    SchedulingNode* node = scheduling_graph.AddNode(instruction, IsSchedulingBarrier(instruction));
-    CalculateLatency(node);
-    scheduling_nodes.push_back(node);
-  }
+  auto [scheduling_graph, scheduling_nodes] =
+      BuildSchedulingGraph(block, &allocator, heap_location_collector);
 
   if (scheduling_graph.Size() <= 1) {
     return;
@@ -723,41 +686,43 @@ bool HScheduler::IsSchedulable(const HInstruction* instruction) const {
   //    HLoadException
   //    HMemoryBarrier
   //    HMonitorOperation
-  //    HNativeDebugInfo
+  //    HNop
   //    HThrow
   //    HTryBoundary
+  //    All unresolved field access instructions
+  //    All volatile field access instructions, e.g. HInstanceFieldGet
   // TODO: Some of the instructions above may be safe to schedule (maybe as
   // scheduling barriers).
   return instruction->IsArrayGet() ||
-      instruction->IsArraySet() ||
-      instruction->IsArrayLength() ||
-      instruction->IsBoundType() ||
-      instruction->IsBoundsCheck() ||
-      instruction->IsCheckCast() ||
-      instruction->IsClassTableGet() ||
-      instruction->IsCurrentMethod() ||
-      instruction->IsDivZeroCheck() ||
-      (instruction->IsInstanceFieldGet() && !instruction->AsInstanceFieldGet()->IsVolatile()) ||
-      (instruction->IsInstanceFieldSet() && !instruction->AsInstanceFieldSet()->IsVolatile()) ||
-      instruction->IsInstanceOf() ||
-      instruction->IsInvokeInterface() ||
-      instruction->IsInvokeStaticOrDirect() ||
-      instruction->IsInvokeUnresolved() ||
-      instruction->IsInvokeVirtual() ||
-      instruction->IsLoadString() ||
-      instruction->IsNewArray() ||
-      instruction->IsNewInstance() ||
-      instruction->IsNullCheck() ||
-      instruction->IsPackedSwitch() ||
-      instruction->IsParameterValue() ||
-      instruction->IsPhi() ||
-      instruction->IsReturn() ||
-      instruction->IsReturnVoid() ||
-      instruction->IsSelect() ||
-      (instruction->IsStaticFieldGet() && !instruction->AsStaticFieldGet()->IsVolatile()) ||
-      (instruction->IsStaticFieldSet() && !instruction->AsStaticFieldSet()->IsVolatile()) ||
-      instruction->IsSuspendCheck() ||
-      instruction->IsTypeConversion();
+         instruction->IsArraySet() ||
+         instruction->IsArrayLength() ||
+         instruction->IsBoundType() ||
+         instruction->IsBoundsCheck() ||
+         instruction->IsCheckCast() ||
+         instruction->IsClassTableGet() ||
+         instruction->IsCurrentMethod() ||
+         instruction->IsDivZeroCheck() ||
+         (instruction->IsInstanceFieldGet() && !instruction->AsInstanceFieldGet()->IsVolatile()) ||
+         (instruction->IsInstanceFieldSet() && !instruction->AsInstanceFieldSet()->IsVolatile()) ||
+         instruction->IsInstanceOf() ||
+         instruction->IsInvokeInterface() ||
+         instruction->IsInvokeStaticOrDirect() ||
+         instruction->IsInvokeUnresolved() ||
+         instruction->IsInvokeVirtual() ||
+         instruction->IsLoadString() ||
+         instruction->IsNewArray() ||
+         instruction->IsNewInstance() ||
+         instruction->IsNullCheck() ||
+         instruction->IsPackedSwitch() ||
+         instruction->IsParameterValue() ||
+         instruction->IsPhi() ||
+         instruction->IsReturn() ||
+         instruction->IsReturnVoid() ||
+         instruction->IsSelect() ||
+         (instruction->IsStaticFieldGet() && !instruction->AsStaticFieldGet()->IsVolatile()) ||
+         (instruction->IsStaticFieldSet() && !instruction->AsStaticFieldSet()->IsVolatile()) ||
+         instruction->IsSuspendCheck() ||
+         instruction->IsTypeConversion();
 }
 
 bool HScheduler::IsSchedulable(const HBasicBlock* block) const {
@@ -801,10 +766,14 @@ bool HInstructionScheduling::Run(bool only_optimize_loop_blocks,
   // Phase-local allocator that allocates scheduler internal data structures like
   // scheduling nodes, internel nodes map, dependencies, etc.
   CriticalPathSchedulingNodeSelector critical_path_selector;
-  RandomSchedulingNodeSelector random_selector;
-  SchedulingNodeSelector* selector = schedule_randomly
-      ? static_cast<SchedulingNodeSelector*>(&random_selector)
-      : static_cast<SchedulingNodeSelector*>(&critical_path_selector);
+  // Do not create the `RandomSchedulingNodeSelector` if not requested.
+  // The construction is expensive, including a call to `srand()`.
+  std::optional<RandomSchedulingNodeSelector> random_selector;
+  SchedulingNodeSelector* selector = &critical_path_selector;
+  if (schedule_randomly) {
+    random_selector.emplace();
+    selector = &random_selector.value();
+  }
 #else
   // Avoid compilation error when compiling for unsupported instruction set.
   UNUSED(only_optimize_loop_blocks);
@@ -824,8 +793,7 @@ bool HInstructionScheduling::Run(bool only_optimize_loop_blocks,
 #if defined(ART_ENABLE_CODEGEN_arm)
     case InstructionSet::kThumb2:
     case InstructionSet::kArm: {
-      arm::SchedulingLatencyVisitorARM arm_latency_visitor(codegen_);
-      arm::HSchedulerARM scheduler(selector, &arm_latency_visitor);
+      arm::HSchedulerARM scheduler(selector, codegen_);
       scheduler.SetOnlyOptimizeLoopBlocks(only_optimize_loop_blocks);
       scheduler.Schedule(graph_);
       break;

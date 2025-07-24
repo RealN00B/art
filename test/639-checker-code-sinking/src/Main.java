@@ -15,8 +15,19 @@
  */
 
 public class Main {
+  static class ValueHolder {
+    int getValue() {
+      // Prevent inliner from matching the code pattern when calling this method to test
+      // the normal inlining path that does not inline in blocks that end with a `throw`.
+      $inline$nop();
 
-  public static void main(String[] args) {
+      return 1;
+    }
+
+    private void $inline$nop() {}
+  }
+
+  public static void main(String[] args) throws Exception {
     testSimpleUse();
     testTwoUses();
     testFieldStores(doThrow);
@@ -26,6 +37,15 @@ public class Main {
     testNoUse();
     testPhiInput();
     testVolatileStore();
+    testCatchBlock();
+    $noinline$testTwoThrowingPathsAndStringBuilderAppend();
+    try {
+      $noinline$testSinkNewInstanceWithClinitCheck();
+      throw new Exception("Unreachable");
+    } catch (Error e) {
+      // expected
+    }
+    $noinline$testMethodEndsWithTryBoundary();
     doThrow = true;
     try {
       testInstanceSideEffects();
@@ -100,13 +120,18 @@ public class Main {
     }
   }
 
+  // NB It might seem that we'd move the allocation and ifield-set but those are
+  // already moved into the throw block by a combo of partial-LSE and DCE.
+  // Instead all that is actually moved is the LoadClass. Also note the
+  // LoadClass can only be moved since it refers to the 'Main' class itself,
+  // meaning there's no need for any clinit/actual loading.
+  //
   /// CHECK-START: void Main.testFieldStores(boolean) code_sinking (before)
   /// CHECK: <<Int42:i\d+>>       IntConstant 42
+  /// CHECK:                      begin_block
   /// CHECK: <<LoadClass:l\d+>>   LoadClass class_name:Main
   /// CHECK: <<NewInstance:l\d+>> NewInstance [<<LoadClass>>]
   /// CHECK:                      InstanceFieldSet [<<NewInstance>>,<<Int42>>]
-  /// CHECK:                      If
-  /// CHECK:                      begin_block
   /// CHECK:                      Throw
 
   /// CHECK-START: void Main.testFieldStores(boolean) code_sinking (after)
@@ -115,14 +140,16 @@ public class Main {
   /// CHECK:                      If
   /// CHECK:                      begin_block
   /// CHECK: <<Error:l\d+>>       LoadClass class_name:java.lang.Error
+  /// CHECK-NOT:                  begin_block
   /// CHECK: <<LoadClass:l\d+>>   LoadClass class_name:Main
   /// CHECK-NOT:                  begin_block
   /// CHECK: <<NewInstance:l\d+>> NewInstance [<<LoadClass>>]
   /// CHECK-NOT:                  begin_block
   /// CHECK:                      InstanceFieldSet [<<NewInstance>>,<<Int42>>]
   /// CHECK-NOT:                  begin_block
-  /// CHECK:                      NewInstance [<<Error>>]
-  /// CHECK:                      Throw
+  /// CHECK: <<Throw:l\d+>>       NewInstance [<<Error>>]
+  /// CHECK-NOT:                  begin_block
+  /// CHECK:                      Throw [<<Throw>>]
   public static void testFieldStores(boolean doThrow) {
     Main m = new Main();
     m.intField = 42;
@@ -281,6 +308,66 @@ public class Main {
     }
   }
 
+  private static void $noinline$testMethodEndsWithTryBoundary() throws Exception {
+    assertEquals(0, $noinline$testDontSinkToReturnBranch(0, 0, false, new Object()));
+    assertEquals(1, $noinline$testSinkToThrowBranch(0, 0, true, new Object()));
+    try {
+      $noinline$testSinkToThrowBranch(0, 0, false, new Object());
+      throw new Exception("Unreachable");
+    } catch (Error expected) {
+    }
+  }
+
+  // Consistency check: only one add
+  /// CHECK-START: int Main.$noinline$testDontSinkToReturnBranch(int, int, boolean, java.lang.Object) code_sinking (before)
+  /// CHECK:     Add
+  /// CHECK-NOT: Add
+
+  /// CHECK-START: int Main.$noinline$testDontSinkToReturnBranch(int, int, boolean, java.lang.Object) code_sinking (before)
+  /// CHECK:      Add
+  /// CHECK-NEXT: If
+
+  /// CHECK-START: int Main.$noinline$testDontSinkToReturnBranch(int, int, boolean, java.lang.Object) code_sinking (after)
+  /// CHECK:      Add
+  /// CHECK-NEXT: If
+  private static int $noinline$testDontSinkToReturnBranch(int a, int b, boolean flag, Object obj) {
+    int c = a + b;
+    if (flag) {
+      return 1;
+    }
+
+    synchronized (obj) {
+      return $noinline$returnSameValue(c);
+    }
+  }
+
+  private static int $noinline$returnSameValue(int value) {
+    return value;
+  }
+
+  // Consistency check: only one add
+  /// CHECK-START: int Main.$noinline$testSinkToThrowBranch(int, int, boolean, java.lang.Object) code_sinking (before)
+  /// CHECK:     Add
+  /// CHECK-NOT: Add
+
+  /// CHECK-START: int Main.$noinline$testSinkToThrowBranch(int, int, boolean, java.lang.Object) code_sinking (before)
+  /// CHECK:      Add
+  /// CHECK:      If
+
+  /// CHECK-START: int Main.$noinline$testSinkToThrowBranch(int, int, boolean, java.lang.Object) code_sinking (after)
+  /// CHECK:      If
+  /// CHECK:      Add
+  private static int $noinline$testSinkToThrowBranch(int a, int b, boolean flag, Object obj) {
+    int c = a + b;
+    if (flag) {
+      return 1;
+    }
+
+    synchronized (obj) {
+      throw new Error(Integer.toString(c));
+    }
+  }
+
   public static void testInstanceSideEffects() {
     int a = mainField.intField;
     $noinline$changeIntField();
@@ -306,16 +393,21 @@ public class Main {
   }
 
   // Test that we preserve the order of stores.
+  // NB It might seem that we'd move the allocation and ifield-set but those are
+  // already moved into the throw block by a combo of partial-LSE and DCE.
+  // Instead all that is actually moved is the LoadClass. Also note the
+  // LoadClass can only be moved since it refers to the 'Main' class itself,
+  // meaning there's no need for any clinit/actual loading.
+  //
   /// CHECK-START: void Main.testStoreStore(boolean) code_sinking (before)
   /// CHECK: <<Int42:i\d+>>       IntConstant 42
   /// CHECK: <<Int43:i\d+>>       IntConstant 43
   /// CHECK: <<LoadClass:l\d+>>   LoadClass class_name:Main
   /// CHECK: <<NewInstance:l\d+>> NewInstance [<<LoadClass>>]
-  /// CHECK:                      InstanceFieldSet [<<NewInstance>>,<<Int42>>]
-  /// CHECK:                      InstanceFieldSet [<<NewInstance>>,<<Int43>>]
-  /// CHECK:                      If
-  /// CHECK:                      begin_block
+  /// CHECK-DAG:                  InstanceFieldSet [<<NewInstance>>,<<Int42>>]
+  /// CHECK-DAG:                  InstanceFieldSet [<<NewInstance>>,<<Int43>>]
   /// CHECK:                      Throw
+  /// CHECK-NOT:                  InstanceFieldSet
 
   /// CHECK-START: void Main.testStoreStore(boolean) code_sinking (after)
   /// CHECK: <<Int42:i\d+>>       IntConstant 42
@@ -324,16 +416,16 @@ public class Main {
   /// CHECK:                      If
   /// CHECK:                      begin_block
   /// CHECK: <<Error:l\d+>>       LoadClass class_name:java.lang.Error
-  /// CHECK: <<LoadClass:l\d+>>   LoadClass class_name:Main
   /// CHECK-NOT:                  begin_block
+  /// CHECK: <<LoadClass:l\d+>>   LoadClass class_name:Main
   /// CHECK: <<NewInstance:l\d+>> NewInstance [<<LoadClass>>]
   /// CHECK-NOT:                  begin_block
-  /// CHECK:                      InstanceFieldSet [<<NewInstance>>,<<Int42>>]
-  /// CHECK-NOT:                  begin_block
-  /// CHECK:                      InstanceFieldSet [<<NewInstance>>,<<Int43>>]
+  /// CHECK-DAG:                  InstanceFieldSet [<<NewInstance>>,<<Int42>>]
+  /// CHECK-DAG:                  InstanceFieldSet [<<NewInstance>>,<<Int43>>]
   /// CHECK-NOT:                  begin_block
   /// CHECK:                      NewInstance [<<Error>>]
   /// CHECK:                      Throw
+  /// CHECK-NOT:                  InstanceFieldSet
   public static void testStoreStore(boolean doThrow) {
     Main m = new Main();
     m.intField = 42;
@@ -378,12 +470,288 @@ public class Main {
     return "" + intField;
   }
 
+  private static void testCatchBlock() {
+    assertEquals(456, testDoNotSinkToTry());
+    assertEquals(456, testSinkWithinTryBlock());
+    assertEquals(456, testSinkRightBeforeTryBlock());
+    assertEquals(456, testDoNotSinkToCatchInsideTryWithMoreThings(false, false));
+    assertEquals(456, DoNotSinkWithOOMThrow());
+  }
+
+  /// CHECK-START: int Main.testDoNotSinkToTry() code_sinking (before)
+  /// CHECK: <<ObjLoadClass:l\d+>>   LoadClass class_name:java.lang.Object
+  /// CHECK:                         NewInstance [<<ObjLoadClass>>]
+  /// CHECK:                         TryBoundary kind:entry
+
+  /// CHECK-START: int Main.testDoNotSinkToTry() code_sinking (after)
+  /// CHECK: <<ObjLoadClass:l\d+>>   LoadClass class_name:java.lang.Object
+  /// CHECK:                         NewInstance [<<ObjLoadClass>>]
+  /// CHECK:                         TryBoundary kind:entry
+
+  // Consistency check to make sure there's only one entry TryBoundary.
+  /// CHECK-START: int Main.testDoNotSinkToTry() code_sinking (after)
+  /// CHECK:                         TryBoundary kind:entry
+  /// CHECK-NOT:                     TryBoundary kind:entry
+
+  // Tests that we don't sink the Object creation into the try.
+  private static int testDoNotSinkToTry() {
+    Object o = new Object();
+    try {
+      if (doEarlyReturn) {
+        throw new Error(o.toString());
+      }
+    } catch (Error e) {
+      throw new Error();
+    }
+    return 456;
+  }
+
+  /// CHECK-START: int Main.testSinkWithinTryBlock() code_sinking (before)
+  /// CHECK: <<ObjLoadClass:l\d+>>   LoadClass class_name:java.lang.Object
+  /// CHECK:                         NewInstance [<<ObjLoadClass>>]
+  /// CHECK:                         If
+
+  /// CHECK-START: int Main.testSinkWithinTryBlock() code_sinking (after)
+  /// CHECK:                         If
+  /// CHECK: <<ObjLoadClass:l\d+>>   LoadClass class_name:java.lang.Object
+  /// CHECK:                         NewInstance [<<ObjLoadClass>>]
+  private static int testSinkWithinTryBlock() {
+    try {
+      Object o = new Object();
+      if (doEarlyReturn) {
+        throw new Error(o.toString());
+      }
+    } catch (Error e) {
+      return 123;
+    }
+    return 456;
+  }
+
+  /// CHECK-START: int Main.testSinkRightBeforeTryBlock() code_sinking (before)
+  /// CHECK: <<ObjLoadClass:l\d+>>   LoadClass class_name:java.lang.Object
+  /// CHECK:                         NewInstance [<<ObjLoadClass>>]
+  /// CHECK:                         If
+  /// CHECK:                         TryBoundary kind:entry
+
+  /// CHECK-START: int Main.testSinkRightBeforeTryBlock() code_sinking (after)
+  /// CHECK:                         If
+  /// CHECK: <<ObjLoadClass:l\d+>>   LoadClass class_name:java.lang.Object
+  /// CHECK:                         NewInstance [<<ObjLoadClass>>]
+  /// CHECK:                         TryBoundary kind:entry
+  private static int testSinkRightBeforeTryBlock() {
+    Object o = new Object();
+    if (doEarlyReturn) {
+      try {
+        throw new Error(o.toString());
+      } catch (Error e) {
+        return 123;
+      }
+    }
+    return 456;
+  }
+
+  /// CHECK-START: int Main.testDoNotSinkToCatchInsideTryWithMoreThings(boolean, boolean) code_sinking (before)
+  /// CHECK-NOT:                     TryBoundary kind:entry
+  /// CHECK: <<ObjLoadClass:l\d+>>   LoadClass class_name:java.lang.Object
+  /// CHECK:                         NewInstance [<<ObjLoadClass>>]
+
+  /// CHECK-START: int Main.testDoNotSinkToCatchInsideTryWithMoreThings(boolean, boolean) code_sinking (after)
+  /// CHECK-NOT:                     TryBoundary kind:entry
+  /// CHECK: <<ObjLoadClass:l\d+>>   LoadClass class_name:java.lang.Object
+  /// CHECK:                         NewInstance [<<ObjLoadClass>>]
+
+  // Tests that we don't sink the Object creation into a catch handler surrounded by try/catch, even
+  // when that inner catch is not at the boundary of the outer try catch.
+  private static int testDoNotSinkToCatchInsideTryWithMoreThings(boolean a, boolean b) {
+    Object o = new Object();
+    try {
+      if (a) {
+        System.out.println(a);
+      }
+      try {
+        if (doEarlyReturn) {
+          return 123;
+        }
+      } catch (Error e) {
+        throw new Error(o.toString());
+      }
+      if (b) {
+        System.out.println(b);
+      }
+    } catch (Error e) {
+      throw new Error();
+    }
+    return 456;
+  }
+
+  private static class ObjectWithInt {
+    int x;
+  }
+
+  /// CHECK-START: int Main.DoNotSinkWithOOMThrow() code_sinking (before)
+  /// CHECK: <<LoadClass:l\d+>>      LoadClass class_name:Main$ObjectWithInt
+  /// CHECK: <<Clinit:l\d+>>         ClinitCheck [<<LoadClass>>]
+  /// CHECK:                         NewInstance [<<Clinit>>]
+  /// CHECK:                         TryBoundary kind:entry
+
+  /// CHECK-START: int Main.DoNotSinkWithOOMThrow() code_sinking (after)
+  /// CHECK: <<LoadClass:l\d+>>      LoadClass class_name:Main$ObjectWithInt
+  /// CHECK: <<Clinit:l\d+>>         ClinitCheck [<<LoadClass>>]
+  /// CHECK:                         NewInstance [<<Clinit>>]
+  /// CHECK:                         TryBoundary kind:entry
+
+  // Consistency check to make sure there's only one entry TryBoundary.
+  /// CHECK-START: int Main.DoNotSinkWithOOMThrow() code_sinking (after)
+  /// CHECK:                         TryBoundary kind:entry
+  /// CHECK-NOT:                     TryBoundary kind:entry
+  private static int DoNotSinkWithOOMThrow() throws OutOfMemoryError {
+    int x = 0;
+    ObjectWithInt obj = new ObjectWithInt();
+    try {
+      // We want an if/else here so that the catch block will have a catch phi.
+      if (doThrow) {
+        x = 1;
+        // Doesn't really matter what we throw we just want it to not be caught by the
+        // NullPointerException below.
+        throw new OutOfMemoryError(Integer.toString(obj.x));
+      } else {
+        x = 456;
+      }
+    } catch (NullPointerException e) {
+    }
+
+    // We want to use obj over here so that it doesn't get deleted by LSE.
+    if (obj.x == 123) {
+      return 123;
+    }
+    return x;
+  }
+
+  private static void $noinline$testTwoThrowingPathsAndStringBuilderAppend() {
+    try {
+      $noinline$twoThrowingPathsAndStringBuilderAppend(null);
+      throw new Error("Unreachable");
+    } catch (Error expected) {
+      assertEquals("Object is null", expected.getMessage());
+    }
+    try {
+      $noinline$twoThrowingPathsAndStringBuilderAppend(new Object());
+      throw new Error("Unreachable");
+    } catch (Error expected) {
+      assertEquals("s1s2", expected.getMessage());
+    }
+  }
+
+  // Consistency check: only one ClinitCheck
+  /// CHECK-START: void Main.$noinline$testSinkNewInstanceWithClinitCheck() code_sinking (before)
+  /// CHECK:                ClinitCheck
+  /// CHECK-NOT:            ClinitCheck
+
+  /// CHECK-START: void Main.$noinline$testSinkNewInstanceWithClinitCheck() code_sinking (before)
+  /// CHECK: <<Check:l\d+>> ClinitCheck
+  /// CHECK:                NewInstance [<<Check>>]
+  /// CHECK:                NewInstance
+  /// CHECK:                If
+
+  /// CHECK-START: void Main.$noinline$testSinkNewInstanceWithClinitCheck() code_sinking (after)
+  /// CHECK: <<Check:l\d+>> ClinitCheck
+  /// CHECK:                If
+  /// CHECK:                NewInstance
+  /// CHECK:                NewInstance [<<Check>>]
+
+  /// CHECK-START: void Main.$noinline$testSinkNewInstanceWithClinitCheck() prepare_for_register_allocation (before)
+  /// CHECK-NOT:            If
+
+  // We have an instruction that can throw between the ClinitCheck and its NewInstance.
+
+  /// CHECK-START: void Main.$noinline$testSinkNewInstanceWithClinitCheck() prepare_for_register_allocation (before)
+  /// CHECK: <<Check:l\d+>> ClinitCheck
+  /// CHECK:                NewInstance
+  /// CHECK:                NewInstance [<<Check>>]
+
+  // We can remove the ClinitCheck by merging it with the LoadClass right before.
+
+  /// CHECK-START: void Main.$noinline$testSinkNewInstanceWithClinitCheck() prepare_for_register_allocation (after)
+  /// CHECK-NOT: ClinitCheck
+  private static void $noinline$testSinkNewInstanceWithClinitCheck() {
+    ValueHolder vh = new ValueHolder();
+    Object o = new Object();
+
+    // The if will always be true but we don't know this after LSE. Code sinking will sink code
+    // since this is an uncommon branch, but then we will have everything in one block before
+    // prepare_for_register_allocation for the crash to appear.
+    staticIntField = 1;
+    int value = staticIntField;
+    if (value == 1) {
+      throw new Error(Integer.toString(vh.getValue()) + o.toString());
+    }
+  }
+
+  // We currently do not inline the `StringBuilder` constructor.
+  // When we did, the `StringBuilderAppend` pattern recognition was looking for
+  // the inlined `NewArray` (and its associated `LoadClass`) and checked in
+  // debug build that the `StringBuilder` has an environment use from this
+  // `NewArray` (and maybe from `LoadClass`). However, code sinking was pruning
+  // the environment of the `NewArray`, leading to a crash when compiling the
+  // code below on the device (we do not inline `core-oj` on host). b/252799691
+
+  // We currently have a heuristic that disallows inlining methods if their basic blocks end with a
+  // throw. We could add code so that `requireNonNull`'s block doesn't end with a throw but that
+  // would mean that the string builder optimization wouldn't fire as it requires all uses to be in
+  // the same block. If `requireNonNull` is inlined at some point, we need to re-mark it as $inline$
+  // so that the test is operational again.
+
+  /// CHECK-START: void Main.$noinline$twoThrowingPathsAndStringBuilderAppend(java.lang.Object) inliner (before)
+  /// CHECK: InvokeStaticOrDirect method_name:Main.requireNonNull
+
+  /// CHECK-START: void Main.$noinline$twoThrowingPathsAndStringBuilderAppend(java.lang.Object) inliner (after)
+  /// CHECK: InvokeStaticOrDirect method_name:Main.requireNonNull
+  private static void $noinline$twoThrowingPathsAndStringBuilderAppend(Object o) {
+    String s1 = "s1";
+    String s2 = "s2";
+    StringBuilder sb = new StringBuilder();
+
+    // Before inlining, the environment use from this invoke prevents the
+    // `StringBuilderAppend` pattern recognition. After inlining, we end up
+    // with two paths ending with a `Throw` and we could sink the `sb`
+    // instructions from above down to those below, enabling the
+    // `StringBuilderAppend` pattern recognition.
+    // (But that does not happen when the `StringBuilder` constructor is
+    // not inlined, see above.)
+    requireNonNull(o);
+
+    String s1s2 = sb.append(s1).append(s2).toString();
+    sb = null;
+    throw new Error(s1s2);
+  }
+
+  private static void requireNonNull(Object o) {
+    if (o == null) {
+      throw new Error("Object is null");
+    }
+  }
+
+  private static void assertEquals(int expected, int actual) {
+    if (expected != actual) {
+      throw new AssertionError("Expected: " + expected + ", Actual: " + actual);
+    }
+  }
+
+  private static void assertEquals(String expected, String actual) {
+    if (!expected.equals(actual)) {
+      throw new AssertionError("Expected: " + expected + ", Actual: " + actual);
+    }
+  }
+
   volatile int volatileField;
   int intField;
   int intField2;
   Object objectField;
   static boolean doThrow;
   static boolean doLoop;
+  static boolean doEarlyReturn;
+  static boolean doOtherEarlyReturn;
+  static int staticIntField;
   static Main mainField = new Main();
   static Object obj = new Object();
 }

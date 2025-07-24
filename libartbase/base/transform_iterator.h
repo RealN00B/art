@@ -39,23 +39,23 @@ namespace art {
 template <typename BaseIterator, typename Function>
 class TransformIterator {
  private:
-  static_assert(std::is_base_of<
-                    std::input_iterator_tag,
-                    typename std::iterator_traits<BaseIterator>::iterator_category>::value,
+  static_assert(std::is_base_of_v<std::input_iterator_tag,
+                                  typename std::iterator_traits<BaseIterator>::iterator_category>,
                 "Transform iterator base must be an input iterator.");
 
-  using InputType = typename std::iterator_traits<BaseIterator>::reference;
-  using ResultType = typename std::result_of<Function(InputType)>::type;
+  using BaseReference = typename std::iterator_traits<BaseIterator>::reference;
+  using InputType = std::conditional_t<std::is_same_v<BaseReference, void>,
+                                       typename std::iterator_traits<BaseIterator>::value_type,
+                                       BaseReference>;
+  using ResultType = std::invoke_result_t<Function, InputType>;
 
  public:
   using iterator_category = typename std::iterator_traits<BaseIterator>::iterator_category;
-  using value_type =
-      typename std::remove_const<typename std::remove_reference<ResultType>::type>::type;
+  using value_type = std::remove_const_t<std::remove_reference_t<ResultType>>;
   using difference_type = typename std::iterator_traits<BaseIterator>::difference_type;
-  using pointer = typename std::conditional<
-      std::is_reference<ResultType>::value,
-      typename std::add_pointer<typename std::remove_reference<ResultType>::type>::type,
-      TransformIterator>::type;
+  using pointer = std::conditional_t<std::is_reference_v<ResultType>,
+                                     std::add_pointer_t<std::remove_reference_t<ResultType>>,
+                                     TransformIterator>;
   using reference = ResultType;
 
   TransformIterator(BaseIterator base, Function fn)
@@ -78,10 +78,9 @@ class TransformIterator {
   }
 
   TransformIterator& operator--() {
-    static_assert(
-        std::is_base_of<std::bidirectional_iterator_tag,
-                        typename std::iterator_traits<BaseIterator>::iterator_category>::value,
-        "BaseIterator must be bidirectional iterator to use operator--()");
+    static_assert(std::is_base_of_v<std::bidirectional_iterator_tag,
+                                    typename std::iterator_traits<BaseIterator>::iterator_category>,
+                  "BaseIterator must be bidirectional iterator to use operator--()");
     --data_.base_;
     return *this;
   }
@@ -97,34 +96,30 @@ class TransformIterator {
   }
 
   reference operator[](difference_type n) const {
-    static_assert(
-        std::is_base_of<std::random_access_iterator_tag,
-                        typename std::iterator_traits<BaseIterator>::iterator_category>::value,
-        "BaseIterator must be random access iterator to use operator[]");
+    static_assert(std::is_base_of_v<std::random_access_iterator_tag,
+                                    typename std::iterator_traits<BaseIterator>::iterator_category>,
+                 "BaseIterator must be random access iterator to use operator[]");
     return GetFunction()(base()[n]);
   }
 
   TransformIterator operator+(difference_type n) const {
-    static_assert(
-        std::is_base_of<std::random_access_iterator_tag,
-                        typename std::iterator_traits<BaseIterator>::iterator_category>::value,
-        "BaseIterator must be random access iterator to use operator+");
+    static_assert(std::is_base_of_v<std::random_access_iterator_tag,
+                                    typename std::iterator_traits<BaseIterator>::iterator_category>,
+                  "BaseIterator must be random access iterator to use operator+");
     return TransformIterator(base() + n, GetFunction());
   }
 
   TransformIterator operator-(difference_type n) const {
-    static_assert(
-        std::is_base_of<std::random_access_iterator_tag,
-                        typename std::iterator_traits<BaseIterator>::iterator_category>::value,
-        "BaseIterator must be random access iterator to use operator-");
+    static_assert(std::is_base_of_v<std::random_access_iterator_tag,
+                                    typename std::iterator_traits<BaseIterator>::iterator_category>,
+                  "BaseIterator must be random access iterator to use operator-");
     return TransformIterator(base() - n, GetFunction());
   }
 
   difference_type operator-(const TransformIterator& other) const {
-    static_assert(
-        std::is_base_of<std::random_access_iterator_tag,
-                        typename std::iterator_traits<BaseIterator>::iterator_category>::value,
-        "BaseIterator must be random access iterator to use operator-");
+    static_assert(std::is_base_of_v<std::random_access_iterator_tag,
+                                    typename std::iterator_traits<BaseIterator>::iterator_category>,
+                  "BaseIterator must be random access iterator to use operator-");
     return base() - other.base();
   }
 
@@ -168,7 +163,7 @@ TransformIterator<BaseIterator, Function> MakeTransformIterator(BaseIterator bas
 }
 
 template <typename BaseRange, typename Function>
-auto MakeTransformRange(BaseRange& range, Function f) {
+auto MakeTransformRange(BaseRange&& range, Function f) {
   return MakeIterationRange(MakeTransformIterator(range.begin(), f),
                             MakeTransformIterator(range.end(), f));
 }

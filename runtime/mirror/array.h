@@ -18,11 +18,12 @@
 #define ART_RUNTIME_MIRROR_ARRAY_H_
 
 #include "base/bit_utils.h"
-#include "base/enums.h"
+#include "base/macros.h"
+#include "base/pointer_size.h"
 #include "obj_ptr.h"
 #include "object.h"
 
-namespace art {
+namespace art HIDDEN {
 
 namespace gc {
 enum AllocatorType : char;
@@ -58,7 +59,10 @@ class MANAGED Array : public Object {
       REQUIRES_SHARED(Locks::mutator_lock_)
       REQUIRES(!Roles::uninterruptible_);
 
-  template<VerifyObjectFlags kVerifyFlags = kDefaultVerifyFlags>
+  template <VerifyObjectFlags kVerifyFlags = kDefaultVerifyFlags>
+  size_t SizeOf(size_t component_size_shift) REQUIRES_SHARED(Locks::mutator_lock_);
+  template <VerifyObjectFlags kVerifyFlags = kDefaultVerifyFlags,
+            ReadBarrierOption kReadBarrierOption = kWithoutReadBarrier>
   size_t SizeOf() REQUIRES_SHARED(Locks::mutator_lock_);
   template<VerifyObjectFlags kVerifyFlags = kDefaultVerifyFlags>
   ALWAYS_INLINE int32_t GetLength() REQUIRES_SHARED(Locks::mutator_lock_) {
@@ -125,23 +129,23 @@ class MANAGED Array : public Object {
   template<VerifyObjectFlags kVerifyFlags = kDefaultVerifyFlags>
   ALWAYS_INLINE bool CheckIsValidIndex(int32_t index) REQUIRES_SHARED(Locks::mutator_lock_);
 
-  static ObjPtr<Array> CopyOf(Handle<Array> h_this, Thread* self, int32_t new_length)
+  EXPORT static ObjPtr<Array> CopyOf(Handle<Array> h_this, Thread* self, int32_t new_length)
       REQUIRES_SHARED(Locks::mutator_lock_) REQUIRES(!Roles::uninterruptible_);
 
  protected:
-  void ThrowArrayStoreException(ObjPtr<Object> object) REQUIRES_SHARED(Locks::mutator_lock_)
+  EXPORT void ThrowArrayStoreException(ObjPtr<Object> object) REQUIRES_SHARED(Locks::mutator_lock_)
       REQUIRES(!Roles::uninterruptible_);
 
  private:
-  void ThrowArrayIndexOutOfBoundsException(int32_t index)
+  EXPORT void ThrowArrayIndexOutOfBoundsException(int32_t index)
       REQUIRES_SHARED(Locks::mutator_lock_);
 
   // The number of array elements.
   // We only use the field indirectly using the LengthOffset() method.
-  int32_t length_ ATTRIBUTE_UNUSED;
+  [[maybe_unused]] int32_t length_;
   // Marker for the data (used by generated code)
   // We only use the field indirectly using the DataOffset() method.
-  uint32_t first_element_[0] ATTRIBUTE_UNUSED;
+  [[maybe_unused]] uint32_t first_element_[0];
 
   DISALLOW_IMPLICIT_CONSTRUCTORS(Array);
 };
@@ -149,14 +153,24 @@ class MANAGED Array : public Object {
 template<typename T>
 class MANAGED PrimitiveArray : public Array {
  public:
-  typedef T ElementType;
+  MIRROR_CLASS("[Z");
+  MIRROR_CLASS("[B");
+  MIRROR_CLASS("[C");
+  MIRROR_CLASS("[S");
+  MIRROR_CLASS("[I");
+  MIRROR_CLASS("[J");
+  MIRROR_CLASS("[F");
+  MIRROR_CLASS("[D");
 
-  static ObjPtr<PrimitiveArray<T>> Alloc(Thread* self, size_t length)
+  using ElementType = T;
+
+  EXPORT static ObjPtr<PrimitiveArray<T>> Alloc(Thread* self, size_t length)
       REQUIRES_SHARED(Locks::mutator_lock_) REQUIRES(!Roles::uninterruptible_);
 
-  static ObjPtr<PrimitiveArray<T>> AllocateAndFill(Thread* self, const T* data, size_t length)
+  EXPORT static ObjPtr<PrimitiveArray<T>> AllocateAndFill(Thread* self,
+                                                          const T* data,
+                                                          size_t length)
       REQUIRES_SHARED(Locks::mutator_lock_) REQUIRES(!Roles::uninterruptible_);
-
 
   const T* GetData() const ALWAYS_INLINE  REQUIRES_SHARED(Locks::mutator_lock_) {
     return reinterpret_cast<const T*>(GetRawData<sizeof(T)>(0));
@@ -200,7 +214,7 @@ class MANAGED PrimitiveArray : public Array {
    * smaller than element size copies). Arguments are assumed to be within the bounds of the array
    * and the arrays non-null.
    */
-  void Memcpy(int32_t dst_pos, ObjPtr<PrimitiveArray<T>> src, int32_t src_pos, int32_t count)
+  EXPORT void Memcpy(int32_t dst_pos, ObjPtr<PrimitiveArray<T>> src, int32_t src_pos, int32_t count)
       REQUIRES_SHARED(Locks::mutator_lock_);
 
  private:
@@ -241,17 +255,20 @@ class PointerArray : public Array {
                                     static_cast<size_t>(ptr_size) * index);
   }
 
-  template<bool kTransactionActive = false, bool kUnchecked = false>
+  template<bool kTransactionActive = false, bool kCheckTransaction = true, bool kUnchecked = false>
   void SetElementPtrSize(uint32_t idx, uint64_t element, PointerSize ptr_size)
       REQUIRES_SHARED(Locks::mutator_lock_);
-  template<bool kTransactionActive = false, bool kUnchecked = false, typename T>
+  template<bool kTransactionActive = false,
+           bool kCheckTransaction = true,
+           bool kUnchecked = false,
+           typename T>
   void SetElementPtrSize(uint32_t idx, T* element, PointerSize ptr_size)
       REQUIRES_SHARED(Locks::mutator_lock_);
 
   // Fixup the pointers in the dest arrays by passing our pointers through the visitor. Only copies
   // to dest if visitor(source_ptr) != source_ptr.
   template <VerifyObjectFlags kVerifyFlags = kVerifyNone, typename Visitor>
-  void Fixup(ObjPtr<mirror::PointerArray> dest, PointerSize pointer_size, const Visitor& visitor)
+  void Fixup(mirror::PointerArray* dest, PointerSize pointer_size, const Visitor& visitor)
       REQUIRES_SHARED(Locks::mutator_lock_);
 
   // Works like memcpy(), except we guarantee not to allow tearing of array values (ie using smaller

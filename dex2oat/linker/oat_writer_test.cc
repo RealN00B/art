@@ -18,13 +18,12 @@
 
 #include "arch/instruction_set_features.h"
 #include "art_method-inl.h"
-#include "base/enums.h"
 #include "base/file_utils.h"
+#include "base/pointer_size.h"
 #include "base/stl_util.h"
 #include "base/unix_file/fd_file.h"
 #include "class_linker.h"
 #include "common_compiler_driver_test.h"
-#include "compiled_method-inl.h"
 #include "compiler.h"
 #include "debug/method_debug_info.h"
 #include "dex/class_accessor-inl.h"
@@ -32,6 +31,7 @@
 #include "dex/quick_compiler_callbacks.h"
 #include "dex/test_dex_file_builder.h"
 #include "dex/verification_results.h"
+#include "driver/compiled_method-inl.h"
 #include "driver/compiler_driver.h"
 #include "driver/compiler_options.h"
 #include "entrypoints/quick/quick_entrypoints.h"
@@ -41,8 +41,8 @@
 #include "mirror/class-inl.h"
 #include "mirror/object-inl.h"
 #include "mirror/object_array-inl.h"
-#include "oat.h"
-#include "oat_file-inl.h"
+#include "oat/oat.h"
+#include "oat/oat_file-inl.h"
 #include "oat_writer.h"
 #include "profile/profile_compilation_info.h"
 #include "scoped_thread_state_change-inl.h"
@@ -106,15 +106,10 @@ class OatTest : public CommonCompilerDriverTest {
                 bool verify) {
     TimingLogger timings("WriteElf", false, false);
     ClearBootImageOption();
-    OatWriter oat_writer(*compiler_options_,
-                         &timings,
-                         /*profile_compilation_info*/nullptr,
-                         CompactDexLevel::kCompactDexLevelNone);
+    OatWriter oat_writer(*compiler_options_, &timings, /*profile_compilation_info*/nullptr);
     for (const DexFile* dex_file : dex_files) {
-      ArrayRef<const uint8_t> raw_dex_file(
-          reinterpret_cast<const uint8_t*>(&dex_file->GetHeader()),
-          dex_file->GetHeader().file_size_);
-      if (!oat_writer.AddRawDexFileSource(raw_dex_file,
+      if (!oat_writer.AddRawDexFileSource(dex_file->GetContainer(),
+                                          dex_file->Begin(),
                                           dex_file->GetLocation().c_str(),
                                           dex_file->GetLocationChecksum())) {
         return false;
@@ -133,10 +128,7 @@ class OatTest : public CommonCompilerDriverTest {
                 ProfileCompilationInfo* profile_compilation_info) {
     TimingLogger timings("WriteElf", false, false);
     ClearBootImageOption();
-    OatWriter oat_writer(*compiler_options_,
-                         &timings,
-                         profile_compilation_info,
-                         CompactDexLevel::kCompactDexLevelNone);
+    OatWriter oat_writer(*compiler_options_, &timings, profile_compilation_info);
     for (const char* dex_filename : dex_filenames) {
       if (!oat_writer.AddDexFileSource(dex_filename, dex_filename)) {
         return false;
@@ -155,10 +147,7 @@ class OatTest : public CommonCompilerDriverTest {
                 ProfileCompilationInfo* profile_compilation_info = nullptr) {
     TimingLogger timings("WriteElf", false, false);
     ClearBootImageOption();
-    OatWriter oat_writer(*compiler_options_,
-                         &timings,
-                         profile_compilation_info,
-                         CompactDexLevel::kCompactDexLevelNone);
+    OatWriter oat_writer(*compiler_options_, &timings, profile_compilation_info);
     if (!oat_writer.AddDexFileSource(std::move(dex_file_fd), location)) {
       return false;
     }
@@ -181,7 +170,7 @@ class OatTest : public CommonCompilerDriverTest {
     if (!oat_writer.WriteAndOpenDexFiles(
         vdex_file,
         verify,
-        /*update_input_vdex=*/ false,
+        /*use_existing_vdex=*/ false,
         copy,
         &opened_dex_files_maps,
         &opened_dex_files)) {
@@ -202,27 +191,21 @@ class OatTest : public CommonCompilerDriverTest {
     if (!oat_writer.StartRoData(dex_files, oat_rodata, &key_value_store)) {
       return false;
     }
-    oat_writer.Initialize(compiler_driver_.get(), /*image_writer=*/ nullptr, dex_files);
+    oat_writer.Initialize(
+        compiler_driver_.get(), verification_results_.get(), /*image_writer=*/ nullptr, dex_files);
+    if (!oat_writer.FinishVdexFile(vdex_file, /*verifier_deps=*/ nullptr)) {
+      return false;
+    }
     oat_writer.PrepareLayout(&patcher);
     elf_writer->PrepareDynamicSection(oat_writer.GetOatHeader().GetExecutableOffset(),
                                       oat_writer.GetCodeSize(),
-                                      oat_writer.GetDataBimgRelRoSize(),
+                                      oat_writer.GetDataImgRelRoSize(),
+                                      oat_writer.GetDataImgRelRoAppImageOffset(),
                                       oat_writer.GetBssSize(),
                                       oat_writer.GetBssMethodsOffset(),
                                       oat_writer.GetBssRootsOffset(),
                                       oat_writer.GetVdexSize());
 
-    std::unique_ptr<BufferedOutputStream> vdex_out =
-        std::make_unique<BufferedOutputStream>(std::make_unique<FileOutputStream>(vdex_file));
-    if (!oat_writer.WriteVerifierDeps(vdex_out.get(), nullptr)) {
-      return false;
-    }
-    if (!oat_writer.WriteQuickeningInfo(vdex_out.get())) {
-      return false;
-    }
-    if (!oat_writer.WriteChecksumsAndVdexHeader(vdex_out.get())) {
-      return false;
-    }
 
     if (!oat_writer.WriteRodata(oat_rodata)) {
       return false;
@@ -235,12 +218,12 @@ class OatTest : public CommonCompilerDriverTest {
     }
     elf_writer->EndText(text);
 
-    if (oat_writer.GetDataBimgRelRoSize() != 0u) {
-      OutputStream* data_bimg_rel_ro = elf_writer->StartDataBimgRelRo();
-      if (!oat_writer.WriteDataBimgRelRo(data_bimg_rel_ro)) {
+    if (oat_writer.GetDataImgRelRoSize() != 0u) {
+      OutputStream* data_img_rel_ro = elf_writer->StartDataImgRelRo();
+      if (!oat_writer.WriteDataImgRelRo(data_img_rel_ro)) {
         return false;
       }
-      elf_writer->EndDataBimgRelRo(data_bimg_rel_ro);
+      elf_writer->EndDataImgRelRo(data_img_rel_ro);
     }
 
     if (!oat_writer.WriteHeader(elf_writer->GetStream())) {
@@ -298,13 +281,6 @@ class OatTest : public CommonCompilerDriverTest {
                           &opened_dex_file->GetHeader(),
                           dex_file_data->GetHeader().file_size_));
       ASSERT_EQ(dex_file_data->GetLocation(), opened_dex_file->GetLocation());
-    }
-    const VdexFile::DexSectionHeader &vdex_header =
-        opened_oat_file->GetVdexFile()->GetDexSectionHeader();
-    if (!compiler_driver_->GetCompilerOptions().IsQuickeningCompilationEnabled()) {
-      // If quickening is enabled we will always write the table since there is no special logic
-      // that checks for all methods not being quickened (not worth the complexity).
-      ASSERT_EQ(vdex_header.GetQuickeningInfoSize(), 0u);
     }
 
     int64_t actual_vdex_size = vdex_file.GetFile()->GetLength();
@@ -475,9 +451,7 @@ TEST_F(OatTest, WriteRead) {
 
   ASSERT_TRUE(java_lang_dex_file_ != nullptr);
   const DexFile& dex_file = *java_lang_dex_file_;
-  uint32_t dex_file_checksum = dex_file.GetLocationChecksum();
-  const OatDexFile* oat_dex_file = oat_file->GetOatDexFile(dex_file.GetLocation().c_str(),
-                                                           &dex_file_checksum);
+  const OatDexFile* oat_dex_file = oat_file->GetOatDexFile(dex_file.GetLocation().c_str());
   ASSERT_TRUE(oat_dex_file != nullptr);
   CHECK_EQ(dex_file.GetLocationChecksum(), oat_dex_file->GetDexFileLocationChecksum());
   ScopedObjectAccess soa(Thread::Current());
@@ -486,13 +460,11 @@ TEST_F(OatTest, WriteRead) {
     size_t num_virtual_methods = accessor.NumVirtualMethods();
 
     const char* descriptor = accessor.GetDescriptor();
-    ObjPtr<mirror::Class> klass = class_linker->FindClass(soa.Self(),
-                                                          descriptor,
-                                                          ScopedNullHandle<mirror::ClassLoader>());
+    ObjPtr<mirror::Class> klass = FindClass(descriptor, ScopedNullHandle<mirror::ClassLoader>());
 
     const OatFile::OatClass oat_class = oat_dex_file->GetOatClass(accessor.GetClassDefIndex());
     CHECK_EQ(ClassStatus::kNotReady, oat_class.GetStatus()) << descriptor;
-    CHECK_EQ(kCompile ? OatClassType::kOatClassAllCompiled : OatClassType::kOatClassNoneCompiled,
+    CHECK_EQ(kCompile ? OatClassType::kAllCompiled : OatClassType::kNoneCompiled,
              oat_class.GetType()) << descriptor;
 
     size_t method_index = 0;
@@ -517,10 +489,10 @@ TEST_F(OatTest, WriteRead) {
 TEST_F(OatTest, OatHeaderSizeCheck) {
   // If this test is failing and you have to update these constants,
   // it is time to update OatHeader::kOatVersion
-  EXPECT_EQ(60U, sizeof(OatHeader));
+  EXPECT_EQ(68U, sizeof(OatHeader));
   EXPECT_EQ(4U, sizeof(OatMethodOffsets));
-  EXPECT_EQ(8U, sizeof(OatQuickMethodHeader));
-  EXPECT_EQ(169 * static_cast<size_t>(GetInstructionSetPointerSize(kRuntimeISA)),
+  EXPECT_EQ(4U, sizeof(OatQuickMethodHeader));
+  EXPECT_EQ(173 * static_cast<size_t>(GetInstructionSetPointerSize(kRuntimeISA)),
             sizeof(QuickEntryPoints));
 }
 
@@ -605,8 +577,8 @@ void OatTest::TestDexFileInput(bool verify, bool low_4gb, bool use_profile) {
 
   ScratchFile dex_file1;
   TestDexFileBuilder builder1;
-  builder1.AddField("Lsome.TestClass;", "int", "someField");
-  builder1.AddMethod("Lsome.TestClass;", "()I", "foo");
+  builder1.AddField("Lsome/TestClass;", "int", "someField");
+  builder1.AddMethod("Lsome/TestClass;", "()I", "foo");
   std::unique_ptr<const DexFile> dex_file1_data = builder1.Build(dex_file1.GetFilename());
 
   MaybeModifyDexFileToFail(verify, dex_file1_data);
@@ -622,8 +594,8 @@ void OatTest::TestDexFileInput(bool verify, bool low_4gb, bool use_profile) {
 
   ScratchFile dex_file2;
   TestDexFileBuilder builder2;
-  builder2.AddField("Land.AnotherTestClass;", "boolean", "someOtherField");
-  builder2.AddMethod("Land.AnotherTestClass;", "()J", "bar");
+  builder2.AddField("Land/AnotherTestClass;", "boolean", "someOtherField");
+  builder2.AddMethod("Land/AnotherTestClass;", "()J", "bar");
   std::unique_ptr<const DexFile> dex_file2_data = builder2.Build(dex_file2.GetFilename());
 
   MaybeModifyDexFileToFail(verify, dex_file2_data);
@@ -729,8 +701,8 @@ void OatTest::TestZipFileInput(bool verify, CopyOption copy) {
 
   ScratchFile dex_file1;
   TestDexFileBuilder builder1;
-  builder1.AddField("Lsome.TestClass;", "long", "someField");
-  builder1.AddMethod("Lsome.TestClass;", "()D", "foo");
+  builder1.AddField("Lsome/TestClass;", "long", "someField");
+  builder1.AddMethod("Lsome/TestClass;", "()D", "foo");
   std::unique_ptr<const DexFile> dex_file1_data = builder1.Build(dex_file1.GetFilename());
 
   MaybeModifyDexFileToFail(verify, dex_file1_data);
@@ -747,8 +719,8 @@ void OatTest::TestZipFileInput(bool verify, CopyOption copy) {
 
   ScratchFile dex_file2;
   TestDexFileBuilder builder2;
-  builder2.AddField("Land.AnotherTestClass;", "boolean", "someOtherField");
-  builder2.AddMethod("Land.AnotherTestClass;", "()J", "bar");
+  builder2.AddField("Land/AnotherTestClass;", "boolean", "someOtherField");
+  builder2.AddMethod("Land/AnotherTestClass;", "()J", "bar");
   std::unique_ptr<const DexFile> dex_file2_data = builder2.Build(dex_file2.GetFilename());
 
   MaybeModifyDexFileToFail(verify, dex_file2_data);

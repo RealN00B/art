@@ -27,9 +27,9 @@
 #include "base/arena_allocator.h"
 #include "base/arena_object.h"
 #include "base/array_ref.h"
-#include "base/enums.h"
 #include "base/macros.h"
 #include "base/memory_region.h"
+#include "base/pointer_size.h"
 #include "dwarf/debug_frame_opcode_writer.h"
 #include "label.h"
 #include "managed_register.h"
@@ -37,7 +37,7 @@
 #include "x86/constants_x86.h"
 #include "x86_64/constants_x86_64.h"
 
-namespace art {
+namespace art HIDDEN {
 
 class Assembler;
 class AssemblerBuffer;
@@ -163,9 +163,8 @@ class AssemblerBuffer {
 
   uint8_t* contents() const { return contents_; }
 
-  // Copy the assembled instructions into the specified memory block
-  // and apply all fixups.
-  void FinalizeInstructions(const MemoryRegion& region);
+  // Copy the assembled instructions into the specified memory block.
+  void CopyInstructions(const MemoryRegion& region);
 
   // To emit an instruction to the assembler buffer, the EnsureCapacity helper
   // must be used to guarantee that the underlying data area is big enough to
@@ -229,7 +228,7 @@ class AssemblerBuffer {
 
   // When building the C++ tests, assertion code is enabled. To allow
   // asserting that the user of the assembler buffer has ensured the
-  // capacity needed for emitting, we add a dummy method in non-debug mode.
+  // capacity needed for emitting, we add a placeholder method in non-debug mode.
   bool HasEnsuredCapacity() const { return true; }
 
 #endif
@@ -246,11 +245,13 @@ class AssemblerBuffer {
   // The provided `min_capacity` must be higher than current `Capacity()`.
   void ExtendCapacity(size_t min_capacity);
 
+  void ProcessFixups();
+
  private:
   // The limit is set to kMinimumGap bytes before the end of the data area.
   // This leaves enough space for the longest possible instruction and allows
   // for a single, fast space check per instruction.
-  static const int kMinimumGap = 32;
+  static constexpr int kMinimumGap = 32;
 
   ArenaAllocator* const allocator_;
   uint8_t* contents_;
@@ -357,7 +358,10 @@ class DebugFrameOpCodeWriterForAssembler final
 class Assembler : public DeletableArenaObject<kArenaAllocAssembler> {
  public:
   // Finalize the code; emit slow paths, fixup branches, add literal pool, etc.
-  virtual void FinalizeCode() { buffer_.EmitSlowPaths(this); }
+  virtual void FinalizeCode() {
+    buffer_.EmitSlowPaths(this);
+    buffer_.ProcessFixups();
+  }
 
   // Size of generated code
   virtual size_t CodeSize() const { return buffer_.Size(); }
@@ -375,12 +379,12 @@ class Assembler : public DeletableArenaObject<kArenaAllocAssembler> {
   virtual size_t CodePosition() { return CodeSize(); }
 
   // Copy instructions out of assembly buffer into the given region of memory
-  virtual void FinalizeInstructions(const MemoryRegion& region) {
-    buffer_.FinalizeInstructions(region);
+  virtual void CopyInstructions(const MemoryRegion& region) {
+    buffer_.CopyInstructions(region);
   }
 
   // TODO: Implement with disassembler.
-  virtual void Comment(const char* format ATTRIBUTE_UNUSED, ...) {}
+  virtual void Comment([[maybe_unused]] const char* format, ...) {}
 
   virtual void Bind(Label* label) = 0;
   virtual void Jump(Label* label) = 0;
@@ -407,6 +411,13 @@ class Assembler : public DeletableArenaObject<kArenaAllocAssembler> {
   AssemblerBuffer buffer_;
 
   DebugFrameOpCodeWriterForAssembler cfi_;
+};
+
+enum ScaleFactor {
+  TIMES_1 = 0,
+  TIMES_2 = 1,
+  TIMES_4 = 2,
+  TIMES_8 = 3
 };
 
 }  // namespace art

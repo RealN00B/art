@@ -14,13 +14,34 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-if [ -t 1 ]; then
-  # Color sequences if terminal is a tty.
-  green='\033[0;32m'
-  nc='\033[0m'
+. "$(dirname $0)/buildbot-utils.sh"
+
+# Clean up local changes to avoid failing incremental `repo sync`.
+# TODO(b/286551985): Remove this after riscv64 support is added to mainline.
+if [[ $TARGET_ARCH = "riscv64" && ! ( -d frameworks/base ) ]]; then
+    msginfo "Reverting local changes to conscrypt and StatsD"
+    (cd $ANDROID_BUILD_TOP/prebuilts/module_sdk/conscrypt && git reset --hard )
+    (cd $ANDROID_BUILD_TOP/prebuilts/module_sdk/StatsD && git reset --hard )
 fi
 
-# Setup as root, as device cleanup requires it.
+# Testing on a Linux VM requires special cleanup.
+if [[ -n "$ART_TEST_ON_VM" ]]; then
+  [[ -d "$ART_TEST_VM_DIR" ]] || { msgfatal "no VM found in $ART_TEST_VM_DIR"; }
+  $ART_SSH_CMD "true" || { msgfatal "VM not responding (tried \"$ART_SSH_CMD true\""; }
+  $ART_SSH_CMD "
+    sudo umount $ART_TEST_CHROOT/proc
+    sudo umount $ART_TEST_CHROOT/sys
+    sudo umount $ART_TEST_CHROOT/dev
+    sudo umount $ART_TEST_CHROOT/bin
+    sudo umount $ART_TEST_CHROOT/lib
+    sudo umount $ART_TEST_CHROOT/usr/lib
+    sudo umount $ART_TEST_CHROOT/usr/share/gdb
+    rm -rf $ART_TEST_CHROOT
+  "
+  exit 0
+fi
+
+# Regular Android device. Setup as root, as device cleanup requires it.
 adb root
 adb wait-for-device
 
@@ -32,16 +53,16 @@ if [[ -n "$ART_TEST_CHROOT" ]]; then
   fi
 
   if adb shell test -d "$ART_TEST_CHROOT"; then
-    echo -e "${green}Remove entire /linkerconfig directory from chroot directory${nc}"
+    msginfo "Remove entire /linkerconfig directory from chroot directory"
     adb shell rm -rf "$ART_TEST_CHROOT/linkerconfig"
 
-    echo -e "${green}Remove entire /system directory from chroot directory${nc}"
+    msginfo "Remove entire /system directory from chroot directory"
     adb shell rm -rf "$ART_TEST_CHROOT/system"
 
-    echo -e "${green}Remove entire /data directory from chroot directory${nc}"
+    msginfo "Remove entire /data directory from chroot directory"
     adb shell rm -rf "$ART_TEST_CHROOT/data"
 
-    echo -e "${green}Remove entire chroot directory${nc}"
+    msginfo "Remove entire chroot directory"
     adb shell rmdir "$ART_TEST_CHROOT" || adb shell ls -la "$ART_TEST_CHROOT"
   fi
 else

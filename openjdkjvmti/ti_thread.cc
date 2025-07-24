@@ -32,19 +32,19 @@
 #include "ti_thread.h"
 
 #include <android-base/logging.h>
-#include <android-base/strings.h>
 
 #include "art_field-inl.h"
 #include "art_jvmti.h"
 #include "base/mutex.h"
 #include "deopt_manager.h"
 #include "events-inl.h"
-#include "gc/system_weak.h"
 #include "gc/collector_type.h"
 #include "gc/gc_cause.h"
 #include "gc/scoped_gc_critical_section.h"
+#include "gc/system_weak.h"
 #include "gc_root-inl.h"
 #include "jni/jni_internal.h"
+#include "metrics/reporter.h"
 #include "mirror/class.h"
 #include "mirror/object-inl.h"
 #include "mirror/string.h"
@@ -58,7 +58,7 @@
 #include "thread-current-inl.h"
 #include "thread_list.h"
 #include "ti_phase.h"
-#include "well_known_classes.h"
+#include "well_known_classes-inl.h"
 
 namespace openjdkjvmti {
 
@@ -123,15 +123,15 @@ struct ThreadCallback : public art::ThreadLifecycleCallback {
     if (!started) {
       // Runtime isn't started. We only expect at most the signal handler or JIT threads to be
       // started here; this includes the perfetto_hprof_listener signal handler thread for
-      // perfetto_hprof.
+      // perfetto_hprof, as well as the metrics background reporting thread.
       if (art::kIsDebugBuild) {
         std::string name;
         self->GetThreadName(name);
-        if (name != "JDWP" &&
-            name != "Signal Catcher" &&
-            name != "perfetto_hprof_listener" &&
-            !android::base::StartsWith(name, "Jit thread pool") &&
-            !android::base::StartsWith(name, "Runtime worker thread")) {
+        if (name != "JDWP" && name != "Signal Catcher" && name != "perfetto_hprof_listener" &&
+            name != art::metrics::MetricsReporter::kBackgroundThreadName &&
+            !name.starts_with("Jit thread pool") &&
+            !name.starts_with("Heap thread pool worker thread") &&
+            !name.starts_with("Runtime worker thread")) {
           LOG(FATAL) << "Unexpected thread before start: " << name << " id: "
                      << self->GetThreadId();
         }
@@ -173,12 +173,7 @@ void ThreadUtil::VMInitEventSent() {
 
 
 static void WaitForSystemDaemonStart(art::Thread* self) REQUIRES_SHARED(art::Locks::mutator_lock_) {
-  {
-    art::ScopedThreadStateChange strc(self, art::kNative);
-    JNIEnv* jni = self->GetJniEnv();
-    jni->CallStaticVoidMethod(art::WellKnownClasses::java_lang_Daemons,
-                              art::WellKnownClasses::java_lang_Daemons_waitForDaemonStart);
-  }
+  art::WellKnownClasses::java_lang_Daemons_waitForDaemonStart->InvokeStatic<'V'>(self);
   if (self->IsExceptionPending()) {
     LOG(WARNING) << "Exception occurred when waiting for system daemons to start: "
                  << self->GetException()->Dump();
@@ -191,8 +186,7 @@ void ThreadUtil::CacheData() {
   gThreadCallback.started = true;
   art::Thread* self = art::Thread::Current();
   art::ScopedObjectAccess soa(self);
-  art::ObjPtr<art::mirror::Class> thread_class =
-      soa.Decode<art::mirror::Class>(art::WellKnownClasses::java_lang_Thread);
+  art::ObjPtr<art::mirror::Class> thread_class = art::WellKnownClasses::java_lang_Thread.Get();
   CHECK(thread_class != nullptr);
   context_class_loader_ = thread_class->FindDeclaredInstanceField("contextClassLoader",
                                                                   "Ljava/lang/ClassLoader;");
@@ -210,7 +204,7 @@ void ThreadUtil::Unregister() {
   runtime->GetRuntimeCallbacks()->RemoveThreadLifecycleCallback(&gThreadCallback);
 }
 
-jvmtiError ThreadUtil::GetCurrentThread(jvmtiEnv* env ATTRIBUTE_UNUSED, jthread* thread_ptr) {
+jvmtiError ThreadUtil::GetCurrentThread([[maybe_unused]] jvmtiEnv* env, jthread* thread_ptr) {
   art::Thread* self = art::Thread::Current();
 
   art::ScopedObjectAccess soa(self);
@@ -235,7 +229,9 @@ bool ThreadUtil::GetNativeThread(jthread thread,
   if (thread == nullptr) {
     *thr = art::Thread::Current();
     return true;
-  } else if (!soa.Env()->IsInstanceOf(thread, art::WellKnownClasses::java_lang_Thread)) {
+  }
+  art::ObjPtr<art::mirror::Object> othread = soa.Decode<art::mirror::Object>(thread);
+  if (!othread->InstanceOf(art::WellKnownClasses::java_lang_Thread.Get())) {
     *err = ERR(INVALID_THREAD);
     return false;
   } else {
@@ -292,11 +288,13 @@ jvmtiError ThreadUtil::GetThreadInfo(jvmtiEnv* env, jthread thread, jvmtiThreadI
 
     info_ptr->is_daemon = target->IsDaemon();
 
-    art::ObjPtr<art::mirror::Object> peer = target->GetPeerFromOtherThread();
+    art::ObjPtr<art::mirror::Object> peer = target->LockedGetPeerFromOtherThread();
+    // *target may be invalid here since we may have temporarily released thread_list_lock_.
+    target = nullptr;  // Value should not be used.
 
     // ThreadGroup.
     if (peer != nullptr) {
-      art::ArtField* f = art::jni::DecodeArtField(art::WellKnownClasses::java_lang_Thread_group);
+      art::ArtField* f = art::WellKnownClasses::java_lang_Thread_group;
       CHECK(f != nullptr);
       art::ObjPtr<art::mirror::Object> group = f->GetObject(peer);
       info_ptr->thread_group = group == nullptr
@@ -321,7 +319,7 @@ jvmtiError ThreadUtil::GetThreadInfo(jvmtiEnv* env, jthread thread, jvmtiThreadI
 
     // Name.
     {
-      art::ArtField* f = art::jni::DecodeArtField(art::WellKnownClasses::java_lang_Thread_name);
+      art::ArtField* f = art::WellKnownClasses::java_lang_Thread_name;
       CHECK(f != nullptr);
       art::ObjPtr<art::mirror::Object> name = f->GetObject(peer);
       std::string name_cpp;
@@ -342,21 +340,21 @@ jvmtiError ThreadUtil::GetThreadInfo(jvmtiEnv* env, jthread thread, jvmtiThreadI
 
     // Priority.
     {
-      art::ArtField* f = art::jni::DecodeArtField(art::WellKnownClasses::java_lang_Thread_priority);
+      art::ArtField* f = art::WellKnownClasses::java_lang_Thread_priority;
       CHECK(f != nullptr);
       info_ptr->priority = static_cast<jint>(f->GetInt(peer));
     }
 
     // Daemon.
     {
-      art::ArtField* f = art::jni::DecodeArtField(art::WellKnownClasses::java_lang_Thread_daemon);
+      art::ArtField* f = art::WellKnownClasses::java_lang_Thread_daemon;
       CHECK(f != nullptr);
       info_ptr->is_daemon = f->GetBoolean(peer) == 0 ? JNI_FALSE : JNI_TRUE;
     }
 
     // ThreadGroup.
     {
-      art::ArtField* f = art::jni::DecodeArtField(art::WellKnownClasses::java_lang_Thread_group);
+      art::ArtField* f = art::WellKnownClasses::java_lang_Thread_group;
       CHECK(f != nullptr);
       art::ObjPtr<art::mirror::Object> group = f->GetObject(peer);
       info_ptr->thread_group = group == nullptr
@@ -487,8 +485,10 @@ static jint GetJvmtiThreadStateFromInternal(const InternalThreadState& state) {
       jvmti_state |= (JVMTI_THREAD_STATE_WAITING |
                       JVMTI_THREAD_STATE_WAITING_INDEFINITELY);
       break;
+    case art::ThreadState::kObsoleteRunnable:  // Obsolete value.
     case art::ThreadState::kStarting:
     case art::ThreadState::kTerminated:
+    case art::ThreadState::kInvalidState:
       // We only call this if we are alive so we shouldn't see either of these states.
       LOG(FATAL) << "Should not be in state " << internal_thread_state;
       UNREACHABLE();
@@ -539,6 +539,10 @@ static jint GetJavaStateFromInternal(const InternalThreadState& state) {
     case art::ThreadState::kWaitingForGcThreadFlip:
     case art::ThreadState::kNativeForAbort:
       return JVMTI_JAVA_LANG_THREAD_STATE_WAITING;
+
+    case art::ThreadState::kObsoleteRunnable:
+    case art::ThreadState::kInvalidState:
+      break;  // Obsolete or invalid value.
   }
   LOG(FATAL) << "Unreachable";
   UNREACHABLE();
@@ -546,6 +550,7 @@ static jint GetJavaStateFromInternal(const InternalThreadState& state) {
 
 // Suspends the current thread if it has any suspend requests on it.
 void ThreadUtil::SuspendCheck(art::Thread* self) {
+  DCHECK(!self->ReadFlag(art::ThreadFlag::kSuspensionImmune));
   art::ScopedObjectAccess soa(self);
   // Really this is only needed if we are in FastJNI and actually have the mutator_lock_ already.
   self->FullSuspendCheck();
@@ -563,7 +568,7 @@ bool ThreadUtil::WouldSuspendForUserCode(art::Thread* self) {
   return WouldSuspendForUserCodeLocked(self);
 }
 
-jvmtiError ThreadUtil::GetThreadState(jvmtiEnv* env ATTRIBUTE_UNUSED,
+jvmtiError ThreadUtil::GetThreadState([[maybe_unused]] jvmtiEnv* env,
                                       jthread thread,
                                       jint* thread_state_ptr) {
   if (thread_state_ptr == nullptr) {
@@ -612,8 +617,7 @@ jvmtiError ThreadUtil::GetThreadState(jvmtiEnv* env ATTRIBUTE_UNUSED,
 
   // Need to read the Java "started" field to know whether this is starting or terminated.
   art::Handle<art::mirror::Object> peer(hs.NewHandle(soa.Decode<art::mirror::Object>(thread)));
-  art::ObjPtr<art::mirror::Class> thread_klass =
-      soa.Decode<art::mirror::Class>(art::WellKnownClasses::java_lang_Thread);
+  art::ObjPtr<art::mirror::Class> thread_klass = art::WellKnownClasses::java_lang_Thread.Get();
   if (!thread_klass->IsAssignableFrom(peer->GetClass())) {
     return ERR(INVALID_THREAD);
   }
@@ -640,20 +644,30 @@ jvmtiError ThreadUtil::GetAllThreads(jvmtiEnv* env,
 
   art::MutexLock mu(current, *art::Locks::thread_list_lock_);
   std::list<art::Thread*> thread_list = art::Runtime::Current()->GetThreadList()->GetList();
+  // We have to be careful with threads exiting while we build this list.
+  std::vector<art::ThreadExitFlag> tefs(thread_list.size());
+  auto i = tefs.begin();
+  for (art::Thread* thd : thread_list) {
+    thd->NotifyOnThreadExit(&*i++);
+  }
+  DCHECK(i == tefs.end());
 
   std::vector<art::ObjPtr<art::mirror::Object>> peers;
 
+  i = tefs.begin();
   for (art::Thread* thread : thread_list) {
-    // Skip threads that are still starting.
-    if (thread->IsStillStarting()) {
-      continue;
+    art::ThreadExitFlag* tef = &*i++;
+    // Skip threads that have since exited or are still starting.
+    if (!tef->HasExited() && !thread->IsStillStarting()) {
+      // LockedGetPeerFromOtherThreads() may release lock!
+      art::ObjPtr<art::mirror::Object> peer = thread->LockedGetPeerFromOtherThread(tef);
+      if (peer != nullptr) {
+        peers.push_back(peer);
+      }
     }
-
-    art::ObjPtr<art::mirror::Object> peer = thread->GetPeerFromOtherThread();
-    if (peer != nullptr) {
-      peers.push_back(peer);
-    }
+    thread->UnregisterThreadExitFlag(tef);
   }
+  DCHECK(i == tefs.end());
 
   if (peers.empty()) {
     *threads_count_ptr = 0;
@@ -665,8 +679,8 @@ jvmtiError ThreadUtil::GetAllThreads(jvmtiEnv* env,
       return data_result;
     }
     jthread* threads = reinterpret_cast<jthread*>(data);
-    for (size_t i = 0; i != peers.size(); ++i) {
-      threads[i] = soa.AddLocalReference<jthread>(peers[i]);
+    for (size_t j = 0; j != peers.size(); ++j) {
+      threads[j] = soa.AddLocalReference<jthread>(peers[j]);
     }
 
     *threads_count_ptr = static_cast<jint>(peers.size());
@@ -810,46 +824,52 @@ jvmtiError ThreadUtil::RunAgentThread(jvmtiEnv* jvmti_env,
   if (priority < JVMTI_THREAD_MIN_PRIORITY || priority > JVMTI_THREAD_MAX_PRIORITY) {
     return ERR(INVALID_PRIORITY);
   }
-  JNIEnv* env = art::Thread::Current()->GetJniEnv();
-  if (thread == nullptr || !env->IsInstanceOf(thread, art::WellKnownClasses::java_lang_Thread)) {
+  if (thread == nullptr) {
     return ERR(INVALID_THREAD);
   }
-  if (proc == nullptr) {
-    return ERR(NULL_POINTER);
-  }
-
+  art::Runtime* runtime = art::Runtime::Current();
+  art::Thread* self = art::Thread::Current();
+  std::unique_ptr<AgentData> data;
   {
-    art::Runtime* runtime = art::Runtime::Current();
-    art::MutexLock mu(art::Thread::Current(), *art::Locks::runtime_shutdown_lock_);
-    if (runtime->IsShuttingDownLocked()) {
-      // The runtime is shutting down so we cannot create new threads.
-      // TODO It's not fully clear from the spec what we should do here. We aren't yet in
-      // JVMTI_PHASE_DEAD so we cannot return ERR(WRONG_PHASE) but creating new threads is now
-      // impossible. Existing agents don't seem to generally do anything with this return value so
-      // it doesn't matter too much. We could do something like sending a fake ThreadStart event
-      // even though code is never actually run.
-      return ERR(INTERNAL);
+    art::ScopedObjectAccess soa(self);
+    art::ObjPtr<art::mirror::Object> othread = soa.Decode<art::mirror::Object>(thread);
+    if (!othread->InstanceOf(art::WellKnownClasses::java_lang_Thread.Get())) {
+      return ERR(INVALID_THREAD);
     }
-    runtime->StartThreadBirth();
-  }
+    if (proc == nullptr) {
+      return ERR(NULL_POINTER);
+    }
 
-  std::unique_ptr<AgentData> data(new AgentData);
-  data->arg = arg;
-  data->proc = proc;
-  // We need a global ref for Java objects, as local refs will be invalid.
-  data->thread = env->NewGlobalRef(thread);
-  data->java_vm = art::Runtime::Current()->GetJavaVM();
-  data->jvmti_env = jvmti_env;
-  data->priority = priority;
-  ScopedLocalRef<jstring> s(
-      env,
-      reinterpret_cast<jstring>(
-          env->GetObjectField(thread, art::WellKnownClasses::java_lang_Thread_name)));
-  if (s == nullptr) {
-    data->name = "JVMTI Agent Thread";
-  } else {
-    ScopedUtfChars name(env, s.get());
-    data->name = name.c_str();
+    {
+      art::MutexLock mu(soa.Self(), *art::Locks::runtime_shutdown_lock_);
+      if (runtime->IsShuttingDownLocked()) {
+        // The runtime is shutting down so we cannot create new threads.
+        // TODO It's not fully clear from the spec what we should do here. We aren't yet in
+        // JVMTI_PHASE_DEAD so we cannot return ERR(WRONG_PHASE) but creating new threads is now
+        // impossible. Existing agents don't seem to generally do anything with this return value so
+        // it doesn't matter too much. We could do something like sending a fake ThreadStart event
+        // even though code is never actually run.
+        return ERR(INTERNAL);
+      }
+      runtime->StartThreadBirth();
+    }
+
+    data.reset(new AgentData);
+    data->arg = arg;
+    data->proc = proc;
+    // We need a global ref for Java objects, as local refs will be invalid.
+    data->thread = runtime->GetJavaVM()->AddGlobalRef(soa.Self(), othread);
+    data->java_vm = runtime->GetJavaVM();
+    data->jvmti_env = jvmti_env;
+    data->priority = priority;
+    art::ObjPtr<art::mirror::Object> name =
+        art::WellKnownClasses::java_lang_Thread_name->GetObject(
+            soa.Decode<art::mirror::Object>(thread));
+    if (name == nullptr) {
+      data->name = "JVMTI Agent Thread";
+    } else {
+      data->name = name->AsString()->ToModifiedUtf8();
+    }
   }
 
   pthread_t pthread;
@@ -859,8 +879,7 @@ jvmtiError ThreadUtil::RunAgentThread(jvmtiEnv* jvmti_env,
                                             reinterpret_cast<void*>(data.get()));
   if (pthread_create_result != 0) {
     // If the create succeeded the other thread will call EndThreadBirth.
-    art::Runtime* runtime = art::Runtime::Current();
-    art::MutexLock mu(art::Thread::Current(), *art::Locks::runtime_shutdown_lock_);
+    art::MutexLock mu(self, *art::Locks::runtime_shutdown_lock_);
     runtime->EndThreadBirth();
     return ERR(INTERNAL);
   }
@@ -895,23 +914,17 @@ jvmtiError ThreadUtil::SuspendOther(art::Thread* self,
         }
       }
     }
-    bool timeout = true;
     art::Thread* ret_target = art::Runtime::Current()->GetThreadList()->SuspendThreadByPeer(
-        target_jthread,
-        /* request_suspension= */ true,
-        art::SuspendReason::kForUserCode,
-        &timeout);
-    if (ret_target == nullptr && !timeout) {
+        target_jthread, art::SuspendReason::kForUserCode);
+    if (ret_target == nullptr) {
       // TODO It would be good to get more information about why exactly the thread failed to
       // suspend.
       return ERR(INTERNAL);
-    } else if (!timeout) {
-      // we didn't time out and got a result.
+    } else {
       return OK;
     }
     // We timed out. Just go around and try again.
   } while (true);
-  UNREACHABLE();
 }
 
 jvmtiError ThreadUtil::SuspendSelf(art::Thread* self) {
@@ -923,10 +936,11 @@ jvmtiError ThreadUtil::SuspendSelf(art::Thread* self) {
       // This can only happen if we race with another thread to suspend 'self' and we lose.
       return ERR(THREAD_SUSPENDED);
     }
-    // We shouldn't be able to fail this.
-    if (!self->ModifySuspendCount(self, +1, nullptr, art::SuspendReason::kForUserCode)) {
-      // TODO More specific error would be nice.
-      return ERR(INTERNAL);
+    {
+      // IncrementSuspendCount normally needs thread_list_lock_ to ensure the thread stays
+      // around. In this case we are the target thread, so we fake it.
+      art::FakeMutexLock fmu(*art::Locks::thread_list_lock_);
+      self->IncrementSuspendCount(self, nullptr, nullptr, art::SuspendReason::kForUserCode);
     }
   }
   // Once we have requested the suspend we actually go to sleep. We need to do this after releasing
@@ -936,7 +950,7 @@ jvmtiError ThreadUtil::SuspendSelf(art::Thread* self) {
   return OK;
 }
 
-jvmtiError ThreadUtil::SuspendThread(jvmtiEnv* env ATTRIBUTE_UNUSED, jthread thread) {
+jvmtiError ThreadUtil::SuspendThread([[maybe_unused]] jvmtiEnv* env, jthread thread) {
   art::Thread* self = art::Thread::Current();
   bool target_is_self = false;
   {
@@ -957,8 +971,7 @@ jvmtiError ThreadUtil::SuspendThread(jvmtiEnv* env ATTRIBUTE_UNUSED, jthread thr
   }
 }
 
-jvmtiError ThreadUtil::ResumeThread(jvmtiEnv* env ATTRIBUTE_UNUSED,
-                                    jthread thread) {
+jvmtiError ThreadUtil::ResumeThread([[maybe_unused]] jvmtiEnv* env, jthread thread) {
   if (thread == nullptr) {
     return ERR(NULL_POINTER);
   }
@@ -1075,7 +1088,7 @@ jvmtiError ThreadUtil::ResumeThreadList(jvmtiEnv* env,
   return OK;
 }
 
-jvmtiError ThreadUtil::StopThread(jvmtiEnv* env ATTRIBUTE_UNUSED,
+jvmtiError ThreadUtil::StopThread([[maybe_unused]] jvmtiEnv* env,
                                   jthread thread,
                                   jobject exception) {
   art::Thread* self = art::Thread::Current();
@@ -1124,7 +1137,7 @@ jvmtiError ThreadUtil::StopThread(jvmtiEnv* env ATTRIBUTE_UNUSED,
   }
 }
 
-jvmtiError ThreadUtil::InterruptThread(jvmtiEnv* env ATTRIBUTE_UNUSED, jthread thread) {
+jvmtiError ThreadUtil::InterruptThread([[maybe_unused]] jvmtiEnv* env, jthread thread) {
   art::Thread* self = art::Thread::Current();
   art::ScopedObjectAccess soa(self);
   art::MutexLock tll_mu(self, *art::Locks::thread_list_lock_);

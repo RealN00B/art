@@ -15,6 +15,7 @@
  */
 
 #include "base/arena_allocator.h"
+#include "base/macros.h"
 #include "builder.h"
 #include "nodes.h"
 #include "optimizing_unit_test.h"
@@ -22,7 +23,7 @@
 
 #include "gtest/gtest.h"
 
-namespace art {
+namespace art HIDDEN {
 
 class GraphTest : public OptimizingUnitTest {
  protected:
@@ -37,18 +38,15 @@ HBasicBlock* GraphTest::CreateIfBlock(HGraph* graph) {
   HBasicBlock* if_block = new (GetAllocator()) HBasicBlock(graph);
   graph->AddBlock(if_block);
   HInstruction* instr = graph->GetIntConstant(4);
-  HInstruction* equal = new (GetAllocator()) HEqual(instr, instr);
-  if_block->AddInstruction(equal);
-  instr = new (GetAllocator()) HIf(equal);
-  if_block->AddInstruction(instr);
+  HInstruction* equal = MakeCondition(if_block, kCondEQ, instr, instr);
+  MakeIf(if_block, equal);
   return if_block;
 }
 
 HBasicBlock* GraphTest::CreateGotoBlock(HGraph* graph) {
   HBasicBlock* block = new (GetAllocator()) HBasicBlock(graph);
   graph->AddBlock(block);
-  HInstruction* got = new (GetAllocator()) HGoto();
-  block->AddInstruction(got);
+  MakeGoto(block);
   return block;
 }
 
@@ -69,8 +67,7 @@ HBasicBlock* GraphTest::CreateReturnBlock(HGraph* graph) {
 HBasicBlock* GraphTest::CreateExitBlock(HGraph* graph) {
   HBasicBlock* block = new (GetAllocator()) HBasicBlock(graph);
   graph->AddBlock(block);
-  HInstruction* exit_instr = new (GetAllocator()) HExit();
-  block->AddInstruction(exit_instr);
+  MakeExit(block);
   return block;
 }
 

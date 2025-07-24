@@ -14,24 +14,21 @@
  * limitations under the License.
  */
 
-#include <algorithm>
-
 #include "instruction_set_features.h"
 
 #include <algorithm>
 #include <ostream>
 
 #include "android-base/strings.h"
-
-#include "base/casts.h"
-#include "base/utils.h"
-
 #include "arm/instruction_set_features_arm.h"
 #include "arm64/instruction_set_features_arm64.h"
+#include "base/casts.h"
+#include "base/utils.h"
+#include "riscv64/instruction_set_features_riscv64.h"
 #include "x86/instruction_set_features_x86.h"
 #include "x86_64/instruction_set_features_x86_64.h"
 
-namespace art {
+namespace art HIDDEN {
 
 std::unique_ptr<const InstructionSetFeatures> InstructionSetFeatures::FromVariant(
     InstructionSet isa, const std::string& variant, std::string* error_msg) {
@@ -41,6 +38,8 @@ std::unique_ptr<const InstructionSetFeatures> InstructionSetFeatures::FromVarian
       return ArmInstructionSetFeatures::FromVariant(variant, error_msg);
     case InstructionSet::kArm64:
       return Arm64InstructionSetFeatures::FromVariant(variant, error_msg);
+    case InstructionSet::kRiscv64:
+      return Riscv64InstructionSetFeatures::FromVariant(variant, error_msg);
     case InstructionSet::kX86:
       return X86InstructionSetFeatures::FromVariant(variant, error_msg);
     case InstructionSet::kX86_64:
@@ -53,6 +52,33 @@ std::unique_ptr<const InstructionSetFeatures> InstructionSetFeatures::FromVarian
   UNREACHABLE();
 }
 
+std::unique_ptr<const InstructionSetFeatures> InstructionSetFeatures::FromVariantAndHwcap(
+    InstructionSet isa, const std::string& variant, std::string* error_msg) {
+  auto variant_features = FromVariant(isa, variant, error_msg);
+  if (variant_features == nullptr) {
+    return nullptr;
+  }
+  // Pixel3a is wrongly reporting itself as cortex-a75, so validate the features
+  // with hwcaps.
+  // Note that when cross-compiling on device (using dex2oat32 for compiling
+  // arm64), the hwcaps will report that no feature is supported. This is
+  // currently our best approach to be safe/correct. Maybe using the
+  // cpu_features library could fix this issue.
+  if (isa == InstructionSet::kArm64) {
+    auto new_features = down_cast<const Arm64InstructionSetFeatures*>(variant_features.get())
+        ->IntersectWithHwcap();
+    if (!variant_features->Equals(new_features.get())) {
+      LOG(WARNING) << "Mismatch between instruction set variant of device ("
+            << *variant_features
+            << ") and features returned by the hardware (" << *new_features << ")";
+    }
+    return new_features;
+  } else {
+    // TODO: Implement this validation on all architectures.
+    return variant_features;
+  }
+}
+
 std::unique_ptr<const InstructionSetFeatures> InstructionSetFeatures::FromBitmap(InstructionSet isa,
                                                                                  uint32_t bitmap) {
   std::unique_ptr<const InstructionSetFeatures> result;
@@ -63,6 +89,9 @@ std::unique_ptr<const InstructionSetFeatures> InstructionSetFeatures::FromBitmap
       break;
     case InstructionSet::kArm64:
       result = Arm64InstructionSetFeatures::FromBitmap(bitmap);
+      break;
+    case InstructionSet::kRiscv64:
+      result = Riscv64InstructionSetFeatures::FromBitmap(bitmap);
       break;
     case InstructionSet::kX86:
       result = X86InstructionSetFeatures::FromBitmap(bitmap);
@@ -86,6 +115,8 @@ std::unique_ptr<const InstructionSetFeatures> InstructionSetFeatures::FromCppDef
       return ArmInstructionSetFeatures::FromCppDefines();
     case InstructionSet::kArm64:
       return Arm64InstructionSetFeatures::FromCppDefines();
+    case InstructionSet::kRiscv64:
+      return Riscv64InstructionSetFeatures::FromCppDefines();
     case InstructionSet::kX86:
       return X86InstructionSetFeatures::FromCppDefines();
     case InstructionSet::kX86_64:
@@ -116,6 +147,8 @@ std::unique_ptr<const InstructionSetFeatures> InstructionSetFeatures::FromCpuInf
       return ArmInstructionSetFeatures::FromCpuInfo();
     case InstructionSet::kArm64:
       return Arm64InstructionSetFeatures::FromCpuInfo();
+    case InstructionSet::kRiscv64:
+      return Riscv64InstructionSetFeatures::FromCpuInfo();
     case InstructionSet::kX86:
       return X86InstructionSetFeatures::FromCpuInfo();
     case InstructionSet::kX86_64:
@@ -135,6 +168,8 @@ std::unique_ptr<const InstructionSetFeatures> InstructionSetFeatures::FromHwcap(
       return ArmInstructionSetFeatures::FromHwcap();
     case InstructionSet::kArm64:
       return Arm64InstructionSetFeatures::FromHwcap();
+    case InstructionSet::kRiscv64:
+      return Riscv64InstructionSetFeatures::FromHwcap();
     case InstructionSet::kX86:
       return X86InstructionSetFeatures::FromHwcap();
     case InstructionSet::kX86_64:
@@ -154,10 +189,33 @@ std::unique_ptr<const InstructionSetFeatures> InstructionSetFeatures::FromAssemb
       return ArmInstructionSetFeatures::FromAssembly();
     case InstructionSet::kArm64:
       return Arm64InstructionSetFeatures::FromAssembly();
+    case InstructionSet::kRiscv64:
+      return Riscv64InstructionSetFeatures::FromAssembly();
     case InstructionSet::kX86:
       return X86InstructionSetFeatures::FromAssembly();
     case InstructionSet::kX86_64:
       return X86_64InstructionSetFeatures::FromAssembly();
+
+    default:
+      break;
+  }
+  UNIMPLEMENTED(FATAL) << kRuntimeISA;
+  UNREACHABLE();
+}
+
+std::unique_ptr<const InstructionSetFeatures> InstructionSetFeatures::FromCpuFeatures() {
+  switch (kRuntimeISA) {
+    case InstructionSet::kArm:
+    case InstructionSet::kThumb2:
+      return ArmInstructionSetFeatures::FromCpuFeatures();
+    case InstructionSet::kArm64:
+      return Arm64InstructionSetFeatures::FromCpuFeatures();
+    case InstructionSet::kRiscv64:
+      return Riscv64InstructionSetFeatures::FromCpuFeatures();
+    case InstructionSet::kX86:
+      return X86InstructionSetFeatures::FromCpuFeatures();
+    case InstructionSet::kX86_64:
+      return X86_64InstructionSetFeatures::FromCpuFeatures();
 
     default:
       break;
@@ -230,6 +288,12 @@ const Arm64InstructionSetFeatures* InstructionSetFeatures::AsArm64InstructionSet
   return down_cast<const Arm64InstructionSetFeatures*>(this);
 }
 
+const Riscv64InstructionSetFeatures* InstructionSetFeatures::AsRiscv64InstructionSetFeatures()
+    const {
+  DCHECK_EQ(InstructionSet::kRiscv64, GetInstructionSet());
+  return down_cast<const Riscv64InstructionSetFeatures*>(this);
+}
+
 const X86InstructionSetFeatures* InstructionSetFeatures::AsX86InstructionSetFeatures() const {
   DCHECK(InstructionSet::kX86 == GetInstructionSet() ||
          InstructionSet::kX86_64 == GetInstructionSet());
@@ -249,7 +313,7 @@ bool InstructionSetFeatures::FindVariantInArray(const char* const variants[], si
 }
 
 std::unique_ptr<const InstructionSetFeatures> InstructionSetFeatures::AddRuntimeDetectedFeatures(
-    const InstructionSetFeatures *features ATTRIBUTE_UNUSED) const {
+    [[maybe_unused]] const InstructionSetFeatures* features) const {
   UNIMPLEMENTED(FATAL) << kRuntimeISA;
   UNREACHABLE();
 }

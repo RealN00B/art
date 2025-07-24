@@ -20,10 +20,12 @@
 #include <string>
 #include <vector>
 
+#include "base/compiler_filter.h"
+#include "base/macros.h"
 #include "base/variant_map.h"
 #include "cmdline_types.h"
 
-namespace art {
+namespace art HIDDEN {
 
 enum class ProfileMethodsCheck : uint8_t;
 
@@ -40,7 +42,7 @@ struct CompilerOptionsMap : VariantMap<Base, KeyType> {
 #include "compiler_options_map.def"
 };
 
-#undef DECLARE_KEY
+#undef COMPILER_OPTIONS_KEY
 
 }  // namespace art
 

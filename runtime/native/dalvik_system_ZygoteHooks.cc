@@ -36,17 +36,18 @@
 #include "nativehelper/jni_macros.h"
 #include "nativehelper/scoped_utf_chars.h"
 #include "non_debuggable_classes.h"
-#include "oat_file.h"
-#include "oat_file_manager.h"
+#include "oat/oat_file.h"
+#include "oat/oat_file_manager.h"
 #include "scoped_thread_state_change-inl.h"
 #include "stack.h"
+#include "startup_completed_task.h"
 #include "thread-current-inl.h"
 #include "thread_list.h"
 #include "trace.h"
 
 #include <sys/resource.h>
 
-namespace art {
+namespace art HIDDEN {
 
 // Set to true to always determine the non-debuggable classes even if we would not allow a debugger
 // to actually attach.
@@ -144,7 +145,7 @@ enum {
   DEBUG_NATIVE_DEBUGGABLE             = 1 << 7,
   DEBUG_JAVA_DEBUGGABLE               = 1 << 8,
   DISABLE_VERIFIER                    = 1 << 9,
-  ONLY_USE_SYSTEM_OAT_FILES           = 1 << 10,
+  ONLY_USE_TRUSTED_OAT_FILES          = 1 << 10,  // Formerly ONLY_USE_SYSTEM_OAT_FILES
   DEBUG_GENERATE_MINI_DEBUG_INFO      = 1 << 11,
   HIDDEN_API_ENFORCEMENT_POLICY_MASK  = (1 << 12)
                                       | (1 << 13),
@@ -153,6 +154,7 @@ enum {
   USE_APP_IMAGE_STARTUP_CACHE         = 1 << 16,
   DEBUG_IGNORE_APP_SIGNAL_HANDLER     = 1 << 17,
   DISABLE_TEST_API_ENFORCEMENT_POLICY = 1 << 18,
+  PROFILEABLE                         = 1 << 24,
 
   // bits to shift (flags & HIDDEN_API_ENFORCEMENT_POLICY_MASK) by to get a value
   // corresponding to hiddenapi::EnforcementPolicy
@@ -166,8 +168,9 @@ static uint32_t EnableDebugFeatures(uint32_t runtime_flags) {
     if (!vm->IsCheckJniEnabled()) {
       LOG(INFO) << "Late-enabling -Xcheck:jni";
       vm->SetCheckJniEnabled(true);
-      // There's only one thread running at this point, so only one JNIEnv to fix up.
-      Thread::Current()->GetJniEnv()->SetCheckJniEnabled(true);
+      // This is the only thread that's running at this point and the above call sets
+      // the CheckJNI flag in the corresponding `JniEnvExt`.
+      DCHECK(Thread::Current()->GetJniEnv()->IsCheckJniEnabled());
     } else {
       LOG(INFO) << "Not late-enabling -Xcheck:jni (already on)";
     }
@@ -184,8 +187,8 @@ static uint32_t EnableDebugFeatures(uint32_t runtime_flags) {
 
   const bool safe_mode = (runtime_flags & DEBUG_ENABLE_SAFEMODE) != 0;
   if (safe_mode) {
-    // Only quicken oat files.
-    runtime->AddCompilerOption("--compiler-filter=quicken");
+    // Only verify oat files.
+    runtime->AddCompilerOption("--compiler-filter=verify");
     runtime->SetSafeMode(true);
     runtime_flags &= ~DEBUG_ENABLE_SAFEMODE;
   }
@@ -196,9 +199,7 @@ static uint32_t EnableDebugFeatures(uint32_t runtime_flags) {
   if ((runtime_flags & DEBUG_ALWAYS_JIT) != 0) {
     jit::JitOptions* jit_options = runtime->GetJITOptions();
     CHECK(jit_options != nullptr);
-    Runtime::Current()->DoAndMaybeSwitchInterpreter([=]() {
-        jit_options->SetJitAtFirstUse();
-    });
+    jit_options->SetJitAtFirstUse();
     runtime_flags &= ~DEBUG_ALWAYS_JIT;
   }
 
@@ -206,7 +207,7 @@ static uint32_t EnableDebugFeatures(uint32_t runtime_flags) {
   if ((runtime_flags & DEBUG_JAVA_DEBUGGABLE) != 0) {
     runtime->AddCompilerOption("--debuggable");
     runtime_flags |= DEBUG_GENERATE_MINI_DEBUG_INFO;
-    runtime->SetJavaDebuggable(true);
+    runtime->SetRuntimeDebugState(Runtime::RuntimeDebugState::kJavaDebuggableAtInit);
     {
       // Deoptimize the boot image as it may be non-debuggable.
       ScopedSuspendAll ssa(__FUNCTION__);
@@ -245,6 +246,8 @@ static uint32_t EnableDebugFeatures(uint32_t runtime_flags) {
 
   runtime->SetProfileableFromShell((runtime_flags & PROFILE_FROM_SHELL) != 0);
   runtime_flags &= ~PROFILE_FROM_SHELL;
+  runtime->SetProfileable((runtime_flags & PROFILEABLE) != 0);
+  runtime_flags &= ~PROFILEABLE;
 
   return runtime_flags;
 }
@@ -256,16 +259,19 @@ static jlong ZygoteHooks_nativePreFork(JNIEnv* env, jclass) {
   runtime->PreZygoteFork();
 
   // Grab thread before fork potentially makes Thread::pthread_key_self_ unusable.
-  return reinterpret_cast<jlong>(ThreadForEnv(env));
+  return reinterpret_cast<jlong>(Thread::ForEnv(env));
 }
 
 static void ZygoteHooks_nativePostZygoteFork(JNIEnv*, jclass) {
   Runtime::Current()->PostZygoteFork();
 }
 
-static void ZygoteHooks_nativePostForkSystemServer(JNIEnv* env ATTRIBUTE_UNUSED,
-                                                   jclass klass ATTRIBUTE_UNUSED,
+static void ZygoteHooks_nativePostForkSystemServer([[maybe_unused]] JNIEnv* env,
+                                                   [[maybe_unused]] jclass klass,
                                                    jint runtime_flags) {
+  // Reload the current flags first. In case we need to take actions based on them.
+  Runtime::Current()->ReloadAllFlags(__FUNCTION__);
+
   // Set the runtime state as the first thing, in case JIT and other services
   // start querying it.
   Runtime::Current()->SetAsSystemServer();
@@ -293,7 +299,9 @@ static void ZygoteHooks_nativePostForkChild(JNIEnv* env,
                                             jboolean is_zygote,
                                             jstring instruction_set) {
   DCHECK(!(is_system_server && is_zygote));
-  // Set the runtime state as the first thing, in case JIT and other services
+  // Reload the current flags first. In case we need to take any updated actions.
+  Runtime::Current()->ReloadAllFlags(__FUNCTION__);
+  // Then, set the runtime state, in case JIT and other services
   // start querying it.
   Runtime::Current()->SetAsZygoteChild(is_system_server, is_zygote);
 
@@ -310,10 +318,10 @@ static void ZygoteHooks_nativePostForkChild(JNIEnv* env,
     runtime_flags &= ~DISABLE_VERIFIER;
   }
 
-  if ((runtime_flags & ONLY_USE_SYSTEM_OAT_FILES) != 0 || is_system_server) {
-    runtime->GetOatFileManager().SetOnlyUseSystemOatFiles();
-    runtime_flags &= ~ONLY_USE_SYSTEM_OAT_FILES;
+  if ((runtime_flags & ONLY_USE_TRUSTED_OAT_FILES) == 0 && !is_system_server) {
+    runtime->GetOatFileManager().ClearOnlyUseTrustedOatFiles();
   }
+  runtime_flags &= ~ONLY_USE_TRUSTED_OAT_FILES;
 
   api_enforcement_policy = hiddenapi::EnforcementPolicyFromInt(
       (runtime_flags & HIDDEN_API_ENFORCEMENT_POLICY_MASK) >> API_ENFORCEMENT_POLICY_SHIFT);
@@ -338,6 +346,14 @@ static void ZygoteHooks_nativePostForkChild(JNIEnv* env,
   }
 
   runtime->GetHeap()->PostForkChildAction(thread);
+
+  if (!is_zygote) {
+    // Setup an app startup complete task in case the app doesn't notify it
+    // through VMRuntime::notifyStartupCompleted.
+    static constexpr uint64_t kMaxAppStartupTimeNs = MsToNs(5000);  // 5 seconds
+    runtime->GetHeap()->AddHeapTask(new StartupCompletedTask(NanoTime() + kMaxAppStartupTimeNs));
+  }
+
   if (runtime->GetJit() != nullptr) {
     if (!is_system_server) {
       // System server already called the JIT cache post fork action in `nativePostForkSystemServer`.
@@ -350,16 +366,18 @@ static void ZygoteHooks_nativePostForkChild(JNIEnv* env,
 
   // Update tracing.
   if (Trace::GetMethodTracingMode() != TracingMode::kTracingInactive) {
-    Trace::TraceOutputMode output_mode = Trace::GetOutputMode();
+    TraceOutputMode output_mode = Trace::GetOutputMode();
     Trace::TraceMode trace_mode = Trace::GetMode();
     size_t buffer_size = Trace::GetBufferSize();
+    int flags = Trace::GetFlags();
+    int interval = Trace::GetIntervalInMillis();
 
     // Just drop it.
     Trace::Abort();
 
     // Only restart if it was streaming mode.
     // TODO: Expose buffer size, so we can also do file mode.
-    if (output_mode == Trace::TraceOutputMode::kStreaming) {
+    if (output_mode == TraceOutputMode::kStreaming) {
       static constexpr size_t kMaxProcessNameLength = 100;
       char name_buf[kMaxProcessNameLength] = {};
       int rc = pthread_getname_np(pthread_self(), name_buf, kMaxProcessNameLength);
@@ -376,13 +394,14 @@ static void ZygoteHooks_nativePostForkChild(JNIEnv* env,
         proc_name = StringPrintf("%u", static_cast<uint32_t>(pid));
       }
 
-      std::string trace_file = StringPrintf("/data/misc/trace/%s.trace.bin", proc_name.c_str());
+      const char* path = kIsTargetBuild ? "/data/misc/trace" : "/tmp";
+      std::string trace_file = StringPrintf("%s/%s.trace.bin", path, proc_name.c_str());
       Trace::Start(trace_file.c_str(),
                    buffer_size,
-                   0,   // TODO: Expose flags.
+                   flags,
                    output_mode,
                    trace_mode,
-                   0);  // TODO: Expose interval.
+                   interval);
       if (thread->IsExceptionPending()) {
         ScopedObjectAccess soa(env);
         thread->ClearException();
@@ -424,14 +443,27 @@ static void ZygoteHooks_nativePostForkChild(JNIEnv* env,
   }
 }
 
-static void ZygoteHooks_startZygoteNoThreadCreation(JNIEnv* env ATTRIBUTE_UNUSED,
-                                                    jclass klass ATTRIBUTE_UNUSED) {
+static void ZygoteHooks_startZygoteNoThreadCreation([[maybe_unused]] JNIEnv* env,
+                                                    [[maybe_unused]] jclass klass) {
   Runtime::Current()->SetZygoteNoThreadSection(true);
 }
 
-static void ZygoteHooks_stopZygoteNoThreadCreation(JNIEnv* env ATTRIBUTE_UNUSED,
-                                                   jclass klass ATTRIBUTE_UNUSED) {
+static void ZygoteHooks_stopZygoteNoThreadCreation([[maybe_unused]] JNIEnv* env,
+                                                   [[maybe_unused]] jclass klass) {
   Runtime::Current()->SetZygoteNoThreadSection(false);
+}
+
+static jboolean ZygoteHooks_nativeZygoteLongSuspendOk([[maybe_unused]] JNIEnv* env,
+                                                      [[maybe_unused]] jclass klass) {
+  // Indefinite thread suspensions are not OK if we're supposed to be JIT-compiling for other
+  // processes.  We only care about JIT compilation that affects other processes.  The zygote
+  // itself doesn't run appreciable amounts of Java code when running single-threaded, so
+  // suspending the JIT in non-jit-zygote mode is OK.
+  // TODO: Make this potentially return true once we're done with JIT compilation in JIT Zygote.
+  // Only called in zygote. Thus static is OK here.
+  static bool isJitZygote = jit::Jit::InZygoteUsingJit();
+  static bool explicitlyDisabled = Runtime::Current()->IsJavaZygoteForkLoopRequired();
+  return (isJitZygote || explicitlyDisabled) ? JNI_FALSE : JNI_TRUE;
 }
 
 static JNINativeMethod gMethods[] = {
@@ -439,6 +471,7 @@ static JNINativeMethod gMethods[] = {
   NATIVE_METHOD(ZygoteHooks, nativePostZygoteFork, "()V"),
   NATIVE_METHOD(ZygoteHooks, nativePostForkSystemServer, "(I)V"),
   NATIVE_METHOD(ZygoteHooks, nativePostForkChild, "(JIZZLjava/lang/String;)V"),
+  NATIVE_METHOD(ZygoteHooks, nativeZygoteLongSuspendOk, "()Z"),
   NATIVE_METHOD(ZygoteHooks, startZygoteNoThreadCreation, "()V"),
   NATIVE_METHOD(ZygoteHooks, stopZygoteNoThreadCreation, "()V"),
 };

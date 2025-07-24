@@ -17,12 +17,13 @@
 #include "induction_var_range.h"
 
 #include "base/arena_allocator.h"
+#include "base/macros.h"
 #include "builder.h"
 #include "induction_var_analysis.h"
 #include "nodes.h"
 #include "optimizing_unit_test.h"
 
-namespace art {
+namespace art HIDDEN {
 
 using Value = InductionVarRange::Value;
 
@@ -32,10 +33,10 @@ using Value = InductionVarRange::Value;
 class InductionVarRangeTest : public OptimizingUnitTest {
  public:
   InductionVarRangeTest()
-      : graph_(CreateGraph()),
-        iva_(new (GetAllocator()) HInductionVarAnalysis(graph_)),
+      : iva_(new (GetAllocator()) HInductionVarAnalysis(BuildGraph())),
         range_(iva_) {
-    BuildGraph();
+    // Set arbitrary range analysis hint while testing private methods.
+    SetHint(x_);
   }
 
   ~InductionVarRangeTest() { }
@@ -57,65 +58,27 @@ class InductionVarRangeTest : public OptimizingUnitTest {
   //
 
   /** Constructs bare minimum graph. */
-  void BuildGraph() {
+  HGraph* BuildGraph() {
+    return_block_ = InitEntryMainExitGraphWithReturnVoid();
     graph_->SetNumberOfVRegs(1);
-    entry_block_ = new (GetAllocator()) HBasicBlock(graph_);
-    exit_block_ = new (GetAllocator()) HBasicBlock(graph_);
-    graph_->AddBlock(entry_block_);
-    graph_->AddBlock(exit_block_);
-    graph_->SetEntryBlock(entry_block_);
-    graph_->SetExitBlock(exit_block_);
     // Two parameters.
-    x_ = new (GetAllocator()) HParameterValue(graph_->GetDexFile(),
-                                              dex::TypeIndex(0),
-                                              0,
-                                              DataType::Type::kInt32);
-    entry_block_->AddInstruction(x_);
-    y_ = new (GetAllocator()) HParameterValue(graph_->GetDexFile(),
-                                              dex::TypeIndex(0),
-                                              0,
-                                              DataType::Type::kInt32);
-    entry_block_->AddInstruction(y_);
-    // Set arbitrary range analysis hint while testing private methods.
-    SetHint(x_);
+    x_ = MakeParam(DataType::Type::kInt32);
+    y_ = MakeParam(DataType::Type::kInt32);
+    return graph_;
   }
 
   /** Constructs loop with given upper bound. */
   void BuildLoop(int32_t lower, HInstruction* upper, int32_t stride) {
     // Control flow.
-    loop_preheader_ = new (GetAllocator()) HBasicBlock(graph_);
-    graph_->AddBlock(loop_preheader_);
-    loop_header_ = new (GetAllocator()) HBasicBlock(graph_);
-    graph_->AddBlock(loop_header_);
-    loop_body_ = new (GetAllocator()) HBasicBlock(graph_);
-    graph_->AddBlock(loop_body_);
-    HBasicBlock* return_block = new (GetAllocator()) HBasicBlock(graph_);
-    graph_->AddBlock(return_block);
-    entry_block_->AddSuccessor(loop_preheader_);
-    loop_preheader_->AddSuccessor(loop_header_);
-    loop_header_->AddSuccessor(loop_body_);
-    loop_header_->AddSuccessor(return_block);
-    loop_body_->AddSuccessor(loop_header_);
-    return_block->AddSuccessor(exit_block_);
+    std::tie(loop_preheader_, loop_header_, loop_body_) = CreateWhileLoop(return_block_);
+    loop_header_->SwapSuccessors();  // Move the loop exit to the "else" successor.
     // Instructions.
-    loop_preheader_->AddInstruction(new (GetAllocator()) HGoto());
-    HPhi* phi = new (GetAllocator()) HPhi(GetAllocator(), 0, 0, DataType::Type::kInt32);
-    loop_header_->AddPhi(phi);
-    phi->AddInput(graph_->GetIntConstant(lower));  // i = l
-    if (stride > 0) {
-      condition_ = new (GetAllocator()) HLessThan(phi, upper);  // i < u
-    } else {
-      condition_ = new (GetAllocator()) HGreaterThan(phi, upper);  // i > u
-    }
-    loop_header_->AddInstruction(condition_);
-    loop_header_->AddInstruction(new (GetAllocator()) HIf(condition_));
-    increment_ =
-        new (GetAllocator()) HAdd(DataType::Type::kInt32, phi, graph_->GetIntConstant(stride));
-    loop_body_->AddInstruction(increment_);  // i += s
-    phi->AddInput(increment_);
-    loop_body_->AddInstruction(new (GetAllocator()) HGoto());
-    return_block->AddInstruction(new (GetAllocator()) HReturnVoid());
-    exit_block_->AddInstruction(new (GetAllocator()) HExit());
+    HInstruction* lower_const = graph_->GetIntConstant(lower);
+    HPhi* phi;
+    std::tie(phi, increment_) = MakeLinearLoopVar(loop_header_, loop_body_, lower, stride);
+    IfCondition cond = (stride > 0) ? kCondLT : kCondGT;
+    condition_ = MakeCondition(loop_header_, cond, phi, upper);  // i < u or i > u
+    MakeIf(loop_header_, condition_);
   }
 
   /** Constructs SSA and performs induction variable analysis. */
@@ -145,7 +108,10 @@ class InductionVarRangeTest : public OptimizingUnitTest {
       case '<': op = HInductionVarAnalysis::kLT;  break;
       default:  op = HInductionVarAnalysis::kNop; break;
     }
-    return iva_->CreateInvariantOp(op, a, b);
+    // Use bogus loop information and context out of the bogus loop.
+    HLoopInformation loop(exit_block_, graph_);
+    HBasicBlock* context = entry_block_;
+    return iva_->CreateInvariantOp(context, &loop, op, a, b);
   }
 
   /** Constructs a fetch. */
@@ -238,8 +204,11 @@ class InductionVarRangeTest : public OptimizingUnitTest {
   //
 
   bool NeedsTripCount(HInductionVarAnalysis::InductionInfo* info) {
+    // Use bogus loop information and context out of the bogus loop.
+    HLoopInformation loop(exit_block_, graph_);
+    HBasicBlock* context = entry_block_;
     int64_t s = 0;
-    return range_.NeedsTripCount(info, &s);
+    return range_.NeedsTripCount(context, &loop, info, &s);
   }
 
   bool IsBodyTripCount(HInductionVarAnalysis::InductionInfo* trip) {
@@ -252,46 +221,87 @@ class InductionVarRangeTest : public OptimizingUnitTest {
 
   Value GetMin(HInductionVarAnalysis::InductionInfo* info,
                HInductionVarAnalysis::InductionInfo* trip) {
-    return range_.GetVal(info, trip, /* in_body= */ true, /* is_min= */ true);
+    // Use bogus loop information and context out of the bogus loop.
+    HLoopInformation loop(exit_block_, graph_);
+    HBasicBlock* context = entry_block_;
+    return GetMin(context, &loop, info, trip);
+  }
+
+  Value GetMin(HBasicBlock* context,
+               HLoopInformation* loop,
+               HInductionVarAnalysis::InductionInfo* info,
+               HInductionVarAnalysis::InductionInfo* trip) {
+    return range_.GetVal(context, loop, info, trip, /*is_min=*/ true);
   }
 
   Value GetMax(HInductionVarAnalysis::InductionInfo* info,
                HInductionVarAnalysis::InductionInfo* trip) {
-    return range_.GetVal(info, trip, /* in_body= */ true, /* is_min= */ false);
+    // Use bogus loop information and context out of the bogus loop.
+    HLoopInformation loop(exit_block_, graph_);
+    HBasicBlock* context = entry_block_;
+    return GetMax(context, &loop, info, trip);
+  }
+
+  Value GetMax(HBasicBlock* context,
+               HLoopInformation* loop,
+               HInductionVarAnalysis::InductionInfo* info,
+               HInductionVarAnalysis::InductionInfo* trip) {
+    return range_.GetVal(context, loop, info, trip, /*is_min=*/ false);
   }
 
   Value GetMul(HInductionVarAnalysis::InductionInfo* info1,
                HInductionVarAnalysis::InductionInfo* info2,
                bool is_min) {
-    return range_.GetMul(info1, info2, nullptr, /* in_body= */ true, is_min);
+    // Use bogus loop information and context out of the bogus loop.
+    HLoopInformation loop(exit_block_, graph_);
+    HBasicBlock* context = entry_block_;
+    return range_.GetMul(context, &loop, info1, info2, nullptr, is_min);
   }
 
   Value GetDiv(HInductionVarAnalysis::InductionInfo* info1,
                HInductionVarAnalysis::InductionInfo* info2,
                bool is_min) {
-    return range_.GetDiv(info1, info2, nullptr, /* in_body= */ true, is_min);
+    // Use bogus loop information and context out of the bogus loop.
+    HLoopInformation loop(exit_block_, graph_);
+    HBasicBlock* context = entry_block_;
+    return range_.GetDiv(context, &loop, info1, info2, nullptr, is_min);
   }
 
   Value GetRem(HInductionVarAnalysis::InductionInfo* info1,
                HInductionVarAnalysis::InductionInfo* info2) {
-    return range_.GetRem(info1, info2);
+    // Use bogus loop information and context out of the bogus loop.
+    HLoopInformation loop(exit_block_, graph_);
+    HBasicBlock* context = entry_block_;
+    return range_.GetRem(context, &loop, info1, info2);
   }
 
   Value GetXor(HInductionVarAnalysis::InductionInfo* info1,
                HInductionVarAnalysis::InductionInfo* info2) {
-    return range_.GetXor(info1, info2);
+    // Use bogus loop information and context out of the bogus loop.
+    HLoopInformation loop(exit_block_, graph_);
+    HBasicBlock* context = entry_block_;
+    return range_.GetXor(context, &loop, info1, info2);
   }
 
   bool IsExact(HInductionVarAnalysis::InductionInfo* info, int64_t* value) {
-    return range_.IsConstant(info, InductionVarRange::kExact, value);
+    // Use bogus loop information and context out of the bogus loop.
+    HLoopInformation loop(exit_block_, graph_);
+    HBasicBlock* context = entry_block_;
+    return range_.IsConstant(context, &loop, info, InductionVarRange::kExact, value);
   }
 
   bool IsAtMost(HInductionVarAnalysis::InductionInfo* info, int64_t* value) {
-    return range_.IsConstant(info, InductionVarRange::kAtMost, value);
+    // Use bogus loop information and context out of the bogus loop.
+    HLoopInformation loop(exit_block_, graph_);
+    HBasicBlock* context = entry_block_;
+    return range_.IsConstant(context, &loop, info, InductionVarRange::kAtMost, value);
   }
 
   bool IsAtLeast(HInductionVarAnalysis::InductionInfo* info, int64_t* value) {
-    return range_.IsConstant(info, InductionVarRange::kAtLeast, value);
+    // Use bogus loop information and context out of the bogus loop.
+    HLoopInformation loop(exit_block_, graph_);
+    HBasicBlock* context = entry_block_;
+    return range_.IsConstant(context, &loop, info, InductionVarRange::kAtLeast, value);
   }
 
   Value AddValue(Value v1, Value v2) { return range_.AddValue(v1, v2); }
@@ -302,9 +312,7 @@ class InductionVarRangeTest : public OptimizingUnitTest {
   Value MaxValue(Value v1, Value v2) { return range_.MergeVal(v1, v2, false); }
 
   // General building fields.
-  HGraph* graph_;
-  HBasicBlock* entry_block_;
-  HBasicBlock* exit_block_;
+  HBasicBlock* return_block_;
   HBasicBlock* loop_preheader_;
   HBasicBlock* loop_header_;
   HBasicBlock* loop_body_;
@@ -447,10 +455,44 @@ TEST_F(InductionVarRangeTest, GetMinMaxFetch) {
 }
 
 TEST_F(InductionVarRangeTest, GetMinMaxLinear) {
-  ExpectEqual(Value(20), GetMin(CreateLinear(10, 20), CreateTripCount(100, true, true)));
-  ExpectEqual(Value(1010), GetMax(CreateLinear(10, 20), CreateTripCount(100, true, true)));
-  ExpectEqual(Value(-970), GetMin(CreateLinear(-10, 20), CreateTripCount(100, true, true)));
-  ExpectEqual(Value(20), GetMax(CreateLinear(-10, 20), CreateTripCount(100, true, true)));
+  BuildLoop(0, graph_->GetIntConstant(100), 1);
+  PerformInductionVarAnalysis();
+  HLoopInformation* loop = loop_header_->GetLoopInformation();
+  ASSERT_TRUE(loop != nullptr);
+
+  ExpectEqual(Value(20),
+              GetMin(loop_header_, loop, CreateLinear(10, 20), CreateTripCount(100, true, true)));
+  ExpectEqual(Value(1020),
+              GetMax(loop_header_, loop, CreateLinear(10, 20), CreateTripCount(100, true, true)));
+  ExpectEqual(Value(20),
+              GetMin(loop_body_, loop, CreateLinear(10, 20), CreateTripCount(100, true, true)));
+  ExpectEqual(Value(1010),
+              GetMax(loop_body_, loop, CreateLinear(10, 20), CreateTripCount(100, true, true)));
+  ExpectEqual(Value(1020),
+              GetMin(exit_block_, loop, CreateLinear(10, 20), CreateTripCount(100, true, true)));
+  ExpectEqual(Value(1020),
+              GetMax(exit_block_, loop, CreateLinear(10, 20), CreateTripCount(100, true, true)));
+  ExpectEqual(Value(20),
+              GetMin(entry_block_, loop, CreateLinear(10, 20), CreateTripCount(100, true, true)));
+  ExpectEqual(Value(),
+              GetMax(entry_block_, loop, CreateLinear(10, 20), CreateTripCount(100, true, true)));
+
+  ExpectEqual(Value(-980),
+              GetMin(loop_header_, loop, CreateLinear(-10, 20), CreateTripCount(100, true, true)));
+  ExpectEqual(Value(20),
+              GetMax(loop_header_, loop, CreateLinear(-10, 20), CreateTripCount(100, true, true)));
+  ExpectEqual(Value(-970),
+              GetMin(loop_body_, loop, CreateLinear(-10, 20), CreateTripCount(100, true, true)));
+  ExpectEqual(Value(20),
+              GetMax(loop_body_, loop, CreateLinear(-10, 20), CreateTripCount(100, true, true)));
+  ExpectEqual(Value(-980),
+              GetMin(exit_block_, loop, CreateLinear(-10, 20), CreateTripCount(100, true, true)));
+  ExpectEqual(Value(-980),
+              GetMax(exit_block_, loop, CreateLinear(-10, 20), CreateTripCount(100, true, true)));
+  ExpectEqual(Value(),
+              GetMin(entry_block_, loop, CreateLinear(-10, 20), CreateTripCount(100, true, true)));
+  ExpectEqual(Value(20),
+              GetMax(entry_block_, loop, CreateLinear(-10, 20), CreateTripCount(100, true, true)));
 }
 
 TEST_F(InductionVarRangeTest, GetMinMaxWrapAround) {
@@ -463,24 +505,163 @@ TEST_F(InductionVarRangeTest, GetMinMaxWrapAround) {
 }
 
 TEST_F(InductionVarRangeTest, GetMinMaxPolynomial) {
-  ExpectEqual(Value(7), GetMin(CreatePolynomial(3, 5, 7), nullptr));
+  BuildLoop(0, graph_->GetIntConstant(100), 1);
+  PerformInductionVarAnalysis();
+  HLoopInformation* loop = loop_header_->GetLoopInformation();
+  ASSERT_TRUE(loop != nullptr);
+
+  ExpectEqual(Value(), GetMin(CreatePolynomial(3, 5, 7), nullptr));
   ExpectEqual(Value(), GetMax(CreatePolynomial(3, 5, 7), nullptr));
-  ExpectEqual(Value(7), GetMin(CreatePolynomial(3, 5, 7), CreateTripCount(5, true, true)));
-  ExpectEqual(Value(45), GetMax(CreatePolynomial(3, 5, 7), CreateTripCount(5, true, true)));
-  ExpectEqual(Value(7), GetMin(CreatePolynomial(3, 5, 7), CreateTripCount(10, true, true)));
-  ExpectEqual(Value(160), GetMax(CreatePolynomial(3, 5, 7), CreateTripCount(10, true, true)));
-  ExpectEqual(Value(-7), GetMin(CreatePolynomial(11, 13, -7),
-                               CreateTripCount(5, true, true)));
-  ExpectEqual(Value(111), GetMax(CreatePolynomial(11, 13, -7),
-                                 CreateTripCount(5, true, true)));
-  ExpectEqual(Value(-7), GetMin(CreatePolynomial(11, 13, -7),
-                               CreateTripCount(10, true, true)));
-  ExpectEqual(Value(506), GetMax(CreatePolynomial(11, 13, -7),
-                                 CreateTripCount(10, true, true)));
-  ExpectEqual(Value(), GetMin(CreatePolynomial(-3, 5, 7), CreateTripCount(10, true, true)));
-  ExpectEqual(Value(), GetMax(CreatePolynomial(-3, 5, 7), CreateTripCount(10, true, true)));
-  ExpectEqual(Value(), GetMin(CreatePolynomial(3, -5, 7), CreateTripCount(10, true, true)));
-  ExpectEqual(Value(), GetMax(CreatePolynomial(3, -5, 7), CreateTripCount(10, true, true)));
+
+  ExpectEqual(
+      Value(7),
+      GetMin(loop_header_, loop, CreatePolynomial(3, 5, 7), CreateTripCount(5, true, true)));
+  ExpectEqual(
+      Value(62),
+      GetMax(loop_header_, loop, CreatePolynomial(3, 5, 7), CreateTripCount(5, true, true)));
+  ExpectEqual(
+      Value(7),
+      GetMin(loop_body_, loop, CreatePolynomial(3, 5, 7), CreateTripCount(5, true, true)));
+  ExpectEqual(
+      Value(45),
+      GetMax(loop_body_, loop, CreatePolynomial(3, 5, 7), CreateTripCount(5, true, true)));
+  ExpectEqual(
+      Value(62),
+      GetMin(exit_block_, loop, CreatePolynomial(3, 5, 7), CreateTripCount(5, true, true)));
+  ExpectEqual(
+      Value(62),
+      GetMax(exit_block_, loop, CreatePolynomial(3, 5, 7), CreateTripCount(5, true, true)));
+  ExpectEqual(
+      Value(7),
+      GetMin(entry_block_, loop, CreatePolynomial(3, 5, 7), CreateTripCount(5, true, true)));
+  ExpectEqual(
+      Value(),
+      GetMax(entry_block_, loop, CreatePolynomial(3, 5, 7), CreateTripCount(5, true, true)));
+
+  ExpectEqual(
+      Value(7),
+      GetMin(loop_header_, loop, CreatePolynomial(3, 5, 7), CreateTripCount(10, true, true)));
+  ExpectEqual(
+      Value(192),
+      GetMax(loop_header_, loop, CreatePolynomial(3, 5, 7), CreateTripCount(10, true, true)));
+  ExpectEqual(
+      Value(7),
+      GetMin(loop_body_, loop, CreatePolynomial(3, 5, 7), CreateTripCount(10, true, true)));
+  ExpectEqual(
+      Value(160),
+      GetMax(loop_body_, loop, CreatePolynomial(3, 5, 7), CreateTripCount(10, true, true)));
+  ExpectEqual(
+      Value(192),
+      GetMin(exit_block_, loop, CreatePolynomial(3, 5, 7), CreateTripCount(10, true, true)));
+  ExpectEqual(
+      Value(192),
+      GetMax(exit_block_, loop, CreatePolynomial(3, 5, 7), CreateTripCount(10, true, true)));
+  ExpectEqual(
+      Value(7),
+      GetMin(entry_block_, loop, CreatePolynomial(3, 5, 7), CreateTripCount(10, true, true)));
+  ExpectEqual(
+      Value(),
+      GetMax(entry_block_, loop, CreatePolynomial(3, 5, 7), CreateTripCount(10, true, true)));
+
+  ExpectEqual(
+      Value(-7),
+      GetMin(loop_header_, loop, CreatePolynomial(11, 13, -7), CreateTripCount(5, true, true)));
+  ExpectEqual(
+      Value(168),
+      GetMax(loop_header_, loop, CreatePolynomial(11, 13, -7), CreateTripCount(5, true, true)));
+  ExpectEqual(
+      Value(-7),
+      GetMin(loop_body_, loop, CreatePolynomial(11, 13, -7), CreateTripCount(5, true, true)));
+  ExpectEqual(
+      Value(111),
+      GetMax(loop_body_, loop, CreatePolynomial(11, 13, -7), CreateTripCount(5, true, true)));
+  ExpectEqual(
+      Value(168),
+      GetMin(exit_block_, loop, CreatePolynomial(11, 13, -7), CreateTripCount(5, true, true)));
+  ExpectEqual(
+      Value(168),
+      GetMax(exit_block_, loop, CreatePolynomial(11, 13, -7), CreateTripCount(5, true, true)));
+  ExpectEqual(
+      Value(-7),
+      GetMin(entry_block_, loop, CreatePolynomial(11, 13, -7), CreateTripCount(5, true, true)));
+  ExpectEqual(
+      Value(),
+      GetMax(entry_block_, loop, CreatePolynomial(11, 13, -7), CreateTripCount(5, true, true)));
+
+  ExpectEqual(
+      Value(-7),
+      GetMin(loop_header_, loop, CreatePolynomial(11, 13, -7), CreateTripCount(10, true, true)));
+  ExpectEqual(
+      Value(618),
+      GetMax(loop_header_, loop, CreatePolynomial(11, 13, -7), CreateTripCount(10, true, true)));
+  ExpectEqual(
+      Value(-7),
+      GetMin(loop_body_, loop, CreatePolynomial(11, 13, -7), CreateTripCount(10, true, true)));
+  ExpectEqual(
+      Value(506),
+      GetMax(loop_body_, loop, CreatePolynomial(11, 13, -7), CreateTripCount(10, true, true)));
+  ExpectEqual(
+      Value(618),
+      GetMin(exit_block_, loop, CreatePolynomial(11, 13, -7), CreateTripCount(10, true, true)));
+  ExpectEqual(
+      Value(618),
+      GetMax(exit_block_, loop, CreatePolynomial(11, 13, -7), CreateTripCount(10, true, true)));
+  ExpectEqual(
+      Value(-7),
+      GetMin(entry_block_, loop, CreatePolynomial(11, 13, -7), CreateTripCount(10, true, true)));
+  ExpectEqual(
+      Value(),
+      GetMax(entry_block_, loop, CreatePolynomial(11, 13, -7), CreateTripCount(10, true, true)));
+
+  ExpectEqual(
+      Value(),
+      GetMin(loop_header_, loop, CreatePolynomial(-3, 5, 7), CreateTripCount(10, true, true)));
+  ExpectEqual(
+      Value(),
+      GetMax(loop_header_, loop, CreatePolynomial(-3, 5, 7), CreateTripCount(10, true, true)));
+  ExpectEqual(
+      Value(),
+      GetMin(loop_body_, loop, CreatePolynomial(-3, 5, 7), CreateTripCount(10, true, true)));
+  ExpectEqual(
+      Value(),
+      GetMax(loop_body_, loop, CreatePolynomial(-3, 5, 7), CreateTripCount(10, true, true)));
+  ExpectEqual(
+      Value(),
+      GetMin(exit_block_, loop, CreatePolynomial(-3, 5, 7), CreateTripCount(10, true, true)));
+  ExpectEqual(
+      Value(),
+      GetMax(exit_block_, loop, CreatePolynomial(-3, 5, 7), CreateTripCount(10, true, true)));
+  ExpectEqual(
+      Value(),
+      GetMin(entry_block_, loop, CreatePolynomial(-3, 5, 7), CreateTripCount(10, true, true)));
+  ExpectEqual(
+      Value(),
+      GetMax(entry_block_, loop, CreatePolynomial(-3, 5, 7), CreateTripCount(10, true, true)));
+
+  ExpectEqual(
+      Value(),
+      GetMin(loop_header_, loop, CreatePolynomial(3, -5, 7), CreateTripCount(10, true, true)));
+  ExpectEqual(
+      Value(),
+      GetMax(loop_header_, loop, CreatePolynomial(3, -5, 7), CreateTripCount(10, true, true)));
+  ExpectEqual(
+      Value(),
+      GetMin(loop_body_, loop, CreatePolynomial(3, -5, 7), CreateTripCount(10, true, true)));
+  ExpectEqual(
+      Value(),
+      GetMax(loop_body_, loop, CreatePolynomial(3, -5, 7), CreateTripCount(10, true, true)));
+  ExpectEqual(
+      Value(),
+      GetMin(exit_block_, loop, CreatePolynomial(3, -5, 7), CreateTripCount(10, true, true)));
+  ExpectEqual(
+      Value(),
+      GetMax(exit_block_, loop, CreatePolynomial(3, -5, 7), CreateTripCount(10, true, true)));
+  ExpectEqual(
+      Value(),
+      GetMin(entry_block_, loop, CreatePolynomial(3, -5, 7), CreateTripCount(10, true, true)));
+  ExpectEqual(
+      Value(),
+      GetMax(entry_block_, loop, CreatePolynomial(3, -5, 7), CreateTripCount(10, true, true)));
 }
 
 TEST_F(InductionVarRangeTest, GetMinMaxGeometricMul) {
@@ -701,14 +882,8 @@ TEST_F(InductionVarRangeTest, MaxValue) {
 
 TEST_F(InductionVarRangeTest, ArrayLengthAndHints) {
   // We pass a bogus constant for the class to avoid mocking one.
-  HInstruction* new_array = new (GetAllocator()) HNewArray(
-      /* cls= */ x_,
-      /* length= */ x_,
-      /* dex_pc= */ 0,
-      /* component_size_shift= */ 0);
-  entry_block_->AddInstruction(new_array);
-  HInstruction* array_length = new (GetAllocator()) HArrayLength(new_array, 0);
-  entry_block_->AddInstruction(array_length);
+  HInstruction* new_array = MakeNewArray(entry_block_, /* cls= */ x_, /* length= */ x_);
+  HInstruction* array_length = MakeArrayLength(entry_block_, new_array);
   // With null hint: yields extreme constants.
   const int32_t max_value = std::numeric_limits<int32_t>::max();
   SetHint(nullptr);
@@ -725,18 +900,12 @@ TEST_F(InductionVarRangeTest, ArrayLengthAndHints) {
 }
 
 TEST_F(InductionVarRangeTest, AddOrSubAndConstant) {
-  HInstruction* add = new (GetAllocator())
-      HAdd(DataType::Type::kInt32, x_, graph_->GetIntConstant(-1));
-  HInstruction* alt = new (GetAllocator())
-      HAdd(DataType::Type::kInt32, graph_->GetIntConstant(-1), x_);
-  HInstruction* sub = new (GetAllocator())
-      HSub(DataType::Type::kInt32, x_, graph_->GetIntConstant(1));
-  HInstruction* rev = new (GetAllocator())
-      HSub(DataType::Type::kInt32, graph_->GetIntConstant(1), x_);
-  entry_block_->AddInstruction(add);
-  entry_block_->AddInstruction(alt);
-  entry_block_->AddInstruction(sub);
-  entry_block_->AddInstruction(rev);
+  HInstruction* plus1 = graph_->GetIntConstant(1);
+  HInstruction* minus1 = graph_->GetIntConstant(-1);
+  HInstruction* add = MakeBinOp<HAdd>(entry_block_, DataType::Type::kInt32, x_, minus1);
+  HInstruction* alt = MakeBinOp<HAdd>(entry_block_, DataType::Type::kInt32, minus1, x_);
+  HInstruction* sub = MakeBinOp<HSub>(entry_block_, DataType::Type::kInt32, x_, plus1);
+  HInstruction* rev = MakeBinOp<HSub>(entry_block_, DataType::Type::kInt32, plus1, x_);
   ExpectEqual(Value(x_, 1, -1), GetMin(CreateFetch(add), nullptr));
   ExpectEqual(Value(x_, 1, -1), GetMax(CreateFetch(add), nullptr));
   ExpectEqual(Value(x_, 1, -1), GetMin(CreateFetch(alt), nullptr));
@@ -763,25 +932,27 @@ TEST_F(InductionVarRangeTest, ConstantTripCountUp) {
   HInstruction* exit = exit_block_->GetLastInstruction();
 
   // In context of header: known.
-  range_.GetInductionRange(condition_, phi, x_, &v1, &v2, &needs_finite_test);
+  range_.GetInductionRange(condition_->GetBlock(), phi, x_, &v1, &v2, &needs_finite_test);
   EXPECT_FALSE(needs_finite_test);
   ExpectEqual(Value(0), v1);
   ExpectEqual(Value(1000), v2);
 
   // In context of loop-body: known.
-  range_.GetInductionRange(increment_, phi, x_, &v1, &v2, &needs_finite_test);
+  range_.GetInductionRange(increment_->GetBlock(), phi, x_, &v1, &v2, &needs_finite_test);
   EXPECT_FALSE(needs_finite_test);
   ExpectEqual(Value(0), v1);
   ExpectEqual(Value(999), v2);
-  range_.GetInductionRange(increment_, increment_, x_, &v1, &v2, &needs_finite_test);
+  range_.GetInductionRange(increment_->GetBlock(), increment_, x_, &v1, &v2, &needs_finite_test);
   EXPECT_FALSE(needs_finite_test);
   ExpectEqual(Value(1), v1);
   ExpectEqual(Value(1000), v2);
 
   // Induction vs. no-induction.
-  EXPECT_TRUE(range_.CanGenerateRange(increment_, phi, &needs_finite_test, &needs_taken_test));
+  EXPECT_TRUE(
+      range_.CanGenerateRange(increment_->GetBlock(), phi, &needs_finite_test, &needs_taken_test));
   EXPECT_TRUE(range_.CanGenerateLastValue(phi));
-  EXPECT_FALSE(range_.CanGenerateRange(exit, exit, &needs_finite_test, &needs_taken_test));
+  EXPECT_FALSE(
+      range_.CanGenerateRange(exit->GetBlock(), exit, &needs_finite_test, &needs_taken_test));
   EXPECT_FALSE(range_.CanGenerateLastValue(exit));
 
   // Last value (unsimplified).
@@ -795,7 +966,7 @@ TEST_F(InductionVarRangeTest, ConstantTripCountUp) {
   EXPECT_TRUE(range_.IsFinite(loop_header_->GetLoopInformation(), &tc));
   EXPECT_EQ(1000, tc);
   HInstruction* offset = nullptr;
-  EXPECT_TRUE(range_.IsUnitStride(phi, phi, graph_, &offset));
+  EXPECT_TRUE(range_.IsUnitStride(phi->GetBlock(), phi, graph_, &offset));
   ExpectInt(0, offset);
   HInstruction* tce = range_.GenerateTripCount(
       loop_header_->GetLoopInformation(), graph_, loop_preheader_);
@@ -815,43 +986,43 @@ TEST_F(InductionVarRangeTest, ConstantTripCountDown) {
   HInstruction* exit = exit_block_->GetLastInstruction();
 
   // In context of header: known.
-  range_.GetInductionRange(condition_, phi, x_, &v1, &v2, &needs_finite_test);
+  range_.GetInductionRange(condition_->GetBlock(), phi, x_, &v1, &v2, &needs_finite_test);
   EXPECT_FALSE(needs_finite_test);
   ExpectEqual(Value(0), v1);
   ExpectEqual(Value(1000), v2);
 
   // In context of loop-body: known.
-  range_.GetInductionRange(increment_, phi, x_, &v1, &v2, &needs_finite_test);
+  range_.GetInductionRange(increment_->GetBlock(), phi, x_, &v1, &v2, &needs_finite_test);
   EXPECT_FALSE(needs_finite_test);
   ExpectEqual(Value(1), v1);
   ExpectEqual(Value(1000), v2);
-  range_.GetInductionRange(increment_, increment_, x_, &v1, &v2, &needs_finite_test);
+  range_.GetInductionRange(increment_->GetBlock(), increment_, x_, &v1, &v2, &needs_finite_test);
   EXPECT_FALSE(needs_finite_test);
   ExpectEqual(Value(0), v1);
   ExpectEqual(Value(999), v2);
 
   // Induction vs. no-induction.
-  EXPECT_TRUE(range_.CanGenerateRange(increment_, phi, &needs_finite_test, &needs_taken_test));
+  EXPECT_TRUE(
+      range_.CanGenerateRange(increment_->GetBlock(), phi, &needs_finite_test, &needs_taken_test));
   EXPECT_TRUE(range_.CanGenerateLastValue(phi));
-  EXPECT_FALSE(range_.CanGenerateRange(exit, exit, &needs_finite_test, &needs_taken_test));
+  EXPECT_FALSE(
+      range_.CanGenerateRange(exit->GetBlock(), exit, &needs_finite_test, &needs_taken_test));
   EXPECT_FALSE(range_.CanGenerateLastValue(exit));
 
-  // Last value (unsimplified).
+  // Last value (unsimplified). We expect Sub(1000, Neg(-1000)) which is equivalent to Sub(1000,
+  // 1000) aka 0.
   HInstruction* last = range_.GenerateLastValue(phi, graph_, loop_preheader_);
   ASSERT_TRUE(last->IsSub());
   ExpectInt(1000, last->InputAt(0));
   ASSERT_TRUE(last->InputAt(1)->IsNeg());
-  last = last->InputAt(1)->InputAt(0);
-  ASSERT_TRUE(last->IsSub());
-  ExpectInt(0, last->InputAt(0));
-  ExpectInt(1000, last->InputAt(1));
+  ExpectInt(-1000, last->InputAt(1)->AsNeg()->InputAt(0));
 
   // Loop logic.
   int64_t tc = 0;
   EXPECT_TRUE(range_.IsFinite(loop_header_->GetLoopInformation(), &tc));
   EXPECT_EQ(1000, tc);
   HInstruction* offset = nullptr;
-  EXPECT_FALSE(range_.IsUnitStride(phi, phi, graph_, &offset));
+  EXPECT_FALSE(range_.IsUnitStride(phi->GetBlock(), phi, graph_, &offset));
   HInstruction* tce = range_.GenerateTripCount(
       loop_header_->GetLoopInformation(), graph_, loop_preheader_);
   ASSERT_TRUE(tce != nullptr);
@@ -873,17 +1044,17 @@ TEST_F(InductionVarRangeTest, SymbolicTripCountUp) {
   HInstruction* phi = condition_->InputAt(0);
 
   // In context of header: upper unknown.
-  range_.GetInductionRange(condition_, phi, x_, &v1, &v2, &needs_finite_test);
+  range_.GetInductionRange(condition_->GetBlock(), phi, x_, &v1, &v2, &needs_finite_test);
   EXPECT_FALSE(needs_finite_test);
   ExpectEqual(Value(0), v1);
   ExpectEqual(Value(), v2);
 
   // In context of loop-body: known.
-  range_.GetInductionRange(increment_, phi, x_, &v1, &v2, &needs_finite_test);
+  range_.GetInductionRange(increment_->GetBlock(), phi, x_, &v1, &v2, &needs_finite_test);
   EXPECT_FALSE(needs_finite_test);
   ExpectEqual(Value(0), v1);
   ExpectEqual(Value(x_, 1, -1), v2);
-  range_.GetInductionRange(increment_, increment_, x_, &v1, &v2, &needs_finite_test);
+  range_.GetInductionRange(increment_->GetBlock(), increment_, x_, &v1, &v2, &needs_finite_test);
   EXPECT_FALSE(needs_finite_test);
   ExpectEqual(Value(1), v1);
   ExpectEqual(Value(x_, 1, 0), v2);
@@ -892,13 +1063,15 @@ TEST_F(InductionVarRangeTest, SymbolicTripCountUp) {
   HInstruction* upper = nullptr;
 
   // Can generate code in context of loop-body only.
-  EXPECT_FALSE(range_.CanGenerateRange(condition_, phi, &needs_finite_test, &needs_taken_test));
-  ASSERT_TRUE(range_.CanGenerateRange(increment_, phi, &needs_finite_test, &needs_taken_test));
+  EXPECT_FALSE(
+      range_.CanGenerateRange(condition_->GetBlock(), phi, &needs_finite_test, &needs_taken_test));
+  ASSERT_TRUE(
+      range_.CanGenerateRange(increment_->GetBlock(), phi, &needs_finite_test, &needs_taken_test));
   EXPECT_FALSE(needs_finite_test);
   EXPECT_TRUE(needs_taken_test);
 
   // Generates code (unsimplified).
-  range_.GenerateRange(increment_, phi, graph_, loop_preheader_, &lower, &upper);
+  range_.GenerateRange(increment_->GetBlock(), phi, graph_, loop_preheader_, &lower, &upper);
 
   // Verify lower is 0+0.
   ASSERT_TRUE(lower != nullptr);
@@ -923,7 +1096,7 @@ TEST_F(InductionVarRangeTest, SymbolicTripCountUp) {
 
   // Replacement.
   range_.Replace(loop_header_->GetLastInstruction(), x_, y_);
-  range_.GetInductionRange(increment_, increment_, x_, &v1, &v2, &needs_finite_test);
+  range_.GetInductionRange(increment_->GetBlock(), increment_, x_, &v1, &v2, &needs_finite_test);
   EXPECT_FALSE(needs_finite_test);
   ExpectEqual(Value(1), v1);
   ExpectEqual(Value(y_, 1, 0), v2);
@@ -933,7 +1106,7 @@ TEST_F(InductionVarRangeTest, SymbolicTripCountUp) {
   EXPECT_TRUE(range_.IsFinite(loop_header_->GetLoopInformation(), &tc));
   EXPECT_EQ(0, tc);  // unknown
   HInstruction* offset = nullptr;
-  EXPECT_TRUE(range_.IsUnitStride(phi, phi, graph_, &offset));
+  EXPECT_TRUE(range_.IsUnitStride(phi->GetBlock(), phi, graph_, &offset));
   ExpectInt(0, offset);
   HInstruction* tce = range_.GenerateTripCount(
       loop_header_->GetLoopInformation(), graph_, loop_preheader_);
@@ -955,17 +1128,17 @@ TEST_F(InductionVarRangeTest, SymbolicTripCountDown) {
   HInstruction* phi = condition_->InputAt(0);
 
   // In context of header: lower unknown.
-  range_.GetInductionRange(condition_, phi, x_, &v1, &v2, &needs_finite_test);
+  range_.GetInductionRange(condition_->GetBlock(), phi, x_, &v1, &v2, &needs_finite_test);
   EXPECT_FALSE(needs_finite_test);
   ExpectEqual(Value(), v1);
   ExpectEqual(Value(1000), v2);
 
   // In context of loop-body: known.
-  range_.GetInductionRange(increment_, phi, x_, &v1, &v2, &needs_finite_test);
+  range_.GetInductionRange(increment_->GetBlock(), phi, x_, &v1, &v2, &needs_finite_test);
   EXPECT_FALSE(needs_finite_test);
   ExpectEqual(Value(x_, 1, 1), v1);
   ExpectEqual(Value(1000), v2);
-  range_.GetInductionRange(increment_, increment_, x_, &v1, &v2, &needs_finite_test);
+  range_.GetInductionRange(increment_->GetBlock(), increment_, x_, &v1, &v2, &needs_finite_test);
   EXPECT_FALSE(needs_finite_test);
   ExpectEqual(Value(x_, 1, 0), v1);
   ExpectEqual(Value(999), v2);
@@ -974,13 +1147,15 @@ TEST_F(InductionVarRangeTest, SymbolicTripCountDown) {
   HInstruction* upper = nullptr;
 
   // Can generate code in context of loop-body only.
-  EXPECT_FALSE(range_.CanGenerateRange(condition_, phi, &needs_finite_test, &needs_taken_test));
-  ASSERT_TRUE(range_.CanGenerateRange(increment_, phi, &needs_finite_test, &needs_taken_test));
+  EXPECT_FALSE(
+      range_.CanGenerateRange(condition_->GetBlock(), phi, &needs_finite_test, &needs_taken_test));
+  ASSERT_TRUE(
+      range_.CanGenerateRange(increment_->GetBlock(), phi, &needs_finite_test, &needs_taken_test));
   EXPECT_FALSE(needs_finite_test);
   EXPECT_TRUE(needs_taken_test);
 
   // Generates code (unsimplified).
-  range_.GenerateRange(increment_, phi, graph_, loop_preheader_, &lower, &upper);
+  range_.GenerateRange(increment_->GetBlock(), phi, graph_, loop_preheader_, &lower, &upper);
 
   // Verify lower is 1000-((1000-V)-1).
   ASSERT_TRUE(lower != nullptr);
@@ -1009,7 +1184,7 @@ TEST_F(InductionVarRangeTest, SymbolicTripCountDown) {
 
   // Replacement.
   range_.Replace(loop_header_->GetLastInstruction(), x_, y_);
-  range_.GetInductionRange(increment_, increment_, x_, &v1, &v2, &needs_finite_test);
+  range_.GetInductionRange(increment_->GetBlock(), increment_, x_, &v1, &v2, &needs_finite_test);
   EXPECT_FALSE(needs_finite_test);
   ExpectEqual(Value(y_, 1, 0), v1);
   ExpectEqual(Value(999), v2);
@@ -1019,7 +1194,7 @@ TEST_F(InductionVarRangeTest, SymbolicTripCountDown) {
   EXPECT_TRUE(range_.IsFinite(loop_header_->GetLoopInformation(), &tc));
   EXPECT_EQ(0, tc);  // unknown
   HInstruction* offset = nullptr;
-  EXPECT_FALSE(range_.IsUnitStride(phi, phi, graph_, &offset));
+  EXPECT_FALSE(range_.IsUnitStride(phi->GetBlock(), phi, graph_, &offset));
   HInstruction* tce = range_.GenerateTripCount(
       loop_header_->GetLoopInformation(), graph_, loop_preheader_);
   ASSERT_TRUE(tce != nullptr);

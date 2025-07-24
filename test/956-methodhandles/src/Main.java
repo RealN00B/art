@@ -185,6 +185,12 @@ public class Main {
         MethodType.methodType(void.class), D.class /* specialCaller */);
     mh3.invoke(dInstance);
 
+    try {
+      mh3.invokeExact((D) null);
+      fail("Expected NPE to be thrown");
+    } catch (NullPointerException expected) {
+    }
+
     // The private method shouldn't be accessible from any special caller except
     // itself...
     try {
@@ -663,6 +669,28 @@ public class Main {
       MethodHandle objMH = voidMH.asType(MethodType.methodType(Object.class));
       assertEquals(Object.class, objMH.type().returnType());
       assertEquals(null, objMH.invoke());
+    }
+
+    // Applying asType() twice.
+    {
+      MethodHandle valueOfMH = MethodHandles.lookup().findStatic(Integer.class, "valueOf",
+          MethodType.methodType(Integer.class, int.class));
+      MethodHandle atMH = valueOfMH.asType(MethodType.methodType(int.class, Object.class));
+      MethodHandle at2MH = atMH.asType(MethodType.methodType(Integer.class, int.class));
+      assertEquals(valueOfMH.type(), at2MH.type());
+      assertEquals(Integer.valueOf(2), (Integer) valueOfMH.invokeExact(2));
+      assertEquals(12345678, (int) atMH.invokeExact((Object) Integer.valueOf(12345678)));
+      assertEquals(Integer.valueOf(987654321), (Integer) at2MH.invokeExact(987654321));
+    }
+    {
+      MethodHandle valueOfMH = MethodHandles.lookup().findStatic(Double.class, "valueOf",
+          MethodType.methodType(Double.class, double.class));
+      MethodHandle atMH = valueOfMH.asType(MethodType.methodType(double.class, Object.class));
+      MethodHandle at2MH = atMH.asType(MethodType.methodType(Double.class, double.class));
+      assertEquals(valueOfMH.type(), at2MH.type());
+      assertEquals(Double.valueOf(1.125e3), (Double) valueOfMH.invokeExact(1.125e3));
+      assertEquals(2.5e-3, (double) atMH.invokeExact((Object) Double.valueOf(2.5e-3)));
+      assertEquals(Double.valueOf(3.125e-2), (Double) at2MH.invokeExact(3.125e-2));
     }
   }
 
@@ -1172,13 +1200,13 @@ public class Main {
 
     // boolean -> int
     try {
-        int dummy = (int) mh.invoke("True");
+        int unexpectedValue = (int) mh.invoke("True");
         fail();
     } catch (WrongMethodTypeException e) {}
 
     // boolean -> Integer
     try {
-        Integer dummy = (Integer) mh.invoke("True");
+        Integer unexpectedValue = (Integer) mh.invoke("True");
         fail();
     } catch (WrongMethodTypeException e) {}
 
@@ -1190,13 +1218,13 @@ public class Main {
 
     // Boolean -> int
     try {
-        int dummy = (int) mh.invoke(false);
+        int unexpectedValue = (int) mh.invoke(false);
         fail();
     } catch (WrongMethodTypeException e) {}
 
     // Boolean -> Integer
     try {
-        Integer dummy = (Integer) mh.invoke("True");
+        Integer unexpectedValue = (Integer) mh.invoke("True");
         fail();
     } catch (WrongMethodTypeException e) {}
 
@@ -1899,5 +1927,47 @@ public class Main {
     } catch (IllegalAccessException e) {
       System.out.println("Got expected IAE when invoke-special on an abstract interface method");
     }
+  }
+
+  private static int returnInput(int value) { return value; }
+  private static byte returnInput(byte value) { return value; }
+  private static char returnInput(char value) { return value; }
+
+  private static void testFastInvoke() throws Throwable {
+    // This tests use of invoke() that have different types and require widening, but do not
+    // require require an explicit asType() transform.
+    MethodHandle mh0 =
+        MethodHandles.lookup().findStatic(
+            Main.class, "returnInput", MethodType.methodType(int.class, int.class));
+    assertEquals((byte) 127, (byte) (int) mh0.invoke((byte) 127));
+    assertEquals((byte) -128, (byte) (int) mh0.invoke((byte) -128));
+    assertEquals((short) 127, (short) (int) mh0.invoke((byte) 127));
+    assertEquals((short) -128, (short) (int) mh0.invoke((byte) -128));
+    assertEquals((char) 127, (char) (int) mh0.invoke((byte) 127));
+    assertEquals((char) 65535, (char) (int) mh0.invoke((byte) -1));
+    assertEquals((char) 0, (char) (int) mh0.invoke((char) 0));
+    assertEquals((char) 65535, (char) (int) mh0.invoke((char) 65535));
+    assertEquals((short) 127, (short) (int) mh0.invoke((short) 127));
+    assertEquals((short) -128, (short) (int) mh0.invoke((short) -128));
+    assertEquals((int) 127, (int) mh0.invoke((byte) 127));
+    assertEquals((int) -128, (int) mh0.invoke((byte) -128));
+    assertEquals((int) 127, (int) mh0.invoke((short) 127));
+    assertEquals((int) -128, (int) mh0.invoke((short) -128));
+    assertEquals((int) 0, (int) mh0.invoke((char) 0));
+    assertEquals((int) 65535, (int) mh0.invoke((char) 65535));
+
+    MethodHandle mh1 =
+        MethodHandles.lookup().findStatic(
+            Main.class, "returnInput", MethodType.methodType(char.class, char.class));
+    assertEquals((int) 0, (int) mh1.invoke((char) 0));
+    assertEquals((int) 65535, (int) mh1.invoke((char) 65535));
+
+    MethodHandle mh2 =
+        MethodHandles.lookup().findStatic(
+            Main.class, "returnInput", MethodType.methodType(byte.class, byte.class));
+    assertEquals((int) -128, (int) mh2.invoke((byte) -128));
+    assertEquals((int) 127, (int) mh2.invoke((byte) 127));
+    assertEquals((short) -128, (short) mh2.invoke((byte) -128));
+    assertEquals((short) 127, (short) mh2.invoke((byte) 127));
   }
 }

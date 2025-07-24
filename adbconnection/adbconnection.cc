@@ -14,40 +14,45 @@
  * limitations under the License.
  */
 
+#include "adbconnection.h"
+
+#include <dlfcn.h>
+#include <jni.h>
+#include <sys/eventfd.h>
+#include <sys/ioctl.h>
+#include <sys/socket.h>
+#include <sys/uio.h>
+#include <sys/un.h>
+
 #include <array>
 #include <cstddef>
 #include <iterator>
 
-#include "adbconnection.h"
-
 #include "adbconnection/client.h"
 #include "android-base/endian.h"
 #include "android-base/stringprintf.h"
+#include "android-base/unique_fd.h"
+#include "art_field-inl.h"
+#include "art_method-alloc-inl.h"
 #include "base/file_utils.h"
+#include "base/globals.h"
 #include "base/logging.h"
 #include "base/macros.h"
 #include "base/mutex.h"
 #include "base/socket_peer_is_trusted.h"
 #include "debugger.h"
+#include "fd_transport.h"
+#include "jdwpargs.h"
 #include "jni/java_vm_ext.h"
 #include "jni/jni_env_ext.h"
+#include "mirror/class-alloc-inl.h"
 #include "mirror/throwable.h"
 #include "nativehelper/scoped_local_ref.h"
+#include "poll.h"
 #include "runtime-inl.h"
 #include "runtime_callbacks.h"
 #include "scoped_thread_state_change-inl.h"
 #include "well_known_classes.h"
-
-#include "fd_transport.h"
-
-#include "poll.h"
-
-#include <sys/ioctl.h>
-#include <sys/socket.h>
-#include <sys/uio.h>
-#include <sys/un.h>
-#include <sys/eventfd.h>
-#include <jni.h>
 
 namespace adbconnection {
 
@@ -61,6 +66,7 @@ using dt_fd_forward::kListenStartMessage;
 using dt_fd_forward::kListenEndMessage;
 using dt_fd_forward::kAcceptMessage;
 using dt_fd_forward::kCloseMessage;
+using dt_fd_forward::kHandshakeCompleteMessage;
 
 // Messages sent to the transport
 using dt_fd_forward::kPerformHandshakeMessage;
@@ -69,8 +75,7 @@ using dt_fd_forward::kSkipHandshakeMessage;
 using android::base::StringPrintf;
 
 static constexpr const char kJdwpHandshake[14] = {
-  'J', 'D', 'W', 'P', '-', 'H', 'a', 'n', 'd', 's', 'h', 'a', 'k', 'e'
-};
+    'J', 'D', 'W', 'P', '-', 'H', 'a', 'n', 'd', 's', 'h', 'a', 'k', 'e'};
 
 static constexpr int kEventfdLocked = 0;
 static constexpr int kEventfdUnlocked = 1;
@@ -87,8 +92,88 @@ static constexpr uint8_t kDdmChunkCommand = 1;
 static std::optional<AdbConnectionState> gState;
 static std::optional<pthread_t> gPthread;
 
-static bool IsDebuggingPossible() {
-  return art::Dbg::IsJdwpAllowed();
+// ADB apex method v2
+using AdbApexProcessName = void (*)(const char*);
+AdbApexProcessName apex_adbconnection_client_set_current_process_name = nullptr;
+using AdbApexPackageName = void (*)(const char*);
+AdbApexPackageName apex_adbconnection_client_add_application = nullptr;
+AdbApexPackageName apex_adbconnection_client_remove_application = nullptr;
+using AdbApexWaitingForDebugger = void (*)(bool);
+AdbApexWaitingForDebugger apex_adbconnection_client_set_waiting_for_debugger = nullptr;
+using AdbApexSendUpdate = void (*)(AdbConnectionClientContext*);
+AdbApexSendUpdate apex_adbconnection_client_send_update = nullptr;
+using AdbApexHasPendingUpdate = bool (*)();
+AdbApexHasPendingUpdate apex_adbconnection_client_has_pending_update = nullptr;
+using AdbApexSetUserId = void (*)(int);
+AdbApexSetUserId apex_adbconnection_client_set_user_id = nullptr;
+
+void apex_adbconnection_client_set_current_process_name_noop(const char*) {}
+void apex_adbconnection_client_add_application_noop(const char*) {}
+void apex_adbconnection_client_remove_application_noop(const char*) {}
+void apex_adbconnection_client_set_waiting_for_debugger_noop(bool) {}
+void apex_adbconnection_client_send_update_noop(AdbConnectionClientContext*) {}
+bool apex_adbconnection_client_has_pending_update_noop() { return false; }
+void apex_adbconnection_client_set_user_id_noop(int) {}
+
+static void RetrieveApexPointers() {
+  apex_adbconnection_client_set_current_process_name =
+      (AdbApexProcessName)dlsym(RTLD_DEFAULT, "adbconnection_client_set_current_process_name");
+  if (!apex_adbconnection_client_set_current_process_name) {
+    VLOG(jdwp) << "Unable to dlsym adbconnection_client_set_current_process_name";
+    apex_adbconnection_client_set_current_process_name =
+        apex_adbconnection_client_set_current_process_name_noop;
+  }
+
+  apex_adbconnection_client_add_application =
+      (AdbApexPackageName)dlsym(RTLD_DEFAULT, "adbconnection_client_add_application");
+  if (!apex_adbconnection_client_add_application) {
+    VLOG(jdwp) << "Unable to dlsym adbconnection_client_add_application";
+    apex_adbconnection_client_add_application = apex_adbconnection_client_add_application_noop;
+  }
+
+  apex_adbconnection_client_remove_application =
+      (AdbApexPackageName)dlsym(RTLD_DEFAULT, "adbconnection_client_remove_application");
+  if (!apex_adbconnection_client_remove_application) {
+    VLOG(jdwp) << "Unable to dlsym adbconnection_client_remove_application";
+    apex_adbconnection_client_remove_application =
+        apex_adbconnection_client_remove_application_noop;
+  }
+
+  apex_adbconnection_client_set_waiting_for_debugger = (AdbApexWaitingForDebugger)dlsym(
+      RTLD_DEFAULT, "adbconnection_client_set_waiting_for_debugger");
+  if (!apex_adbconnection_client_set_waiting_for_debugger) {
+    VLOG(jdwp) << "Unable to dlsym adbconnection_client_set_waiting_for_debugger";
+    apex_adbconnection_client_set_waiting_for_debugger =
+        apex_adbconnection_client_set_waiting_for_debugger_noop;
+  }
+
+  apex_adbconnection_client_send_update =
+      (AdbApexSendUpdate)dlsym(RTLD_DEFAULT, "adbconnection_client_send_update");
+  if (!apex_adbconnection_client_send_update) {
+    VLOG(jdwp) << "Unable to dlsym adbconnection_client_send_update";
+    apex_adbconnection_client_send_update = apex_adbconnection_client_send_update_noop;
+  }
+
+  apex_adbconnection_client_has_pending_update =
+      (AdbApexHasPendingUpdate)dlsym(RTLD_DEFAULT, "adbconnection_client_has_pending_update");
+  if (!apex_adbconnection_client_has_pending_update) {
+    VLOG(jdwp) << "Unable to dlsym adbconnection_client_has_pending_update";
+    apex_adbconnection_client_has_pending_update =
+        apex_adbconnection_client_has_pending_update_noop;
+  }
+
+  apex_adbconnection_client_set_user_id =
+      (AdbApexSetUserId)dlsym(RTLD_DEFAULT, "adbconnection_client_set_user_id");
+  if (!apex_adbconnection_client_set_user_id) {
+    VLOG(jdwp) << "Unable to dlsym adbconnection_client_set_user_id";
+    apex_adbconnection_client_set_user_id = apex_adbconnection_client_set_user_id_noop;
+  }
+}
+
+static bool IsDebuggingPossible() { return art::Dbg::IsJdwpAllowed(); }
+
+static bool IsDebuggableOrProfilable() {
+  return IsDebuggingPossible() || art::Runtime::Current()->IsProfileableFromShell();
 }
 
 // Begin running the debugger.
@@ -96,7 +181,7 @@ void AdbConnectionDebuggerController::StartDebugger() {
   // The debugger thread is started for a debuggable or profileable-from-shell process.
   // The pid will be send to adbd for adb's "track-jdwp" and "track-app" services.
   // The thread will also set up the jdwp tunnel if the process is debuggable.
-  if (IsDebuggingPossible() || art::Runtime::Current()->IsProfileableFromShell()) {
+  if (IsDebuggableOrProfilable()) {
     connection_->StartDebuggerThreads();
   } else {
     LOG(ERROR) << "Not starting debugger since process cannot load the jdwp agent.";
@@ -130,15 +215,31 @@ void AdbConnectionDdmCallback::DdmPublishChunk(uint32_t type,
   connection_->PublishDdmData(type, data);
 }
 
+void AdbConnectionAppInfoCallback::SetCurrentProcessName(const std::string& process_name) {
+  connection_->SetCurrentProcessName(process_name);
+}
+
+void AdbConnectionAppInfoCallback::AddApplication(const std::string& package_name) {
+  connection_->AddApplication(package_name);
+}
+
+void AdbConnectionAppInfoCallback::RemoveApplication(const std::string& package_name) {
+  connection_->RemoveApplication(package_name);
+}
+
+void AdbConnectionAppInfoCallback::SetWaitingForDebugger(bool waiting) {
+  connection_->SetWaitingForDebugger(waiting);
+}
+
+void AdbConnectionAppInfoCallback::SetUserId(int user_id) { connection_->SetUserId(user_id); }
+
 class ScopedEventFdLock {
  public:
   explicit ScopedEventFdLock(int fd) : fd_(fd), data_(0) {
     TEMP_FAILURE_RETRY(read(fd_, &data_, sizeof(data_)));
   }
 
-  ~ScopedEventFdLock() {
-    TEMP_FAILURE_RETRY(write(fd_, &data_, sizeof(data_)));
-  }
+  ~ScopedEventFdLock() { TEMP_FAILURE_RETRY(write(fd_, &data_, sizeof(data_))); }
 
  private:
   int fd_;
@@ -146,24 +247,25 @@ class ScopedEventFdLock {
 };
 
 AdbConnectionState::AdbConnectionState(const std::string& agent_name)
-  : agent_name_(agent_name),
-    controller_(this),
-    ddm_callback_(this),
-    sleep_event_fd_(-1),
-    control_ctx_(nullptr, adbconnection_client_destroy),
-    local_agent_control_sock_(-1),
-    remote_agent_control_sock_(-1),
-    adb_connection_socket_(-1),
-    adb_write_event_fd_(-1),
-    shutting_down_(false),
-    agent_loaded_(false),
-    agent_listening_(false),
-    agent_has_socket_(false),
-    sent_agent_fds_(false),
-    performed_handshake_(false),
-    notified_ddm_active_(false),
-    next_ddm_id_(1),
-    started_debugger_threads_(false) {
+    : agent_name_(agent_name),
+      controller_(this),
+      ddm_callback_(this),
+      appinfo_callback_(this),
+      sleep_event_fd_(-1),
+      control_ctx_(nullptr, adbconnection_client_destroy),
+      local_agent_control_sock_(-1),
+      remote_agent_control_sock_(-1),
+      adb_connection_socket_(-1),
+      adb_write_event_fd_(-1),
+      shutting_down_(false),
+      agent_loaded_(false),
+      agent_listening_(false),
+      agent_has_socket_(false),
+      sent_agent_fds_(false),
+      performed_handshake_(false),
+      notified_ddm_active_(false),
+      next_ddm_id_(1),
+      started_debugger_threads_(false) {
   // Add the startup callback.
   art::ScopedObjectAccess soa(art::Thread::Current());
   art::Runtime::Current()->GetRuntimeCallbacks()->AddDebuggerControlCallback(&controller_);
@@ -178,21 +280,27 @@ AdbConnectionState::~AdbConnectionState() {
   }
 }
 
-static jobject CreateAdbConnectionThread(art::Thread* thr) {
-  JNIEnv* env = thr->GetJniEnv();
-  // Move to native state to talk with the jnienv api.
-  art::ScopedThreadStateChange stsc(thr, art::kNative);
-  ScopedLocalRef<jstring> thr_name(env, env->NewStringUTF(kAdbConnectionThreadName));
-  ScopedLocalRef<jobject> thr_group(
-      env,
-      env->GetStaticObjectField(art::WellKnownClasses::java_lang_ThreadGroup,
-                                art::WellKnownClasses::java_lang_ThreadGroup_systemThreadGroup));
-  return env->NewObject(art::WellKnownClasses::java_lang_Thread,
-                        art::WellKnownClasses::java_lang_Thread_init,
-                        thr_group.get(),
-                        thr_name.get(),
-                        /*Priority=*/ 0,
-                        /*Daemon=*/ true);
+static art::ObjPtr<art::mirror::Object> CreateAdbConnectionThread(art::Thread* self)
+    REQUIRES_SHARED(art::Locks::mutator_lock_) {
+  art::StackHandleScope<3u> hs(self);
+  art::Handle<art::mirror::String> thr_name =
+      hs.NewHandle(art::mirror::String::AllocFromModifiedUtf8(self, kAdbConnectionThreadName));
+  if (thr_name == nullptr) {
+    DCHECK(self->IsExceptionPending());
+    return nullptr;
+  }
+  art::ArtField* system_thread_group_field =
+      art::WellKnownClasses::java_lang_ThreadGroup_systemThreadGroup;
+  DCHECK(system_thread_group_field->GetDeclaringClass()->IsInitialized());
+  // Avoid using `ArtField::GetObject` as it requires linking against `libdexfile` for
+  // `operator<<(std::ostream&, Primitive::Type)`.
+  art::Handle<art::mirror::Object> system_thread_group = hs.NewHandle(
+      system_thread_group_field->GetDeclaringClass()->GetFieldObject<art::mirror::Object>(
+          system_thread_group_field->GetOffset()));
+  return art::WellKnownClasses::java_lang_Thread_init
+      ->NewObject<'L', 'L', 'I', 'Z'>(
+          hs, self, system_thread_group, thr_name, /*priority=*/0, /*daemon=*/true)
+      .Get();
 }
 
 struct CallbackData {
@@ -202,9 +310,7 @@ struct CallbackData {
 
 static void* CallbackFunction(void* vdata) {
   std::unique_ptr<CallbackData> data(reinterpret_cast<CallbackData*>(vdata));
-  art::Thread* self = art::Thread::Attach(kAdbConnectionThreadName,
-                                          true,
-                                          data->thr_);
+  art::Thread* self = art::Thread::Attach(kAdbConnectionThreadName, true, data->thr_);
   CHECK(self != nullptr) << "threads_being_born_ should have ensured thread could be attached.";
   // The name in Attach() is only for logging. Set the thread name. This is important so
   // that the thread is no longer seen as starting up.
@@ -245,6 +351,7 @@ void AdbConnectionState::StartDebuggerThreads() {
   {
     art::ScopedObjectAccess soa(art::Thread::Current());
     art::Runtime::Current()->GetRuntimeCallbacks()->AddDdmCallback(&ddm_callback_);
+    art::Runtime::Current()->GetRuntimeCallbacks()->AddAppInfoCallback(&appinfo_callback_);
   }
   // Setup the socketpair we use to talk to the agent.
   bool has_sockets;
@@ -272,22 +379,24 @@ void AdbConnectionState::StartDebuggerThreads() {
     }
     runtime->StartThreadBirth();
   }
-  ScopedLocalRef<jobject> thr(soa.Env(), CreateAdbConnectionThread(soa.Self()));
+  jobject thr = soa.Env()->GetVm()->AddGlobalRef(self, CreateAdbConnectionThread(soa.Self()));
+  if (thr == nullptr) {
+    LOG(ERROR) << "Failed to create debugger thread!";
+    return;
+  }
   // Note: Using pthreads instead of std::thread to not abort when the thread cannot be
   //       created (exception support required).
-  std::unique_ptr<CallbackData> data(new CallbackData { this, soa.Env()->NewGlobalRef(thr.get()) });
+  std::unique_ptr<CallbackData> data(new CallbackData{this, thr});
   started_debugger_threads_ = true;
   gPthread.emplace();
-  int pthread_create_result = pthread_create(&gPthread.value(),
-                                             nullptr,
-                                             &CallbackFunction,
-                                             data.get());
+  int pthread_create_result =
+      pthread_create(&gPthread.value(), nullptr, &CallbackFunction, data.get());
   if (pthread_create_result != 0) {
     gPthread.reset();
     started_debugger_threads_ = false;
     // If the create succeeded the other thread will call EndThreadBirth.
     art::Runtime* runtime = art::Runtime::Current();
-    soa.Env()->DeleteGlobalRef(data->thr_);
+    soa.Env()->DeleteGlobalRef(thr);
     LOG(ERROR) << "Failed to create thread for adb-jdwp connection manager!";
     art::MutexLock mu(art::Thread::Current(), *art::Locks::runtime_shutdown_lock_);
     runtime->EndThreadBirth();
@@ -296,9 +405,7 @@ void AdbConnectionState::StartDebuggerThreads() {
   data.release();  // NOLINT pthreads API.
 }
 
-static bool FlagsSet(int16_t data, int16_t flags) {
-  return (data & flags) == flags;
-}
+static bool FlagsSet(int16_t data, int16_t flags) { return (data & flags) == flags; }
 
 void AdbConnectionState::CloseFds() {
   {
@@ -338,13 +445,48 @@ void AdbConnectionState::PublishDdmData(uint32_t type, const art::ArrayRef<const
   SendDdmPacket(NextDdmId(), DdmPacketType::kCmd, type, data);
 }
 
+void AdbConnectionState::SetCurrentProcessName(const std::string& process_name) {
+  DCHECK(IsDebuggableOrProfilable());
+  VLOG(jdwp) << "SetCurrentProcessName '" << process_name << "'";
+  apex_adbconnection_client_set_current_process_name(process_name.c_str());
+  WakeupPollLoop();
+}
+
+void AdbConnectionState::AddApplication(const std::string& package_name) {
+  DCHECK(IsDebuggableOrProfilable());
+  VLOG(jdwp) << "AddApplication'" << package_name << "'";
+  apex_adbconnection_client_add_application(package_name.c_str());
+  WakeupPollLoop();
+}
+
+void AdbConnectionState::RemoveApplication(const std::string& package_name) {
+  DCHECK(IsDebuggableOrProfilable());
+  VLOG(jdwp) << "RemoveApplication'" << package_name << "'";
+  apex_adbconnection_client_remove_application(package_name.c_str());
+  WakeupPollLoop();
+}
+
+void AdbConnectionState::SetWaitingForDebugger(bool waiting) {
+  DCHECK(IsDebuggableOrProfilable());
+  VLOG(jdwp) << "SetWaitingForDebugger'" << waiting << "'";
+  apex_adbconnection_client_set_waiting_for_debugger(waiting);
+  WakeupPollLoop();
+}
+
+void AdbConnectionState::SetUserId(int user_id) {
+  DCHECK(IsDebuggableOrProfilable());
+  VLOG(jdwp) << "SetUserId'" << user_id << "'";
+  apex_adbconnection_client_set_user_id(user_id);
+  WakeupPollLoop();
+}
+
 void AdbConnectionState::SendDdmPacket(uint32_t id,
                                        DdmPacketType packet_type,
                                        uint32_t type,
                                        art::ArrayRef<const uint8_t> data) {
   // Get the write_event early to fail fast.
   ScopedEventFdLock lk(adb_write_event_fd_);
-  if (adb_connection_socket_ == -1) {
+  if (adb_connection_socket_ == -1 || !performed_handshake_) {
     VLOG(jdwp) << "Not sending ddms data of type "
                << StringPrintf("%c%c%c%c",
                                static_cast<char>(type >> 24),
@@ -471,10 +613,6 @@ void AdbConnectionState::SendAgentFds(bool require_handshake) {
   }
 }
 
-android::base::unique_fd AdbConnectionState::ReadFdFromAdb() {
-  return android::base::unique_fd(adbconnection_client_receive_jdwp_fd(control_ctx_.get()));
-}
-
 bool AdbConnectionState::SetupAdbConnection() {
   int sleep_ms = 500;
   const int sleep_max_ms = 2 * 1000;
@@ -524,11 +662,11 @@ bool AdbConnectionState::SetupAdbConnection() {
 }
 
 void AdbConnectionState::RunPollLoop(art::Thread* self) {
-  DCHECK(IsDebuggingPossible() || art::Runtime::Current()->IsProfileableFromShell());
+  DCHECK(IsDebuggableOrProfilable());
   CHECK_NE(agent_name_, "");
-  CHECK_EQ(self->GetState(), art::kNative);
+  CHECK_EQ(self->GetState(), art::ThreadState::kNative);
   art::Locks::mutator_lock_->AssertNotHeld(self);
-  self->SetState(art::kWaitingInMainDebuggerLoop);
+  self->SetState(art::ThreadState::kWaitingInMainDebuggerLoop);
   // shutting_down_ set by StopDebuggerThreads
   while (!shutting_down_) {
     // First, connect to adbd if we haven't already.
@@ -538,26 +676,33 @@ void AdbConnectionState::RunPollLoop(art::Thread* self) {
     }
     while (!shutting_down_ && control_ctx_) {
       bool should_listen_on_connection = !agent_has_socket_ && !sent_agent_fds_;
+      // By default we are always interested in read and hangup events on the control ctx.
+      int16_t interestingControlEventSet = POLLIN | POLLRDHUP;
+      if (apex_adbconnection_client_has_pending_update()) {
+        // If we have an update for ADBd, we also want to know when the control ctx
+        // socket is writable.
+        interestingControlEventSet |= POLLOUT;
+      }
       struct pollfd pollfds[4] = {
-        { sleep_event_fd_, POLLIN, 0 },
-        // -1 as an fd causes it to be ignored by poll
-        { (agent_loaded_ ? local_agent_control_sock_ : -1), POLLIN, 0 },
-        // Check for the control_sock_ actually going away. Only do this if we don't have an active
-        // connection.
-        { (adb_connection_socket_ == -1 ? adbconnection_client_pollfd(control_ctx_.get()) : -1),
-          POLLIN | POLLRDHUP, 0 },
-        // if we have not loaded the agent either the adb_connection_socket_ is -1 meaning we don't
-        // have a real connection yet or the socket through adb needs to be listened to for incoming
-        // data that the agent or this plugin can handle.
-        { should_listen_on_connection ? adb_connection_socket_ : -1, POLLIN | POLLRDHUP, 0 }
-      };
+          {sleep_event_fd_, POLLIN, 0},
+          // -1 as an fd causes it to be ignored by poll
+          {(agent_loaded_ ? local_agent_control_sock_ : -1), POLLIN, 0},
+          // Check for the control_sock_ actually going away. We always monitor for POLLIN, even if
+          // we already have an adbd socket. This allows to reject incoming debugger connection if
+          // there is already have one connected.
+          {adbconnection_client_pollfd(control_ctx_.get()), interestingControlEventSet, 0},
+          // if we have not loaded the agent either the adb_connection_socket_ is -1 meaning we
+          // don't have a real connection yet or the socket through adb needs to be listened to for
+          // incoming data that the agent or this plugin can handle.
+          {should_listen_on_connection ? adb_connection_socket_ : -1, POLLIN | POLLRDHUP, 0}};
       int res = TEMP_FAILURE_RETRY(poll(pollfds, 4, -1));
       if (res < 0) {
         PLOG(ERROR) << "Failed to poll!";
         return;
       }
-      // We don't actually care about doing this we just use it to wake us up.
-      // const struct pollfd& sleep_event_poll     = pollfds[0];
+      VLOG(jdwp) << "adbconnection poll awakening";
+
+      const struct pollfd& sleep_event_poll = pollfds[0];
       const struct pollfd& agent_control_sock_poll = pollfds[1];
       const struct pollfd& control_sock_poll       = pollfds[2];
       const struct pollfd& adb_socket_poll         = pollfds[3];
@@ -580,6 +725,10 @@ void AdbConnectionState::RunPollLoop(art::Thread* self) {
           }
         } else if (memcmp(kListenEndMessage, buf, sizeof(kListenEndMessage)) == 0) {
           agent_listening_ = false;
+        } else if (memcmp(kHandshakeCompleteMessage, buf, sizeof(kHandshakeCompleteMessage)) == 0) {
+          if (agent_has_socket_) {
+            performed_handshake_ = true;
+          }
         } else if (memcmp(kCloseMessage, buf, sizeof(kCloseMessage)) == 0) {
           CloseFds();
           agent_has_socket_ = false;
@@ -640,12 +789,19 @@ void AdbConnectionState::RunPollLoop(art::Thread* self) {
         } else if (agent_listening_ && !sent_agent_fds_) {
           VLOG(jdwp) << "Sending agent fds again on data.";
           // Agent was already loaded so it can deal with the handshake.
-          SendAgentFds(/*require_handshake=*/ true);
+          SendAgentFds(/*require_handshake=*/true);
         }
+      } else if (FlagsSet(control_sock_poll.revents, POLLOUT)) {
+        VLOG(jdwp) << "Sending state update to adbd";
+        apex_adbconnection_client_send_update(control_ctx_.get());
       } else if (FlagsSet(adb_socket_poll.revents, POLLRDHUP)) {
         CHECK(IsDebuggingPossible());  // This path is unexpected for a profileable process.
         DCHECK(!agent_has_socket_);
         CloseFds();
+      } else if (FlagsSet(sleep_event_poll.revents, POLLIN)) {
+        // Poll was awakened via fdevent, we need to decrease fdevent counter to prevent poll from
+        // triggering again.
+        AcknowledgeWakeup();
       } else {
         VLOG(jdwp) << "Woke up poll without anything to do!";
       }
@@ -804,8 +960,12 @@ void AdbConnectionState::PerformHandshake() {
 void AdbConnectionState::AttachJdwpAgent(art::Thread* self) {
   art::Runtime* runtime = art::Runtime::Current();
   self->AssertNoPendingException();
+
+  std::string args = MakeAgentArg();
+  VLOG(jdwp) << "Attaching JDWP agent with args '" << args << "'";
+
   runtime->AttachAgent(/* env= */ nullptr,
-                       MakeAgentArg(),
+                       args,
                        /* class_loader= */ nullptr);
   if (self->IsExceptionPending()) {
     LOG(ERROR) << "Failed to load agent " << agent_name_;
@@ -839,34 +999,97 @@ bool ValidateJdwpOptions(const std::string& opts) {
   return res;
 }
 
+#if defined(__ANDROID__)
+void FixLogfile(JdwpArgs& parameters) {
+  const std::string kLogfile = "logfile";
+  // On Android, an app will not have write access to the cwd (which is "/").
+  // If a relative path was provided, we need to patch it with a writable
+  // location. For now, we use /data/data/<PKG_NAME>.
+  // Note that /data/local/tmp/ was also considered but it not a good candidate since apps don't
+  // have write access to it.
+
+  if (!parameters.contains(kLogfile)) {
+    return;
+  }
+
+  std::string& logfile = parameters.get(kLogfile);
+  if (logfile.front() == '/') {
+    // We only fix logfile if it is not using an absolute path
+    return;
+  }
+
+  std::string packageName = art::Runtime::Current()->GetProcessPackageName();
+  if (packageName.empty()) {
+    VLOG(jdwp) << "Unable to fix relative path logfile='" + logfile + "' without package name.";
+    return;
+  }
+  parameters.put(kLogfile, "/data/data/" + packageName + "/" + logfile);
+}
+#else
+void FixLogfile(JdwpArgs&) {}
+#endif
+
 std::string AdbConnectionState::MakeAgentArg() {
   const std::string& opts = art::Runtime::Current()->GetJdwpOptions();
   DCHECK(ValidateJdwpOptions(opts));
+
+  VLOG(jdwp) << "Raw jdwp options '" + opts + "'";
+  JdwpArgs parameters = JdwpArgs(opts);
+
+  // See the comment above for why we need to be server=y. Since the agent defaults to server=n
+  // we must always set it.
+  parameters.put("server", "y");
+
+  // See the comment above for why we need to be suspend=n. Since the agent defaults to
+  // suspend=y we must always set it.
+  parameters.put("suspend", "n");
+
+  std::string ddm_already_active = "n";
+  if (notified_ddm_active_) {
+    ddm_already_active = "y";
+  }
+  parameters.put("ddm_already_active", ddm_already_active);
+
+  parameters.put("transport", "dt_fd_forward");
+  parameters.put("address", std::to_string(remote_agent_control_sock_));
+
+  // If logfile is relative, we need to fix it.
+  FixLogfile(parameters);
+
   // TODO Get agent_name_ from something user settable?
-  return agent_name_ + "=" + opts + (opts.empty() ? "" : ",") +
-      "ddm_already_active=" + (notified_ddm_active_ ? "y" : "n") + "," +
-      // See the comment above for why we need to be server=y. Since the agent defaults to server=n
-      // we will add it if it wasn't already present for the convenience of the user.
-      (ContainsArgument(opts, "server=y") ? "" : "server=y,") +
-      // See the comment above for why we need to be suspend=n. Since the agent defaults to
-      // suspend=y we will add it if it wasn't already present.
-      (ContainsArgument(opts, "suspend=n") ? "" : "suspend=n,") +
-      "transport=dt_fd_forward,address=" + std::to_string(remote_agent_control_sock_);
+  return agent_name_ + "=" + parameters.join();
 }
 
-void AdbConnectionState::StopDebuggerThreads() {
-  // The regular agent system will take care of unloading the agent (if needed).
-  shutting_down_ = true;
-  // Wakeup the poll loop.
+void AdbConnectionState::WakeupPollLoop() {
+  if (!control_ctx_) {
+    return;
+  }
+
   uint64_t data = 1;
   if (sleep_event_fd_ != -1) {
     TEMP_FAILURE_RETRY(write(sleep_event_fd_, &data, sizeof(data)));
   }
 }
 
+void AdbConnectionState::AcknowledgeWakeup() {
+  uint64_t data;
+  if (sleep_event_fd_ != -1) {
+    TEMP_FAILURE_RETRY(read(sleep_event_fd_, &data, sizeof(data)));
+  }
+}
+
+void AdbConnectionState::StopDebuggerThreads() {
+  // The regular agent system will take care of unloading the agent (if needed).
+  shutting_down_ = true;
+  WakeupPollLoop();
+}
+
 // The plugin initialization function.
 extern "C" bool ArtPlugin_Initialize() {
   DCHECK(art::Runtime::Current()->GetJdwpProvider() == art::JdwpProvider::kAdbConnection);
+
+  RetrieveApexPointers();
+
   // TODO Provide some way for apps to set this maybe?
   gState.emplace(kDefaultJdwpAgentName);
   return ValidateJdwpOptions(art::Runtime::Current()->GetJdwpOptions());

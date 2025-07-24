@@ -64,7 +64,7 @@ public class Test912 {
     testClassStatus(Object.class);
     testClassStatus(TestForNonInit.class);
     try {
-      System.out.println(TestForInitFail.dummy);
+      System.out.println(TestForInitFail.intValue);
     } catch (ExceptionInInitializerError e) {
     }
     testClassStatus(TestForInitFail.class);
@@ -262,6 +262,7 @@ public class Test912 {
         "java.util.NoSuchElementException",
         "java.io.FileNotFoundException",  // b/63581208
         "java.util.zip.ZipException",     // b/63581208
+        "sun.invoke.util.Wrapper",        // For "ClassEvents" thread in JIT/no-image config.
     };
     for (String s : PRELOAD_FOR_JIT) {
       Class.forName(s);
@@ -281,9 +282,9 @@ public class Test912 {
       }
     };
 
-    Thread dummyThread = new Thread();
-    dummyThread.start();
-    dummyThread.join();
+    Thread noopThread = new Thread();
+    noopThread.start();
+    noopThread.join();
 
     enableClassLoadPreparePrintEvents(true, Thread.currentThread());
 
@@ -424,12 +425,12 @@ public class Test912 {
   }
 
   private static class TestForNonInit {
-    public static double dummy = Math.random();  // So it can't be compile-time initialized.
+    public static double doubleValue = Math.random();  // So it can't be compile-time initialized.
   }
 
   @SuppressWarnings("RandomCast")
   private static class TestForInitFail {
-    public static int dummy = ((int)Math.random())/0;  // So it throws when initializing.
+    public static int intValue = ((int)Math.random())/0;  // So it throws when initializing.
   }
 
   public static interface InfA {

@@ -26,6 +26,7 @@
 #include "dex/code_item_accessors.h"
 #include "dex/dex_file_structs.h"
 #include "dex/primitive.h"
+#include "entrypoints/entrypoint_utils.h"
 #include "handle_scope-inl.h"
 #include "instrumentation.h"
 #include "interpreter/interpreter.h"
@@ -41,7 +42,7 @@
 #include "stack.h"
 #include "thread.h"
 
-namespace art {
+namespace art HIDDEN {
 
 namespace interpreter {
   void ArtInterpreterToInterpreterBridge(Thread* self,
@@ -55,7 +56,27 @@ namespace interpreter {
                                           ShadowFrame* shadow_frame,
                                           uint16_t arg_offset,
                                           JValue* result);
+
 }  // namespace interpreter
+
+inline bool EnsureInitialized(Thread* self, ShadowFrame* shadow_frame)
+    REQUIRES_SHARED(Locks::mutator_lock_) {
+  if (LIKELY(!shadow_frame->GetMethod()->StillNeedsClinitCheck())) {
+    return true;
+  }
+
+  // Save the shadow frame.
+  ScopedStackedShadowFramePusher pusher(self, shadow_frame);
+  StackHandleScope<1> hs(self);
+  Handle<mirror::Class> h_class = hs.NewHandle(shadow_frame->GetMethod()->GetDeclaringClass());
+  if (UNLIKELY(!Runtime::Current()->GetClassLinker()->EnsureInitialized(
+                    self, h_class, /*can_init_fields=*/ true, /*can_init_parents=*/ true))) {
+    DCHECK(self->IsExceptionPending());
+    return false;
+  }
+  DCHECK(h_class->IsInitializing());
+  return true;
+}
 
 inline void PerformCall(Thread* self,
                         const CodeItemDataAccessor& accessor,
@@ -65,15 +86,20 @@ inline void PerformCall(Thread* self,
                         JValue* result,
                         bool use_interpreter_entrypoint)
     REQUIRES_SHARED(Locks::mutator_lock_) {
-  if (LIKELY(Runtime::Current()->IsStarted())) {
-    if (use_interpreter_entrypoint) {
-      interpreter::ArtInterpreterToInterpreterBridge(self, accessor, callee_frame, result);
-    } else {
-      interpreter::ArtInterpreterToCompiledCodeBridge(
-          self, caller_method, callee_frame, first_dest_reg, result);
-    }
-  } else {
+  if (UNLIKELY(!Runtime::Current()->IsStarted())) {
     interpreter::UnstartedRuntime::Invoke(self, accessor, callee_frame, result, first_dest_reg);
+    return;
+  }
+
+  if (!EnsureInitialized(self, callee_frame)) {
+    return;
+  }
+
+  if (use_interpreter_entrypoint) {
+    interpreter::ArtInterpreterToInterpreterBridge(self, accessor, callee_frame, result);
+  } else {
+    interpreter::ArtInterpreterToCompiledCodeBridge(
+        self, caller_method, callee_frame, first_dest_reg, result);
   }
 }
 
@@ -149,7 +175,7 @@ static ALWAYS_INLINE bool DoFieldGetCommon(Thread* self,
   return true;
 }
 
-template<Primitive::Type field_type, bool do_assignability_check, bool transaction_active>
+template<Primitive::Type field_type, bool transaction_active>
 ALWAYS_INLINE bool DoFieldPutCommon(Thread* self,
                                     const ShadowFrame& shadow_frame,
                                     ObjPtr<mirror::Object> obj,
@@ -210,7 +236,7 @@ ALWAYS_INLINE bool DoFieldPutCommon(Thread* self,
       break;
     case Primitive::kPrimNot: {
       ObjPtr<mirror::Object> reg = value.GetL();
-      if (do_assignability_check && reg != nullptr) {
+      if (reg != nullptr && !shadow_frame.GetMethod()->SkipAccessChecks()) {
         // FieldHelper::GetType can resolve classes, use a handle wrapper which will restore the
         // object in the destructor.
         ObjPtr<mirror::Class> field_class;
@@ -229,12 +255,12 @@ ALWAYS_INLINE bool DoFieldPutCommon(Thread* self,
         }
         if (UNLIKELY(!reg->VerifierInstanceOf(field_class))) {
           // This should never happen.
-          std::string temp1, temp2, temp3;
+          std::string temp1, temp2;
           self->ThrowNewExceptionF("Ljava/lang/InternalError;",
                                    "Put '%s' that is not instance of field '%s' in '%s'",
                                    reg->GetClass()->GetDescriptor(&temp1),
                                    field_class->GetDescriptor(&temp2),
-                                   field->GetDeclaringClass()->GetDescriptor(&temp3));
+                                   field->GetDeclaringClassDescriptor());
           return false;
         }
       }

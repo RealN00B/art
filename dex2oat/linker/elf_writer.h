@@ -18,6 +18,7 @@
 #define ART_DEX2OAT_LINKER_ELF_WRITER_H_
 
 #include <stdint.h>
+
 #include <cstddef>
 #include <string>
 #include <vector>
@@ -27,6 +28,7 @@
 #include "base/mutex.h"
 #include "base/os.h"
 #include "debug/debug_info.h"
+#include "thread_pool.h"
 
 namespace art {
 
@@ -50,8 +52,6 @@ class ElfWriter {
   // Returns runtime oat_data runtime address for an opened ElfFile.
   static uintptr_t GetOatDataAddress(ElfFile* elf_file);
 
-  static bool Fixup(File* file, uintptr_t oat_data_begin);
-
   virtual ~ElfWriter() {}
 
   virtual void Start() = 0;
@@ -62,18 +62,19 @@ class ElfWriter {
   // This method must be called before calling GetLoadedSize().
   virtual void PrepareDynamicSection(size_t rodata_size,
                                      size_t text_size,
-                                     size_t data_bimg_rel_ro_size,
+                                     size_t data_img_rel_ro_size,
+                                     size_t data_img_rel_ro_app_image_offset,
                                      size_t bss_size,
                                      size_t bss_methods_offset,
                                      size_t bss_roots_offset,
                                      size_t dex_section_size) = 0;
-  virtual void PrepareDebugInfo(const debug::DebugInfo& debug_info) = 0;
+  virtual std::unique_ptr<ThreadPool> PrepareDebugInfo(const debug::DebugInfo& debug_info) = 0;
   virtual OutputStream* StartRoData() = 0;
   virtual void EndRoData(OutputStream* rodata) = 0;
   virtual OutputStream* StartText() = 0;
   virtual void EndText(OutputStream* text) = 0;
-  virtual OutputStream* StartDataBimgRelRo() = 0;
-  virtual void EndDataBimgRelRo(OutputStream* data_bimg_rel_ro) = 0;
+  virtual OutputStream* StartDataImgRelRo() = 0;
+  virtual void EndDataImgRelRo(OutputStream* data_img_rel_ro) = 0;
   virtual void WriteDynamicSection() = 0;
   virtual void WriteDebugInfo(const debug::DebugInfo& debug_info) = 0;
   virtual bool StripDebugInfo() = 0;

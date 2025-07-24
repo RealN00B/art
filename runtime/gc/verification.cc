@@ -14,10 +14,12 @@
  * limitations under the License.
  */
 
-#include "verification.h"
+#include "verification-inl.h"
 
 #include <iomanip>
 #include <sstream>
+
+#include <android-base/unique_fd.h>
 
 #include "art_field-inl.h"
 #include "base/file_utils.h"
@@ -25,27 +27,35 @@
 #include "mirror/class-inl.h"
 #include "mirror/object-refvisitor-inl.h"
 
-namespace art {
+namespace art HIDDEN {
 namespace gc {
 
 std::string Verification::DumpRAMAroundAddress(uintptr_t addr, uintptr_t bytes) const {
-  const uintptr_t dump_start = addr - bytes;
-  const uintptr_t dump_end = addr + bytes;
+  uintptr_t* dump_start = reinterpret_cast<uintptr_t*>(addr - bytes);
+  uintptr_t* dump_end = reinterpret_cast<uintptr_t*>(addr + bytes);
   std::ostringstream oss;
-  if (dump_start < dump_end &&
-      IsAddressInHeapSpace(reinterpret_cast<const void*>(dump_start)) &&
-      IsAddressInHeapSpace(reinterpret_cast<const void*>(dump_end - 1))) {
-    oss << " adjacent_ram=";
-    for (uintptr_t p = dump_start; p < dump_end; ++p) {
-      if (p == addr) {
-        // Marker of where the address is.
-        oss << "|";
+  oss << " adjacent_ram=";
+
+  {
+    // Check if the RAM is accessible.
+    android::base::unique_fd read_fd, write_fd;
+    if (!android::base::Pipe(&read_fd, &write_fd)) {
+      LOG(WARNING) << "Could not create pipe, RAM being dumped may be unaccessible";
+    } else {
+      size_t count = 2 * bytes;
+      if (write(write_fd.get(), dump_start, count) != static_cast<ssize_t>(count)) {
+        oss << "unaccessible";
+        dump_start = dump_end;
       }
-      uint8_t* ptr = reinterpret_cast<uint8_t*>(p);
-      oss << std::hex << std::setfill('0') << std::setw(2) << static_cast<uintptr_t>(*ptr);
     }
-  } else {
-    oss << " <invalid address>";
+  }
+
+  for (const uintptr_t* p = dump_start; p < dump_end; ++p) {
+    if (p == reinterpret_cast<uintptr_t*>(addr)) {
+      // Marker of where the address is.
+      oss << "|";
+    }
+    oss << std::hex << std::setfill('0') << std::setw(sizeof(uintptr_t) * 2) << *p << " ";
   }
   return oss.str();
 }
@@ -93,7 +103,7 @@ void Verification::LogHeapCorruption(ObjPtr<mirror::Object> holder,
   std::ostringstream oss;
   oss << "GC tried to mark invalid reference " << ref << std::endl;
   oss << DumpObjectInfo(ref, "ref") << "\n";
-  oss << DumpObjectInfo(holder.Ptr(), "holder");
+  oss << DumpObjectInfo(holder.Ptr(), "holder") << "\n";
   if (holder != nullptr) {
     mirror::Class* holder_klass = holder->GetClass<kVerifyNone, kWithoutReadBarrier>();
     if (IsValidClass(holder_klass)) {
@@ -132,25 +142,6 @@ bool Verification::IsValidHeapObjectAddress(const void* addr, space::Space** out
   return IsAligned<kObjectAlignment>(addr) && IsAddressInHeapSpace(addr, out_space);
 }
 
-bool Verification::IsValidClass(const void* addr) const {
-  if (!IsValidHeapObjectAddress(addr)) {
-    return false;
-  }
-  mirror::Class* klass = reinterpret_cast<mirror::Class*>(const_cast<void*>(addr));
-  mirror::Class* k1 = klass->GetClass<kVerifyNone, kWithoutReadBarrier>();
-  if (!IsValidHeapObjectAddress(k1)) {
-    return false;
-  }
-  // `k1` should be class class, take the class again to verify.
-  // Note that this check may not be valid for the no image space since the class class might move
-  // around from moving GC.
-  mirror::Class* k2 = k1->GetClass<kVerifyNone, kWithoutReadBarrier>();
-  if (!IsValidHeapObjectAddress(k2)) {
-    return false;
-  }
-  return k1 == k2;
-}
-
 using ObjectSet = std::set<mirror::Object*>;
 using WorkQueue = std::deque<std::pair<mirror::Object*, std::string>>;
 
@@ -159,7 +150,7 @@ class Verification::BFSFindReachable {
  public:
   explicit BFSFindReachable(ObjectSet* visited) : visited_(visited) {}
 
-  void operator()(mirror::Object* obj, MemberOffset offset, bool is_static ATTRIBUTE_UNUSED) const
+  void operator()(mirror::Object* obj, MemberOffset offset, [[maybe_unused]] bool is_static) const
       REQUIRES_SHARED(Locks::mutator_lock_) {
     ArtField* field = obj->FindFieldByOffset(offset);
     Visit(obj->GetFieldObject<mirror::Object>(offset),

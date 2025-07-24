@@ -17,6 +17,7 @@
 #ifndef ART_RUNTIME_GC_COLLECTOR_CONCURRENT_COPYING_H_
 #define ART_RUNTIME_GC_COLLECTOR_CONCURRENT_COPYING_H_
 
+#include "base/macros.h"
 #include "garbage_collector.h"
 #include "gc/accounting/space_bitmap.h"
 #include "immune_spaces.h"
@@ -27,7 +28,7 @@
 #include <unordered_map>
 #include <vector>
 
-namespace art {
+namespace art HIDDEN {
 class Barrier;
 class Closure;
 class RootInfo;
@@ -41,10 +42,8 @@ class Object;
 namespace gc {
 
 namespace accounting {
-template<typename T> class AtomicStack;
-typedef AtomicStack<mirror::Object> ObjectStack;
 template <size_t kAlignment> class SpaceBitmap;
-typedef SpaceBitmap<kObjectAlignment> ContinuousSpaceBitmap;
+using ContinuousSpaceBitmap = SpaceBitmap<kObjectAlignment>;
 class HeapBitmap;
 class ReadBarrierTable;
 }  // namespace accounting
@@ -152,24 +151,34 @@ class ConcurrentCopying : public GarbageCollector {
   }
   void RevokeThreadLocalMarkStack(Thread* thread) REQUIRES(!mark_stack_lock_);
 
+  // Blindly return the forwarding pointer from the lockword, or null if there is none.
+  static mirror::Object* GetFwdPtrUnchecked(mirror::Object* from_ref)
+      REQUIRES_SHARED(Locks::mutator_lock_);
+
+  // If marked, return the to-space object, otherwise null.
   mirror::Object* IsMarked(mirror::Object* from_ref) override
       REQUIRES_SHARED(Locks::mutator_lock_);
 
   void AssertNoThreadMarkStackMapping(Thread* thread) REQUIRES(!mark_stack_lock_);
+  // Dump information about reference `ref` and return it as a string.
+  // Use `ref_name` to name the reference in messages. Each message is prefixed with `indent`.
+  std::string DumpReferenceInfo(mirror::Object* ref, const char* ref_name, const char* indent = "")
+      REQUIRES_SHARED(Locks::mutator_lock_);
 
  private:
-  void PushOntoMarkStack(Thread* const self, mirror::Object* obj)
-      REQUIRES_SHARED(Locks::mutator_lock_)
-      REQUIRES(!mark_stack_lock_);
-  mirror::Object* Copy(Thread* const self,
-                       mirror::Object* from_ref,
-                       mirror::Object* holder,
-                       MemberOffset offset)
-      REQUIRES_SHARED(Locks::mutator_lock_)
+  EXPORT void PushOntoMarkStack(Thread* const self, mirror::Object* obj)
+      REQUIRES_SHARED(Locks::mutator_lock_) REQUIRES(!mark_stack_lock_);
+  // Returns a to-space copy of the from-space object from_ref, and atomically installs a
+  // forwarding pointer. Ensures that the forwarding reference is visible to other threads before
+  // the returned to-space pointer becomes visible to them.
+  EXPORT mirror::Object* Copy(Thread* const self,
+                              mirror::Object* from_ref,
+                              mirror::Object* holder,
+                              MemberOffset offset) REQUIRES_SHARED(Locks::mutator_lock_)
       REQUIRES(!mark_stack_lock_, !skipped_blocks_lock_, !immune_gray_stack_lock_);
   // Scan the reference fields of object `to_ref`.
   template <bool kNoUnEvac>
-  void Scan(mirror::Object* to_ref) REQUIRES_SHARED(Locks::mutator_lock_)
+  void Scan(mirror::Object* to_ref, size_t obj_size = 0) REQUIRES_SHARED(Locks::mutator_lock_)
       REQUIRES(!mark_stack_lock_);
   // Scan the reference fields of object 'obj' in the dirty cards during
   // card-table scan. In addition to visiting the references, it also sets the
@@ -250,14 +259,13 @@ class ConcurrentCopying : public GarbageCollector {
   // a subset of the heap.
   void Sweep(bool swap_bitmaps)
       REQUIRES_SHARED(Locks::mutator_lock_) REQUIRES(Locks::heap_bitmap_lock_, !mark_stack_lock_);
-  // Sweep only pointers within an array.
-  void SweepArray(accounting::ObjectStack* allocation_stack_, bool swap_bitmaps)
+  void SweepArray(accounting::ObjectStack* obj_arr, bool swap_bitmaps)
       REQUIRES_SHARED(Locks::mutator_lock_) REQUIRES(Locks::heap_bitmap_lock_, !mark_stack_lock_);
   void SweepLargeObjects(bool swap_bitmaps)
       REQUIRES_SHARED(Locks::mutator_lock_) REQUIRES(Locks::heap_bitmap_lock_);
   void MarkZygoteLargeObjects()
       REQUIRES_SHARED(Locks::mutator_lock_);
-  void FillWithDummyObject(Thread* const self, mirror::Object* dummy_obj, size_t byte_size)
+  void FillWithFakeObject(Thread* const self, mirror::Object* fake_obj, size_t byte_size)
       REQUIRES(!mark_stack_lock_, !skipped_blocks_lock_, !immune_gray_stack_lock_)
       REQUIRES_SHARED(Locks::mutator_lock_);
   mirror::Object* AllocateInSkippedBlock(Thread* const self, size_t alloc_size)
@@ -266,22 +274,19 @@ class ConcurrentCopying : public GarbageCollector {
   void CheckEmptyMarkStack() REQUIRES_SHARED(Locks::mutator_lock_) REQUIRES(!mark_stack_lock_);
   void IssueEmptyCheckpoint() REQUIRES_SHARED(Locks::mutator_lock_);
   bool IsOnAllocStack(mirror::Object* ref) REQUIRES_SHARED(Locks::mutator_lock_);
-  mirror::Object* GetFwdPtr(mirror::Object* from_ref)
-      REQUIRES_SHARED(Locks::mutator_lock_);
+  // Return the forwarding pointer from the lockword. The argument must be in from space.
+  mirror::Object* GetFwdPtr(mirror::Object* from_ref) REQUIRES_SHARED(Locks::mutator_lock_);
   void FlipThreadRoots() REQUIRES(!Locks::mutator_lock_);
   void SwapStacks() REQUIRES_SHARED(Locks::mutator_lock_);
   void RecordLiveStackFreezeSize(Thread* self);
   void ComputeUnevacFromSpaceLiveRatio();
   void LogFromSpaceRefHolder(mirror::Object* obj, MemberOffset offset)
       REQUIRES_SHARED(Locks::mutator_lock_);
-  // Dump information about reference `ref` and return it as a string.
-  // Use `ref_name` to name the reference in messages. Each message is prefixed with `indent`.
-  std::string DumpReferenceInfo(mirror::Object* ref, const char* ref_name, const char* indent = "")
-      REQUIRES_SHARED(Locks::mutator_lock_);
   // Dump information about heap reference `ref`, referenced from object `obj` at offset `offset`,
   // and return it as a string.
-  std::string DumpHeapReference(mirror::Object* obj, MemberOffset offset, mirror::Object* ref)
-      REQUIRES_SHARED(Locks::mutator_lock_);
+  EXPORT std::string DumpHeapReference(mirror::Object* obj,
+                                       MemberOffset offset,
+                                       mirror::Object* ref) REQUIRES_SHARED(Locks::mutator_lock_);
   // Dump information about GC root `ref` and return it as a string.
   std::string DumpGcRoot(mirror::Object* ref) REQUIRES_SHARED(Locks::mutator_lock_);
   void AssertToSpaceInvariantInNonMovingSpace(mirror::Object* obj, mirror::Object* ref)
@@ -290,12 +295,11 @@ class ConcurrentCopying : public GarbageCollector {
   void DisableMarking() REQUIRES_SHARED(Locks::mutator_lock_);
   void IssueDisableMarkingCheckpoint() REQUIRES_SHARED(Locks::mutator_lock_);
   void ExpandGcMarkStack() REQUIRES_SHARED(Locks::mutator_lock_);
-  mirror::Object* MarkNonMoving(Thread* const self,
-                                mirror::Object* from_ref,
-                                mirror::Object* holder = nullptr,
-                                MemberOffset offset = MemberOffset(0))
-      REQUIRES_SHARED(Locks::mutator_lock_)
-      REQUIRES(!mark_stack_lock_, !skipped_blocks_lock_);
+  EXPORT mirror::Object* MarkNonMoving(Thread* const self,
+                                       mirror::Object* from_ref,
+                                       mirror::Object* holder = nullptr,
+                                       MemberOffset offset = MemberOffset(0))
+      REQUIRES_SHARED(Locks::mutator_lock_) REQUIRES(!mark_stack_lock_, !skipped_blocks_lock_);
   ALWAYS_INLINE mirror::Object* MarkUnevacFromSpaceRegion(Thread* const self,
       mirror::Object* from_ref,
       accounting::SpaceBitmap<kObjectAlignment>* bitmap)
@@ -307,8 +311,8 @@ class ConcurrentCopying : public GarbageCollector {
       REQUIRES_SHARED(Locks::mutator_lock_) REQUIRES(!immune_gray_stack_lock_);
   void ScanImmuneObject(mirror::Object* obj)
       REQUIRES_SHARED(Locks::mutator_lock_) REQUIRES(!mark_stack_lock_);
-  mirror::Object* MarkFromReadBarrierWithMeasurements(Thread* const self,
-                                                      mirror::Object* from_ref)
+  EXPORT mirror::Object* MarkFromReadBarrierWithMeasurements(Thread* const self,
+                                                             mirror::Object* from_ref)
       REQUIRES_SHARED(Locks::mutator_lock_)
       REQUIRES(!mark_stack_lock_, !skipped_blocks_lock_, !immune_gray_stack_lock_);
   void DumpPerformanceInfo(std::ostream& os) override REQUIRES(!rb_slow_path_histogram_lock_);
@@ -367,12 +371,12 @@ class ConcurrentCopying : public GarbageCollector {
   Mutex mark_stack_lock_ DEFAULT_MUTEX_ACQUIRED_AFTER;
   std::vector<accounting::ObjectStack*> revoked_mark_stacks_
       GUARDED_BY(mark_stack_lock_);
-  static constexpr size_t kMarkStackSize = kPageSize;
+  // Size of thread local mark stack.
+  static size_t GetMarkStackSize() {
+    return gPageSize;
+  }
   static constexpr size_t kMarkStackPoolSize = 256;
   std::vector<accounting::ObjectStack*> pooled_mark_stacks_
-      GUARDED_BY(mark_stack_lock_);
-  // TODO(lokeshgidra b/140119552): remove this after bug fix.
-  std::unordered_map<Thread*, accounting::ObjectStack*> thread_mark_stack_map_
       GUARDED_BY(mark_stack_lock_);
   Thread* thread_running_gc_;
   bool is_marking_;                       // True while marking is ongoing.
@@ -385,9 +389,8 @@ class ConcurrentCopying : public GarbageCollector {
   // A cache of Heap::GetMarkBitmap().
   accounting::HeapBitmap* heap_mark_bitmap_;
   size_t live_stack_freeze_size_;
-  size_t from_space_num_objects_at_first_pause_;  // Computed if kEnableFromSpaceAccountingCheck
   size_t from_space_num_bytes_at_first_pause_;  // Computed if kEnableFromSpaceAccountingCheck
-  Atomic<int> is_mark_stack_push_disallowed_;
+  Atomic<int> is_mark_stack_push_disallowed_;   // Debug only.
   enum MarkStackMode {
     kMarkStackModeOff = 0,      // Mark stack is off.
     kMarkStackModeThreadLocal,  // All threads except for the GC-running thread push refs onto
@@ -397,6 +400,11 @@ class ConcurrentCopying : public GarbageCollector {
     kMarkStackModeGcExclusive   // The GC-running thread pushes onto and pops from the GC mark stack
                                 // without a lock. Other threads won't access the mark stack.
   };
+  // mark_stack_mode_ is updated asynchronoulsy by the GC. We cannot assume that another thread
+  // has seen it until it has run some kind of checkpoint.  We generally access this using
+  // acquire/release ordering, to ensure that any relevant prior changes are visible to readers of
+  // the flag, and to ensure that CHECKs prior to a state change cannot be delayed past the state
+  // change.
   Atomic<MarkStackMode> mark_stack_mode_;
   bool weak_ref_access_enabled_ GUARDED_BY(Locks::thread_list_lock_);
 
@@ -405,10 +413,6 @@ class ConcurrentCopying : public GarbageCollector {
   // bytes_moved_gc_thread_ are critical for GC triggering; the others are just informative.
   Atomic<size_t> bytes_moved_;  // Used by mutators
   Atomic<size_t> objects_moved_;  // Used by mutators
-  size_t bytes_moved_gc_thread_;  // Used by GC
-  size_t objects_moved_gc_thread_;  // Used by GC
-  Atomic<uint64_t> cumulative_bytes_moved_;
-  Atomic<uint64_t> cumulative_objects_moved_;
 
   // copied_live_bytes_ratio_sum_ is read and written by CC per GC, in
   // ReclaimPhase, and is read by DumpPerformanceInfo (potentially from another
@@ -430,6 +434,14 @@ class ConcurrentCopying : public GarbageCollector {
 
   // reclaimed_bytes_ratio = reclaimed_bytes/num_allocated_bytes per GC cycle
   float reclaimed_bytes_ratio_sum_;
+
+  // Used only by GC thread, so need not be atomic. Also, should be kept
+  // in a different cacheline than bytes/objects_moved_ (above) to avoid false
+  // cacheline sharing.
+  size_t bytes_moved_gc_thread_;
+  size_t objects_moved_gc_thread_;
+  uint64_t bytes_scanned_;
+  uint64_t cumulative_bytes_moved_;
 
   // The skipped blocks are memory blocks/chucks that were copies of
   // objects that were unused due to lost races (cas failures) at
@@ -465,14 +477,9 @@ class ConcurrentCopying : public GarbageCollector {
   std::vector<mirror::Object*> immune_gray_stack_ GUARDED_BY(immune_gray_stack_lock_);
 
   // Class of java.lang.Object. Filled in from WellKnownClasses in FlipCallback. Must
-  // be filled in before flipping thread roots so that FillDummyObject can run. Not
+  // be filled in before flipping thread roots so that FillWithFakeObject can run. Not
   // ObjPtr since the GC may transition to suspended and runnable between phases.
   mirror::Class* java_lang_Object_;
-
-  // Sweep array free buffer, used to sweep the spaces based on an array more
-  // efficiently, by recording dead objects to be freed in batches (see
-  // ConcurrentCopying::SweepArray).
-  MemMap sweep_array_free_buffer_mem_map_;
 
   // Use signed because after_gc may be larger than before_gc.
   int64_t num_bytes_allocated_before_gc_;

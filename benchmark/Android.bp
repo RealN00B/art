@@ -14,6 +14,16 @@
 // limitations under the License.
 //
 
+package {
+    // See: http://go/android-license-faq
+    // A large-scale-change added 'default_applicable_licenses' to import
+    // all of the 'license_kinds' from "art_license"
+    // to get the below license kinds:
+    //   SPDX-license-identifier-Apache-2.0
+    default_applicable_licenses: ["art_license"],
+    default_team: "trendy_team_art_performance",
+}
+
 art_cc_library {
     name: "libartbenchmark",
     host_supported: true,
@@ -25,15 +35,24 @@ art_cc_library {
         "micro-native/micro_native.cc",
         "scoped-primitive-array/scoped_primitive_array.cc",
     ],
-    cflags: [
-        "-Wno-frame-larger-than=",
-    ],
+    target: {
+        // This has to be duplicated for android and host to make sure it
+        // comes after the -Wframe-larger-than warnings inserted by art.go
+        // target-specific properties
+        android: {
+            cflags: ["-Wno-frame-larger-than="],
+        },
+        host: {
+            cflags: ["-Wno-frame-larger-than="],
+        },
+    },
     header_libs: [
         "libnativehelper_header_only",
     ],
     // TODO(ngeoffray): find a way to link against the libraries in the apex.
     shared_libs: [
         "libart",
+        "libartbase",
         "libbase",
     ],
 }
@@ -42,10 +61,7 @@ art_cc_library {
     name: "libartbenchmark-micronative-host",
     host_supported: true,
     device_supported: false,
-    defaults: [
-        "art_debug_defaults",
-        "art_defaults",
-    ],
+    defaults: ["art_debug_defaults"],
     srcs: [
         "jni_loader.cc",
         "micro-native/micro_native.cc",
@@ -56,7 +72,42 @@ art_cc_library {
     ],
     header_libs: ["jni_headers"],
     stl: "libc++_static",
-    cflags: [
-        "-Wno-frame-larger-than=",
+    target: {
+        // This has to be duplicated for android and host to make sure it
+        // comes after the -Wframe-larger-than warnings inserted by art.go
+        // target-specific properties
+        android: {
+            cflags: ["-Wno-frame-larger-than="],
+        },
+        host: {
+            cflags: ["-Wno-frame-larger-than="],
+        },
+    },
+}
+
+art_cc_library {
+    name: "libgolemtiagent",
+    host_supported: true,
+    defaults: ["art_defaults"],
+    srcs: [
+        "golem-tiagent/golem-tiagent.cc",
+    ],
+    target: {
+        // This has to be duplicated for android and host to make sure it
+        // comes after the -Wframe-larger-than warnings inserted by art.go
+        // target-specific properties
+        android: {
+            cflags: ["-Wno-frame-larger-than="],
+        },
+        host: {
+            cflags: ["-Wno-frame-larger-than="],
+        },
+    },
+    header_libs: [
+        "libnativehelper_header_only",
+        "libopenjdkjvmti_headers",
+    ],
+    shared_libs: [
+        "libbase",
     ],
 }

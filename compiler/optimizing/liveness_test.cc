@@ -15,6 +15,7 @@
  */
 
 #include "base/arena_allocator.h"
+#include "base/macros.h"
 #include "builder.h"
 #include "code_generator.h"
 #include "dex/dex_file.h"
@@ -25,9 +26,9 @@
 #include "prepare_for_register_allocation.h"
 #include "ssa_liveness_analysis.h"
 
-namespace art {
+namespace art HIDDEN {
 
-class LivenessTest : public OptimizingUnitTest {
+class LivenessTest : public CommonCompilerTest, public OptimizingUnitTestHelper {
  protected:
   void TestCode(const std::vector<uint16_t>& data, const char* expected);
 };
@@ -47,8 +48,10 @@ static void DumpBitVector(BitVector* vector,
 void LivenessTest::TestCode(const std::vector<uint16_t>& data, const char* expected) {
   HGraph* graph = CreateCFG(data);
   // `Inline` conditions into ifs.
-  PrepareForRegisterAllocation(graph, *compiler_options_).Run();
-  std::unique_ptr<CodeGenerator> codegen = CodeGenerator::Create(graph, *compiler_options_);
+  std::unique_ptr<CompilerOptions> compiler_options =
+      CommonCompilerTest::CreateCompilerOptions(kRuntimeISA, "default");
+  PrepareForRegisterAllocation(graph, *compiler_options).Run();
+  std::unique_ptr<CodeGenerator> codegen = CodeGenerator::Create(graph, *compiler_options);
   SsaLivenessAnalysis liveness(graph, codegen.get(), GetScopedAllocator());
   liveness.Analyze();
 

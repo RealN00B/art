@@ -22,14 +22,15 @@
 #include <string>
 #include <vector>
 
+#include "base/compiler_filter.h"
 #include "base/globals.h"
 #include "base/hash_set.h"
 #include "base/macros.h"
+#include "base/stl_util.h"
 #include "base/utils.h"
-#include "compiler_filter.h"
 #include "optimizing/register_allocator.h"
 
-namespace art {
+namespace art HIDDEN {
 
 namespace jit {
 class JitCompiler;
@@ -41,14 +42,14 @@ class VerifierDepsTest;
 
 namespace linker {
 class Arm64RelativePatcherTest;
+class Thumb2RelativePatcherTest;
 }  // namespace linker
 
+class ArtMethod;
 class DexFile;
 enum class InstructionSet;
 class InstructionSetFeatures;
 class ProfileCompilationInfo;
-class VerificationResults;
-class VerifiedMethod;
 
 // Enum for CheckProfileMethodsCompiled. Outside CompilerOptions so it can be forward-declared.
 enum class ProfileMethodsCheck : uint8_t {
@@ -59,15 +60,23 @@ enum class ProfileMethodsCheck : uint8_t {
 
 class CompilerOptions final {
  public:
-  // Guide heuristics to determine whether to compile method if profile data not available.
-  static const size_t kDefaultHugeMethodThreshold = 10000;
-  static const size_t kDefaultLargeMethodThreshold = 600;
-  static const size_t kDefaultNumDexMethodsThreshold = 900;
-  static constexpr double kDefaultTopKProfileThreshold = 90.0;
-  static const bool kDefaultGenerateDebugInfo = false;
-  static const bool kDefaultGenerateMiniDebugInfo = false;
-  static const size_t kDefaultInlineMaxCodeUnits = 32;
+  // Default values for parameters set via flags.
+  static constexpr bool kDefaultGenerateDebugInfo = false;
+  static constexpr bool kDefaultGenerateMiniDebugInfo = true;
+  static constexpr size_t kDefaultHugeMethodThreshold = 10000;
+  static constexpr size_t kDefaultInlineMaxCodeUnits = 32;
+  // Token to represent no value set for `inline_max_code_units_`.
   static constexpr size_t kUnsetInlineMaxCodeUnits = -1;
+  // We set a lower inlining threshold for baseline to reduce code size and compilation time. This
+  // cannot be changed via flags.
+  static constexpr size_t kBaselineInlineMaxCodeUnits = 14;
+
+  enum class CompilerType : uint8_t {
+    kAotCompiler,             // AOT compiler.
+    kJitCompiler,             // Normal JIT compiler.
+    kSharedCodeJitCompiler,   // Zygote JIT producing code in the shared region area, putting
+                              // restrictions on, for example, how literals are being generated.
+  };
 
   enum class ImageType : uint8_t {
     kNone,                    // JIT or AOT app compilation producing only an oat file but no image.
@@ -76,8 +85,8 @@ class CompilerOptions final {
     kAppImage,                // Creating app image.
   };
 
-  CompilerOptions();
-  ~CompilerOptions();
+  EXPORT CompilerOptions();
+  EXPORT ~CompilerOptions();
 
   CompilerFilter::Filter GetCompilerFilter() const {
     return compiler_filter_;
@@ -95,10 +104,6 @@ class CompilerOptions final {
     return CompilerFilter::IsJniCompilationEnabled(compiler_filter_);
   }
 
-  bool IsQuickeningCompilationEnabled() const {
-    return CompilerFilter::IsQuickeningCompilationEnabled(compiler_filter_);
-  }
-
   bool IsVerificationEnabled() const {
     return CompilerFilter::IsVerificationEnabled(compiler_filter_);
   }
@@ -111,10 +116,6 @@ class CompilerOptions final {
     return compiler_filter_ == CompilerFilter::kAssumeVerified;
   }
 
-  bool VerifyAtRuntime() const {
-    return compiler_filter_ == CompilerFilter::kExtract;
-  }
-
   bool IsAnyCompilationEnabled() const {
     return CompilerFilter::IsAnyCompilationEnabled(compiler_filter_);
   }
@@ -123,20 +124,8 @@ class CompilerOptions final {
     return huge_method_threshold_;
   }
 
-  size_t GetLargeMethodThreshold() const {
-    return large_method_threshold_;
-  }
-
   bool IsHugeMethod(size_t num_dalvik_instructions) const {
     return num_dalvik_instructions > huge_method_threshold_;
-  }
-
-  bool IsLargeMethod(size_t num_dalvik_instructions) const {
-    return num_dalvik_instructions > large_method_threshold_;
-  }
-
-  size_t GetNumDexMethodsThreshold() const {
-    return num_dex_methods_threshold_;
   }
 
   size_t GetInlineMaxCodeUnits() const {
@@ -146,8 +135,8 @@ class CompilerOptions final {
     inline_max_code_units_ = units;
   }
 
-  double GetTopKProfileThreshold() const {
-    return top_k_profile_threshold_;
+  bool EmitReadBarrier() const {
+    return emit_read_barrier_;
   }
 
   bool GetDebuggable() const {
@@ -191,6 +180,19 @@ class CompilerOptions final {
     return implicit_so_checks_;
   }
 
+  bool IsAotCompiler() const {
+    return compiler_type_ == CompilerType::kAotCompiler;
+  }
+
+  bool IsJitCompiler() const {
+    return compiler_type_ == CompilerType::kJitCompiler ||
+           compiler_type_ == CompilerType::kSharedCodeJitCompiler;
+  }
+
+  bool IsJitCompilerForSharedCode() const {
+    return compiler_type_ == CompilerType::kSharedCodeJitCompiler;
+  }
+
   bool GetImplicitSuspendChecks() const {
     return implicit_suspend_checks_;
   }
@@ -213,9 +215,17 @@ class CompilerOptions final {
     return baseline_;
   }
 
+  bool ProfileBranches() const {
+    return profile_branches_;
+  }
+
   // Are we compiling an app image?
   bool IsAppImage() const {
     return image_type_ == ImageType::kAppImage;
+  }
+
+  bool IsMultiImage() const {
+    return multi_image_;
   }
 
   // Returns whether we are running ART tests.
@@ -278,17 +288,11 @@ class CompilerOptions final {
     return image_classes_;
   }
 
-  bool IsImageClass(const char* descriptor) const;
+  EXPORT bool IsImageClass(const char* descriptor) const;
 
-  const VerificationResults* GetVerificationResults() const;
-
-  const VerifiedMethod* GetVerifiedMethod(const DexFile* dex_file, uint32_t method_idx) const;
-
-  // Checks if the specified method has been verified without failures. Returns
-  // false if the method is not in the verification results (GetVerificationResults).
-  bool IsMethodVerifiedWithoutFailures(uint32_t method_idx,
-                                       uint16_t class_def_idx,
-                                       const DexFile& dex_file) const;
+  // Returns whether the given `pretty_descriptor` is in the list of preloaded
+  // classes. `pretty_descriptor` should be the result of calling `PrettyDescriptor`.
+  EXPORT bool IsPreloadedClass(std::string_view pretty_descriptor) const;
 
   bool ParseCompilerOptions(const std::vector<std::string>& options,
                             bool ignore_unrecognized,
@@ -320,10 +324,6 @@ class CompilerOptions final {
 
   bool DeduplicateCode() const {
     return deduplicate_code_;
-  }
-
-  RegisterAllocator::Strategy GetRegisterAllocationStrategy() const {
-    return register_allocation_strategy_;
   }
 
   const std::vector<std::string>* GetPassesToRun() const {
@@ -366,14 +366,22 @@ class CompilerOptions final {
     return initialize_app_image_classes_;
   }
 
+  // Returns true if `dex_file` is within an oat file we're producing right now.
+  bool WithinOatFile(const DexFile* dex_file) const {
+    return ContainsElement(GetDexFilesForOatFile(), dex_file);
+  }
+
+  // If this is a static non-constructor method in the boot classpath, and its class isn't
+  // initialized at compile-time, or won't be initialized by the zygote, add
+  // initialization checks at entry. This will avoid the need of trampolines
+  // which at runtime we will need to dirty after initialization.
+  EXPORT bool ShouldCompileWithClinitCheck(ArtMethod* method) const;
+
  private:
-  bool ParseDumpInitFailures(const std::string& option, std::string* error_msg);
-  bool ParseRegisterAllocationStrategy(const std::string& option, std::string* error_msg);
+  EXPORT bool ParseDumpInitFailures(const std::string& option, std::string* error_msg);
 
   CompilerFilter::Filter compiler_filter_;
   size_t huge_method_threshold_;
-  size_t large_method_threshold_;
-  size_t num_dex_methods_threshold_;
   size_t inline_max_code_units_;
 
   InstructionSet instruction_set_;
@@ -391,11 +399,15 @@ class CompilerOptions final {
   // Must not be empty for real boot image, only for tests pretending to compile boot image.
   HashSet<std::string> image_classes_;
 
-  // Results of AOT verification.
-  const VerificationResults* verification_results_;
+  // Classes listed in the preloaded-classes file, used for boot image and
+  // boot image extension compilation.
+  HashSet<std::string> preloaded_classes_;
 
+  CompilerType compiler_type_;
   ImageType image_type_;
+  bool multi_image_;
   bool compile_art_test_;
+  bool emit_read_barrier_;
   bool baseline_;
   bool debuggable_;
   bool generate_debug_info_;
@@ -408,9 +420,7 @@ class CompilerOptions final {
   bool dump_timings_;
   bool dump_pass_timings_;
   bool dump_stats_;
-
-  // When using a profile file only the top K% of the profiled samples will be compiled.
-  double top_k_profile_threshold_;
+  bool profile_branches_;
 
   // Info for profile guided compilation.
   const ProfileCompilationInfo* profile_compilation_info_;
@@ -462,8 +472,6 @@ class CompilerOptions final {
   // Maximum solid block size in the generated image.
   uint32_t max_image_block_size_;
 
-  RegisterAllocator::Strategy register_allocation_strategy_;
-
   // If not null, specifies optimization passes which will be run instead of defaults.
   // Note that passes_to_run_ is not checked for correctness and providing an incorrect
   // list of passes can lead to unexpected compiler behaviour. This is caused by dependencies
@@ -473,12 +481,12 @@ class CompilerOptions final {
   const std::vector<std::string>* passes_to_run_;
 
   friend class Dex2Oat;
-  friend class DexToDexDecompilerTest;
   friend class CommonCompilerDriverTest;
-  friend class CommonCompilerTest;
+  friend class CommonCompilerTestImpl;
   friend class jit::JitCompiler;
   friend class verifier::VerifierDepsTest;
   friend class linker::Arm64RelativePatcherTest;
+  friend class linker::Thumb2RelativePatcherTest;
 
   template <class Base>
   friend bool ReadCompilerOptions(Base& map, CompilerOptions* options, std::string* error_msg);

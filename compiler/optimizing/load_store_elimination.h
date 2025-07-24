@@ -17,32 +17,28 @@
 #ifndef ART_COMPILER_OPTIMIZING_LOAD_STORE_ELIMINATION_H_
 #define ART_COMPILER_OPTIMIZING_LOAD_STORE_ELIMINATION_H_
 
+#include "base/macros.h"
 #include "optimization.h"
 
-namespace art {
+namespace art HIDDEN {
 
 class SideEffectsAnalysis;
-class LoadStoreAnalysis;
 
 class LoadStoreElimination : public HOptimization {
  public:
+  // Controls whether to enable VLOG(compiler) logs explaining the transforms taking place.
+  static constexpr bool kVerboseLoggingMode = false;
+
   LoadStoreElimination(HGraph* graph,
-                       const SideEffectsAnalysis& side_effects,
-                       const LoadStoreAnalysis& lsa,
                        OptimizingCompilerStats* stats,
                        const char* name = kLoadStoreEliminationPassName)
-      : HOptimization(graph, name, stats),
-        side_effects_(side_effects),
-        lsa_(lsa) {}
+      : HOptimization(graph, name, stats) {}
 
-  bool Run() override;
+  bool Run();
 
   static constexpr const char* kLoadStoreEliminationPassName = "load_store_elimination";
 
  private:
-  const SideEffectsAnalysis& side_effects_;
-  const LoadStoreAnalysis& lsa_;
-
   DISALLOW_COPY_AND_ASSIGN(LoadStoreElimination);
 };
 

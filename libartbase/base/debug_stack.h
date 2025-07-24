@@ -37,9 +37,9 @@ class DebugStackReferenceImpl;
 template <bool kIsDebug>
 class DebugStackIndirectTopRefImpl;
 
-typedef DebugStackRefCounterImpl<kIsDebugBuild> DebugStackRefCounter;
-typedef DebugStackReferenceImpl<kIsDebugBuild> DebugStackReference;
-typedef DebugStackIndirectTopRefImpl<kIsDebugBuild> DebugStackIndirectTopRef;
+using DebugStackRefCounter = DebugStackRefCounterImpl<kIsDebugBuild>;
+using DebugStackReference = DebugStackReferenceImpl<kIsDebugBuild>;
+using DebugStackIndirectTopRef = DebugStackIndirectTopRefImpl<kIsDebugBuild>;
 
 // Non-debug mode specializations. This should be optimized away.
 
@@ -55,7 +55,7 @@ class DebugStackRefCounterImpl<false> {
 template <>
 class DebugStackReferenceImpl<false> {
  public:
-  explicit DebugStackReferenceImpl(DebugStackRefCounterImpl<false>* counter ATTRIBUTE_UNUSED) {}
+  explicit DebugStackReferenceImpl([[maybe_unused]] DebugStackRefCounterImpl<false>* counter) {}
   DebugStackReferenceImpl(const DebugStackReferenceImpl& other) = default;
   DebugStackReferenceImpl& operator=(const DebugStackReferenceImpl& other) = default;
   void CheckTop() { }
@@ -64,7 +64,7 @@ class DebugStackReferenceImpl<false> {
 template <>
 class DebugStackIndirectTopRefImpl<false> {
  public:
-  explicit DebugStackIndirectTopRefImpl(DebugStackReferenceImpl<false>* ref ATTRIBUTE_UNUSED) {}
+  explicit DebugStackIndirectTopRefImpl([[maybe_unused]] DebugStackReferenceImpl<false>* ref) {}
   DebugStackIndirectTopRefImpl(const DebugStackIndirectTopRefImpl& other) = default;
   DebugStackIndirectTopRefImpl& operator=(const DebugStackIndirectTopRefImpl& other) = default;
   void CheckTop() { }
@@ -95,7 +95,7 @@ class DebugStackReferenceImpl {
   DebugStackReferenceImpl(const DebugStackReferenceImpl& other)
     : counter_(other.counter_), ref_count_(counter_->IncrementRefCount()) {
   }
-  DebugStackReferenceImpl(DebugStackReferenceImpl&& other)
+  DebugStackReferenceImpl(DebugStackReferenceImpl&& other) noexcept
     : counter_(other.counter_), ref_count_(other.ref_count_) {
     other.counter_ = nullptr;
   }

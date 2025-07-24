@@ -17,183 +17,57 @@
 #include "jit.h"
 
 #include <dlfcn.h>
+#include <sys/resource.h>
 
+#include "app_info.h"
 #include "art_method-inl.h"
-#include "base/enums.h"
 #include "base/file_utils.h"
 #include "base/logging.h"  // For VLOG.
 #include "base/memfd.h"
 #include "base/memory_tool.h"
+#include "base/pointer_size.h"
 #include "base/runtime_debug.h"
 #include "base/scoped_flock.h"
 #include "base/utils.h"
-#include "class_root.h"
+#include "class_root-inl.h"
+#include "compilation_kind.h"
 #include "debugger.h"
 #include "dex/type_lookup_table.h"
-#include "gc/space/image_space.h"
 #include "entrypoints/entrypoint_utils-inl.h"
 #include "entrypoints/runtime_asm_entrypoints.h"
-#include "image-inl.h"
+#include "gc/space/image_space.h"
+#include "gc/task_processor.h"
 #include "interpreter/interpreter.h"
 #include "jit-inl.h"
 #include "jit_code_cache.h"
+#include "jit_create.h"
 #include "jni/java_vm_ext.h"
 #include "mirror/method_handle_impl.h"
 #include "mirror/var_handle.h"
-#include "oat_file.h"
-#include "oat_file_manager.h"
-#include "oat_quick_method_header.h"
+#include "oat/image-inl.h"
+#include "oat/oat_file.h"
+#include "oat/oat_file_manager.h"
+#include "oat/oat_quick_method_header.h"
+#include "oat/stack_map.h"
 #include "profile/profile_boot_info.h"
 #include "profile/profile_compilation_info.h"
 #include "profile_saver.h"
 #include "runtime.h"
 #include "runtime_options.h"
+#include "small_pattern_matcher.h"
 #include "stack.h"
-#include "stack_map.h"
 #include "thread-inl.h"
 #include "thread_list.h"
 
 using android::base::unique_fd;
 
-namespace art {
+namespace art HIDDEN {
 namespace jit {
 
 static constexpr bool kEnableOnStackReplacement = true;
 
-// Maximum permitted threshold value.
-static constexpr uint32_t kJitMaxThreshold = std::numeric_limits<uint16_t>::max();
-
-// Different compilation threshold constants. These can be overridden on the command line.
-
-// Non-debug default
-static constexpr uint32_t kJitDefaultCompileThreshold = 20 * kJitSamplesBatchSize;
-// Fast-debug build.
-static constexpr uint32_t kJitStressDefaultCompileThreshold = 2 * kJitSamplesBatchSize;
-// Slow-debug build.
-static constexpr uint32_t kJitSlowStressDefaultCompileThreshold = 2;
-
-// Different warm-up threshold constants. These default to the equivalent compile thresholds divided
-// by 2, but can be overridden at the command-line.
-static constexpr uint32_t kJitDefaultWarmUpThreshold = kJitDefaultCompileThreshold / 2;
-static constexpr uint32_t kJitStressDefaultWarmUpThreshold = kJitStressDefaultCompileThreshold / 2;
-static constexpr uint32_t kJitSlowStressDefaultWarmUpThreshold =
-    kJitSlowStressDefaultCompileThreshold / 2;
-
-DEFINE_RUNTIME_DEBUG_FLAG(Jit, kSlowMode);
-
 // JIT compiler
-void* Jit::jit_library_handle_ = nullptr;
 JitCompilerInterface* Jit::jit_compiler_ = nullptr;
-JitCompilerInterface* (*Jit::jit_load_)(void) = nullptr;
-
-JitOptions* JitOptions::CreateFromRuntimeArguments(const RuntimeArgumentMap& options) {
-  auto* jit_options = new JitOptions;
-  jit_options->use_jit_compilation_ = options.GetOrDefault(RuntimeArgumentMap::UseJitCompilation);
-  jit_options->use_tiered_jit_compilation_ =
-      options.GetOrDefault(RuntimeArgumentMap::UseTieredJitCompilation);
-
-  jit_options->code_cache_initial_capacity_ =
-      options.GetOrDefault(RuntimeArgumentMap::JITCodeCacheInitialCapacity);
-  jit_options->code_cache_max_capacity_ =
-      options.GetOrDefault(RuntimeArgumentMap::JITCodeCacheMaxCapacity);
-  jit_options->dump_info_on_shutdown_ =
-      options.Exists(RuntimeArgumentMap::DumpJITInfoOnShutdown);
-  jit_options->profile_saver_options_ =
-      options.GetOrDefault(RuntimeArgumentMap::ProfileSaverOpts);
-  jit_options->thread_pool_pthread_priority_ =
-      options.GetOrDefault(RuntimeArgumentMap::JITPoolThreadPthreadPriority);
-
-  // Set default compile threshold to aide with sanity checking defaults.
-  jit_options->compile_threshold_ =
-      kIsDebugBuild
-      ? (Jit::kSlowMode
-         ? kJitSlowStressDefaultCompileThreshold
-         : kJitStressDefaultCompileThreshold)
-      : kJitDefaultCompileThreshold;
-
-  // When not running in slow-mode, thresholds are quantized to kJitSamplesbatchsize.
-  const uint32_t kJitThresholdStep = Jit::kSlowMode ? 1u : kJitSamplesBatchSize;
-
-  // Set default warm-up threshold to aide with sanity checking defaults.
-  jit_options->warmup_threshold_ =
-      kIsDebugBuild ? (Jit::kSlowMode
-                       ? kJitSlowStressDefaultWarmUpThreshold
-                       : kJitStressDefaultWarmUpThreshold)
-      : kJitDefaultWarmUpThreshold;
-
-  // Warmup threshold should be less than compile threshold (so long as compile threshold is not
-  // zero == JIT-on-first-use).
-  DCHECK_LT(jit_options->warmup_threshold_, jit_options->compile_threshold_);
-  DCHECK_EQ(RoundUp(jit_options->warmup_threshold_, kJitThresholdStep),
-            jit_options->warmup_threshold_);
-
-  if (options.Exists(RuntimeArgumentMap::JITCompileThreshold)) {
-    jit_options->compile_threshold_ = *options.Get(RuntimeArgumentMap::JITCompileThreshold);
-  }
-  jit_options->compile_threshold_ = RoundUp(jit_options->compile_threshold_, kJitThresholdStep);
-
-  if (options.Exists(RuntimeArgumentMap::JITWarmupThreshold)) {
-    jit_options->warmup_threshold_ = *options.Get(RuntimeArgumentMap::JITWarmupThreshold);
-  }
-  jit_options->warmup_threshold_ = RoundUp(jit_options->warmup_threshold_, kJitThresholdStep);
-
-  if (options.Exists(RuntimeArgumentMap::JITOsrThreshold)) {
-    jit_options->osr_threshold_ = *options.Get(RuntimeArgumentMap::JITOsrThreshold);
-  } else {
-    jit_options->osr_threshold_ = jit_options->compile_threshold_ * 2;
-    if (jit_options->osr_threshold_ > kJitMaxThreshold) {
-      jit_options->osr_threshold_ =
-          RoundDown(kJitMaxThreshold, kJitThresholdStep);
-    }
-  }
-  jit_options->osr_threshold_ = RoundUp(jit_options->osr_threshold_, kJitThresholdStep);
-
-  // Enforce ordering constraints between thresholds if not jit-on-first-use (when the compile
-  // threshold is 0).
-  if (jit_options->compile_threshold_ != 0) {
-    // Clamp thresholds such that OSR > compile > warm-up (see Jit::MaybeCompileMethod).
-    jit_options->osr_threshold_ = std::clamp(jit_options->osr_threshold_,
-                                             2u * kJitThresholdStep,
-                                             RoundDown(kJitMaxThreshold, kJitThresholdStep));
-    jit_options->compile_threshold_ = std::clamp(jit_options->compile_threshold_,
-                                                 kJitThresholdStep,
-                                                 jit_options->osr_threshold_ - kJitThresholdStep);
-    jit_options->warmup_threshold_ =
-        std::clamp(jit_options->warmup_threshold_,
-                   0u,
-                   jit_options->compile_threshold_ - kJitThresholdStep);
-  }
-
-  if (options.Exists(RuntimeArgumentMap::JITPriorityThreadWeight)) {
-    jit_options->priority_thread_weight_ =
-        *options.Get(RuntimeArgumentMap::JITPriorityThreadWeight);
-    if (jit_options->priority_thread_weight_ > jit_options->warmup_threshold_) {
-      LOG(FATAL) << "Priority thread weight is above the warmup threshold.";
-    } else if (jit_options->priority_thread_weight_ == 0) {
-      LOG(FATAL) << "Priority thread weight cannot be 0.";
-    }
-  } else {
-    jit_options->priority_thread_weight_ = std::max(
-        jit_options->warmup_threshold_ / Jit::kDefaultPriorityThreadWeightRatio,
-        static_cast<size_t>(1));
-  }
-
-  if (options.Exists(RuntimeArgumentMap::JITInvokeTransitionWeight)) {
-    jit_options->invoke_transition_weight_ =
-        *options.Get(RuntimeArgumentMap::JITInvokeTransitionWeight);
-    if (jit_options->invoke_transition_weight_ > jit_options->warmup_threshold_) {
-      LOG(FATAL) << "Invoke transition weight is above the warmup threshold.";
-    } else if (jit_options->invoke_transition_weight_  == 0) {
-      LOG(FATAL) << "Invoke transition weight cannot be 0.";
-    }
-  } else {
-    jit_options->invoke_transition_weight_ = std::max(
-        jit_options->warmup_threshold_ / Jit::kDefaultInvokeTransitionWeightRatio,
-        static_cast<size_t>(1));
-  }
-
-  return jit_options;
-}
 
 void Jit::DumpInfo(std::ostream& os) {
   code_cache_->Dump(os);
@@ -222,31 +96,27 @@ Jit::Jit(JitCodeCache* code_cache, JitOptions* options)
       fd_methods_(-1),
       fd_methods_size_(0) {}
 
-Jit* Jit::Create(JitCodeCache* code_cache, JitOptions* options) {
-  if (jit_load_ == nullptr) {
-    LOG(WARNING) << "Not creating JIT: library not loaded";
-    return nullptr;
-  }
-  jit_compiler_ = (jit_load_)();
-  if (jit_compiler_ == nullptr) {
-    LOG(WARNING) << "Not creating JIT: failed to allocate a compiler";
-    return nullptr;
-  }
+std::unique_ptr<Jit> Jit::Create(JitCodeCache* code_cache, JitOptions* options) {
+  jit_compiler_ = jit_create();
   std::unique_ptr<Jit> jit(new Jit(code_cache, options));
 
   // If the code collector is enabled, check if that still holds:
   // With 'perf', we want a 1-1 mapping between an address and a method.
   // We aren't able to keep method pointers live during the instrumentation method entry trampoline
   // so we will just disable jit-gc if we are doing that.
+  // JitAtFirstUse compiles the methods synchronously on mutator threads. While this should work
+  // in theory it is causing deadlocks in some jvmti tests related to Jit GC. Hence, disabling
+  // Jit GC for now (b/147208992).
   if (code_cache->GetGarbageCollectCode()) {
     code_cache->SetGarbageCollectCode(!jit_compiler_->GenerateDebugInfo() &&
-        !Runtime::Current()->GetInstrumentation()->AreExitStubsInstalled());
+        !jit->JitAtFirstUse());
   }
 
   VLOG(jit) << "JIT created with initial_capacity="
       << PrettySize(options->GetCodeCacheInitialCapacity())
       << ", max_capacity=" << PrettySize(options->GetCodeCacheMaxCapacity())
-      << ", compile_threshold=" << options->GetCompileThreshold()
+      << ", warmup_threshold=" << options->GetWarmupThreshold()
+      << ", optimize_threshold=" << options->GetOptimizeThreshold()
       << ", profile_saver_options=" << options->GetProfileSaverOptions();
 
   // We want to know whether the compiler is compiling baseline, as this
@@ -260,42 +130,58 @@ Jit* Jit::Create(JitCodeCache* code_cache, JitOptions* options) {
 
   // Notify native debugger about the classes already loaded before the creation of the jit.
   jit->DumpTypeInfoForLoadedTypes(Runtime::Current()->GetClassLinker());
-  return jit.release();
+
+  return jit;
 }
 
-template <typename T>
-bool Jit::LoadSymbol(T* address, const char* name, std::string* error_msg) {
-  *address = reinterpret_cast<T>(dlsym(jit_library_handle_, name));
-  if (*address == nullptr) {
-    *error_msg = std::string("JIT couldn't find ") + name + std::string(" entry point");
-    return false;
+
+bool Jit::TryPatternMatch(ArtMethod* method_to_compile, CompilationKind compilation_kind) {
+  // Try to pattern match the method. Only on arm and arm64 for now as we have
+  // sufficiently similar calling convention between C++ and managed code.
+  if (kRuntimeISA == InstructionSet::kArm || kRuntimeISA == InstructionSet::kArm64) {
+    if (!Runtime::Current()->IsJavaDebuggable() &&
+        compilation_kind == CompilationKind::kBaseline &&
+        !method_to_compile->StillNeedsClinitCheck()) {
+      const void* pattern = SmallPatternMatcher::TryMatch(method_to_compile);
+      if (pattern != nullptr) {
+        VLOG(jit) << "Successfully pattern matched " << method_to_compile->PrettyMethod();
+        Runtime::Current()->GetInstrumentation()->UpdateMethodsCode(method_to_compile, pattern);
+        return true;
+      }
+    }
   }
-  return true;
+  return false;
 }
 
-bool Jit::LoadCompilerLibrary(std::string* error_msg) {
-  jit_library_handle_ = dlopen(
-      kIsDebugBuild ? "libartd-compiler.so" : "libart-compiler.so", RTLD_NOW);
-  if (jit_library_handle_ == nullptr) {
-    std::ostringstream oss;
-    oss << "JIT could not load libart-compiler.so: " << dlerror();
-    *error_msg = oss.str();
-    return false;
-  }
-  if (!LoadSymbol(&jit_load_, "jit_load", error_msg)) {
-    dlclose(jit_library_handle_);
-    return false;
-  }
-  return true;
-}
-
-bool Jit::CompileMethod(ArtMethod* method, Thread* self, bool baseline, bool osr, bool prejit) {
+bool Jit::CompileMethodInternal(ArtMethod* method,
+                                Thread* self,
+                                CompilationKind compilation_kind,
+                                bool prejit) {
   DCHECK(Runtime::Current()->UseJitCompilation());
   DCHECK(!method->IsRuntimeMethod());
 
-  RuntimeCallbacks* cb = Runtime::Current()->GetRuntimeCallbacks();
+  // If the baseline flag was explicitly passed in the compiler options, change the compilation kind
+  // from optimized to baseline.
+  if (jit_compiler_->IsBaselineCompiler() && compilation_kind == CompilationKind::kOptimized) {
+    compilation_kind = CompilationKind::kBaseline;
+  }
+
+  if (method->IsPreCompiled() && !prejit) {
+    VLOG(jit) << "JIT not compiling " << method->PrettyMethod()
+              << " due to method marked pre-compile,"
+              << " and the compilation request isn't for pre-compilation.";
+    return false;
+  }
+
+  // If we're asked to compile baseline, but we cannot allocate profiling infos,
+  // change the compilation kind to optimized.
+  if ((compilation_kind == CompilationKind::kBaseline) &&
+      !GetCodeCache()->CanAllocateProfilingInfo()) {
+    compilation_kind = CompilationKind::kOptimized;
+  }
+
   // Don't compile the method if it has breakpoints.
-  if (cb->IsMethodBeingInspected(method) && !cb->IsMethodSafeToJit(method)) {
+  if (Runtime::Current()->GetInstrumentation()->IsDeoptimized(method)) {
     VLOG(jit) << "JIT not compiling " << method->PrettyMethod()
               << " due to not being safe to jit according to runtime-callbacks. For example, there"
               << " could be breakpoints in this method.";
@@ -319,7 +205,7 @@ bool Jit::CompileMethod(ArtMethod* method, Thread* self, bool baseline, bool osr
   }
 
   JitMemoryRegion* region = GetCodeCache()->GetCurrentRegion();
-  if (osr && GetCodeCache()->IsSharedRegion(*region)) {
+  if ((compilation_kind == CompilationKind::kOsr) && GetCodeCache()->IsSharedRegion(*region)) {
     VLOG(jit) << "JIT not osr compiling "
               << method->PrettyMethod()
               << " due to using shared region";
@@ -329,20 +215,24 @@ bool Jit::CompileMethod(ArtMethod* method, Thread* self, bool baseline, bool osr
   // If we get a request to compile a proxy method, we pass the actual Java method
   // of that proxy method, as the compiler does not expect a proxy method.
   ArtMethod* method_to_compile = method->GetInterfaceMethodIfProxy(kRuntimePointerSize);
-  if (!code_cache_->NotifyCompilationOf(method_to_compile, self, osr, prejit, baseline, region)) {
+
+  if (TryPatternMatch(method_to_compile, compilation_kind)) {
+    return true;
+  }
+
+  if (!code_cache_->NotifyCompilationOf(method_to_compile, self, compilation_kind, prejit)) {
     return false;
   }
 
   VLOG(jit) << "Compiling method "
             << ArtMethod::PrettyMethod(method_to_compile)
-            << " osr=" << std::boolalpha << osr
-            << " baseline=" << std::boolalpha << baseline;
-  bool success = jit_compiler_->CompileMethod(self, region, method_to_compile, baseline, osr);
-  code_cache_->DoneCompiling(method_to_compile, self, osr);
+            << " kind=" << compilation_kind;
+  bool success = jit_compiler_->CompileMethod(self, region, method_to_compile, compilation_kind);
+  code_cache_->DoneCompiling(method_to_compile, self);
   if (!success) {
     VLOG(jit) << "Failed to compile method "
               << ArtMethod::PrettyMethod(method_to_compile)
-              << " osr=" << std::boolalpha << osr;
+              << " kind=" << compilation_kind;
   }
   if (kIsDebugBuild) {
     if (self->IsExceptionPending()) {
@@ -365,7 +255,7 @@ void Jit::WaitForWorkersToBeCreated() {
 void Jit::DeleteThreadPool() {
   Thread* self = Thread::Current();
   if (thread_pool_ != nullptr) {
-    std::unique_ptr<ThreadPool> pool;
+    std::unique_ptr<JitThreadPool> pool;
     {
       ScopedSuspendAll ssa(__FUNCTION__);
       // Clear thread_pool_ field while the threads are suspended.
@@ -385,10 +275,17 @@ void Jit::DeleteThreadPool() {
   }
 }
 
-void Jit::StartProfileSaver(const std::string& filename,
-                            const std::vector<std::string>& code_paths) {
+void Jit::StartProfileSaver(const std::string& profile_filename,
+                            const std::vector<std::string>& code_paths,
+                            const std::string& ref_profile_filename,
+                            AppInfo::CodeType code_type) {
   if (options_->GetSaveProfilingInfo()) {
-    ProfileSaver::Start(options_->GetProfileSaverOptions(), filename, code_cache_, code_paths);
+    ProfileSaver::Start(options_->GetProfileSaverOptions(),
+                        profile_filename,
+                        code_cache_,
+                        code_paths,
+                        ref_profile_filename,
+                        code_type);
   }
 }
 
@@ -407,7 +304,7 @@ bool Jit::CanInvokeCompiledCode(ArtMethod* method) {
 }
 
 Jit::~Jit() {
-  DCHECK(!options_->GetSaveProfilingInfo() || !ProfileSaver::IsStarted());
+  DCHECK_IMPLIES(options_->GetSaveProfilingInfo(), !ProfileSaver::IsStarted());
   if (options_->DumpJitInfoOnShutdown()) {
     DumpInfo(LOG_STREAM(INFO));
     Runtime::Current()->DumpDeoptimizations(LOG_STREAM(INFO));
@@ -416,10 +313,6 @@ Jit::~Jit() {
   if (jit_compiler_ != nullptr) {
     delete jit_compiler_;
     jit_compiler_ = nullptr;
-  }
-  if (jit_library_handle_ != nullptr) {
-    dlclose(jit_library_handle_);
-    jit_library_handle_ = nullptr;
   }
 }
 
@@ -543,7 +436,7 @@ OsrData* Jit::PrepareForOsr(ArtMethod* method, uint32_t dex_pc, uint32_t* vregs)
       }
     }
 
-    osr_data->native_pc = stack_map.GetNativePcOffset(kRuntimeISA) +
+    osr_data->native_pc = stack_map.GetNativePcOffset(kRuntimeQuickCodeISA) +
         osr_method->GetEntryPoint();
     VLOG(jit) << "Jumping to "
               << method_name
@@ -563,7 +456,7 @@ bool Jit::MaybeDoOnStackReplacement(Thread* thread,
     return false;
   }
 
-  if (UNLIKELY(__builtin_frame_address(0) < thread->GetStackEnd())) {
+  if (UNLIKELY(__builtin_frame_address(0) < thread->GetStackEnd<kNativeStackType>())) {
     // Don't attempt to do an OSR if we are close to the stack limit. Since
     // the interpreter frames are still on stack, OSR has the potential
     // to stack overflow even for a simple loop.
@@ -578,7 +471,11 @@ bool Jit::MaybeDoOnStackReplacement(Thread* thread,
   // Before allowing the jump, make sure no code is actively inspecting the method to avoid
   // jumping from interpreter to OSR while e.g. single stepping. Note that we could selectively
   // disable OSR when single stepping, but that's currently hard to know at this point.
-  if (Runtime::Current()->GetRuntimeCallbacks()->IsMethodBeingInspected(method)) {
+  // Currently, HaveLocalsChanged is not frame specific. It is possible to make it frame specific
+  // to allow OSR of frames that don't have any locals changed but it isn't worth the additional
+  // complexity.
+  if (Runtime::Current()->GetInstrumentation()->NeedsSlowInterpreterForMethod(thread, method) ||
+      Runtime::Current()->GetRuntimeCallbacks()->HaveLocalsChanged()) {
     return false;
   }
 
@@ -637,9 +534,9 @@ void Jit::NotifyZygoteCompilationDone() {
     // within a page range. For methods that falls above or below the range,
     // the child processes will copy their contents to their private mapping
     // in `child_mapping_methods`. See `MapBootImageMethods`.
-    uint8_t* page_start = AlignUp(header.GetImageBegin() + section.Offset(), kPageSize);
+    uint8_t* page_start = AlignUp(header.GetImageBegin() + section.Offset(), gPageSize);
     uint8_t* page_end =
-        AlignDown(header.GetImageBegin() + section.Offset() + section.Size(), kPageSize);
+        AlignDown(header.GetImageBegin() + section.Offset() + section.Size(), gPageSize);
     if (page_end > page_start) {
       uint64_t capacity = page_end - page_start;
       memcpy(zygote_mapping_methods_.Begin() + offset, page_start, capacity);
@@ -675,6 +572,7 @@ void Jit::NotifyZygoteCompilationDone() {
       /* start= */ 0,
       /* low_4gb= */ false,
       "boot-image-methods",
+      /* reuse= */ true,  // The mapping will be reused by the mremaps below.
       &error_str);
 
   if (!child_mapping_methods.IsValid()) {
@@ -696,9 +594,9 @@ void Jit::NotifyZygoteCompilationDone() {
     // within a page range. For methods that falls above or below the range,
     // the child processes will copy their contents to their private mapping
     // in `child_mapping_methods`. See `MapBootImageMethods`.
-    uint8_t* page_start = AlignUp(header.GetImageBegin() + section.Offset(), kPageSize);
+    uint8_t* page_start = AlignUp(header.GetImageBegin() + section.Offset(), gPageSize);
     uint8_t* page_end =
-        AlignDown(header.GetImageBegin() + section.Offset() + section.Size(), kPageSize);
+        AlignDown(header.GetImageBegin() + section.Offset() + section.Size(), gPageSize);
     if (page_end > page_start) {
       uint64_t capacity = page_end - page_start;
       if (memcmp(child_mapping_methods.Begin() + offset, page_start, capacity) != 0) {
@@ -724,9 +622,9 @@ void Jit::NotifyZygoteCompilationDone() {
     // within a page range. For methods that falls above or below the range,
     // the child processes will copy their contents to their private mapping
     // in `child_mapping_methods`. See `MapBootImageMethods`.
-    uint8_t* page_start = AlignUp(header.GetImageBegin() + section.Offset(), kPageSize);
+    uint8_t* page_start = AlignUp(header.GetImageBegin() + section.Offset(), gPageSize);
     uint8_t* page_end =
-        AlignDown(header.GetImageBegin() + section.Offset() + section.Size(), kPageSize);
+        AlignDown(header.GetImageBegin() + section.Offset() + section.Size(), gPageSize);
     if (page_end > page_start) {
       uint64_t capacity = page_end - page_start;
       if (mremap(child_mapping_methods.Begin() + offset,
@@ -747,62 +645,34 @@ void Jit::NotifyZygoteCompilationDone() {
   // Mark that compilation of boot classpath is done, and memory can now be
   // shared. Other processes will pick up this information.
   code_cache_->GetZygoteMap()->SetCompilationState(ZygoteCompilationState::kNotifiedOk);
-
-  // The private mapping created for this process has been mremaped. We can
-  // reset it.
-  child_mapping_methods.Reset();
 }
 
 class JitCompileTask final : public Task {
  public:
   enum class TaskKind {
-    kAllocateProfile,
     kCompile,
-    kCompileBaseline,
-    kCompileOsr,
     kPreCompile,
   };
 
-  JitCompileTask(ArtMethod* method, TaskKind kind) : method_(method), kind_(kind), klass_(nullptr) {
-    ScopedObjectAccess soa(Thread::Current());
-    // For a non-bootclasspath class, add a global ref to the class to prevent class unloading
-    // until compilation is done.
-    // When we precompile, this is either with boot classpath methods, or main
-    // class loader methods, so we don't need to keep a global reference.
-    if (method->GetDeclaringClass()->GetClassLoader() != nullptr &&
-        kind_ != TaskKind::kPreCompile) {
-      klass_ = soa.Vm()->AddGlobalRef(soa.Self(), method_->GetDeclaringClass());
-      CHECK(klass_ != nullptr);
-    }
-  }
-
-  ~JitCompileTask() {
-    if (klass_ != nullptr) {
-      ScopedObjectAccess soa(Thread::Current());
-      soa.Vm()->DeleteGlobalRef(soa.Self(), klass_);
-    }
+  JitCompileTask(ArtMethod* method,
+                 TaskKind task_kind,
+                 CompilationKind compilation_kind)
+      : method_(method),
+        kind_(task_kind),
+        compilation_kind_(compilation_kind) {
   }
 
   void Run(Thread* self) override {
     {
       ScopedObjectAccess soa(self);
       switch (kind_) {
-        case TaskKind::kPreCompile:
         case TaskKind::kCompile:
-        case TaskKind::kCompileBaseline:
-        case TaskKind::kCompileOsr: {
-          Runtime::Current()->GetJit()->CompileMethod(
+        case TaskKind::kPreCompile: {
+          Runtime::Current()->GetJit()->CompileMethodInternal(
               method_,
               self,
-              /* baseline= */ (kind_ == TaskKind::kCompileBaseline),
-              /* osr= */ (kind_ == TaskKind::kCompileOsr),
+              compilation_kind_,
               /* prejit= */ (kind_ == TaskKind::kPreCompile));
-          break;
-        }
-        case TaskKind::kAllocateProfile: {
-          if (ProfilingInfo::Create(self, method_, /* retry_allocation= */ true)) {
-            VLOG(jit) << "Start profiling " << ArtMethod::PrettyMethod(method_);
-          }
           break;
         }
       }
@@ -811,13 +681,25 @@ class JitCompileTask final : public Task {
   }
 
   void Finalize() override {
+    JitThreadPool* thread_pool = Runtime::Current()->GetJit()->GetThreadPool();
+    if (thread_pool != nullptr) {
+      thread_pool->Remove(this);
+    }
     delete this;
+  }
+
+  ArtMethod* GetArtMethod() const {
+    return method_;
+  }
+
+  CompilationKind GetCompilationKind() const {
+    return compilation_kind_;
   }
 
  private:
   ArtMethod* const method_;
   const TaskKind kind_;
-  jobject klass_;
+  const CompilationKind compilation_kind_;
 
   DISALLOW_IMPLICIT_CONSTRUCTORS(JitCompileTask);
 };
@@ -836,6 +718,32 @@ static std::string GetBootProfileFile(const std::string& profile) {
   return ReplaceFileExtension(profile, "bprof");
 }
 
+// Return whether the address is guaranteed to be backed by a file or is shared.
+// This information can be used to know whether MADV_DONTNEED will make
+// following accesses repopulate the memory or return zero.
+static bool IsAddressKnownBackedByFileOrShared(const void* addr) {
+  // We use the Linux pagemap interface for knowing if an address is backed
+  // by a file or is shared. See:
+  // https://www.kernel.org/doc/Documentation/vm/pagemap.txt
+  const size_t page_size = MemMap::GetPageSize();
+  uintptr_t vmstart = reinterpret_cast<uintptr_t>(AlignDown(addr, page_size));
+  off_t index = (vmstart / page_size) * sizeof(uint64_t);
+  android::base::unique_fd pagemap(open("/proc/self/pagemap", O_RDONLY | O_CLOEXEC));
+  if (pagemap == -1) {
+    return false;
+  }
+  if (lseek(pagemap, index, SEEK_SET) != index) {
+    return false;
+  }
+  uint64_t flags;
+  if (read(pagemap, &flags, sizeof(uint64_t)) != sizeof(uint64_t)) {
+    return false;
+  }
+  // From https://www.kernel.org/doc/Documentation/vm/pagemap.txt:
+  //  * Bit  61    page is file-page or shared-anon (since 3.5)
+  return (flags & (1LL << 61)) != 0;
+}
+
 /**
  * A JIT task to run after all profile compilation is done.
  */
@@ -844,23 +752,17 @@ class JitDoneCompilingProfileTask final : public SelfDeletingTask {
   explicit JitDoneCompilingProfileTask(const std::vector<const DexFile*>& dex_files)
       : dex_files_(dex_files) {}
 
-  void Run(Thread* self ATTRIBUTE_UNUSED) override {
+  void Run([[maybe_unused]] Thread* self) override {
     // Madvise DONTNEED dex files now that we're done compiling methods.
     for (const DexFile* dex_file : dex_files_) {
       if (IsAddressKnownBackedByFileOrShared(dex_file->Begin())) {
-        int result = madvise(const_cast<uint8_t*>(AlignDown(dex_file->Begin(), kPageSize)),
-                             RoundUp(dex_file->Size(), kPageSize),
+        int result = madvise(const_cast<uint8_t*>(AlignDown(dex_file->Begin(), gPageSize)),
+                             RoundUp(dex_file->Size(), gPageSize),
                              MADV_DONTNEED);
         if (result == -1) {
           PLOG(WARNING) << "Madvise failed";
         }
       }
-    }
-
-    if (Runtime::Current()->IsZygote()) {
-      // Record that we are done compiling the profile.
-      Runtime::Current()->GetJit()->GetCodeCache()->GetZygoteMap()->SetCompilationState(
-          ZygoteCompilationState::kDone);
     }
   }
 
@@ -868,6 +770,20 @@ class JitDoneCompilingProfileTask final : public SelfDeletingTask {
   std::vector<const DexFile*> dex_files_;
 
   DISALLOW_COPY_AND_ASSIGN(JitDoneCompilingProfileTask);
+};
+
+class JitZygoteDoneCompilingTask final : public SelfDeletingTask {
+ public:
+  JitZygoteDoneCompilingTask() {}
+
+  void Run([[maybe_unused]] Thread* self) override {
+    DCHECK(Runtime::Current()->IsZygote());
+    Runtime::Current()->GetJit()->GetCodeCache()->GetZygoteMap()->SetCompilationState(
+        ZygoteCompilationState::kDone);
+  }
+
+ private:
+  DISALLOW_COPY_AND_ASSIGN(JitZygoteDoneCompilingTask);
 };
 
 /**
@@ -879,41 +795,51 @@ class ZygoteVerificationTask final : public Task {
   ZygoteVerificationTask() {}
 
   void Run(Thread* self) override {
+    // We are going to load class and run verification, which may also need to load
+    // classes. If the thread cannot load classes (typically when the runtime is
+    // debuggable), then just return.
+    if (!self->CanLoadClasses()) {
+      return;
+    }
     Runtime* runtime = Runtime::Current();
     ClassLinker* linker = runtime->GetClassLinker();
     const std::vector<const DexFile*>& boot_class_path =
         runtime->GetClassLinker()->GetBootClassPath();
     ScopedObjectAccess soa(self);
-    StackHandleScope<1> hs(self);
+    StackHandleScope<2> hs(self);
+    MutableHandle<mirror::DexCache> dex_cache = hs.NewHandle<mirror::DexCache>(nullptr);
     MutableHandle<mirror::Class> klass = hs.NewHandle<mirror::Class>(nullptr);
     uint64_t start_ns = ThreadCpuNanoTime();
     uint64_t number_of_classes = 0;
     for (const DexFile* dex_file : boot_class_path) {
-      if (dex_file->GetOatDexFile() != nullptr &&
-          dex_file->GetOatDexFile()->GetOatFile() != nullptr) {
-        // If backed by an .oat file, we have already run verification at
-        // compile-time. Note that some classes may still have failed
-        // verification there if they reference updatable mainline module
-        // classes.
-        continue;
-      }
+      dex_cache.Assign(linker->FindDexCache(self, *dex_file));
       for (uint32_t i = 0; i < dex_file->NumClassDefs(); ++i) {
         const dex::ClassDef& class_def = dex_file->GetClassDef(i);
-        const char* descriptor = dex_file->GetClassDescriptor(class_def);
-        ScopedNullHandle<mirror::ClassLoader> null_loader;
-        klass.Assign(linker->FindClass(self, descriptor, null_loader));
+        klass.Assign(linker->LookupResolvedType(
+            class_def.class_idx_, dex_cache.Get(), /* class_loader= */ nullptr));
         if (klass == nullptr) {
-          self->ClearException();
-          LOG(WARNING) << "Could not find " << descriptor;
+          // Class not loaded yet.
+          DCHECK(!self->IsExceptionPending());
           continue;
         }
-        ++number_of_classes;
-        linker->VerifyClass(self, klass);
+        if (klass->IsVerified()) {
+          continue;
+        }
+        if (linker->VerifyClass(self, /* verifier_deps= */ nullptr, klass) ==
+                verifier::FailureKind::kHardFailure) {
+          CHECK(self->IsExceptionPending());
+          LOG(WARNING) << "Methods in the boot classpath failed to verify: "
+                       << self->GetException()->Dump();
+          self->ClearException();
+        } else {
+          ++number_of_classes;
+        }
+        CHECK(!self->IsExceptionPending());
       }
     }
-    LOG(INFO) << "Verified "
+    LOG(INFO) << "Background verification of "
               << number_of_classes
-              << " classes from mainline modules in "
+              << " classes from boot classpath took "
               << PrettyDuration(ThreadCpuNanoTime() - start_ns);
   }
 };
@@ -926,27 +852,30 @@ class ZygoteTask final : public Task {
     Runtime* runtime = Runtime::Current();
     uint32_t added_to_queue = 0;
     for (gc::space::ImageSpace* space : Runtime::Current()->GetHeap()->GetBootImageSpaces()) {
-      const std::string& profile_file = space->GetProfileFile();
-      if (profile_file.empty()) {
-        continue;
-      }
-      LOG(INFO) << "JIT Zygote looking at profile " << profile_file;
-
       const std::vector<const DexFile*>& boot_class_path =
           runtime->GetClassLinker()->GetBootClassPath();
       ScopedNullHandle<mirror::ClassLoader> null_handle;
-      // We add to the queue for zygote so that we can fork processes in-between
-      // compilations.
+      // We avoid doing compilation at boot for the secondary zygote, as apps forked from it are not
+      // critical for boot.
       if (Runtime::Current()->IsPrimaryZygote()) {
-        std::string boot_profile = GetBootProfileFile(profile_file);
-        // We avoid doing compilation at boot for the secondary zygote, as apps
-        // forked from it are not critical for boot.
-        added_to_queue += runtime->GetJit()->CompileMethodsFromBootProfile(
-            self, boot_class_path, boot_profile, null_handle, /* add_to_queue= */ true);
+        for (const std::string& profile_file : space->GetProfileFiles()) {
+          std::string boot_profile = GetBootProfileFile(profile_file);
+          LOG(INFO) << "JIT Zygote looking at boot profile " << boot_profile;
+
+          // We add to the queue for zygote so that we can fork processes in-between compilations.
+          added_to_queue += runtime->GetJit()->CompileMethodsFromBootProfile(
+              self, boot_class_path, boot_profile, null_handle, /* add_to_queue= */ true);
+        }
       }
-      added_to_queue += runtime->GetJit()->CompileMethodsFromProfile(
-          self, boot_class_path, profile_file, null_handle, /* add_to_queue= */ true);
+      for (const std::string& profile_file : space->GetProfileFiles()) {
+        LOG(INFO) << "JIT Zygote looking at profile " << profile_file;
+
+        added_to_queue += runtime->GetJit()->CompileMethodsFromProfile(
+            self, boot_class_path, profile_file, null_handle, /* add_to_queue= */ true);
+      }
     }
+    DCHECK(runtime->GetJit()->InZygoteUsingJit());
+    runtime->GetJit()->AddPostBootTask(self, new JitZygoteDoneCompilingTask());
 
     JitCodeCache* code_cache = runtime->GetJit()->GetCodeCache();
     code_cache->GetZygoteMap()->Initialize(added_to_queue);
@@ -1049,6 +978,7 @@ void Jit::MapBootImageMethods() {
       /* start= */ 0,
       /* low_4gb= */ false,
       "boot-image-methods",
+      /* reuse= */ true,  // The mapping will be reused by the mremaps below.
       &error_str);
 
   // We don't need the fd anymore.
@@ -1058,23 +988,44 @@ void Jit::MapBootImageMethods() {
     LOG(WARNING) << "Failed to create child mapping of boot image methods: " << error_str;
     return;
   }
+  //  We are going to mremap the child mapping into the image:
+  //
+  //                            ImageSection       ChildMappingMethods
+  //
+  //         section start -->  -----------
+  //                            |         |
+  //                            |         |
+  //            page_start -->  |         |   <-----   -----------
+  //                            |         |            |         |
+  //                            |         |            |         |
+  //                            |         |            |         |
+  //                            |         |            |         |
+  //                            |         |            |         |
+  //                            |         |            |         |
+  //                            |         |            |         |
+  //             page_end  -->  |         |   <-----   -----------
+  //                            |         |
+  //         section end   -->  -----------
+  //
   size_t offset = 0;
-  ClassLinker* class_linker = Runtime::Current()->GetClassLinker();
   for (gc::space::ImageSpace* space : Runtime::Current()->GetHeap()->GetBootImageSpaces()) {
     const ImageHeader& header = space->GetImageHeader();
     const ImageSection& section = header.GetMethodsSection();
-    uint8_t* page_start = AlignUp(header.GetImageBegin() + section.Offset(), kPageSize);
+    uint8_t* page_start = AlignUp(header.GetImageBegin() + section.Offset(), gPageSize);
     uint8_t* page_end =
-        AlignDown(header.GetImageBegin() + section.Offset() + section.Size(), kPageSize);
+        AlignDown(header.GetImageBegin() + section.Offset() + section.Size(), gPageSize);
     if (page_end <= page_start) {
       // Section doesn't contain one aligned entire page.
       continue;
     }
     uint64_t capacity = page_end - page_start;
-    // Walk over methods in the boot image, and check for ones whose class is
-    // not initialized in the process, but are in the zygote process. For
-    // such methods, we need their entrypoints to be stubs that do the
-    // initialization check.
+    // Walk over methods in the boot image, and check for:
+    // 1) methods whose class is not initialized in the process, but are in the
+    // zygote process. For such methods, we need their entrypoints to be stubs
+    // that do the initialization check.
+    // 2) native methods whose data pointer is different than the one in the
+    // zygote. Such methods may have had custom native implementation provided
+    // by JNI RegisterNatives.
     header.VisitPackedArtMethods([&](ArtMethod& method) NO_THREAD_SAFETY_ANALYSIS {
       // Methods in the boot image should never have their single
       // implementation flag set (and therefore never have a `data_` pointing
@@ -1083,78 +1034,33 @@ void Jit::MapBootImageMethods() {
       if (method.IsRuntimeMethod()) {
         return;
       }
-      if (method.GetDeclaringClassUnchecked()->IsVisiblyInitialized() ||
-          !method.IsStatic() ||
-          method.IsConstructor()) {
-        // Method does not need any stub.
-        return;
+
+      // Pointer to the method we're currently using.
+      uint8_t* pointer = reinterpret_cast<uint8_t*>(&method);
+      // The data pointer of that method that we want to keep.
+      uint8_t* data_pointer = pointer + ArtMethod::DataOffset(kRuntimePointerSize).Int32Value();
+      if (method.IsNative() && data_pointer >= page_start && data_pointer < page_end) {
+        // The data pointer of the ArtMethod in the shared memory we are going to remap into our
+        // own mapping. This is the data that we will see after the remap.
+        uint8_t* new_data_pointer =
+            child_mapping_methods.Begin() + offset + (data_pointer - page_start);
+        CopyIfDifferent(new_data_pointer, data_pointer, sizeof(void*));
       }
 
-      //  We are going to mremap the child mapping into the image:
-      //
-      //                            ImageSection       ChildMappingMethods
-      //
-      //         section start -->  -----------
-      //                            |         |
-      //                            |         |
-      //            page_start -->  |         |   <-----   -----------
-      //                            |         |            |         |
-      //                            |         |            |         |
-      //                            |         |            |         |
-      //                            |         |            |         |
-      //                            |         |            |         |
-      //                            |         |            |         |
-      //                            |         |            |         |
-      //             page_end  -->  |         |   <-----   -----------
-      //                            |         |
-      //         section end   -->  -----------
-
-
-      uint8_t* pointer = reinterpret_cast<uint8_t*>(&method);
-      // Note: We could refactor this to only check if the ArtMethod entrypoint is inside the
-      // page region. This would remove the need for the edge case handling below.
-      if (pointer >= page_start && pointer + sizeof(ArtMethod) < page_end) {
-        // For all the methods in the mapping, put the entrypoint to the
-        // resolution stub.
-        ArtMethod* new_method = reinterpret_cast<ArtMethod*>(
-            child_mapping_methods.Begin() + offset + (pointer - page_start));
-        const void* code = new_method->GetEntryPointFromQuickCompiledCode();
-        if (!class_linker->IsQuickGenericJniStub(code) &&
-            !class_linker->IsQuickToInterpreterBridge(code) &&
-            !class_linker->IsQuickResolutionStub(code)) {
-          LOG(INFO) << "Putting back the resolution stub to an ArtMethod";
-          new_method->SetEntryPointFromQuickCompiledCode(GetQuickResolutionStub());
-        }
-      } else if (pointer < page_start && (pointer + sizeof(ArtMethod)) > page_start) {
-        LOG(INFO) << "Copying parts of the contents of an ArtMethod spanning page_start";
-        // If the method spans `page_start`, copy the contents of the child
-        // into the pages we are going to remap into the image.
-        //
-        //         section start -->  -----------
-        //                            |         |
-        //                            |         |
-        //            page_start -->  |/////////|            -----------
-        //                            |/////////| -> copy -> |/////////|
-        //                            |         |            |         |
-        //
-        CopyIfDifferent(child_mapping_methods.Begin() + offset,
-                        page_start,
-                        pointer + sizeof(ArtMethod) - page_start);
-      } else if (pointer < page_end && (pointer + sizeof(ArtMethod)) > page_end) {
-        LOG(INFO) << "Copying parts of the contents of an ArtMethod spanning page_end";
-        // If the method spans `page_end`, copy the contents of the child
-        // into the pages we are going to remap into the image.
-        //
-        //                            |         |            |         |
-        //                            |/////////| -> copy -> |/////////|
-        //             page_end  -->  |/////////|            -----------
-        //                            |         |
-        //         section end   -->  -----------
-        //
-        size_t bytes_to_copy = (page_end - pointer);
-        CopyIfDifferent(child_mapping_methods.Begin() + offset + capacity - bytes_to_copy,
-                        page_end - bytes_to_copy,
-                        bytes_to_copy);
+      // The entrypoint of the method we're currently using and that we want to
+      // keep.
+      uint8_t* entry_point_pointer = pointer +
+          ArtMethod::EntryPointFromQuickCompiledCodeOffset(kRuntimePointerSize).Int32Value();
+      if (!method.GetDeclaringClassUnchecked()->IsVisiblyInitialized() &&
+          method.IsStatic() &&
+          !method.IsConstructor() &&
+          entry_point_pointer >= page_start &&
+          entry_point_pointer < page_end) {
+        // The entry point of the ArtMethod in the shared memory we are going to remap into our
+        // own mapping. This is the entrypoint that we will see after the remap.
+        uint8_t* new_entry_point_pointer =
+            child_mapping_methods.Begin() + offset + (entry_point_pointer - page_start);
+        CopyIfDifferent(new_entry_point_pointer, entry_point_pointer, sizeof(void*));
       }
     }, space->Begin(), kRuntimePointerSize);
 
@@ -1169,35 +1075,27 @@ void Jit::MapBootImageMethods() {
     offset += capacity;
   }
 
-  // The private mapping created for this process has been mremaped. We can
-  // reset it.
-  child_mapping_methods.Reset();
   LOG(INFO) << "Successfully mapped boot image methods";
 }
 
-// Return whether a boot image has a profile. This means we'll need to pre-JIT
-// methods in that profile for performance.
-static bool HasImageWithProfile() {
-  for (gc::space::ImageSpace* space : Runtime::Current()->GetHeap()->GetBootImageSpaces()) {
-    if (!space->GetProfileFile().empty()) {
-      return true;
-    }
-  }
-  return false;
+bool Jit::InZygoteUsingJit() {
+  Runtime* runtime = Runtime::Current();
+  return runtime->IsZygote() && runtime->HasImageWithProfile() && runtime->UseJitCompilation();
 }
 
 void Jit::CreateThreadPool() {
   // There is a DCHECK in the 'AddSamples' method to ensure the tread pool
   // is not null when we instrument.
 
-  // We need peers as we may report the JIT thread, e.g., in the debugger.
-  constexpr bool kJitPoolNeedsPeers = true;
-  thread_pool_.reset(new ThreadPool("Jit thread pool", 1, kJitPoolNeedsPeers));
-
-  thread_pool_->SetPthreadPriority(options_->GetThreadPoolPthreadPriority());
-  Start();
+  thread_pool_.reset(JitThreadPool::Create("Jit thread pool", 1));
 
   Runtime* runtime = Runtime::Current();
+  thread_pool_->SetPthreadPriority(
+      runtime->IsZygote()
+          ? options_->GetZygoteThreadPoolPthreadPriority()
+          : options_->GetThreadPoolPthreadPriority());
+  Start();
+
   if (runtime->IsZygote()) {
     // To speed up class lookups, generate a type lookup table for
     // dex files not backed by oat file.
@@ -1215,7 +1113,7 @@ void Jit::CreateThreadPool() {
     thread_pool_->AddTask(Thread::Current(), new ZygoteVerificationTask());
   }
 
-  if (runtime->IsZygote() && HasImageWithProfile() && UseJitCompilation()) {
+  if (InZygoteUsingJit()) {
     // If we have an image with a profile, request a JIT task to
     // compile all methods in that profile.
     thread_pool_->AddTask(Thread::Current(), new ZygoteTask());
@@ -1229,9 +1127,9 @@ void Jit::CreateThreadPool() {
       const ImageHeader& header = space->GetImageHeader();
       const ImageSection& section = header.GetMethodsSection();
       // Mappings need to be at the page level.
-      uint8_t* page_start = AlignUp(header.GetImageBegin() + section.Offset(), kPageSize);
+      uint8_t* page_start = AlignUp(header.GetImageBegin() + section.Offset(), gPageSize);
       uint8_t* page_end =
-          AlignDown(header.GetImageBegin() + section.Offset() + section.Size(), kPageSize);
+          AlignDown(header.GetImageBegin() + section.Offset() + section.Size(), gPageSize);
       if (page_end > page_start) {
         total_capacity += (page_end - page_start);
       }
@@ -1242,7 +1140,8 @@ void Jit::CreateThreadPool() {
       // Start with '/boot' and end with '.art' to match the pattern recognized
       // by android_os_Debug.cpp for boot images.
       const char* name = "/boot-image-methods.art";
-      unique_fd mem_fd = unique_fd(art::memfd_create(name, /* flags= */ MFD_ALLOW_SEALING));
+      unique_fd mem_fd =
+          unique_fd(art::memfd_create(name, /* flags= */ MFD_ALLOW_SEALING | MFD_CLOEXEC));
       if (mem_fd.get() == -1) {
         PLOG(WARNING) << "Could not create boot image methods file descriptor";
         return;
@@ -1296,12 +1195,29 @@ void Jit::RegisterDexFiles(const std::vector<std::unique_ptr<const DexFile>>& de
     return;
   }
   Runtime* runtime = Runtime::Current();
-  // If the runtime is debuggable, no need to precompile methods.
+  // If the runtime is debuggable, don't bother precompiling methods.
+  // If system server is being profiled, don't precompile as we are going to use
+  // the JIT to count hotness. Note that --count-hotness-in-compiled-code is
+  // only forced when we also profile the boot classpath, see
+  // AndroidRuntime.cpp.
   if (runtime->IsSystemServer() &&
-      UseJitCompilation() && HasImageWithProfile() &&
+      UseJitCompilation() &&
+      options_->UseProfiledJitCompilation() &&
+      runtime->HasImageWithProfile() &&
+      !runtime->IsSystemServerProfiled() &&
       !runtime->IsJavaDebuggable()) {
+    // Note: this precompilation is currently not running in production because:
+    // - UseProfiledJitCompilation() is not set by default.
+    // - System server dex files are registered *before* we set the runtime as
+    //   system server (though we are in the system server process).
     thread_pool_->AddTask(Thread::Current(), new JitProfileTask(dex_files, class_loader));
   }
+}
+
+void Jit::AddCompileTask(Thread* self,
+                         ArtMethod* method,
+                         CompilationKind compilation_kind) {
+  thread_pool_->AddTask(self, method, compilation_kind);
 }
 
 bool Jit::CompileMethodFromProfile(Thread* self,
@@ -1311,8 +1227,7 @@ bool Jit::CompileMethodFromProfile(Thread* self,
                                    Handle<mirror::ClassLoader> class_loader,
                                    bool add_to_queue,
                                    bool compile_after_boot) {
-  ArtMethod* method = class_linker->ResolveMethodWithoutInvokeType(
-      method_idx, dex_cache, class_loader);
+  ArtMethod* method = class_linker->ResolveMethodId(method_idx, dex_cache, class_loader);
   if (method == nullptr) {
     self->ClearException();
     return false;
@@ -1324,26 +1239,28 @@ bool Jit::CompileMethodFromProfile(Thread* self,
     // Already seen by another profile.
     return false;
   }
+  CompilationKind compilation_kind = CompilationKind::kOptimized;
   const void* entry_point = method->GetEntryPointFromQuickCompiledCode();
   if (class_linker->IsQuickToInterpreterBridge(entry_point) ||
       class_linker->IsQuickGenericJniStub(entry_point) ||
-      // We explicitly check for the stub. The trampoline is for methods backed by
-      // a .oat file that has a compiled version of the method.
+      class_linker->IsNterpEntryPoint(entry_point) ||
+      // We explicitly check for the resolution stub, and not the resolution trampoline.
+      // The trampoline is for methods backed by a .oat file that has a compiled version of
+      // the method.
       (entry_point == GetQuickResolutionStub())) {
+    VLOG(jit) << "JIT Zygote processing method " << ArtMethod::PrettyMethod(method)
+              << " from profile";
     method->SetPreCompiled();
     if (!add_to_queue) {
-      CompileMethod(method, self, /* baseline= */ false, /* osr= */ false, /* prejit= */ true);
+      CompileMethodInternal(method, self, compilation_kind, /* prejit= */ true);
     } else {
-      Task* task = new JitCompileTask(method, JitCompileTask::TaskKind::kPreCompile);
+      Task* task = new JitCompileTask(
+          method, JitCompileTask::TaskKind::kPreCompile, compilation_kind);
       if (compile_after_boot) {
-        MutexLock mu(Thread::Current(), boot_completed_lock_);
-        if (!boot_completed_) {
-          tasks_after_boot_.push_back(task);
-          return true;
-        }
-        DCHECK(tasks_after_boot_.empty());
+        AddPostBootTask(self, task);
+      } else {
+        thread_pool_->AddTask(self, task);
       }
-      thread_pool_->AddTask(self, task);
       return true;
     }
   }
@@ -1356,7 +1273,7 @@ uint32_t Jit::CompileMethodsFromBootProfile(
     const std::string& profile_file,
     Handle<mirror::ClassLoader> class_loader,
     bool add_to_queue) {
-  unix_file::FdFile profile(profile_file.c_str(), O_RDONLY, true);
+  unix_file::FdFile profile(profile_file, O_RDONLY, true);
 
   if (profile.Fd() == -1) {
     PLOG(WARNING) << "No boot profile: " << profile_file;
@@ -1406,14 +1323,14 @@ uint32_t Jit::CompileMethodsFromProfile(
 
   // We don't generate boot profiles on device, therefore we don't
   // need to lock the file.
-  unix_file::FdFile profile(profile_file.c_str(), O_RDONLY, true);
+  unix_file::FdFile profile(profile_file, O_RDONLY, true);
 
   if (profile.Fd() == -1) {
     PLOG(WARNING) << "No profile: " << profile_file;
     return 0u;
   }
 
-  ProfileCompilationInfo profile_info;
+  ProfileCompilationInfo profile_info(/* for_boot_image= */ class_loader.IsNull());
   if (!profile_info.Load(profile.Fd())) {
     LOG(ERROR) << "Could not load profile file";
     return 0u;
@@ -1424,11 +1341,6 @@ uint32_t Jit::CompileMethodsFromProfile(
   ClassLinker* class_linker = Runtime::Current()->GetClassLinker();
   uint32_t added_to_queue = 0u;
   for (const DexFile* dex_file : dex_files) {
-    if (LocationIsOnArtModule(dex_file->GetLocation().c_str())) {
-      // The ART module jars are already preopted.
-      continue;
-    }
-
     std::set<dex::TypeIndex> class_types;
     std::set<uint16_t> all_methods;
     if (!profile_info.GetClassesAndMethods(*dex_file,
@@ -1457,19 +1369,12 @@ uint32_t Jit::CompileMethodsFromProfile(
   }
 
   // Add a task to run when all compilation is done.
-  JitDoneCompilingProfileTask* task = new JitDoneCompilingProfileTask(dex_files);
-  MutexLock mu(Thread::Current(), boot_completed_lock_);
-  if (!boot_completed_) {
-    tasks_after_boot_.push_back(task);
-  } else {
-    DCHECK(tasks_after_boot_.empty());
-    thread_pool_->AddTask(self, task);
-  }
+  AddPostBootTask(self, new JitDoneCompilingProfileTask(dex_files));
   return added_to_queue;
 }
 
-static bool IgnoreSamplesForMethod(ArtMethod* method) REQUIRES_SHARED(Locks::mutator_lock_) {
-  if (method->IsClassInitializer() || !method->IsCompilable() || method->IsPreCompiled()) {
+bool Jit::IgnoreSamplesForMethod(ArtMethod* method) REQUIRES_SHARED(Locks::mutator_lock_) {
+  if (method->IsClassInitializer() || !method->IsCompilable()) {
     // We do not want to compile such methods.
     return true;
   }
@@ -1489,99 +1394,27 @@ static bool IgnoreSamplesForMethod(ArtMethod* method) REQUIRES_SHARED(Locks::mut
   return false;
 }
 
-bool Jit::MaybeCompileMethod(Thread* self,
-                             ArtMethod* method,
-                             uint32_t old_count,
-                             uint32_t new_count,
-                             bool with_backedges) {
-  if (thread_pool_ == nullptr) {
-    return false;
-  }
-  if (UNLIKELY(method->IsPreCompiled()) && !with_backedges /* don't check for OSR */) {
-    if (!NeedsClinitCheckBeforeCall(method) ||
-        method->GetDeclaringClass()->IsVisiblyInitialized()) {
-      const void* entry_point = code_cache_->GetSavedEntryPointOfPreCompiledMethod(method);
-      if (entry_point != nullptr) {
-        Runtime::Current()->GetInstrumentation()->UpdateMethodsCode(method, entry_point);
-        return true;
-      }
-    }
-  }
-
-  if (IgnoreSamplesForMethod(method)) {
-    return false;
-  }
-  if (HotMethodThreshold() == 0) {
-    // Tests might request JIT on first use (compiled synchronously in the interpreter).
-    return false;
-  }
-  DCHECK_GT(WarmMethodThreshold(), 0);
-  DCHECK_GT(HotMethodThreshold(), WarmMethodThreshold());
-  DCHECK_GT(OSRMethodThreshold(), HotMethodThreshold());
-  DCHECK_GE(PriorityThreadWeight(), 1);
-  DCHECK_LE(PriorityThreadWeight(), HotMethodThreshold());
-
-  if (old_count < WarmMethodThreshold() && new_count >= WarmMethodThreshold()) {
-    // Note: Native method have no "warm" state or profiling info.
-    if (!method->IsNative() &&
-        (method->GetProfilingInfo(kRuntimePointerSize) == nullptr) &&
-        code_cache_->CanAllocateProfilingInfo() &&
-        !options_->UseTieredJitCompilation()) {
-      bool success = ProfilingInfo::Create(self, method, /* retry_allocation= */ false);
-      if (success) {
-        VLOG(jit) << "Start profiling " << method->PrettyMethod();
-      }
-
-      if (thread_pool_ == nullptr) {
-        // Calling ProfilingInfo::Create might put us in a suspended state, which could
-        // lead to the thread pool being deleted when we are shutting down.
-        return false;
-      }
-
-      if (!success) {
-        // We failed allocating. Instead of doing the collection on the Java thread, we push
-        // an allocation to a compiler thread, that will do the collection.
-        thread_pool_->AddTask(
-            self, new JitCompileTask(method, JitCompileTask::TaskKind::kAllocateProfile));
-      }
-    }
-  }
-  if (UseJitCompilation()) {
-    if (old_count < HotMethodThreshold() && new_count >= HotMethodThreshold()) {
-      if (!code_cache_->ContainsPc(method->GetEntryPointFromQuickCompiledCode())) {
-        DCHECK(thread_pool_ != nullptr);
-        JitCompileTask::TaskKind kind =
-            (options_->UseTieredJitCompilation() || options_->UseBaselineCompiler())
-                ? JitCompileTask::TaskKind::kCompileBaseline
-                : JitCompileTask::TaskKind::kCompile;
-        thread_pool_->AddTask(self, new JitCompileTask(method, kind));
-      }
-    }
-    if (old_count < OSRMethodThreshold() && new_count >= OSRMethodThreshold()) {
-      if (!with_backedges) {
-        return false;
-      }
-      DCHECK(!method->IsNative());  // No back edges reported for native methods.
-      if (!code_cache_->IsOsrCompiled(method)) {
-        DCHECK(thread_pool_ != nullptr);
-        thread_pool_->AddTask(
-            self, new JitCompileTask(method, JitCompileTask::TaskKind::kCompileOsr));
-      }
-    }
-  }
-  return true;
-}
-
 void Jit::EnqueueOptimizedCompilation(ArtMethod* method, Thread* self) {
+  // Note the hotness counter will be reset by the compiled code.
+
   if (thread_pool_ == nullptr) {
     return;
   }
+
+  const void* entry_point = method->GetEntryPointFromQuickCompiledCode();
+  // Check if we already have optimized code. We might still be executing baseline code even
+  // when we have optimized code.
+  if (GetCodeCache()->ContainsPc(entry_point) &&
+      !CodeInfo::IsBaseline(
+          OatQuickMethodHeader::FromEntryPoint(entry_point)->GetOptimizedCodeInfoPtr())) {
+    return;
+  }
+
   // We arrive here after a baseline compiled code has reached its baseline
-  // hotness threshold. If tiered compilation is enabled, enqueue a compilation
+  // hotness threshold. If we're not only using the baseline compiler, enqueue a compilation
   // task that will compile optimize the method.
-  if (options_->UseTieredJitCompilation()) {
-    thread_pool_->AddTask(
-        self, new JitCompileTask(method, JitCompileTask::TaskKind::kCompile));
+  if (!options_->UseBaselineCompiler()) {
+    AddCompileTask(self, method, CompilationKind::kOptimized);
   }
 }
 
@@ -1601,49 +1434,17 @@ class ScopedSetRuntimeThread {
   bool was_runtime_thread_;
 };
 
-void Jit::MethodEntered(Thread* thread, ArtMethod* method) {
+void Jit::MethodEntered(Thread* self, ArtMethod* method) {
   Runtime* runtime = Runtime::Current();
   if (UNLIKELY(runtime->UseJitCompilation() && JitAtFirstUse())) {
     ArtMethod* np_method = method->GetInterfaceMethodIfProxy(kRuntimePointerSize);
     if (np_method->IsCompilable()) {
-      if (!np_method->IsNative() && GetCodeCache()->CanAllocateProfilingInfo()) {
-        // The compiler requires a ProfilingInfo object for non-native methods.
-        ProfilingInfo::Create(thread, np_method, /* retry_allocation= */ true);
-      }
-      // TODO(ngeoffray): For JIT at first use, use kPreCompile. Currently we don't due to
-      // conflicts with jitzygote optimizations.
-      JitCompileTask compile_task(method, JitCompileTask::TaskKind::kCompile);
-      // Fake being in a runtime thread so that class-load behavior will be the same as normal jit.
-      ScopedSetRuntimeThread ssrt(thread);
-      compile_task.Run(thread);
+      CompileMethod(method, self, CompilationKind::kOptimized, /* prejit= */ false);
     }
     return;
   }
 
-  ProfilingInfo* profiling_info = method->GetProfilingInfo(kRuntimePointerSize);
-  // Update the entrypoint if the ProfilingInfo has one. The interpreter will call it
-  // instead of interpreting the method. We don't update it for instrumentation as the entrypoint
-  // must remain the instrumentation entrypoint.
-  if ((profiling_info != nullptr) &&
-      (profiling_info->GetSavedEntryPoint() != nullptr) &&
-      (method->GetEntryPointFromQuickCompiledCode() != GetQuickInstrumentationEntryPoint())) {
-    Runtime::Current()->GetInstrumentation()->UpdateMethodsCode(
-        method, profiling_info->GetSavedEntryPoint());
-  } else {
-    AddSamples(thread, method, 1, /* with_backedges= */false);
-  }
-}
-
-void Jit::InvokeVirtualOrInterface(ObjPtr<mirror::Object> this_object,
-                                   ArtMethod* caller,
-                                   uint32_t dex_pc,
-                                   ArtMethod* callee ATTRIBUTE_UNUSED) {
-  ScopedAssertNoThreadSuspension ants(__FUNCTION__);
-  DCHECK(this_object != nullptr);
-  ProfilingInfo* info = caller->GetProfilingInfo(kRuntimePointerSize);
-  if (info != nullptr) {
-    info->AddInvokeInfo(dex_pc, this_object->GetClass());
-  }
+  AddSamples(self, method);
 }
 
 void Jit::WaitForCompilationToFinish(Thread* self) {
@@ -1680,33 +1481,25 @@ ScopedJitSuspend::~ScopedJitSuspend() {
   }
 }
 
-static void* RunPollingThread(void* arg) {
-  Jit* jit = reinterpret_cast<Jit*>(arg);
-  do {
-    sleep(10);
-  } while (!jit->GetCodeCache()->GetZygoteMap()->IsCompilationNotified());
+class MapBootImageMethodsTask : public gc::HeapTask {
+ public:
+  explicit MapBootImageMethodsTask(uint64_t target_run_time) : gc::HeapTask(target_run_time) {}
 
-  // We will suspend other threads: we can only do that if we're attached to the
-  // runtime.
-  Runtime* runtime = Runtime::Current();
-  bool thread_attached = runtime->AttachCurrentThread(
-      "BootImagePollingThread",
-      /* as_daemon= */ true,
-      /* thread_group= */ nullptr,
-      /* create_peer= */ false);
-  CHECK(thread_attached);
-
-  {
+  void Run(Thread* self ATTRIBUTE_UNUSED) override {
+    Runtime* runtime = Runtime::Current();
+    if (!runtime->GetJit()->GetCodeCache()->GetZygoteMap()->IsCompilationNotified()) {
+      // Add a new task that will execute in 10 seconds.
+      static constexpr uint64_t kWaitTimeNs = MsToNs(10000);  // 10 seconds
+      runtime->GetHeap()->AddHeapTask(new MapBootImageMethodsTask(NanoTime() + kWaitTimeNs));
+      return;
+    }
     // Prevent other threads from running while we are remapping the boot image
     // ArtMethod's. Native threads might still be running, but they cannot
     // change the contents of ArtMethod's.
     ScopedSuspendAll ssa(__FUNCTION__);
     runtime->GetJit()->MapBootImageMethods();
   }
-
-  Runtime::Current()->DetachCurrentThread();
-  return nullptr;
-}
+};
 
 void Jit::PostForkChildAction(bool is_system_server, bool is_zygote) {
   // Clear the potential boot tasks inherited from the zygote.
@@ -1718,19 +1511,8 @@ void Jit::PostForkChildAction(bool is_system_server, bool is_zygote) {
   Runtime* const runtime = Runtime::Current();
   // Check if we'll need to remap the boot image methods.
   if (!is_zygote && fd_methods_ != -1) {
-    // Create a thread that will poll the status of zygote compilation, and map
-    // the private mapping of boot image methods.
-    // For child zygote, we instead query IsCompilationNotified() post zygote fork.
-    zygote_mapping_methods_.ResetInForkedProcess();
-    pthread_t polling_thread;
-    pthread_attr_t attr;
-    CHECK_PTHREAD_CALL(pthread_attr_init, (&attr), "new thread");
-    CHECK_PTHREAD_CALL(pthread_attr_setdetachstate, (&attr, PTHREAD_CREATE_DETACHED),
-                       "PTHREAD_CREATE_DETACHED");
-    CHECK_PTHREAD_CALL(
-        pthread_create,
-        (&polling_thread, &attr, RunPollingThread, reinterpret_cast<void*>(this)),
-        "Methods maps thread");
+    Runtime::Current()->GetHeap()->AddHeapTask(
+        new MapBootImageMethodsTask(NanoTime() + MsToNs(10000)));
   }
 
   if (is_zygote || runtime->IsSafeMode()) {
@@ -1743,10 +1525,14 @@ void Jit::PostForkChildAction(bool is_system_server, bool is_zygote) {
   jit_compiler_->ParseCompilerOptions();
 
   // Adjust the status of code cache collection: the status from zygote was to not collect.
-  code_cache_->SetGarbageCollectCode(!jit_compiler_->GenerateDebugInfo() &&
-      !Runtime::Current()->GetInstrumentation()->AreExitStubsInstalled());
+  // JitAtFirstUse compiles the methods synchronously on mutator threads. While this should work
+  // in theory it is causing deadlocks in some jvmti tests related to Jit GC. Hence, disabling
+  // Jit GC for now (b/147208992).
+  code_cache_->SetGarbageCollectCode(
+      !jit_compiler_->GenerateDebugInfo() &&
+      !JitAtFirstUse());
 
-  if (is_system_server && HasImageWithProfile()) {
+  if (is_system_server && runtime->HasImageWithProfile()) {
     // Disable garbage collection: we don't want it to delete methods we're compiling
     // through boot and system server profiles.
     // TODO(ngeoffray): Fix this so we still collect deoptimized and unused code.
@@ -1767,11 +1553,31 @@ void Jit::PreZygoteFork() {
   NativeDebugInfoPreFork();
 }
 
+// Returns the number of threads running.
+static int GetTaskCount() {
+  DIR* directory = opendir("/proc/self/task");
+  if (directory == nullptr) {
+    return -1;
+  }
+
+  uint32_t count = 0;
+  struct dirent* entry = nullptr;
+  while ((entry = readdir(directory)) != nullptr) {
+    if ((strcmp(entry->d_name, ".") == 0) || (strcmp(entry->d_name, "..") == 0)) {
+      continue;
+    }
+    ++count;
+  }
+  closedir(directory);
+  return count;
+}
+
 void Jit::PostZygoteFork() {
+  Runtime* runtime = Runtime::Current();
   if (thread_pool_ == nullptr) {
     // If this is a child zygote, check if we need to remap the boot image
     // methods.
-    if (Runtime::Current()->IsZygote() &&
+    if (runtime->IsZygote() &&
         fd_methods_ != -1 &&
         code_cache_->GetZygoteMap()->IsCompilationNotified()) {
       ScopedSuspendAll ssa(__FUNCTION__);
@@ -1779,8 +1585,7 @@ void Jit::PostZygoteFork() {
     }
     return;
   }
-  if (Runtime::Current()->IsZygote() &&
-      code_cache_->GetZygoteMap()->IsCompilationDoneButNotNotified()) {
+  if (runtime->IsZygote() && code_cache_->GetZygoteMap()->IsCompilationDoneButNotNotified()) {
     // Copy the boot image methods data to the mappings we created to share
     // with the children. We do this here as we are the only thread running and
     // we don't risk other threads concurrently updating the ArtMethod's.
@@ -1789,6 +1594,19 @@ void Jit::PostZygoteFork() {
     CHECK(code_cache_->GetZygoteMap()->IsCompilationNotified());
   }
   thread_pool_->CreateThreads();
+  thread_pool_->SetPthreadPriority(
+      runtime->IsZygote()
+          ? options_->GetZygoteThreadPoolPthreadPriority()
+          : options_->GetThreadPoolPthreadPriority());
+}
+
+void Jit::AddPostBootTask(Thread* self, Task* task) {
+  MutexLock mu(self, boot_completed_lock_);
+  if (boot_completed_) {
+    thread_pool_->AddTask(self, task);
+  } else {
+    tasks_after_boot_.push_back(task);
+  }
 }
 
 void Jit::BootCompleted() {
@@ -1833,24 +1651,249 @@ bool Jit::CanAssumeInitialized(ObjPtr<mirror::Class> cls, bool is_for_shared_reg
   }
 }
 
-void Jit::EnqueueCompilationFromNterp(ArtMethod* method, Thread* self) {
+void Jit::MaybeEnqueueCompilation(ArtMethod* method, Thread* self) {
   if (thread_pool_ == nullptr) {
     return;
   }
-  if (GetCodeCache()->ContainsPc(method->GetEntryPointFromQuickCompiledCode())) {
-    // If we already have compiled code for it, nterp may be stuck in a loop.
-    // Compile OSR.
-    thread_pool_->AddTask(
-        self, new JitCompileTask(method, JitCompileTask::TaskKind::kCompileOsr));
+
+  if (JitAtFirstUse()) {
+    // Tests might request JIT on first use (compiled synchronously in the interpreter).
     return;
   }
-  if (GetCodeCache()->CanAllocateProfilingInfo()) {
-    ProfilingInfo::Create(self, method, /* retry_allocation= */ false);
-    thread_pool_->AddTask(
-        self, new JitCompileTask(method, JitCompileTask::TaskKind::kCompileBaseline));
+
+  if (!UseJitCompilation()) {
+    return;
+  }
+
+  if (IgnoreSamplesForMethod(method)) {
+    return;
+  }
+
+  if (GetCodeCache()->ContainsPc(method->GetEntryPointFromQuickCompiledCode())) {
+    if (!method->IsNative() && !code_cache_->IsOsrCompiled(method)) {
+      // If we already have compiled code for it, nterp may be stuck in a loop.
+      // Compile OSR.
+      AddCompileTask(self, method, CompilationKind::kOsr);
+    }
+    return;
+  }
+
+  // Check if we have precompiled this method.
+  if (UNLIKELY(method->IsPreCompiled())) {
+    if (!method->StillNeedsClinitCheck()) {
+      const void* entry_point = code_cache_->GetSavedEntryPointOfPreCompiledMethod(method);
+      if (entry_point != nullptr) {
+        Runtime::Current()->GetInstrumentation()->UpdateMethodsCode(method, entry_point);
+      }
+    }
+    return;
+  }
+
+  static constexpr size_t kIndividualSharedMethodHotnessThreshold = 0x3f;
+  // Intrinsics are always in the boot image and considered hot.
+  if (method->IsMemorySharedMethod() && !method->IsIntrinsic()) {
+    MutexLock mu(self, lock_);
+    auto it = shared_method_counters_.find(method);
+    if (it == shared_method_counters_.end()) {
+      shared_method_counters_[method] = kIndividualSharedMethodHotnessThreshold;
+      return;
+    } else if (it->second != 0) {
+      DCHECK_LE(it->second, kIndividualSharedMethodHotnessThreshold);
+      shared_method_counters_[method] = it->second - 1;
+      return;
+    } else {
+      shared_method_counters_[method] = kIndividualSharedMethodHotnessThreshold;
+    }
+  }
+
+  if (!method->IsNative() && GetCodeCache()->CanAllocateProfilingInfo()) {
+    AddCompileTask(self, method, CompilationKind::kBaseline);
   } else {
-    thread_pool_->AddTask(
-        self, new JitCompileTask(method, JitCompileTask::TaskKind::kCompile));
+    AddCompileTask(self, method, CompilationKind::kOptimized);
+  }
+}
+
+bool Jit::CompileMethod(ArtMethod* method,
+                        Thread* self,
+                        CompilationKind compilation_kind,
+                        bool prejit) {
+  // Fake being in a runtime thread so that class-load behavior will be the same as normal jit.
+  ScopedSetRuntimeThread ssrt(self);
+  // TODO(ngeoffray): For JIT at first use, use kPreCompile. Currently we don't due to
+  // conflicts with jitzygote optimizations.
+  return CompileMethodInternal(method, self, compilation_kind, prejit);
+}
+
+size_t JitThreadPool::GetTaskCount(Thread* self) {
+  MutexLock mu(self, task_queue_lock_);
+  return generic_queue_.size() +
+      baseline_queue_.size() +
+      optimized_queue_.size() +
+      osr_queue_.size();
+}
+
+void JitThreadPool::RemoveAllTasks(Thread* self) {
+  // The ThreadPool is responsible for calling Finalize (which usually deletes
+  // the task memory) on all the tasks.
+  Task* task = nullptr;
+  do {
+    {
+      MutexLock mu(self, task_queue_lock_);
+      if (generic_queue_.empty()) {
+        break;
+      }
+      task = generic_queue_.front();
+      generic_queue_.pop_front();
+    }
+    task->Finalize();
+  } while (true);
+
+  MutexLock mu(self, task_queue_lock_);
+  baseline_queue_.clear();
+  optimized_queue_.clear();
+  osr_queue_.clear();
+}
+
+JitThreadPool::~JitThreadPool() {
+  DeleteThreads();
+  RemoveAllTasks(Thread::Current());
+}
+
+void JitThreadPool::AddTask(Thread* self, Task* task) {
+  MutexLock mu(self, task_queue_lock_);
+  // We don't want to enqueue any new tasks when thread pool has stopped. This simplifies
+  // the implementation of redefinition feature in jvmti.
+  if (!started_) {
+    task->Finalize();
+    return;
+  }
+  generic_queue_.push_back(task);
+  // If we have any waiters, signal one.
+  if (waiting_count_ != 0) {
+    task_queue_condition_.Signal(self);
+  }
+}
+
+void JitThreadPool::AddTask(Thread* self, ArtMethod* method, CompilationKind kind) {
+  MutexLock mu(self, task_queue_lock_);
+  // We don't want to enqueue any new tasks when thread pool has stopped. This simplifies
+  // the implementation of redefinition feature in jvmti.
+  if (!started_) {
+    return;
+  }
+  switch (kind) {
+    case CompilationKind::kOsr:
+      if (ContainsElement(osr_enqueued_methods_, method)) {
+        return;
+      }
+      osr_enqueued_methods_.insert(method);
+      osr_queue_.push_back(method);
+      break;
+    case CompilationKind::kBaseline:
+      if (ContainsElement(baseline_enqueued_methods_, method)) {
+        return;
+      }
+      baseline_enqueued_methods_.insert(method);
+      baseline_queue_.push_back(method);
+      break;
+    case CompilationKind::kOptimized:
+      if (ContainsElement(optimized_enqueued_methods_, method)) {
+        return;
+      }
+      optimized_enqueued_methods_.insert(method);
+      optimized_queue_.push_back(method);
+      break;
+  }
+  // If we have any waiters, signal one.
+  if (waiting_count_ != 0) {
+    task_queue_condition_.Signal(self);
+  }
+}
+
+Task* JitThreadPool::TryGetTaskLocked() {
+  if (!started_) {
+    return nullptr;
+  }
+
+  // Fetch generic tasks first.
+  if (!generic_queue_.empty()) {
+    Task* task = generic_queue_.front();
+    generic_queue_.pop_front();
+    return task;
+  }
+
+  // OSR requests second, then baseline and finally optimized.
+  Task* task = FetchFrom(osr_queue_, CompilationKind::kOsr);
+  if (task == nullptr) {
+    task = FetchFrom(baseline_queue_, CompilationKind::kBaseline);
+    if (task == nullptr) {
+      task = FetchFrom(optimized_queue_, CompilationKind::kOptimized);
+    }
+  }
+  return task;
+}
+
+Task* JitThreadPool::FetchFrom(std::deque<ArtMethod*>& methods, CompilationKind kind) {
+  if (!methods.empty()) {
+    ArtMethod* method = methods.front();
+    methods.pop_front();
+    JitCompileTask* task = new JitCompileTask(method, JitCompileTask::TaskKind::kCompile, kind);
+    current_compilations_.insert(task);
+    return task;
+  }
+  return nullptr;
+}
+
+void JitThreadPool::Remove(JitCompileTask* task) {
+  MutexLock mu(Thread::Current(), task_queue_lock_);
+  current_compilations_.erase(task);
+  switch (task->GetCompilationKind()) {
+    case CompilationKind::kOsr: {
+      osr_enqueued_methods_.erase(task->GetArtMethod());
+      break;
+    }
+    case CompilationKind::kBaseline: {
+      baseline_enqueued_methods_.erase(task->GetArtMethod());
+      break;
+    }
+    case CompilationKind::kOptimized: {
+      optimized_enqueued_methods_.erase(task->GetArtMethod());
+      break;
+    }
+  }
+}
+
+void Jit::VisitRoots(RootVisitor* visitor) {
+  if (thread_pool_ != nullptr) {
+    thread_pool_->VisitRoots(visitor);
+  }
+}
+
+void JitThreadPool::VisitRoots(RootVisitor* visitor) {
+  if (Runtime::Current()->GetHeap()->IsPerformingUffdCompaction()) {
+    // In case of userfaultfd compaction, ArtMethods are updated concurrently
+    // via linear-alloc.
+    return;
+  }
+  // Fetch all ArtMethod first, to avoid holding `task_queue_lock_` for too
+  // long.
+  std::vector<ArtMethod*> methods;
+  {
+    MutexLock mu(Thread::Current(), task_queue_lock_);
+    // We don't look at `generic_queue_` because it contains:
+    // - Generic tasks like `ZygoteVerificationTask` which don't hold any root.
+    // - `JitCompileTask` for precompiled methods, which we know are live, being
+    //   part of the boot classpath or system server classpath.
+    methods.insert(methods.end(), osr_queue_.begin(), osr_queue_.end());
+    methods.insert(methods.end(), baseline_queue_.begin(), baseline_queue_.end());
+    methods.insert(methods.end(), optimized_queue_.begin(), optimized_queue_.end());
+    for (JitCompileTask* task : current_compilations_) {
+      methods.push_back(task->GetArtMethod());
+    }
+  }
+  UnbufferedRootVisitor root_visitor(visitor, RootInfo(kRootStickyClass));
+  for (ArtMethod* method : methods) {
+    method->VisitRoots(root_visitor, kRuntimePointerSize);
   }
 }
 

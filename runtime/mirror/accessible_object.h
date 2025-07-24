@@ -17,16 +17,19 @@
 #ifndef ART_RUNTIME_MIRROR_ACCESSIBLE_OBJECT_H_
 #define ART_RUNTIME_MIRROR_ACCESSIBLE_OBJECT_H_
 
+#include "base/macros.h"
 #include "object.h"
 #include "read_barrier_option.h"
 
-namespace art {
+namespace art HIDDEN {
 
 namespace mirror {
 
 // C++ mirror of java.lang.reflect.AccessibleObject
 class MANAGED AccessibleObject : public Object {
  public:
+  MIRROR_CLASS("Ljava/lang/reflect/AccessibleObject;");
+
   static MemberOffset FlagOffset() {
     return OFFSET_OF_OBJECT_MEMBER(AccessibleObject, flag_);
   }
@@ -37,9 +40,7 @@ class MANAGED AccessibleObject : public Object {
 
  private:
   // We only use the field indirectly using the FlagOffset() method.
-  uint8_t flag_ ATTRIBUTE_UNUSED;
-  // Padding required for correct alignment of subclasses like Executable, Field, etc.
-  uint8_t padding_[1] ATTRIBUTE_UNUSED;
+  [[maybe_unused]] uint8_t flag_;
 
   DISALLOW_IMPLICIT_CONSTRUCTORS(AccessibleObject);
 };

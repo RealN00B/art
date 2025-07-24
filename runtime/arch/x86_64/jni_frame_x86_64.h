@@ -23,8 +23,9 @@
 #include "base/bit_utils.h"
 #include "base/globals.h"
 #include "base/logging.h"
+#include "base/macros.h"
 
-namespace art {
+namespace art HIDDEN {
 namespace x86_64 {
 
 constexpr size_t kFramePointerSize = static_cast<size_t>(PointerSize::k64);
@@ -46,28 +47,32 @@ constexpr size_t kMaxFloatOrDoubleRegisterArguments = 8u;
 // -- JNI calling convention only (Managed excludes RDI, so it's actually 5).
 constexpr size_t kMaxIntLikeRegisterArguments = 6u;
 
-// Get the size of "out args" for @CriticalNative method stub.
-// This must match the size of the frame emitted by the JNI compiler at the native call site.
-inline size_t GetCriticalNativeOutArgsSize(const char* shorty, uint32_t shorty_len) {
-  DCHECK_EQ(shorty_len, strlen(shorty));
-
-  size_t num_fp_args = 0u;
-  for (size_t i = 1; i != shorty_len; ++i) {
-    if (shorty[i] == 'F' || shorty[i] == 'D') {
-      num_fp_args += 1u;
-    }
-  }
-  size_t num_non_fp_args = shorty_len - 1u - num_fp_args;
-
+// Get the size of the arguments for a native call.
+inline size_t GetNativeOutArgsSize(size_t num_fp_args, size_t num_non_fp_args) {
   // Account for FP arguments passed through Xmm0..Xmm7.
   size_t num_stack_fp_args =
       num_fp_args - std::min(kMaxFloatOrDoubleRegisterArguments, num_fp_args);
   // Account for other (integer) arguments passed through GPR (RDI, RSI, RDX, RCX, R8, R9).
   size_t num_stack_non_fp_args =
       num_non_fp_args - std::min(kMaxIntLikeRegisterArguments, num_non_fp_args);
-  // The size of outgoing arguments.
   static_assert(kFramePointerSize == kMmxSpillSize);
-  size_t size = (num_stack_fp_args + num_stack_non_fp_args) * kFramePointerSize;
+  return (num_stack_fp_args + num_stack_non_fp_args) * kFramePointerSize;
+}
+
+// Get stack args size for @CriticalNative method calls.
+inline size_t GetCriticalNativeCallArgsSize(std::string_view shorty) {
+  size_t num_fp_args =
+      std::count_if(shorty.begin() + 1, shorty.end(), [](char c) { return c == 'F' || c == 'D'; });
+  size_t num_non_fp_args = shorty.length() - 1u - num_fp_args;
+
+  return GetNativeOutArgsSize(num_fp_args, num_non_fp_args);
+}
+
+// Get the frame size for @CriticalNative method stub.
+// This must match the size of the frame emitted by the JNI compiler at the native call site.
+inline size_t GetCriticalNativeStubFrameSize(std::string_view shorty) {
+  // The size of outgoing arguments.
+  size_t size = GetCriticalNativeCallArgsSize(shorty);
 
   // We always need to spill xmm12-xmm15 as they are managed callee-saves
   // but not native callee-saves.
@@ -78,8 +83,17 @@ inline size_t GetCriticalNativeOutArgsSize(const char* shorty, uint32_t shorty_l
   return RoundUp(size, kNativeStackAlignment);
 }
 
+// Get the frame size for direct call to a @CriticalNative method.
+// This must match the size of the extra frame emitted by the compiler at the native call site.
+inline size_t GetCriticalNativeDirectCallFrameSize(std::string_view shorty) {
+  // The size of outgoing arguments.
+  size_t size = GetCriticalNativeCallArgsSize(shorty);
+
+  // No return PC to save, zero- and sign-extension are handled by the caller.
+  return RoundUp(size, kNativeStackAlignment);
+}
+
 }  // namespace x86_64
 }  // namespace art
 
 #endif  // ART_RUNTIME_ARCH_X86_64_JNI_FRAME_X86_64_H_
-

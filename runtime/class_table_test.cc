@@ -28,7 +28,7 @@
 #include "obj_ptr.h"
 #include "scoped_thread_state_change-inl.h"
 
-namespace art {
+namespace art HIDDEN {
 namespace mirror {
 
 class CollectRootVisitor {
@@ -66,7 +66,12 @@ class CollectRootVisitor {
 };
 
 
-class ClassTableTest : public CommonRuntimeTest {};
+class ClassTableTest : public CommonRuntimeTest {
+ protected:
+  ClassTableTest() {
+    use_boot_image_ = true;  // Make the Runtime creation cheaper.
+  }
+};
 
 TEST_F(ClassTableTest, ClassTable) {
   ScopedObjectAccess soa(Thread::Current());
@@ -75,10 +80,8 @@ TEST_F(ClassTableTest, ClassTable) {
   Handle<ClassLoader> class_loader(hs.NewHandle(soa.Decode<ClassLoader>(jclass_loader)));
   const char* descriptor_x = "LX;";
   const char* descriptor_y = "LY;";
-  Handle<mirror::Class> h_X(
-      hs.NewHandle(class_linker_->FindClass(soa.Self(), descriptor_x, class_loader)));
-  Handle<mirror::Class> h_Y(
-      hs.NewHandle(class_linker_->FindClass(soa.Self(), descriptor_y, class_loader)));
+  Handle<mirror::Class> h_X = hs.NewHandle(FindClass(descriptor_x, class_loader));
+  Handle<mirror::Class> h_Y = hs.NewHandle(FindClass(descriptor_y, class_loader));
   Handle<mirror::Object> obj_X = hs.NewHandle(h_X->AllocObject(soa.Self()));
   ASSERT_TRUE(obj_X != nullptr);
   ClassTable table;
@@ -100,12 +103,9 @@ TEST_F(ClassTableTest, ClassTable) {
 
   // Test inserting and related lookup functions.
   EXPECT_TRUE(table.LookupByDescriptor(h_Y.Get()) == nullptr);
-  EXPECT_FALSE(table.Contains(h_Y.Get()));
   table.Insert(h_Y.Get());
   EXPECT_OBJ_PTR_EQ(table.LookupByDescriptor(h_X.Get()), h_X.Get());
   EXPECT_OBJ_PTR_EQ(table.LookupByDescriptor(h_Y.Get()), h_Y.Get());
-  EXPECT_TRUE(table.Contains(h_X.Get()));
-  EXPECT_TRUE(table.Contains(h_Y.Get()));
 
   EXPECT_EQ(table.NumZygoteClasses(class_loader.Get()), 1u);
   EXPECT_EQ(table.NumNonZygoteClasses(class_loader.Get()), 1u);
@@ -140,21 +140,21 @@ TEST_F(ClassTableTest, ClassTable) {
   });
   EXPECT_EQ(classes.size(), 1u);
 
-  // Test remove.
-  table.Remove(descriptor_x);
-  EXPECT_FALSE(table.Contains(h_X.Get()));
-
-  // Test that WriteToMemory and ReadFromMemory work.
-  table.Insert(h_X.Get());
-  const size_t count = table.WriteToMemory(nullptr);
+  // Test that reading a class set from memory works.
+  ClassTable::ClassSet temp_set;
+  table.Visit([&temp_set](ObjPtr<mirror::Class> klass) REQUIRES_SHARED(Locks::mutator_lock_) {
+    temp_set.insert(ClassTable::TableSlot(klass));
+    return true;
+  });
+  const size_t count = temp_set.WriteToMemory(nullptr);
   std::unique_ptr<uint8_t[]> buffer(new uint8_t[count]());
-  ASSERT_EQ(table.WriteToMemory(&buffer[0]), count);
+  ASSERT_EQ(temp_set.WriteToMemory(&buffer[0]), count);
   ClassTable table2;
   size_t count2 = table2.ReadFromMemory(&buffer[0]);
   EXPECT_EQ(count, count2);
   // Strong roots are not serialized, only classes.
-  EXPECT_TRUE(table2.Contains(h_X.Get()));
-  EXPECT_TRUE(table2.Contains(h_Y.Get()));
+  EXPECT_OBJ_PTR_EQ(table2.LookupByDescriptor(h_X.Get()), h_X.Get());
+  EXPECT_OBJ_PTR_EQ(table2.LookupByDescriptor(h_Y.Get()), h_Y.Get());
 
   // TODO: Add tests for UpdateClass, InsertOatFile.
 }

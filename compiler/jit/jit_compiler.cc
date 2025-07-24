@@ -17,28 +17,31 @@
 #include "jit_compiler.h"
 
 #include "android-base/stringprintf.h"
-
 #include "arch/instruction_set.h"
 #include "arch/instruction_set_features.h"
 #include "art_method-inl.h"
 #include "base/logging.h"  // For VLOG
-#include "base/string_view_cpp20.h"
 #include "base/systrace.h"
 #include "base/time_utils.h"
 #include "base/timing_logger.h"
 #include "compiler.h"
 #include "debug/elf_debug_writer.h"
 #include "driver/compiler_options.h"
+#include "export/jit_create.h"
 #include "jit/debugger_interface.h"
 #include "jit/jit.h"
 #include "jit/jit_code_cache.h"
 #include "jit/jit_logger.h"
 
-namespace art {
+namespace art HIDDEN {
 namespace jit {
 
 JitCompiler* JitCompiler::Create() {
   return new JitCompiler();
+}
+
+void JitCompiler::SetDebuggableCompilerOption(bool value) {
+  compiler_options_->SetDebuggable(value);
 }
 
 void JitCompiler::ParseCompilerOptions() {
@@ -55,14 +58,25 @@ void JitCompiler::ParseCompilerOptions() {
       UNREACHABLE();
     }
   }
+  // Set to appropriate JIT compiler type.
+  compiler_options_->compiler_type_ = runtime->IsZygote()
+      ? CompilerOptions::CompilerType::kSharedCodeJitCompiler
+      : CompilerOptions::CompilerType::kJitCompiler;
   // JIT is never PIC, no matter what the runtime compiler options specify.
   compiler_options_->SetNonPic();
+
+  // Set the appropriate read barrier option.
+  compiler_options_->emit_read_barrier_ = gUseReadBarrier;
 
   // If the options don't provide whether we generate debuggable code, set
   // debuggability based on the runtime value.
   if (!compiler_options_->GetDebuggable()) {
     compiler_options_->SetDebuggable(runtime->IsJavaDebuggable());
   }
+
+  compiler_options_->implicit_null_checks_ = runtime->GetImplicitNullChecks();
+  compiler_options_->implicit_so_checks_ = runtime->GetImplicitStackOverflowChecks();
+  compiler_options_->implicit_suspend_checks_ = runtime->GetImplicitSuspendChecks();
 
   const InstructionSet instruction_set = compiler_options_->GetInstructionSet();
   if (kRuntimeISA == InstructionSet::kArm) {
@@ -74,15 +88,15 @@ void JitCompiler::ParseCompilerOptions() {
   for (const std::string& option : runtime->GetCompilerOptions()) {
     VLOG(compiler) << "JIT compiler option " << option;
     std::string error_msg;
-    if (StartsWith(option, "--instruction-set-variant=")) {
+    if (option.starts_with("--instruction-set-variant=")) {
       const char* str = option.c_str() + strlen("--instruction-set-variant=");
       VLOG(compiler) << "JIT instruction set variant " << str;
-      instruction_set_features = InstructionSetFeatures::FromVariant(
+      instruction_set_features = InstructionSetFeatures::FromVariantAndHwcap(
           instruction_set, str, &error_msg);
       if (instruction_set_features == nullptr) {
         LOG(WARNING) << "Error parsing " << option << " message=" << error_msg;
       }
-    } else if (StartsWith(option, "--instruction-set-features=")) {
+    } else if (option.starts_with("--instruction-set-features=")) {
       const char* str = option.c_str() + strlen("--instruction-set-features=");
       VLOG(compiler) << "JIT instruction set features " << str;
       if (instruction_set_features == nullptr) {
@@ -113,7 +127,7 @@ void JitCompiler::ParseCompilerOptions() {
   }
 }
 
-extern "C" JitCompilerInterface* jit_load() {
+JitCompilerInterface* jit_create() {
   VLOG(jit) << "Create jit compiler";
   auto* const jit_compiler = JitCompiler::Create();
   CHECK(jit_compiler != nullptr);
@@ -150,8 +164,7 @@ std::vector<uint8_t> JitCompiler::PackElfFileForJIT(ArrayRef<const JITCodeEntry*
 JitCompiler::JitCompiler() {
   compiler_options_.reset(new CompilerOptions());
   ParseCompilerOptions();
-  compiler_.reset(
-      Compiler::Create(*compiler_options_, /*storage=*/ nullptr, Compiler::kOptimizing));
+  compiler_.reset(Compiler::Create(*compiler_options_, /*storage=*/ nullptr));
 }
 
 JitCompiler::~JitCompiler() {
@@ -161,10 +174,11 @@ JitCompiler::~JitCompiler() {
 }
 
 bool JitCompiler::CompileMethod(
-    Thread* self, JitMemoryRegion* region, ArtMethod* method, bool baseline, bool osr) {
+    Thread* self, JitMemoryRegion* region, ArtMethod* method, CompilationKind compilation_kind) {
   SCOPED_TRACE << "JIT compiling "
                << method->PrettyMethod()
-               << " (baseline=" << baseline << ", osr=" << osr << ")";
+               << " (kind=" << compilation_kind << ")"
+               << " from " << method->GetDexFile()->GetLocation();
 
   DCHECK(!method->IsProxyMethod());
   DCHECK(method->GetDeclaringClass()->IsResolved());
@@ -176,28 +190,43 @@ bool JitCompiler::CompileMethod(
 
   // Do the compilation.
   bool success = false;
+  Jit* jit = runtime->GetJit();
   {
-    TimingLogger::ScopedTiming t2("Compiling", &logger);
-    JitCodeCache* const code_cache = runtime->GetJit()->GetCodeCache();
-    uint64_t start_ns = NanoTime();
+    TimingLogger::ScopedTiming t2(compilation_kind == CompilationKind::kOsr
+                                      ? "Compiling OSR"
+                                      : compilation_kind == CompilationKind::kOptimized
+                                          ? "Compiling optimized"
+                                          : "Compiling baseline",
+                                  &logger);
+    JitCodeCache* const code_cache = jit->GetCodeCache();
+    metrics::AutoTimer timer{runtime->GetMetrics()->JitMethodCompileTotalTime()};
     success = compiler_->JitCompile(
-        self, code_cache, region, method, baseline, osr, jit_logger_.get());
-    uint64_t duration_ns = NanoTime() - start_ns;
-    VLOG(jit) << "Compilation of "
-              << method->PrettyMethod()
-              << " took "
-              << PrettyDuration(duration_ns);
+        self, code_cache, region, method, compilation_kind, jit_logger_.get());
+    uint64_t duration_us = timer.Stop();
+    VLOG(jit) << "Compilation of " << method->PrettyMethod() << " took "
+              << PrettyDuration(UsToNs(duration_us));
+    runtime->GetMetrics()->JitMethodCompileCount()->AddOne();
+    runtime->GetMetrics()->JitMethodCompileTotalTimeDelta()->Add(duration_us);
+    runtime->GetMetrics()->JitMethodCompileCountDelta()->AddOne();
   }
 
-  // Trim maps to reduce memory usage.
-  // TODO: move this to an idle phase.
-  {
+  // If we don't have a new task following this compile,
+  // trim maps to reduce memory usage.
+  if (jit->GetThreadPool() == nullptr || jit->GetThreadPool()->GetTaskCount(self) == 0) {
     TimingLogger::ScopedTiming t2("TrimMaps", &logger);
     runtime->GetJitArenaPool()->TrimMaps();
   }
 
-  runtime->GetJit()->AddTimingLogger(logger);
+  jit->AddTimingLogger(logger);
   return success;
+}
+
+bool JitCompiler::IsBaselineCompiler() const {
+  return compiler_options_->IsBaseline();
+}
+
+uint32_t JitCompiler::GetInlineMaxCodeUnits() const {
+  return compiler_options_->GetInlineMaxCodeUnits();
 }
 
 }  // namespace jit

@@ -30,7 +30,7 @@
 
 %def op_const_object(jumbo="0", helper="nterp_load_object"):
    // Fast-path which gets the object from thread-local cache.
-   FETCH_FROM_THREAD_CACHE %rax, 2f
+%  fetch_from_thread_cache("%rax", miss_label="2f")
    cmpq MACRO_LITERAL(0), rSELF:THREAD_READ_BARRIER_MARK_REG00_OFFSET
    jne 3f
 1:
@@ -53,7 +53,7 @@
    jmp 1b
 
 %def op_const_class():
-%  op_const_object(jumbo="0", helper="nterp_get_class_or_allocate_object")
+%  op_const_object(jumbo="0", helper="nterp_get_class")
 
 %def op_const_method_handle():
 %  op_const_object(jumbo="0")
@@ -239,10 +239,61 @@
 %def op_unused_43():
 %  unused()
 
+%def op_unused_73():
+%  unused()
+
 %def op_unused_79():
 %  unused()
 
 %def op_unused_7a():
+%  unused()
+
+%def op_unused_e3():
+%  unused()
+
+%def op_unused_e4():
+%  unused()
+
+%def op_unused_e5():
+%  unused()
+
+%def op_unused_e6():
+%  unused()
+
+%def op_unused_e7():
+%  unused()
+
+%def op_unused_e8():
+%  unused()
+
+%def op_unused_e9():
+%  unused()
+
+%def op_unused_ea():
+%  unused()
+
+%def op_unused_eb():
+%  unused()
+
+%def op_unused_ec():
+%  unused()
+
+%def op_unused_ed():
+%  unused()
+
+%def op_unused_ee():
+%  unused()
+
+%def op_unused_ef():
+%  unused()
+
+%def op_unused_f0():
+%  unused()
+
+%def op_unused_f1():
+%  unused()
+
+%def op_unused_f2():
 %  unused()
 
 %def op_unused_f3():

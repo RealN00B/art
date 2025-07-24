@@ -17,7 +17,7 @@
 #include "mod_union_table-inl.h"
 
 #include "class_linker-inl.h"
-#include "class_root.h"
+#include "class_root-inl.h"
 #include "common_runtime_test.h"
 #include "gc/space/space-inl.h"
 #include "mirror/array-alloc-inl.h"
@@ -26,7 +26,7 @@
 #include "thread-current-inl.h"
 #include "thread_list.h"
 
-namespace art {
+namespace art HIDDEN {
 namespace gc {
 namespace accounting {
 
@@ -46,6 +46,7 @@ class ModUnionTableFactory {
 class ModUnionTableTest : public CommonRuntimeTest {
  public:
   ModUnionTableTest() : java_lang_object_array_(nullptr) {
+    use_boot_image_ = true;  // Make the Runtime creation cheaper.
   }
   mirror::ObjectArray<mirror::Object>* AllocObjectArray(
       Thread* self, space::ContinuousMemMapAllocSpace* space, size_t component_count)
@@ -99,7 +100,7 @@ class CollectVisitedVisitor : public MarkObjectVisitor {
  public:
   explicit CollectVisitedVisitor(std::set<mirror::Object*>* out) : out_(out) {}
   void MarkHeapReference(mirror::HeapReference<mirror::Object>* ref,
-                         bool do_atomic_update ATTRIBUTE_UNUSED) override
+                         [[maybe_unused]] bool do_atomic_update) override
       REQUIRES_SHARED(Locks::mutator_lock_) {
     DCHECK(ref != nullptr);
     MarkObject(ref->AsMirrorPtr());
@@ -188,7 +189,7 @@ void ModUnionTableTest::RunTest(ModUnionTableFactory::TableType type) {
       "other space", 128 * KB, 4 * MB, 4 * MB, /*can_move_objects=*/ false));
   ASSERT_TRUE(other_space.get() != nullptr);
   {
-    ScopedThreadSuspension sts(self, kSuspended);
+    ScopedThreadSuspension sts(self, ThreadState::kSuspended);
     ScopedSuspendAll ssa("Add image space");
     heap->AddSpace(other_space.get());
   }
@@ -248,7 +249,7 @@ void ModUnionTableTest::RunTest(ModUnionTableFactory::TableType type) {
       ptr += CardTable::kCardSize) {
     ASSERT_TRUE(table->ContainsCardFor(reinterpret_cast<uintptr_t>(ptr)));
   }
-  // Visit again and make sure the cards got cleared back to their sane state.
+  // Visit again and make sure the cards got cleared back to their expected state.
   std::set<mirror::Object*> visited_after;
   CollectVisitedVisitor collector_after(&visited_after);
   table->UpdateAndMarkReferences(&collector_after);
@@ -260,7 +261,7 @@ void ModUnionTableTest::RunTest(ModUnionTableFactory::TableType type) {
   std::ostringstream oss2;
   table->Dump(oss2);
   // Remove the space we added so it doesn't persist to the next test.
-  ScopedThreadSuspension sts(self, kSuspended);
+  ScopedThreadSuspension sts(self, ThreadState::kSuspended);
   ScopedSuspendAll ssa("Add image space");
   heap->RemoveSpace(other_space.get());
 }

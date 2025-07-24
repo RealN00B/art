@@ -27,7 +27,7 @@
 #include "scoped_thread_state_change-inl.h"
 #include "ssa_phi_elimination.h"
 
-namespace art {
+namespace art HIDDEN {
 
 void SsaBuilder::FixNullConstantType() {
   // The order doesn't matter here.
@@ -538,9 +538,7 @@ GraphAnalysisResult SsaBuilder::BuildSsa() {
   // Compute type of reference type instructions. The pass assumes that
   // NullConstant has been fixed up.
   ReferenceTypePropagation(graph_,
-                           class_loader_,
                            dex_cache_,
-                           handles_,
                            /* is_first_run= */ true).Run();
 
   // HInstructionBuilder duplicated ArrayGet instructions with ambiguous type
@@ -606,7 +604,7 @@ GraphAnalysisResult SsaBuilder::BuildSsa() {
  */
 HFloatConstant* SsaBuilder::GetFloatEquivalent(HIntConstant* constant) {
   // We place the floating point constant next to this constant.
-  HFloatConstant* result = constant->GetNext()->AsFloatConstant();
+  HFloatConstant* result = constant->GetNext()->AsFloatConstantOrNull();
   if (result == nullptr) {
     float value = bit_cast<float, int32_t>(constant->GetValue());
     result = new (graph_->GetAllocator()) HFloatConstant(value);
@@ -628,7 +626,7 @@ HFloatConstant* SsaBuilder::GetFloatEquivalent(HIntConstant* constant) {
  */
 HDoubleConstant* SsaBuilder::GetDoubleEquivalent(HLongConstant* constant) {
   // We place the floating point constant next to this constant.
-  HDoubleConstant* result = constant->GetNext()->AsDoubleConstant();
+  HDoubleConstant* result = constant->GetNext()->AsDoubleConstantOrNull();
   if (result == nullptr) {
     double value = bit_cast<double, int64_t>(constant->GetValue());
     result = new (graph_->GetAllocator()) HDoubleConstant(value);
@@ -654,16 +652,16 @@ HPhi* SsaBuilder::GetFloatDoubleOrReferenceEquivalentOfPhi(HPhi* phi, DataType::
 
   // We place the floating point /reference phi next to this phi.
   HInstruction* next = phi->GetNext();
-  if (next != nullptr
-      && next->AsPhi()->GetRegNumber() == phi->GetRegNumber()
-      && next->GetType() != type) {
+  if (next != nullptr &&
+      next->AsPhi()->GetRegNumber() == phi->GetRegNumber() &&
+      next->GetType() != type) {
     // Move to the next phi to see if it is the one we are looking for.
     next = next->GetNext();
   }
 
-  if (next == nullptr
-      || (next->AsPhi()->GetRegNumber() != phi->GetRegNumber())
-      || (next->GetType() != type)) {
+  if (next == nullptr ||
+      (next->AsPhi()->GetRegNumber() != phi->GetRegNumber()) ||
+      (next->GetType() != type)) {
     ArenaAllocator* allocator = graph_->GetAllocator();
     HInputsRef inputs = phi->GetInputs();
     HPhi* new_phi = new (allocator) HPhi(allocator, phi->GetRegNumber(), inputs.size(), type);

@@ -16,40 +16,52 @@
 
 #include "hidden_api.h"
 
-#include <nativehelper/scoped_local_ref.h>
+#include <atomic>
 
 #include "art_field-inl.h"
 #include "art_method-inl.h"
 #include "base/dumpable.h"
 #include "base/file_utils.h"
-#include "class_root.h"
+#include "class_root-inl.h"
+#include "compat_framework.h"
 #include "dex/class_accessor-inl.h"
 #include "dex/dex_file_loader.h"
 #include "mirror/class_ext.h"
-#include "oat_file.h"
+#include "mirror/proxy.h"
+#include "nativehelper/scoped_local_ref.h"
+#include "oat/oat_file.h"
 #include "scoped_thread_state_change.h"
+#include "stack.h"
 #include "thread-inl.h"
 #include "well_known_classes.h"
 
-namespace art {
+namespace art HIDDEN {
 namespace hiddenapi {
 
-// Should be the same as dalvik.system.VMRuntime.HIDE_MAXTARGETSDK_P_HIDDEN_APIS and
-// dalvik.system.VMRuntime.HIDE_MAXTARGETSDK_Q_HIDDEN_APIS.
+// Should be the same as dalvik.system.VMRuntime.HIDE_MAXTARGETSDK_P_HIDDEN_APIS,
+// dalvik.system.VMRuntime.HIDE_MAXTARGETSDK_Q_HIDDEN_APIS, and
+// dalvik.system.VMRuntime.ALLOW_TEST_API_ACCESS.
 // Corresponds to bug ids.
 static constexpr uint64_t kHideMaxtargetsdkPHiddenApis = 149997251;
 static constexpr uint64_t kHideMaxtargetsdkQHiddenApis = 149994052;
+static constexpr uint64_t kAllowTestApiAccess = 166236554;
+
+static constexpr uint64_t kMaxLogWarnings = 100;
+
+// Should be the same as dalvik.system.VMRuntime.PREVENT_META_REFLECTION_BLOCKLIST_ACCESS.
+// Corresponds to a bug id.
+static constexpr uint64_t kPreventMetaReflectionBlocklistAccess = 142365358;
 
 // Set to true if we should always print a warning in logcat for all hidden API accesses, not just
-// dark grey and black. This can be set to true for developer preview / beta builds, but should be
-// false for public release builds.
+// conditionally and unconditionally blocked. This can be set to true for developer preview / beta
+// builds, but should be false for public release builds.
 // Note that when flipping this flag, you must also update the expectations of test 674-hiddenapi
-// as it affects whether or not we warn for light grey APIs that have been added to the exemptions
+// as it affects whether or not we warn for unsupported APIs that have been added to the exemptions
 // list.
 static constexpr bool kLogAllAccesses = false;
 
 // Exemptions for logcat warning. Following signatures do not produce a warning as app developers
-// should not be alerted on the usage of these greylised APIs. See b/154851649.
+// should not be alerted on the usage of these unsupported APIs. See b/154851649.
 static const std::vector<std::string> kWarningExemptions = {
     "Ljava/nio/Buffer;",
     "Llibcore/io/Memory;",
@@ -93,23 +105,30 @@ static Domain DetermineDomainFromLocation(const std::string& dex_location,
   // These checks will be skipped on target buildbots where ANDROID_ART_ROOT
   // is set to "/system".
   if (ArtModuleRootDistinctFromAndroidRoot()) {
-    if (LocationIsOnArtModule(dex_location.c_str()) ||
-        LocationIsOnConscryptModule(dex_location.c_str())) {
+    if (LocationIsOnArtModule(dex_location) || LocationIsOnConscryptModule(dex_location) ||
+        LocationIsOnI18nModule(dex_location)) {
       return Domain::kCorePlatform;
     }
 
-    if (LocationIsOnApex(dex_location.c_str())) {
+    if (LocationIsOnApex(dex_location)) {
       return Domain::kPlatform;
     }
   }
 
-  if (LocationIsOnSystemFramework(dex_location.c_str())) {
+  if (LocationIsOnSystemFramework(dex_location)) {
+    return Domain::kPlatform;
+  }
+
+  if (LocationIsOnSystemExtFramework(dex_location)) {
     return Domain::kPlatform;
   }
 
   if (class_loader.IsNull()) {
-    LOG(WARNING) << "DexFile " << dex_location
-        << " is in boot class path but is not in a known location";
+    if (kIsTargetBuild && !kIsTargetLinux) {
+      // This is unexpected only when running on Android.
+      LOG(WARNING) << "DexFile " << dex_location
+                   << " is in boot class path but is not in a known location";
+    }
     return Domain::kPlatform;
   }
 
@@ -129,22 +148,95 @@ void InitializeDexFileDomain(const DexFile& dex_file, ObjPtr<mirror::ClassLoader
 void InitializeCorePlatformApiPrivateFields() {
   // The following fields in WellKnownClasses correspond to private fields in the Core Platform
   // API that cannot be otherwise expressed and propagated through tooling (b/144502743).
-  jfieldID private_core_platform_api_fields[] = {
-    WellKnownClasses::java_io_FileDescriptor_descriptor,
-    WellKnownClasses::java_nio_Buffer_address,
-    WellKnownClasses::java_nio_Buffer_elementSizeShift,
-    WellKnownClasses::java_nio_Buffer_limit,
-    WellKnownClasses::java_nio_Buffer_position,
+  ArtField* private_core_platform_api_fields[] = {
+      WellKnownClasses::java_io_FileDescriptor_descriptor,
+      WellKnownClasses::java_nio_Buffer_address,
+      WellKnownClasses::java_nio_Buffer_elementSizeShift,
+      WellKnownClasses::java_nio_Buffer_limit,
+      WellKnownClasses::java_nio_Buffer_position,
   };
 
   ScopedObjectAccess soa(Thread::Current());
-  for (const auto private_core_platform_api_field : private_core_platform_api_fields) {
-    ArtField* field = jni::DecodeArtField(private_core_platform_api_field);
+  for (ArtField* field : private_core_platform_api_fields) {
     const uint32_t access_flags = field->GetAccessFlags();
     uint32_t new_access_flags = access_flags | kAccCorePlatformApi;
     DCHECK(new_access_flags != access_flags);
     field->SetAccessFlags(new_access_flags);
   }
+}
+
+hiddenapi::AccessContext GetReflectionCallerAccessContext(Thread* self)
+    REQUIRES_SHARED(Locks::mutator_lock_) {
+  // Walk the stack and find the first frame not from java.lang.Class,
+  // java.lang.invoke or java.lang.reflect. This is very expensive.
+  // Save this till the last.
+  struct FirstExternalCallerVisitor : public StackVisitor {
+    explicit FirstExternalCallerVisitor(Thread* thread)
+        : StackVisitor(thread, nullptr, StackVisitor::StackWalkKind::kIncludeInlinedFrames),
+          caller(nullptr) {}
+
+    bool VisitFrame() override REQUIRES_SHARED(Locks::mutator_lock_) {
+      ArtMethod* m = GetMethod();
+      if (m == nullptr) {
+        // Attached native thread. Assume this is *not* boot class path.
+        caller = nullptr;
+        return false;
+      } else if (m->IsRuntimeMethod()) {
+        // Internal runtime method, continue walking the stack.
+        return true;
+      }
+
+      ObjPtr<mirror::Class> declaring_class = m->GetDeclaringClass();
+      if (declaring_class->IsBootStrapClassLoaded()) {
+        if (declaring_class->IsClassClass()) {
+          return true;
+        }
+
+        // MethodHandles.makeIdentity is doing findStatic to find hidden methods,
+        // where reflection is used.
+        if (m == WellKnownClasses::java_lang_invoke_MethodHandles_makeIdentity) {
+          return false;
+        }
+
+        // Check classes in the java.lang.invoke package. At the time of writing, the
+        // classes of interest are MethodHandles and MethodHandles.Lookup, but this
+        // is subject to change so conservatively cover the entire package.
+        // NB Static initializers within java.lang.invoke are permitted and do not
+        // need further stack inspection.
+        ObjPtr<mirror::Class> lookup_class = GetClassRoot<mirror::MethodHandlesLookup>();
+        if ((declaring_class == lookup_class || declaring_class->IsInSamePackage(lookup_class)) &&
+            !m->IsClassInitializer()) {
+          return true;
+        }
+        // Check for classes in the java.lang.reflect package, except for java.lang.reflect.Proxy.
+        // java.lang.reflect.Proxy does its own hidden api checks (https://r.android.com/915496),
+        // and walking over this frame would cause a null pointer dereference
+        // (e.g. in 691-hiddenapi-proxy).
+        ObjPtr<mirror::Class> proxy_class = GetClassRoot<mirror::Proxy>();
+        CompatFramework& compat_framework = Runtime::Current()->GetCompatFramework();
+        if (declaring_class->IsInSamePackage(proxy_class) && declaring_class != proxy_class) {
+          if (compat_framework.IsChangeEnabled(kPreventMetaReflectionBlocklistAccess)) {
+            return true;
+          }
+        }
+      }
+
+      caller = m;
+      return false;
+    }
+
+    ArtMethod* caller;
+  };
+
+  FirstExternalCallerVisitor visitor(self);
+  visitor.WalkStack();
+
+  // Construct AccessContext from the calling class found on the stack.
+  // If the calling class cannot be determined, e.g. unattached threads,
+  // we conservatively assume the caller is trusted.
+  ObjPtr<mirror::Class> caller =
+      (visitor.caller == nullptr) ? nullptr : visitor.caller->GetDeclaringClass();
+  return caller.IsNull() ? AccessContext(/* is_trusted= */ true) : AccessContext(caller);
 }
 
 namespace detail {
@@ -155,21 +247,22 @@ enum AccessContextFlags {
   // Accessed member is a field if this bit is set, else a method
   kMemberIsField = 1 << 0,
   // Indicates if access was denied to the member, instead of just printing a warning.
-  kAccessDenied  = 1 << 1,
+  kAccessDenied = 1 << 1,
 };
 
 MemberSignature::MemberSignature(ArtField* field) {
+  // Note: `ArtField::GetDeclaringClassDescriptor()` does not support proxy classes.
   class_name_ = field->GetDeclaringClass()->GetDescriptor(&tmp_);
-  member_name_ = field->GetName();
-  type_signature_ = field->GetTypeDescriptor();
+  member_name_ = field->GetNameView();
+  type_signature_ = field->GetTypeDescriptorView();
   type_ = kField;
 }
 
 MemberSignature::MemberSignature(ArtMethod* method) {
   DCHECK(method == method->GetInterfaceMethodIfProxy(kRuntimePointerSize))
       << "Caller should have replaced proxy method with interface method";
-  class_name_ = method->GetDeclaringClass()->GetDescriptor(&tmp_);
-  member_name_ = method->GetName();
+  class_name_ = method->GetDeclaringClassDescriptorView();
+  member_name_ = method->GetNameView();
   type_signature_ = method->GetSignature().ToString();
   type_ = kMethod;
 }
@@ -194,10 +287,10 @@ MemberSignature::MemberSignature(const ClassAccessor::Method& method) {
 
 inline std::vector<const char*> MemberSignature::GetSignatureParts() const {
   if (type_ == kField) {
-    return { class_name_.c_str(), "->", member_name_.c_str(), ":", type_signature_.c_str() };
+    return {class_name_.c_str(), "->", member_name_.c_str(), ":", type_signature_.c_str()};
   } else {
     DCHECK_EQ(type_, kMethod);
-    return { class_name_.c_str(), "->", member_name_.c_str(), type_signature_.c_str() };
+    return {class_name_.c_str(), "->", member_name_.c_str(), type_signature_.c_str()};
   }
 }
 
@@ -234,16 +327,27 @@ void MemberSignature::Dump(std::ostream& os) const {
 void MemberSignature::WarnAboutAccess(AccessMethod access_method,
                                       hiddenapi::ApiList list,
                                       bool access_denied) {
+  static std::atomic<uint64_t> log_warning_count_ = 0;
+  if (log_warning_count_ > kMaxLogWarnings) {
+    return;
+  }
   LOG(WARNING) << "Accessing hidden " << (type_ == kField ? "field " : "method ")
                << Dumpable<MemberSignature>(*this) << " (" << list << ", " << access_method
                << (access_denied ? ", denied)" : ", allowed)");
+  if (access_denied && list.IsTestApi()) {
+    // see b/177047045 for more details about test api access getting denied
+    LOG(WARNING) << "If this is a platform test consider enabling "
+                 << "VMRuntime.ALLOW_TEST_API_ACCESS change id for this package.";
+  }
+  if (log_warning_count_ >= kMaxLogWarnings) {
+    LOG(WARNING) << "Reached maximum number of hidden api access warnings.";
+  }
+  ++log_warning_count_;
 }
 
 bool MemberSignature::Equals(const MemberSignature& other) {
-  return type_ == other.type_ &&
-         class_name_ == other.class_name_ &&
-         member_name_ == other.member_name_ &&
-         type_signature_ == other.type_signature_;
+  return type_ == other.type_ && class_name_ == other.class_name_ &&
+         member_name_ == other.member_name_ && type_signature_ == other.type_signature_;
 }
 
 bool MemberSignature::MemberNameAndTypeMatch(const MemberSignature& other) {
@@ -265,30 +369,34 @@ void MemberSignature::LogAccessToEventLog(uint32_t sampled_value,
   if (runtime->IsAotCompiler()) {
     return;
   }
-  JNIEnvExt* env = Thread::Current()->GetJniEnv();
-  const std::string& package_name = Runtime::Current()->GetProcessPackageName();
-  ScopedLocalRef<jstring> package_str(env, env->NewStringUTF(package_name.c_str()));
-  if (env->ExceptionCheck()) {
-    env->ExceptionClear();
-    LOG(ERROR) << "Unable to allocate string for package name which called hidden api";
-  }
+
+  const std::string& package_name = runtime->GetProcessPackageName();
   std::ostringstream signature_str;
   Dump(signature_str);
-  ScopedLocalRef<jstring> signature_jstr(env,
-      env->NewStringUTF(signature_str.str().c_str()));
-  if (env->ExceptionCheck()) {
-    env->ExceptionClear();
+
+  ScopedObjectAccess soa(Thread::Current());
+  StackHandleScope<2u> hs(soa.Self());
+  Handle<mirror::String> package_str =
+      hs.NewHandle(mirror::String::AllocFromModifiedUtf8(soa.Self(), package_name.c_str()));
+  if (soa.Self()->IsExceptionPending()) {
+    soa.Self()->ClearException();
+    LOG(ERROR) << "Unable to allocate string for package name which called hidden api";
+  }
+  Handle<mirror::String> signature_jstr =
+      hs.NewHandle(mirror::String::AllocFromModifiedUtf8(soa.Self(), signature_str.str().c_str()));
+  if (soa.Self()->IsExceptionPending()) {
+    soa.Self()->ClearException();
     LOG(ERROR) << "Unable to allocate string for hidden api method signature";
   }
-  env->CallStaticVoidMethod(WellKnownClasses::dalvik_system_VMRuntime,
-      WellKnownClasses::dalvik_system_VMRuntime_hiddenApiUsed,
-      sampled_value,
-      package_str.get(),
-      signature_jstr.get(),
-      static_cast<jint>(access_method),
-      access_denied);
-  if (env->ExceptionCheck()) {
-    env->ExceptionClear();
+  WellKnownClasses::dalvik_system_VMRuntime_hiddenApiUsed
+      ->InvokeStatic<'V', 'I', 'L', 'L', 'I', 'Z'>(soa.Self(),
+                                                   static_cast<jint>(sampled_value),
+                                                   package_str.Get(),
+                                                   signature_jstr.Get(),
+                                                   static_cast<jint>(access_method),
+                                                   access_denied);
+  if (soa.Self()->IsExceptionPending()) {
+    soa.Self()->ClearException();
     LOG(ERROR) << "Unable to report hidden api usage";
   }
 #else
@@ -306,47 +414,46 @@ void MemberSignature::NotifyHiddenApiListener(AccessMethod access_method) {
 
   Runtime* runtime = Runtime::Current();
   if (!runtime->IsAotCompiler()) {
-    ScopedObjectAccessUnchecked soa(Thread::Current());
+    ScopedObjectAccess soa(Thread::Current());
+    StackHandleScope<2u> hs(soa.Self());
 
-    ScopedLocalRef<jobject> consumer_object(soa.Env(),
-        soa.Env()->GetStaticObjectField(
-            WellKnownClasses::dalvik_system_VMRuntime,
-            WellKnownClasses::dalvik_system_VMRuntime_nonSdkApiUsageConsumer));
+    ArtField* consumer_field = WellKnownClasses::dalvik_system_VMRuntime_nonSdkApiUsageConsumer;
+    DCHECK(consumer_field->GetDeclaringClass()->IsInitialized());
+    Handle<mirror::Object> consumer_object =
+        hs.NewHandle(consumer_field->GetObject(consumer_field->GetDeclaringClass()));
+
     // If the consumer is non-null, we call back to it to let it know that we
     // have encountered an API that's in one of our lists.
     if (consumer_object != nullptr) {
       std::ostringstream member_signature_str;
       Dump(member_signature_str);
 
-      ScopedLocalRef<jobject> signature_str(
-          soa.Env(),
-          soa.Env()->NewStringUTF(member_signature_str.str().c_str()));
+      Handle<mirror::String> signature_str = hs.NewHandle(
+          mirror::String::AllocFromModifiedUtf8(soa.Self(), member_signature_str.str().c_str()));
+      // FIXME: Handle OOME. For now, crash immediatelly (do not continue with a pending exception).
+      CHECK(signature_str != nullptr);
 
       // Call through to Consumer.accept(String memberSignature);
-      soa.Env()->CallVoidMethod(consumer_object.get(),
-                                WellKnownClasses::java_util_function_Consumer_accept,
-                                signature_str.get());
+      WellKnownClasses::java_util_function_Consumer_accept->InvokeInterface<'V', 'L'>(
+          soa.Self(), consumer_object.Get(), signature_str.Get());
     }
   }
 }
 
-static ALWAYS_INLINE bool CanUpdateRuntimeFlags(ArtField*) {
-  return true;
-}
+static ALWAYS_INLINE bool CanUpdateRuntimeFlags(ArtField*) { return true; }
 
 static ALWAYS_INLINE bool CanUpdateRuntimeFlags(ArtMethod* method) {
   return !method->IsIntrinsic();
 }
 
-template<typename T>
+template <typename T>
 static ALWAYS_INLINE void MaybeUpdateAccessFlags(Runtime* runtime, T* member, uint32_t flag)
     REQUIRES_SHARED(Locks::mutator_lock_) {
   // Update the access flags unless:
   // (a) `member` is an intrinsic
   // (b) this is AOT compiler, as we do not want the updated access flags in the boot/app image
   // (c) deduping warnings has been explicitly switched off.
-  if (CanUpdateRuntimeFlags(member) &&
-      !runtime->IsAotCompiler() &&
+  if (CanUpdateRuntimeFlags(member) && !runtime->IsAotCompiler() &&
       runtime->ShouldDedupeHiddenApiWarnings()) {
     member->SetAccessFlags(member->GetAccessFlags() | flag);
   }
@@ -377,12 +484,13 @@ static void VisitMembers(const DexFile& dex_file,
   accessor.VisitMethods(fn_visit, fn_visit);
 }
 
-template<typename T>
+template <typename T>
 uint32_t GetDexFlags(T* member) REQUIRES_SHARED(Locks::mutator_lock_) {
   static_assert(std::is_same<T, ArtField>::value || std::is_same<T, ArtMethod>::value);
   constexpr bool kMemberIsField = std::is_same<T, ArtField>::value;
   using AccessorType = typename std::conditional<std::is_same<T, ArtField>::value,
-      ClassAccessor::Field, ClassAccessor::Method>::type;
+                                                 ClassAccessor::Field,
+                                                 ClassAccessor::Method>::type;
 
   ObjPtr<mirror::Class> declaring_class = member->GetDeclaringClass();
   DCHECK(!declaring_class.IsNull()) << "Attempting to access a runtime method";
@@ -405,7 +513,7 @@ uint32_t GetDexFlags(T* member) REQUIRES_SHARED(Locks::mutator_lock_) {
           << "Only proxy classes are expected not to have a class def";
       DCHECK(kMemberIsField)
           << "Interface methods should be inspected instead of proxy class methods";
-      flags = ApiList::Greylist();
+      flags = ApiList::Unsupported();
     } else {
       uint32_t member_index = GetMemberDexIndex(member);
       auto fn_visit = [&](const AccessorType& dex_member) {
@@ -437,11 +545,11 @@ uint32_t GetDexFlags(T* member) REQUIRES_SHARED(Locks::mutator_lock_) {
   }
 
   CHECK(flags.IsValid()) << "Could not find hiddenapi flags for "
-      << Dumpable<MemberSignature>(MemberSignature(member));
+                         << Dumpable<MemberSignature>(MemberSignature(member));
   return flags.GetDexFlags();
 }
 
-template<typename T>
+template <typename T>
 bool HandleCorePlatformApiViolation(T* member,
                                     const AccessContext& caller_context,
                                     AccessMethod access_method,
@@ -451,8 +559,8 @@ bool HandleCorePlatformApiViolation(T* member,
 
   if (access_method != AccessMethod::kNone) {
     LOG(WARNING) << "Core platform API violation: "
-        << Dumpable<MemberSignature>(MemberSignature(member))
-        << " from " << caller_context << " using " << access_method;
+                 << Dumpable<MemberSignature>(MemberSignature(member)) << " from " << caller_context
+                 << " using " << access_method;
 
     // If policy is set to just warn, add kAccCorePlatformApi to access flags of
     // `member` to avoid reporting the violation again next time.
@@ -465,10 +573,11 @@ bool HandleCorePlatformApiViolation(T* member,
   return policy == EnforcementPolicy::kEnabled;
 }
 
-template<typename T>
+template <typename T>
 bool ShouldDenyAccessToMemberImpl(T* member, ApiList api_list, AccessMethod access_method) {
   DCHECK(member != nullptr);
   Runtime* runtime = Runtime::Current();
+  CompatFramework& compatFramework = runtime->GetCompatFramework();
 
   EnforcementPolicy hiddenApiPolicy = runtime->GetHiddenApiEnforcementPolicy();
   DCHECK(hiddenApiPolicy != EnforcementPolicy::kDisabled)
@@ -476,11 +585,11 @@ bool ShouldDenyAccessToMemberImpl(T* member, ApiList api_list, AccessMethod acce
 
   MemberSignature member_signature(member);
 
-  // Check for an exemption first. Exempted APIs are treated as white list.
+  // Check for an exemption first. Exempted APIs are treated as SDK.
   if (member_signature.DoesPrefixMatchAny(runtime->GetHiddenApiExemptions())) {
     // Avoid re-examining the exemption list next time.
     // Note this results in no warning for the member, which seems like what one would expect.
-    // Exemptions effectively adds new members to the whitelist.
+    // Exemptions effectively adds new members to the public API list.
     MaybeUpdateAccessFlags(runtime, member, kAccPublicApi);
     return false;
   }
@@ -489,25 +598,26 @@ bool ShouldDenyAccessToMemberImpl(T* member, ApiList api_list, AccessMethod acce
 
   bool deny_access = false;
   if (hiddenApiPolicy == EnforcementPolicy::kEnabled) {
-    if (testApiPolicy == EnforcementPolicy::kDisabled && api_list.IsTestApi()) {
+    if (api_list.IsTestApi() && (testApiPolicy == EnforcementPolicy::kDisabled ||
+                                 compatFramework.IsChangeEnabled(kAllowTestApiAccess))) {
       deny_access = false;
     } else {
       switch (api_list.GetMaxAllowedSdkVersion()) {
         case SdkVersion::kP:
-          deny_access = runtime->isChangeEnabled(kHideMaxtargetsdkPHiddenApis);
+          deny_access = compatFramework.IsChangeEnabled(kHideMaxtargetsdkPHiddenApis);
           break;
         case SdkVersion::kQ:
-          deny_access = runtime->isChangeEnabled(kHideMaxtargetsdkQHiddenApis);
+          deny_access = compatFramework.IsChangeEnabled(kHideMaxtargetsdkQHiddenApis);
           break;
         default:
           deny_access = IsSdkVersionSetAndMoreThan(runtime->GetTargetSdkVersion(),
-                                                         api_list.GetMaxAllowedSdkVersion());
+                                                   api_list.GetMaxAllowedSdkVersion());
       }
     }
   }
 
   if (access_method != AccessMethod::kNone) {
-    // Warn if non-greylisted signature is being accessed or it is not exempted.
+    // Warn if blocked signature is being accessed or it is not exempted.
     if (deny_access || !member_signature.DoesPrefixMatchAny(kWarningExemptions)) {
       // Print a log message with information about this class member access.
       // We do this if we're about to deny access, or the app is debuggable.
@@ -526,15 +636,16 @@ bool ShouldDenyAccessToMemberImpl(T* member, ApiList api_list, AccessMethod acce
       static_assert(RAND_MAX >= 0xffff, "RAND_MAX too small");
       if (eventLogSampleRate != 0) {
         const uint32_t sampled_value = static_cast<uint32_t>(std::rand()) & 0xffff;
-        if (sampled_value < eventLogSampleRate) {
+        if (sampled_value <= eventLogSampleRate) {
           member_signature.LogAccessToEventLog(sampled_value, access_method, deny_access);
         }
       }
     }
 
-    // If this access was not denied, move the member into whitelist and skip
-    // the warning the next time the member is accessed.
-    if (!deny_access) {
+    // If this access was not denied, flag member as SDK and skip
+    // the warning the next time the member is accessed. Don't update for
+    // non-debuggable apps as this has a memory cost.
+    if (!deny_access && runtime->IsJavaDebuggable()) {
       MaybeUpdateAccessFlags(runtime, member, kAccPublicApi);
     }
   }
@@ -560,6 +671,119 @@ template bool ShouldDenyAccessToMemberImpl<ArtMethod>(ArtMethod* member,
                                                       ApiList api_list,
                                                       AccessMethod access_method);
 }  // namespace detail
+
+template <typename T>
+bool ShouldDenyAccessToMember(T* member,
+                              const std::function<AccessContext()>& fn_get_access_context,
+                              AccessMethod access_method) {
+  DCHECK(member != nullptr);
+
+  // First check if we have an explicit sdk checker installed that should be used to
+  // verify access. If so, make the decision based on it.
+  //
+  // This is used during off-device AOT compilation which may want to generate verification
+  // metadata only for a specific list of public SDKs. Note that the check here is made
+  // based on descriptor equality and it's aim to further restrict a symbol that would
+  // otherwise be resolved.
+  //
+  // The check only applies to boot classpaths dex files.
+  Runtime* runtime = Runtime::Current();
+  if (UNLIKELY(runtime->IsAotCompiler())) {
+    if (member->GetDeclaringClass()->IsBootStrapClassLoaded() &&
+        runtime->GetClassLinker()->DenyAccessBasedOnPublicSdk(member)) {
+      return true;
+    }
+  }
+
+  // Get the runtime flags encoded in member's access flags.
+  // Note: this works for proxy methods because they inherit access flags from their
+  // respective interface methods.
+  const uint32_t runtime_flags = GetRuntimeFlags(member);
+
+  // Exit early if member is public API. This flag is also set for non-boot class
+  // path fields/methods.
+  if ((runtime_flags & kAccPublicApi) != 0) {
+    return false;
+  }
+
+  // Determine which domain the caller and callee belong to.
+  // This can be *very* expensive. This is why ShouldDenyAccessToMember
+  // should not be called on every individual access.
+  const AccessContext caller_context = fn_get_access_context();
+  const AccessContext callee_context(member->GetDeclaringClass());
+
+  // Non-boot classpath callers should have exited early.
+  DCHECK(!callee_context.IsApplicationDomain());
+
+  // Check if the caller is always allowed to access members in the callee context.
+  if (caller_context.CanAlwaysAccess(callee_context)) {
+    return false;
+  }
+
+  // Check if this is platform accessing core platform. We may warn if `member` is
+  // not part of core platform API.
+  switch (caller_context.GetDomain()) {
+    case Domain::kApplication: {
+      DCHECK(!callee_context.IsApplicationDomain());
+
+      // Exit early if access checks are completely disabled.
+      EnforcementPolicy policy = runtime->GetHiddenApiEnforcementPolicy();
+      if (policy == EnforcementPolicy::kDisabled) {
+        return false;
+      }
+
+      // If this is a proxy method, look at the interface method instead.
+      member = detail::GetInterfaceMemberIfProxy(member);
+
+      // Decode hidden API access flags from the dex file.
+      // This is an O(N) operation scaling with the number of fields/methods
+      // in the class. Only do this on slow path and only do it once.
+      ApiList api_list(detail::GetDexFlags(member));
+      DCHECK(api_list.IsValid());
+
+      // Member is hidden and caller is not exempted. Enter slow path.
+      return detail::ShouldDenyAccessToMemberImpl(member, api_list, access_method);
+    }
+
+    case Domain::kPlatform: {
+      DCHECK(callee_context.GetDomain() == Domain::kCorePlatform);
+
+      // Member is part of core platform API. Accessing it is allowed.
+      if ((runtime_flags & kAccCorePlatformApi) != 0) {
+        return false;
+      }
+
+      // Allow access if access checks are disabled.
+      EnforcementPolicy policy = Runtime::Current()->GetCorePlatformApiEnforcementPolicy();
+      if (policy == EnforcementPolicy::kDisabled) {
+        return false;
+      }
+
+      // If this is a proxy method, look at the interface method instead.
+      member = detail::GetInterfaceMemberIfProxy(member);
+
+      // Access checks are not disabled, report the violation.
+      // This may also add kAccCorePlatformApi to the access flags of `member`
+      // so as to not warn again on next access.
+      return detail::HandleCorePlatformApiViolation(member, caller_context, access_method, policy);
+    }
+
+    case Domain::kCorePlatform: {
+      LOG(FATAL) << "CorePlatform domain should be allowed to access all domains";
+      UNREACHABLE();
+    }
+  }
+}
+
+// Need to instantiate these.
+template bool ShouldDenyAccessToMember<ArtField>(
+    ArtField* member,
+    const std::function<AccessContext()>& fn_get_access_context,
+    AccessMethod access_method);
+template bool ShouldDenyAccessToMember<ArtMethod>(
+    ArtMethod* member,
+    const std::function<AccessContext()>& fn_get_access_context,
+    AccessMethod access_method);
 
 }  // namespace hiddenapi
 }  // namespace art

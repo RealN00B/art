@@ -19,7 +19,8 @@
 
 #include "base/atomic.h"
 #include "base/casts.h"
-#include "base/enums.h"
+#include "base/macros.h"
+#include "base/pointer_size.h"
 #include "dex/primitive.h"
 #include "obj_ptr.h"
 #include "object_reference.h"
@@ -29,7 +30,7 @@
 #include "runtime_globals.h"
 #include "verify_object.h"
 
-namespace art {
+namespace art HIDDEN {
 
 class ArtField;
 class ArtMethod;
@@ -49,14 +50,14 @@ class DexCache;
 class FinalizerReference;
 template<class T> class ObjectArray;
 template<class T> class PrimitiveArray;
-typedef PrimitiveArray<uint8_t> BooleanArray;
-typedef PrimitiveArray<int8_t> ByteArray;
-typedef PrimitiveArray<uint16_t> CharArray;
-typedef PrimitiveArray<double> DoubleArray;
-typedef PrimitiveArray<float> FloatArray;
-typedef PrimitiveArray<int32_t> IntArray;
-typedef PrimitiveArray<int64_t> LongArray;
-typedef PrimitiveArray<int16_t> ShortArray;
+using BooleanArray = PrimitiveArray<uint8_t>;
+using ByteArray = PrimitiveArray<int8_t>;
+using CharArray = PrimitiveArray<uint16_t>;
+using DoubleArray = PrimitiveArray<double>;
+using FloatArray = PrimitiveArray<float>;
+using IntArray = PrimitiveArray<int32_t>;
+using LongArray = PrimitiveArray<int64_t>;
+using ShortArray = PrimitiveArray<int16_t>;
 class Reference;
 class String;
 class Throwable;
@@ -71,11 +72,13 @@ class Throwable;
 static constexpr bool kCheckFieldAssignments = false;
 
 // Size of Object.
-static constexpr uint32_t kObjectHeaderSize = kUseBrooksReadBarrier ? 16 : 8;
+static constexpr uint32_t kObjectHeaderSize = 8;
 
 // C++ mirror of java.lang.Object
-class MANAGED LOCKABLE Object {
+class EXPORT MANAGED LOCKABLE Object {
  public:
+  MIRROR_CLASS("Ljava/lang/Object;");
+
   // The number of vtable entries in java.lang.Object.
   static constexpr size_t kVTableLength = 11;
 
@@ -109,8 +112,9 @@ class MANAGED LOCKABLE Object {
 
   ALWAYS_INLINE void SetReadBarrierState(uint32_t rb_state) REQUIRES_SHARED(Locks::mutator_lock_);
 
-  template<std::memory_order kMemoryOrder = std::memory_order_relaxed>
-  ALWAYS_INLINE bool AtomicSetReadBarrierState(uint32_t expected_rb_state, uint32_t rb_state)
+  ALWAYS_INLINE bool AtomicSetReadBarrierState(uint32_t expected_rb_state,
+                                               uint32_t rb_state,
+                                               std::memory_order order = std::memory_order_relaxed)
       REQUIRES_SHARED(Locks::mutator_lock_);
 
   ALWAYS_INLINE uint32_t GetMarkBit() REQUIRES_SHARED(Locks::mutator_lock_);
@@ -135,10 +139,15 @@ class MANAGED LOCKABLE Object {
       REQUIRES_SHARED(Locks::mutator_lock_)
       REQUIRES(!Roles::uninterruptible_);
 
+  // Returns a nonzero value that fits into lockword slot.
   int32_t IdentityHashCode()
       REQUIRES_SHARED(Locks::mutator_lock_)
       REQUIRES(!Locks::thread_list_lock_,
                !Locks::thread_suspend_count_lock_);
+
+  // Identical to the above, but returns 0 if monitor inflation would otherwise be needed.
+  int32_t IdentityHashCodeNoInflation() REQUIRES_SHARED(Locks::mutator_lock_)
+      REQUIRES(!Locks::thread_list_lock_, !Locks::thread_suspend_count_lock_);
 
   static constexpr MemberOffset MonitorOffset() {
     return OFFSET_OF_OBJECT_MEMBER(Object, monitor_);
@@ -152,7 +161,7 @@ class MANAGED LOCKABLE Object {
   void SetLockWord(LockWord new_val, bool as_volatile) REQUIRES_SHARED(Locks::mutator_lock_);
   bool CasLockWord(LockWord old_val, LockWord new_val, CASMode mode, std::memory_order memory_order)
       REQUIRES_SHARED(Locks::mutator_lock_);
-  uint32_t GetLockOwnerThreadId();
+  uint32_t GetLockOwnerThreadId() REQUIRES_SHARED(Locks::mutator_lock_);
 
   // Try to enter the monitor, returns non null if we succeeded.
   ObjPtr<mirror::Object> MonitorTryEnter(Thread* self)
@@ -541,12 +550,20 @@ class MANAGED LOCKABLE Object {
                                             int64_t new_value)
       REQUIRES_SHARED(Locks::mutator_lock_);
 
-  template<bool kTransactionActive,
-           bool kCheckTransaction = true,
-           VerifyObjectFlags kVerifyFlags = kDefaultVerifyFlags>
+  template <bool kTransactionActive,
+            bool kCheckTransaction = true,
+            VerifyObjectFlags kVerifyFlags = kDefaultVerifyFlags>
   bool CasFieldStrongSequentiallyConsistent64(MemberOffset field_offset,
                                               int64_t old_value,
                                               int64_t new_value)
+      REQUIRES_SHARED(Locks::mutator_lock_);
+
+  template <bool kTransactionActive,
+            bool kCheckTransaction = true,
+            VerifyObjectFlags kVerifyFlags = kDefaultVerifyFlags>
+  int64_t CaeFieldStrongSequentiallyConsistent64(MemberOffset field_offset,
+                                                 int64_t old_value,
+                                                 int64_t new_value)
       REQUIRES_SHARED(Locks::mutator_lock_);
 
   template<bool kTransactionActive,
@@ -645,6 +662,17 @@ class MANAGED LOCKABLE Object {
             typename JavaLangRefVisitor = VoidFunctor>
   void VisitReferences(const Visitor& visitor, const JavaLangRefVisitor& ref_visitor)
       NO_THREAD_SAFETY_ANALYSIS;
+  // VisitReferences version for compaction. It is invoked with from-space
+  // object so that portions of the object, like klass and length (for arrays),
+  // can be accessed without causing cascading faults.
+  template <bool kFetchObjSize = true,
+            bool kVisitNativeRoots = false,
+            VerifyObjectFlags kVerifyFlags = kDefaultVerifyFlags,
+            ReadBarrierOption kReadBarrierOption = kWithFromSpaceBarrier,
+            typename Visitor>
+  size_t VisitRefsForCompaction(const Visitor& visitor,
+                                MemberOffset begin,
+                                MemberOffset end) NO_THREAD_SAFETY_ANALYSIS;
 
   ArtField* FindFieldByOffset(MemberOffset offset) REQUIRES_SHARED(Locks::mutator_lock_);
 
@@ -660,6 +688,13 @@ class MANAGED LOCKABLE Object {
   static std::string PrettyTypeOf(ObjPtr<mirror::Object> obj)
       REQUIRES_SHARED(Locks::mutator_lock_);
   std::string PrettyTypeOf()
+      REQUIRES_SHARED(Locks::mutator_lock_);
+
+  // A utility function that does a raw copy of `src`'s data into the buffer `dst_bytes`.
+  // Skips the object header.
+  static void CopyRawObjectData(uint8_t* dst_bytes,
+                                ObjPtr<mirror::Object> src,
+                                size_t num_bytes)
       REQUIRES_SHARED(Locks::mutator_lock_);
 
  protected:
@@ -687,25 +722,17 @@ class MANAGED LOCKABLE Object {
     }
   }
 
-  // TODO: Fixme when anotatalysis works with visitors.
-  template<bool kIsStatic,
-          VerifyObjectFlags kVerifyFlags = kDefaultVerifyFlags,
-          ReadBarrierOption kReadBarrierOption = kWithReadBarrier,
-          typename Visitor>
-  void VisitFieldsReferences(uint32_t ref_offsets, const Visitor& visitor) HOT_ATTR
-      NO_THREAD_SAFETY_ANALYSIS;
-  template<VerifyObjectFlags kVerifyFlags = kDefaultVerifyFlags,
-           ReadBarrierOption kReadBarrierOption = kWithReadBarrier,
-           typename Visitor>
+  template <VerifyObjectFlags kVerifyFlags = kDefaultVerifyFlags,
+            ReadBarrierOption kReadBarrierOption = kWithReadBarrier,
+            typename Visitor>
   void VisitInstanceFieldsReferences(ObjPtr<mirror::Class> klass, const Visitor& visitor) HOT_ATTR
-      REQUIRES_SHARED(Locks::mutator_lock_);
-  template<VerifyObjectFlags kVerifyFlags = kDefaultVerifyFlags,
-           ReadBarrierOption kReadBarrierOption = kWithReadBarrier,
-           typename Visitor>
-  void VisitStaticFieldsReferences(ObjPtr<mirror::Class> klass, const Visitor& visitor) HOT_ATTR
       REQUIRES_SHARED(Locks::mutator_lock_);
 
  private:
+  template <bool kAllowInflation>
+  int32_t IdentityHashCodeHelper() REQUIRES_SHARED(Locks::mutator_lock_)
+      REQUIRES(!Locks::thread_list_lock_, !Locks::thread_suspend_count_lock_);
+
   // Get a field with acquire semantics.
   template<typename kSize>
   ALWAYS_INLINE kSize GetFieldAcquire(MemberOffset field_offset)
@@ -723,7 +750,7 @@ class MANAGED LOCKABLE Object {
   }
 
   template<VerifyObjectFlags kVerifyFlags>
-  ALWAYS_INLINE void Verify() {
+  ALWAYS_INLINE void Verify() REQUIRES_SHARED(Locks::mutator_lock_) {
     if (kVerifyFlags & kVerifyThis) {
       VerifyObject(this);
     }
@@ -731,21 +758,23 @@ class MANAGED LOCKABLE Object {
 
   // Not ObjPtr since the values may be unaligned for logic in verification.cc.
   template<VerifyObjectFlags kVerifyFlags, typename Reference>
-  ALWAYS_INLINE static void VerifyRead(Reference value) {
+  ALWAYS_INLINE static void VerifyRead(Reference value) REQUIRES_SHARED(Locks::mutator_lock_) {
     if (kVerifyFlags & kVerifyReads) {
       VerifyObject(value);
     }
   }
 
   template<VerifyObjectFlags kVerifyFlags>
-  ALWAYS_INLINE static void VerifyWrite(ObjPtr<mirror::Object> value) {
+  ALWAYS_INLINE static void VerifyWrite(ObjPtr<mirror::Object> value)
+      REQUIRES_SHARED(Locks::mutator_lock_) {
     if (kVerifyFlags & kVerifyWrites) {
       VerifyObject(value);
     }
   }
 
   template<VerifyObjectFlags kVerifyFlags>
-  ALWAYS_INLINE void VerifyCAS(ObjPtr<mirror::Object> new_value, ObjPtr<mirror::Object> old_value) {
+  ALWAYS_INLINE void VerifyCAS(ObjPtr<mirror::Object> new_value, ObjPtr<mirror::Object> old_value)
+      REQUIRES_SHARED(Locks::mutator_lock_) {
     Verify<kVerifyFlags>();
     VerifyRead<kVerifyFlags>(old_value);
     VerifyWrite<kVerifyFlags>(new_value);
@@ -772,14 +801,6 @@ class MANAGED LOCKABLE Object {
   HeapReference<Class> klass_;
   // Monitor and hash code information.
   uint32_t monitor_;
-
-#ifdef USE_BROOKS_READ_BARRIER
-  // Note names use a 'x' prefix and the x_rb_ptr_ is of type int
-  // instead of Object to go with the alphabetical/by-type field order
-  // on the Java side.
-  uint32_t x_rb_ptr_;      // For the Brooks pointer.
-  uint32_t x_xpadding_;    // For 8-byte alignment. TODO: get rid of this.
-#endif
 
   friend class art::Monitor;
   friend struct art::ObjectOffsets;  // for verifying offset information

@@ -24,6 +24,7 @@
 #include "android-base/stringprintf.h"
 
 #include "dex_file-inl.h"
+#include "dex_instruction_list.h"
 #include "utf.h"
 
 namespace art {
@@ -32,46 +33,11 @@ using android::base::StringPrintf;
 
 const char* const Instruction::kInstructionNames[] = {
 #define INSTRUCTION_NAME(o, c, pname, f, i, a, e, v) pname,
-#include "dex_instruction_list.h"
   DEX_INSTRUCTION_LIST(INSTRUCTION_NAME)
-#undef DEX_INSTRUCTION_LIST
 #undef INSTRUCTION_NAME
 };
 
 static_assert(sizeof(Instruction::InstructionDescriptor) == 8u, "Unexpected descriptor size");
-
-static constexpr int8_t InstructionSizeInCodeUnitsByOpcode(Instruction::Code opcode,
-                                                           Instruction::Format format) {
-  if (opcode == Instruction::Code::NOP) {
-    return -1;
-  } else if ((format >= Instruction::Format::k10x) && (format <= Instruction::Format::k10t)) {
-    return 1;
-  } else if ((format >= Instruction::Format::k20t) && (format <= Instruction::Format::k22c)) {
-    return 2;
-  } else if ((format >= Instruction::Format::k32x) && (format <= Instruction::Format::k3rc)) {
-    return 3;
-  } else if ((format >= Instruction::Format::k45cc) && (format <= Instruction::Format::k4rcc)) {
-    return 4;
-  } else if (format == Instruction::Format::k51l) {
-    return 5;
-  } else {
-    return -1;
-  }
-}
-
-Instruction::InstructionDescriptor const Instruction::kInstructionDescriptors[] = {
-#define INSTRUCTION_DESCR(opcode, c, p, format, index, flags, eflags, vflags) \
-    { vflags, \
-      format, \
-      index, \
-      flags, \
-      InstructionSizeInCodeUnitsByOpcode((c), (format)), \
-    },
-#include "dex_instruction_list.h"
-  DEX_INSTRUCTION_LIST(INSTRUCTION_DESCR)
-#undef DEX_INSTRUCTION_LIST
-#undef INSTRUCTION_DESCR
-};
 
 int32_t Instruction::GetTargetOffset() const {
   switch (FormatOf(Opcode())) {
@@ -82,10 +48,11 @@ int32_t Instruction::GetTargetOffset() const {
     case k10t: return VRegA_10t();
     case k20t: return VRegA_20t();
     case k30t: return VRegA_30t();
-    default: LOG(FATAL) << "Tried to access the branch offset of an instruction " << Name() <<
-        " which does not have a target operand.";
+    default:
+      LOG(FATAL) << "Tried to access the branch offset of an instruction " << Name()
+                 << " which does not have a target operand.";
+      UNREACHABLE();
   }
-  UNREACHABLE();
 }
 
 bool Instruction::CanFlowThrough() const {
@@ -206,7 +173,7 @@ std::string Instruction::DumpString(const DexFile* file) const {
               os << StringPrintf(
                   "const-string v%d, %s // string@%d",
                   VRegA_21c(),
-                  PrintableString(file->StringDataByIdx(dex::StringIndex(string_idx))).c_str(),
+                  PrintableString(file->GetStringData(dex::StringIndex(string_idx))).c_str(),
                   string_idx);
             } else {
               os << StringPrintf("const-string v%d, <<invalid-string-idx-%d>> // string@%d",
@@ -281,15 +248,6 @@ std::string Instruction::DumpString(const DexFile* file) const {
             break;
           }
           FALLTHROUGH_INTENDED;
-        case IGET_QUICK:
-        case IGET_OBJECT_QUICK:
-          if (file != nullptr) {
-            uint32_t field_idx = VRegC_22c();
-            os << opcode << " v" << static_cast<int>(VRegA_22c()) << ", v" << static_cast<int>(VRegB_22c()) << ", "
-               << "// offset@" << field_idx;
-            break;
-          }
-          FALLTHROUGH_INTENDED;
         case IPUT:
         case IPUT_WIDE:
         case IPUT_OBJECT:
@@ -301,15 +259,6 @@ std::string Instruction::DumpString(const DexFile* file) const {
             uint32_t field_idx = VRegC_22c();
             os << opcode << " v" << static_cast<int>(VRegA_22c()) << ", v" << static_cast<int>(VRegB_22c()) << ", "
                << file->PrettyField(field_idx, true) << " // field@" << field_idx;
-            break;
-          }
-          FALLTHROUGH_INTENDED;
-        case IPUT_QUICK:
-        case IPUT_OBJECT_QUICK:
-          if (file != nullptr) {
-            uint32_t field_idx = VRegC_22c();
-            os << opcode << " v" << static_cast<int>(VRegA_22c()) << ", v" << static_cast<int>(VRegB_22c()) << ", "
-               << "// offset@" << field_idx;
             break;
           }
           FALLTHROUGH_INTENDED;
@@ -350,7 +299,7 @@ std::string Instruction::DumpString(const DexFile* file) const {
                 "%s v%d, %s // string@%d",
                 opcode,
                 VRegA_31c(),
-                PrintableString(file->StringDataByIdx(dex::StringIndex(string_idx))).c_str(),
+                PrintableString(file->GetStringData(dex::StringIndex(string_idx))).c_str(),
                 string_idx);
           } else {
             os << StringPrintf("%s v%d, <<invalid-string-idx-%d>> // string@%d",
@@ -399,15 +348,6 @@ std::string Instruction::DumpString(const DexFile* file) const {
             break;
           }
           FALLTHROUGH_INTENDED;
-        case INVOKE_VIRTUAL_QUICK:
-          if (file != nullptr) {
-            os << opcode << " {";
-            uint32_t vtable_offset = VRegB_35c();
-            DumpArgs(VRegA_35c());
-            os << "},  // vtable@" << vtable_offset;
-            break;
-          }
-          FALLTHROUGH_INTENDED;
         case INVOKE_CUSTOM:
           if (file != nullptr) {
             os << opcode << " {";
@@ -438,14 +378,6 @@ std::string Instruction::DumpString(const DexFile* file) const {
             uint32_t method_idx = VRegB_3rc();
             os << StringPrintf("%s, {v%d .. v%d}, ", opcode, first_reg, last_reg)
                << file->PrettyMethod(method_idx) << " // method@" << method_idx;
-            break;
-          }
-          FALLTHROUGH_INTENDED;
-        case INVOKE_VIRTUAL_RANGE_QUICK:
-          if (file != nullptr) {
-            uint32_t method_idx = VRegB_3rc();
-            os << StringPrintf("%s, {v%d .. v%d}, ", opcode, first_reg, last_reg)
-               << "// vtable@" << method_idx;
             break;
           }
           FALLTHROUGH_INTENDED;
@@ -524,30 +456,24 @@ struct InstructionStaticAsserts : private Instruction {
     static_assert(IMPLIES((f) == k35c || (f) == k45cc, \
                           ((v) & (kVerifyVarArg | kVerifyVarArgNonZero)) != 0), \
                   "Missing var-arg verification");
-  #include "dex_instruction_list.h"
     DEX_INSTRUCTION_LIST(VAR_ARGS_CHECK)
-  #undef DEX_INSTRUCTION_LIST
   #undef VAR_ARGS_CHECK
 
   #define VAR_ARGS_RANGE_CHECK(o, c, pname, f, i, a, e, v) \
     static_assert(IMPLIES((f) == k3rc || (f) == k4rcc, \
                           ((v) & (kVerifyVarArgRange | kVerifyVarArgRangeNonZero)) != 0), \
                   "Missing var-arg verification");
-  #include "dex_instruction_list.h"
     DEX_INSTRUCTION_LIST(VAR_ARGS_RANGE_CHECK)
-  #undef DEX_INSTRUCTION_LIST
   #undef VAR_ARGS_RANGE_CHECK
 
   #define EXPERIMENTAL_CHECK(o, c, pname, f, i, a, e, v) \
     static_assert(kHaveExperimentalInstructions || (((a) & kExperimental) == 0), \
                   "Unexpected experimental instruction.");
-    #include "dex_instruction_list.h"
   DEX_INSTRUCTION_LIST(EXPERIMENTAL_CHECK)
-  #undef DEX_INSTRUCTION_LIST
   #undef EXPERIMENTAL_CHECK
 };
 
-std::ostream& operator<<(std::ostream& os, const Instruction::Code& code) {
+std::ostream& operator<<(std::ostream& os, Instruction::Code code) {
   return os << Instruction::Name(code);
 }
 

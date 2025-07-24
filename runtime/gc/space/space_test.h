@@ -31,7 +31,7 @@
 #include "thread_list.h"
 #include "zygote_space.h"
 
-namespace art {
+namespace art HIDDEN {
 namespace gc {
 namespace space {
 
@@ -46,7 +46,7 @@ class SpaceTest : public Super {
       heap->RevokeAllThreadLocalBuffers();
     }
     {
-      ScopedThreadStateChange sts(Thread::Current(), kSuspended);
+      ScopedThreadStateChange sts(Thread::Current(), ThreadState::kSuspended);
       ScopedSuspendAll ssa("Add image space");
       heap->AddSpace(space);
     }
@@ -237,12 +237,12 @@ void SpaceTest<Super>::SizeFootPrintGrowthLimitAndTrimBody(MallocSpace* space,
   size_t free_increment = 96;
   while (true) {
     {
-      ScopedThreadStateChange tsc(self, kNative);
+      ScopedThreadStateChange tsc(self, ThreadState::kNative);
       // Give the space a haircut.
       space->Trim();
     }
 
-    // Bounds sanity
+    // Bounds consistency check.
     footprint = space->GetFootprint();
     EXPECT_LE(amount_allocated, growth_limit);
     EXPECT_GE(footprint, amount_allocated);
@@ -299,16 +299,16 @@ void SpaceTest<Super>::SizeFootPrintGrowthLimitAndTrimBody(MallocSpace* space,
   }
   EXPECT_TRUE(large_object != nullptr);
 
-  // Sanity check footprint
+  // Consistency check of the footprint.
   footprint = space->GetFootprint();
   EXPECT_LE(footprint, growth_limit);
   EXPECT_GE(space->Size(), footprint);
   EXPECT_LE(space->Size(), growth_limit);
 
-  // Clean up
+  // Clean up.
   space->Free(self, large_object.Assign(nullptr));
 
-  // Sanity check footprint
+  // Consistency check of the footprint.
   footprint = space->GetFootprint();
   EXPECT_LE(footprint, growth_limit);
   EXPECT_GE(space->Size(), footprint);
@@ -328,7 +328,7 @@ void SpaceTest<Super>::SizeFootPrintGrowthLimitAndTrimDriver(size_t object_size,
   MallocSpace* space(create_space("test", initial_size, growth_limit, capacity));
   ASSERT_TRUE(space != nullptr);
 
-  // Basic sanity
+  // Basic consistency check.
   EXPECT_EQ(space->Capacity(), growth_limit);
   EXPECT_EQ(space->NonGrowthLimitCapacity(), capacity);
 

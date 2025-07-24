@@ -22,9 +22,10 @@
 #include "base/bit_field.h"
 #include "base/bit_utils.h"
 #include "base/bit_vector.h"
+#include "base/macros.h"
 #include "base/value_object.h"
 
-namespace art {
+namespace art HIDDEN {
 
 class HConstant;
 class HInstruction;
@@ -78,7 +79,7 @@ class Location : public ValueObject {
     kUnallocated = 11,
   };
 
-  Location() : ValueObject(), value_(kInvalid) {
+  constexpr Location() : ValueObject(), value_(kInvalid) {
     // Verify that non-constant location kinds do not interfere with kConstant.
     static_assert((kInvalid & kLocationConstantMask) != kConstant, "TagError");
     static_assert((kUnallocated & kLocationConstantMask) != kConstant, "TagError");
@@ -94,7 +95,7 @@ class Location : public ValueObject {
     DCHECK(!IsValid());
   }
 
-  Location(const Location& other) = default;
+  constexpr Location(const Location& other) = default;
 
   Location& operator=(const Location& other) = default;
 
@@ -102,8 +103,12 @@ class Location : public ValueObject {
     return (value_ & kLocationConstantMask) == kConstant;
   }
 
-  static Location ConstantLocation(HConstant* constant) {
+  static Location ConstantLocation(HInstruction* constant) {
     DCHECK(constant != nullptr);
+    if (kIsDebugBuild) {
+      // Call out-of-line helper to avoid circular dependency with `nodes.h`.
+      DCheckInstructionIsConstant(constant);
+    }
     return Location(kConstant | reinterpret_cast<uintptr_t>(constant));
   }
 
@@ -121,24 +126,24 @@ class Location : public ValueObject {
   }
 
   // Empty location. Used if there the location should be ignored.
-  static Location NoLocation() {
+  static constexpr Location NoLocation() {
     return Location();
   }
 
   // Register locations.
-  static Location RegisterLocation(int reg) {
+  static constexpr Location RegisterLocation(int reg) {
     return Location(kRegister, reg);
   }
 
-  static Location FpuRegisterLocation(int reg) {
+  static constexpr Location FpuRegisterLocation(int reg) {
     return Location(kFpuRegister, reg);
   }
 
-  static Location RegisterPairLocation(int low, int high) {
+  static constexpr Location RegisterPairLocation(int low, int high) {
     return Location(kRegisterPair, low << 16 | high);
   }
 
-  static Location FpuRegisterPairLocation(int low, int high) {
+  static constexpr Location FpuRegisterPairLocation(int low, int high) {
     return Location(kFpuRegisterPair, low << 16 | high);
   }
 
@@ -418,18 +423,20 @@ class Location : public ValueObject {
 
   explicit Location(uintptr_t value) : value_(value) {}
 
-  Location(Kind kind, uintptr_t payload)
+  constexpr Location(Kind kind, uintptr_t payload)
       : value_(KindField::Encode(kind) | PayloadField::Encode(payload)) {}
 
   uintptr_t GetPayload() const {
     return PayloadField::Decode(value_);
   }
 
-  typedef BitField<Kind, 0, kBitsForKind> KindField;
-  typedef BitField<uintptr_t, kBitsForKind, kBitsForPayload> PayloadField;
+  static void DCheckInstructionIsConstant(HInstruction* instruction);
+
+  using KindField = BitField<Kind, 0, kBitsForKind>;
+  using PayloadField = BitField<uintptr_t, kBitsForKind, kBitsForPayload>;
 
   // Layout for kUnallocated locations payload.
-  typedef BitField<Policy, 0, 3> PolicyField;
+  using PolicyField = BitField<Policy, 0, 3>;
 
   // Layout for stack slots.
   static const intptr_t kStackIndexBias =
@@ -440,8 +447,8 @@ class Location : public ValueObject {
   // way that none of them can be interpreted as a kConstant tag.
   uintptr_t value_;
 };
-std::ostream& operator<<(std::ostream& os, const Location::Kind& rhs);
-std::ostream& operator<<(std::ostream& os, const Location::Policy& rhs);
+std::ostream& operator<<(std::ostream& os, Location::Kind rhs);
+std::ostream& operator<<(std::ostream& os, Location::Policy rhs);
 
 class RegisterSet : public ValueObject {
  public:
@@ -476,6 +483,23 @@ class RegisterSet : public ValueObject {
 
   static bool Contains(uint32_t register_set, uint32_t reg) {
     return (register_set & (1 << reg)) != 0;
+  }
+
+  bool OverlapsRegisters(Location out) {
+    DCHECK(out.IsRegisterKind());
+    switch (out.GetKind()) {
+      case Location::Kind::kRegister:
+        return ContainsCoreRegister(out.reg());
+      case Location::Kind::kFpuRegister:
+        return ContainsFloatingPointRegister(out.reg());
+      case Location::Kind::kRegisterPair:
+        return ContainsCoreRegister(out.low()) || ContainsCoreRegister(out.high());
+      case Location::Kind::kFpuRegisterPair:
+        return ContainsFloatingPointRegister(out.low()) ||
+               ContainsFloatingPointRegister(out.high());
+      default:
+        return false;
+    }
   }
 
   size_t GetNumberOfRegisters() const {
@@ -588,11 +612,17 @@ class LocationSummary : public ArenaObject<kArenaAllocLocationSummary> {
   }
 
   bool CallsOnSlowPath() const {
-    return call_kind_ == kCallOnSlowPath || call_kind_ == kCallOnMainAndSlowPath;
+    return OnlyCallsOnSlowPath() || CallsOnMainAndSlowPath();
   }
 
   bool OnlyCallsOnSlowPath() const {
     return call_kind_ == kCallOnSlowPath;
+  }
+
+  bool NeedsSuspendCheckEntry() const {
+    // Slow path calls do not need a SuspendCheck at method entry since they go into the runtime,
+    // which we expect to either do a suspend check or return quickly.
+    return WillCall();
   }
 
   bool CallsOnMainAndSlowPath() const {
@@ -707,7 +737,8 @@ class LocationSummary : public ArenaObject<kArenaAllocLocationSummary> {
   // Custom slow path caller saves. Valid only if indicated by slow_path_calling_convention_.
   RegisterSet custom_slow_path_caller_saves_;
 
-  friend class RegisterAllocatorTest;
+  ART_FRIEND_TEST(RegisterAllocatorTest, ExpectedInRegisterHint);
+  ART_FRIEND_TEST(RegisterAllocatorTest, SameAsFirstInputHint);
   DISALLOW_COPY_AND_ASSIGN(LocationSummary);
 };
 

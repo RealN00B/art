@@ -16,23 +16,28 @@
 
 #if defined(ART_TARGET_ANDROID)
 
+#define LOG_TAG "nativeloader"
+
 #include "library_namespaces.h"
 
 #include <dirent.h>
 #include <dlfcn.h>
+#include <stdio.h>
 
+#include <algorithm>
+#include <optional>
 #include <regex>
 #include <string>
+#include <string_view>
 #include <vector>
 
-#include <android-base/file.h>
-#include <android-base/logging.h>
-#include <android-base/macros.h>
-#include <android-base/properties.h>
-#include <android-base/result.h>
-#include <android-base/strings.h>
-#include <nativehelper/scoped_utf_chars.h>
-
+#include "android-base/file.h"
+#include "android-base/logging.h"
+#include "android-base/macros.h"
+#include "android-base/result.h"
+#include "android-base/stringprintf.h"
+#include "android-base/strings.h"
+#include "nativehelper/scoped_utf_chars.h"
 #include "nativeloader/dlext_namespaces.h"
 #include "public_libraries.h"
 #include "utils.h"
@@ -41,56 +46,48 @@ namespace android::nativeloader {
 
 namespace {
 
+using ::android::base::Error;
+
 constexpr const char* kApexPath = "/apex/";
 
-// The device may be configured to have the vendor libraries loaded to a separate namespace.
-// For historical reasons this namespace was named sphal but effectively it is intended
-// to use to load vendor libraries to separate namespace with controlled interface between
-// vendor and system namespaces.
-constexpr const char* kVendorNamespaceName = "sphal";
-constexpr const char* kVndkNamespaceName = "vndk";
-constexpr const char* kVndkProductNamespaceName = "vndk_product";
-constexpr const char* kArtNamespaceName = "com_android_art";
-constexpr const char* kNeuralNetworksNamespaceName = "com_android_neuralnetworks";
-constexpr const char* kStatsdNamespaceName = "com_android_os_statsd";
-
-// classloader-namespace is a linker namespace that is created for the loaded
-// app. To be specific, it is created for the app classloader. When
-// System.load() is called from a Java class that is loaded from the
-// classloader, the classloader-namespace namespace associated with that
-// classloader is selected for dlopen. The namespace is configured so that its
-// search path is set to the app-local JNI directory and it is linked to the
-// system namespace with the names of libs listed in the public.libraries.txt.
-// This way an app can only load its own JNI libraries along with the public libs.
-constexpr const char* kClassloaderNamespaceName = "classloader-namespace";
-// Same thing for vendor APKs.
-constexpr const char* kVendorClassloaderNamespaceName = "vendor-classloader-namespace";
-// If the namespace is shared then add this suffix to form
-// "classloader-namespace-shared" or "vendor-classloader-namespace-shared",
-// respectively. A shared namespace (cf. ANDROID_NAMESPACE_TYPE_SHARED) has
+// clns-XX is a linker namespace that is created for normal apps installed in
+// the data partition. To be specific, it is created for the app classloader.
+// When System.load() is called from a Java class that is loaded from the
+// classloader, the clns namespace associated with that classloader is selected
+// for dlopen. The namespace is configured so that its search path is set to the
+// app-local JNI directory and it is linked to the system namespace with the
+// names of libs listed in the public.libraries.txt and other public libraries.
+// This way an app can only load its own JNI libraries along with the public
+// libs.
+constexpr const char* kClassloaderNamespaceName = "clns";
+// Same thing for unbundled APKs in the vendor partition.
+constexpr const char* kVendorClassloaderNamespaceName = "vendor-clns";
+// Same thing for unbundled APKs in the product partition.
+constexpr const char* kProductClassloaderNamespaceName = "product-clns";
+// If the namespace is shared then add this suffix to help identify it in debug
+// messages. A shared namespace (cf. ANDROID_NAMESPACE_TYPE_SHARED) has
 // inherited all the libraries of the parent classloader namespace, or the
-// system namespace for the main app classloader. It is used to give full
-// access to the platform libraries for apps bundled in the system image,
-// including their later updates installed in /data.
+// system namespace for the main app classloader. It is used to give full access
+// to the platform libraries for apps bundled in the system image, including
+// their later updates installed in /data.
 constexpr const char* kSharedNamespaceSuffix = "-shared";
 
 // (http://b/27588281) This is a workaround for apps using custom classloaders and calling
 // System.load() with an absolute path which is outside of the classloader library search path.
 // This list includes all directories app is allowed to access this way.
-constexpr const char* kWhitelistedDirectories = "/data:/mnt/expand";
+constexpr const char* kAlwaysPermittedDirectories = "/data:/mnt/expand";
 
 constexpr const char* kVendorLibPath = "/vendor/" LIB;
+// TODO(mast): It's unlikely that both paths are necessary for kProductLibPath
+// below, because they can't be two separate directories - either one has to be
+// a symlink to the other.
 constexpr const char* kProductLibPath = "/product/" LIB ":/system/product/" LIB;
 
-const std::regex kVendorDexPathRegex("(^|:)/vendor/");
-const std::regex kProductDexPathRegex("(^|:)(/system)?/product/");
-
-// Define origin of APK if it is from vendor partition or product partition
-using ApkOrigin = enum {
-  APK_ORIGIN_DEFAULT = 0,
-  APK_ORIGIN_VENDOR = 1,
-  APK_ORIGIN_PRODUCT = 2,
-};
+const std::regex kVendorPathRegex("(/system)?/vendor/.*");
+const std::regex kProductPathRegex("(/system)?/product/.*");
+const std::regex kSystemPathRegex("/system(_ext)?/.*");  // MUST be tested last.
+const std::regex kPartitionNativeLibPathRegex(
+    "/(system|(system/)?(system_ext|vendor|product))/lib(64)?/.*");
 
 jobject GetParentClassLoader(JNIEnv* env, jobject class_loader) {
   jclass class_loader_class = env->FindClass("java/lang/ClassLoader");
@@ -100,22 +97,54 @@ jobject GetParentClassLoader(JNIEnv* env, jobject class_loader) {
   return env->CallObjectMethod(class_loader, get_parent);
 }
 
-ApkOrigin GetApkOriginFromDexPath(const std::string& dex_path) {
-  ApkOrigin apk_origin = APK_ORIGIN_DEFAULT;
-  if (std::regex_search(dex_path, kVendorDexPathRegex)) {
-    apk_origin = APK_ORIGIN_VENDOR;
-  }
-  if (std::regex_search(dex_path, kProductDexPathRegex)) {
-    LOG_ALWAYS_FATAL_IF(apk_origin == APK_ORIGIN_VENDOR,
-                        "Dex path contains both vendor and product partition : %s",
-                        dex_path.c_str());
+}  // namespace
 
-    apk_origin = APK_ORIGIN_PRODUCT;
+ApiDomain GetApiDomainFromPath(const std::string_view path) {
+  if (std::regex_match(path.begin(), path.end(), kVendorPathRegex)) {
+    return API_DOMAIN_VENDOR;
   }
-  return apk_origin;
+  if (is_product_treblelized() && std::regex_match(path.begin(), path.end(), kProductPathRegex)) {
+    return API_DOMAIN_PRODUCT;
+  }
+  if (std::regex_match(path.begin(), path.end(), kSystemPathRegex)) {
+    return API_DOMAIN_SYSTEM;
+  }
+  return API_DOMAIN_DEFAULT;
 }
 
-}  // namespace
+// Returns the API domain for a ':'-separated list of paths, or an error if they
+// match more than one. This function does not recognize API_DOMAIN_SYSTEM and
+// will return API_DOMAIN_DEFAULT instead.
+Result<ApiDomain> GetApiDomainFromPathList(const std::string& path_list) {
+  ApiDomain result = API_DOMAIN_DEFAULT;
+  size_t start_pos = 0;
+  while (true) {
+    size_t end_pos = path_list.find(':', start_pos);
+    ApiDomain api_domain =
+        GetApiDomainFromPath(std::string_view(path_list).substr(start_pos, end_pos));
+    if (api_domain == API_DOMAIN_VENDOR || api_domain == API_DOMAIN_PRODUCT) {
+      if ((result == API_DOMAIN_VENDOR || result == API_DOMAIN_PRODUCT) && result != api_domain) {
+        // Fail only if the path list has both vendor and product paths. Allow
+        // combinations of either with API_DOMAIN_SYSTEM and API_DOMAIN_DEFAULT,
+        // because the path list we get here may contain shared Java system
+        // libraries and app APKs which may be in /data.
+        return Error() << "Path list crosses vendor/product partition boundaries: " << path_list;
+      }
+      result = api_domain;
+    }
+    if (end_pos == std::string::npos) {
+      break;
+    }
+    start_pos = end_pos + 1;
+  }
+  return result;
+}
+
+// Returns true if the given path is in a partition-wide native library location,
+// i.e. <partition root>/lib(64).
+bool IsPartitionNativeLibPath(const std::string& path) {
+  return std::regex_match(path, kPartitionNativeLibPathRegex);
+}
 
 void LibraryNamespaces::Initialize() {
   // Once public namespace is initialized there is no
@@ -125,39 +154,84 @@ void LibraryNamespaces::Initialize() {
     return;
   }
 
-  // android_init_namespaces() expects all the public libraries
-  // to be loaded so that they can be found by soname alone.
+  // Load the preloadable public libraries. Since libnativeloader is in the
+  // com_android_art namespace, use OpenSystemLibrary rather than dlopen to
+  // ensure the libraries are loaded in the system namespace.
   //
   // TODO(dimitry): this is a bit misleading since we do not know
   // if the vendor public library is going to be opened from /vendor/lib
   // we might as well end up loading them from /system/lib or /product/lib
   // For now we rely on CTS test to catch things like this but
   // it should probably be addressed in the future.
-  for (const auto& soname : android::base::Split(preloadable_public_libraries(), ":")) {
-    LOG_ALWAYS_FATAL_IF(dlopen(soname.c_str(), RTLD_NOW | RTLD_NODELETE) == nullptr,
+  for (const std::string& soname : android::base::Split(preloadable_public_libraries(), ":")) {
+    void* handle = OpenSystemLibrary(soname.c_str(), RTLD_NOW | RTLD_NODELETE);
+    LOG_ALWAYS_FATAL_IF(handle == nullptr,
                         "Error preloading public library %s: %s", soname.c_str(), dlerror());
   }
 }
 
-Result<NativeLoaderNamespace*> LibraryNamespaces::Create(JNIEnv* env, uint32_t target_sdk_version,
-                                                         jobject class_loader, bool is_shared,
-                                                         jstring dex_path_j,
-                                                         jstring java_library_path,
-                                                         jstring java_permitted_path) {
-  std::string library_path;  // empty string by default.
-  std::string dex_path;
+// "ALL" is a magic name that allows all public libraries even when the
+// target SDK is > 30. Currently this is used for (Java) shared libraries
+// which don't use <uses-native-library>
+// TODO(b/142191088) remove this hack
+static constexpr const char LIBRARY_ALL[] = "ALL";
 
-  if (java_library_path != nullptr) {
-    ScopedUtfChars library_path_utf_chars(env, java_library_path);
+// Returns the colon-separated list of library names by filtering uses_libraries from
+// public_libraries. The returned names will actually be available to the app. If the app is pre-S
+// (<= 30), the filtering is not done; the entire public_libraries are provided.
+static const std::string filter_public_libraries(
+    uint32_t target_sdk_version, const std::vector<std::string>& uses_libraries,
+    const std::string& public_libraries) {
+  // Apps targeting Android 11 or earlier gets all public libraries
+  if (target_sdk_version <= 30) {
+    return public_libraries;
+  }
+  if (std::find(uses_libraries.begin(), uses_libraries.end(), LIBRARY_ALL) !=
+      uses_libraries.end()) {
+    return public_libraries;
+  }
+  std::vector<std::string> filtered;
+  std::vector<std::string> orig = android::base::Split(public_libraries, ":");
+  for (const std::string& lib : uses_libraries) {
+    if (std::find(orig.begin(), orig.end(), lib) != orig.end()) {
+      filtered.emplace_back(lib);
+    }
+  }
+  return android::base::Join(filtered, ":");
+}
+
+Result<NativeLoaderNamespace*> LibraryNamespaces::Create(JNIEnv* env,
+                                                         uint32_t target_sdk_version,
+                                                         jobject class_loader,
+                                                         ApiDomain api_domain,
+                                                         bool is_shared,
+                                                         const std::string& dex_path,
+                                                         jstring library_path_j,
+                                                         jstring permitted_path_j,
+                                                         jstring uses_library_list_j) {
+  std::string library_path;  // empty string by default.
+
+  if (library_path_j != nullptr) {
+    ScopedUtfChars library_path_utf_chars(env, library_path_j);
     library_path = library_path_utf_chars.c_str();
   }
 
-  if (dex_path_j != nullptr) {
-    ScopedUtfChars dex_path_chars(env, dex_path_j);
-    dex_path = dex_path_chars.c_str();
+  std::vector<std::string> uses_libraries;
+  if (uses_library_list_j != nullptr) {
+    ScopedUtfChars names(env, uses_library_list_j);
+    uses_libraries = android::base::Split(names.c_str(), ":");
+  } else {
+    // uses_library_list_j could be nullptr when System.loadLibrary is called
+    // from a custom classloader. In that case, we don't know the list of public
+    // libraries because we don't know which apk the classloader is for. Only
+    // choices we can have are 1) allowing all public libs (as before), or 2)
+    // not allowing all but NDK libs. Here we take #1 because #2 would surprise
+    // developers unnecessarily.
+    // TODO(b/142191088) finalize the policy here. We could either 1) allow all
+    // public libs, 2) disallow any lib, or 3) use the libs that were granted to
+    // the first (i.e. app main) classloader.
+    uses_libraries.emplace_back(LIBRARY_ALL);
   }
-
-  ApkOrigin apk_origin = GetApkOriginFromDexPath(dex_path);
 
   // (http://b/27588281) This is a workaround for apps using custom
   // classloaders and calling System.load() with an absolute path which
@@ -165,10 +239,10 @@ Result<NativeLoaderNamespace*> LibraryNamespaces::Create(JNIEnv* env, uint32_t t
   //
   // This part effectively allows such a classloader to access anything
   // under /data and /mnt/expand
-  std::string permitted_path = kWhitelistedDirectories;
+  std::string permitted_path = kAlwaysPermittedDirectories;
 
-  if (java_permitted_path != nullptr) {
-    ScopedUtfChars path(env, java_permitted_path);
+  if (permitted_path_j != nullptr) {
+    ScopedUtfChars path(env, permitted_path_j);
     if (path.c_str() != nullptr && path.size() > 0) {
       permitted_path = permitted_path + ":" + path.c_str();
     }
@@ -179,50 +253,39 @@ Result<NativeLoaderNamespace*> LibraryNamespaces::Create(JNIEnv* env, uint32_t t
 
   std::string system_exposed_libraries = default_public_libraries();
   std::string namespace_name = kClassloaderNamespaceName;
-  ApkOrigin unbundled_app_origin = APK_ORIGIN_DEFAULT;
-  if ((apk_origin == APK_ORIGIN_VENDOR ||
-       (apk_origin == APK_ORIGIN_PRODUCT &&
-        is_product_vndk_version_defined())) &&
-      !is_shared) {
-    unbundled_app_origin = apk_origin;
-    // For vendor / product apks, give access to the vendor / product lib even though
-    // they are treated as unbundled; the libs and apks are still bundled
-    // together in the vendor / product partition.
-    const char* origin_partition;
-    const char* origin_lib_path;
-    const char* llndk_libraries;
+  ApiDomain unbundled_app_domain = API_DOMAIN_DEFAULT;
+  const char* api_domain_msg = "other apk";  // Only for debug logging.
 
-    switch (apk_origin) {
-      case APK_ORIGIN_VENDOR:
-        origin_partition = "vendor";
-        origin_lib_path = kVendorLibPath;
-        llndk_libraries = llndk_libraries_vendor().c_str();
-        break;
-      case APK_ORIGIN_PRODUCT:
-        origin_partition = "product";
-        origin_lib_path = kProductLibPath;
-        llndk_libraries = llndk_libraries_product().c_str();
-        break;
-      default:
-        origin_partition = "unknown";
-        origin_lib_path = "";
-        llndk_libraries = "";
-    }
-    library_path = library_path + ":" + origin_lib_path;
-    permitted_path = permitted_path + ":" + origin_lib_path;
+  if (!is_shared) {
+    if (api_domain == API_DOMAIN_VENDOR) {
+      unbundled_app_domain = API_DOMAIN_VENDOR;
+      api_domain_msg = "unbundled vendor apk";
 
-    // Also give access to LLNDK libraries since they are available to vendor or product
-    system_exposed_libraries = system_exposed_libraries + ":" + llndk_libraries;
+      // For vendor apks, give access to the vendor libs even though they are
+      // treated as unbundled; the libs and apks are still bundled together in the
+      // vendor partition.
+      library_path = library_path + ':' + kVendorLibPath;
+      permitted_path = permitted_path + ':' + kVendorLibPath;
 
-    // Different name is useful for debugging
-    namespace_name = kVendorClassloaderNamespaceName;
-    ALOGD("classloader namespace configured for unbundled %s apk. library_path=%s",
-          origin_partition, library_path.c_str());
-  } else {
-    // extended public libraries are NOT available to vendor apks, otherwise it
-    // would be system->vendor violation.
-    if (!extended_public_libraries().empty()) {
-      system_exposed_libraries = system_exposed_libraries + ':' + extended_public_libraries();
+      // Also give access to LLNDK libraries since they are available to vendor.
+      system_exposed_libraries = system_exposed_libraries + ':' + llndk_libraries_vendor();
+
+      // Different name is useful for debugging
+      namespace_name = kVendorClassloaderNamespaceName;
+    } else if (api_domain == API_DOMAIN_PRODUCT) {
+      unbundled_app_domain = API_DOMAIN_PRODUCT;
+      api_domain_msg = "unbundled product apk";
+
+      // Like for vendor apks, give access to the product libs since they are
+      // bundled together in the same partition.
+      library_path = library_path + ':' + kProductLibPath;
+      permitted_path = permitted_path + ':' + kProductLibPath;
+
+      // Also give access to LLNDK libraries since they are available to product.
+      system_exposed_libraries = system_exposed_libraries + ':' + llndk_libraries_product();
+
+      // Different name is useful for debugging
+      namespace_name = kProductClassloaderNamespaceName;
     }
   }
 
@@ -230,6 +293,36 @@ Result<NativeLoaderNamespace*> LibraryNamespaces::Create(JNIEnv* env, uint32_t t
     // Show in the name that the namespace was created as shared, for debugging
     // purposes.
     namespace_name = namespace_name + kSharedNamespaceSuffix;
+  }
+
+  // Append a unique number to the namespace name, to tell them apart when
+  // debugging linker issues, e.g. with debug.ld.all set to "dlopen,dlerror".
+  static int clns_count = 0;
+  namespace_name = android::base::StringPrintf("%s-%d", namespace_name.c_str(), ++clns_count);
+
+  ALOGD(
+      "Configuring %s for %s %s. target_sdk_version=%u, uses_libraries=%s, library_path=%s, "
+      "permitted_path=%s",
+      namespace_name.c_str(),
+      api_domain_msg,
+      dex_path.c_str(),
+      static_cast<unsigned>(target_sdk_version),
+      android::base::Join(uses_libraries, ':').c_str(),
+      library_path.c_str(),
+      permitted_path.c_str());
+
+  if (unbundled_app_domain != API_DOMAIN_VENDOR) {
+    // Extended public libraries are NOT available to unbundled vendor apks, but
+    // they are to other apps, including those in system, system_ext, and
+    // product partitions. The reason is that when GSI is used, the system
+    // partition may get replaced, and then vendor apps may fail. It's fine for
+    // product apps, because that partition isn't mounted in GSI tests.
+    const std::string libs =
+        filter_public_libraries(target_sdk_version, uses_libraries, extended_public_libraries());
+    if (!libs.empty()) {
+      ALOGD("Extending system_exposed_libraries: %s", libs.c_str());
+      system_exposed_libraries = system_exposed_libraries + ':' + libs;
+    }
   }
 
   // Create the app namespace
@@ -244,49 +337,48 @@ Result<NativeLoaderNamespace*> LibraryNamespaces::Create(JNIEnv* env, uint32_t t
   bool also_used_as_anonymous = is_main_classloader;
   // Note: this function is executed with g_namespaces_mutex held, thus no
   // racing here.
-  auto app_ns = NativeLoaderNamespace::Create(
-      namespace_name, library_path, permitted_path, parent_ns, is_shared,
-      target_sdk_version < 24 /* is_greylist_enabled */, also_used_as_anonymous);
+  Result<NativeLoaderNamespace> app_ns =
+      NativeLoaderNamespace::Create(namespace_name,
+                                    library_path,
+                                    permitted_path,
+                                    parent_ns,
+                                    is_shared,
+                                    target_sdk_version < 24 /* is_exempt_list_enabled */,
+                                    also_used_as_anonymous);
   if (!app_ns.ok()) {
     return app_ns.error();
   }
   // ... and link to other namespaces to allow access to some public libraries
   bool is_bridged = app_ns->IsBridged();
 
-  auto system_ns = NativeLoaderNamespace::GetSystemNamespace(is_bridged);
+  Result<NativeLoaderNamespace> system_ns = NativeLoaderNamespace::GetSystemNamespace(is_bridged);
   if (!system_ns.ok()) {
     return system_ns.error();
   }
 
-  auto linked = app_ns->Link(*system_ns, system_exposed_libraries);
+  Result<void> linked = app_ns->Link(&system_ns.value(), system_exposed_libraries);
   if (!linked.ok()) {
     return linked.error();
   }
 
-  auto art_ns = NativeLoaderNamespace::GetExportedNamespace(kArtNamespaceName, is_bridged);
-  // ART APEX does not exist on host, and under certain build conditions.
-  if (art_ns.ok()) {
-    linked = app_ns->Link(*art_ns, art_public_libraries());
-    if (!linked.ok()) {
-      return linked.error();
-    }
-  }
-
-  // Give access to NNAPI libraries (apex-updated LLNDK library).
-  auto nnapi_ns =
-      NativeLoaderNamespace::GetExportedNamespace(kNeuralNetworksNamespaceName, is_bridged);
-  if (nnapi_ns.ok()) {
-    linked = app_ns->Link(*nnapi_ns, neuralnetworks_public_libraries());
-    if (!linked.ok()) {
-      return linked.error();
+  for (const auto&[apex_ns_name, public_libs] : apex_public_libraries()) {
+    Result<NativeLoaderNamespace> ns =
+        NativeLoaderNamespace::GetExportedNamespace(apex_ns_name, is_bridged);
+    // Even if APEX namespace is visible, it may not be available to bridged.
+    if (ns.ok()) {
+      linked = app_ns->Link(&ns.value(), public_libs);
+      if (!linked.ok()) {
+        return linked.error();
+      }
     }
   }
 
   // Give access to VNDK-SP libraries from the 'vndk' namespace for unbundled vendor apps.
-  if (unbundled_app_origin == APK_ORIGIN_VENDOR && !vndksp_libraries_vendor().empty()) {
-    auto vndk_ns = NativeLoaderNamespace::GetExportedNamespace(kVndkNamespaceName, is_bridged);
+  if (unbundled_app_domain == API_DOMAIN_VENDOR && !vndksp_libraries_vendor().empty()) {
+    Result<NativeLoaderNamespace> vndk_ns =
+        NativeLoaderNamespace::GetExportedNamespace(kVndkNamespaceName, is_bridged);
     if (vndk_ns.ok()) {
-      linked = app_ns->Link(*vndk_ns, vndksp_libraries_vendor());
+      linked = app_ns->Link(&vndk_ns.value(), vndksp_libraries_vendor());
       if (!linked.ok()) {
         return linked.error();
       }
@@ -294,54 +386,71 @@ Result<NativeLoaderNamespace*> LibraryNamespaces::Create(JNIEnv* env, uint32_t t
   }
 
   // Give access to VNDK-SP libraries from the 'vndk_product' namespace for unbundled product apps.
-  if (unbundled_app_origin == APK_ORIGIN_PRODUCT && !vndksp_libraries_product().empty()) {
-    auto vndk_ns = NativeLoaderNamespace::GetExportedNamespace(kVndkProductNamespaceName, is_bridged);
+  if (unbundled_app_domain == API_DOMAIN_PRODUCT && !vndksp_libraries_product().empty()) {
+    Result<NativeLoaderNamespace> vndk_ns =
+        NativeLoaderNamespace::GetExportedNamespace(kVndkProductNamespaceName, is_bridged);
     if (vndk_ns.ok()) {
-      linked = app_ns->Link(*vndk_ns, vndksp_libraries_product());
+      linked = app_ns->Link(&vndk_ns.value(), vndksp_libraries_product());
       if (!linked.ok()) {
         return linked.error();
       }
     }
   }
 
-  auto apex_ns_name = FindApexNamespaceName(dex_path);
-  if (apex_ns_name.ok()) {
-    const auto& jni_libs = apex_jni_libraries(*apex_ns_name);
-    if (jni_libs != "") {
-      auto apex_ns = NativeLoaderNamespace::GetExportedNamespace(*apex_ns_name, is_bridged);
-      if (apex_ns.ok()) {
-        auto link = app_ns->Link(*apex_ns, jni_libs);
-        if (!link.ok()) {
-          return linked.error();
+  for (const std::string& each_jar_path : android::base::Split(dex_path, ":")) {
+    std::optional<std::string> apex_ns_name = FindApexNamespaceName(each_jar_path);
+    if (apex_ns_name.has_value()) {
+      const std::string& jni_libs = apex_jni_libraries(apex_ns_name.value());
+      if (jni_libs != "") {
+        Result<NativeLoaderNamespace> apex_ns =
+            NativeLoaderNamespace::GetExportedNamespace(apex_ns_name.value(), is_bridged);
+        if (apex_ns.ok()) {
+          linked = app_ns->Link(&apex_ns.value(), jni_libs);
+          if (!linked.ok()) {
+            return linked.error();
+          }
         }
       }
     }
   }
 
-  // Give access to StatsdAPI libraries
-  auto statsd_ns =
-      NativeLoaderNamespace::GetExportedNamespace(kStatsdNamespaceName, is_bridged);
-  if (statsd_ns.ok()) {
-    linked = app_ns->Link(*statsd_ns, statsd_public_libraries());
-    if (!linked.ok()) {
-      return linked.error();
-    }
-  }
-
-  if (!vendor_public_libraries().empty()) {
-    auto vendor_ns = NativeLoaderNamespace::GetExportedNamespace(kVendorNamespaceName, is_bridged);
+  const std::string vendor_libs =
+      filter_public_libraries(target_sdk_version, uses_libraries, vendor_public_libraries());
+  if (!vendor_libs.empty()) {
+    Result<NativeLoaderNamespace> vendor_ns =
+        NativeLoaderNamespace::GetExportedNamespace(kVendorNamespaceName, is_bridged);
     // when vendor_ns is not configured, link to the system namespace
-    auto target_ns = vendor_ns.ok() ? vendor_ns : system_ns;
+    Result<NativeLoaderNamespace> target_ns = vendor_ns.ok() ? vendor_ns : system_ns;
     if (target_ns.ok()) {
-      linked = app_ns->Link(*target_ns, vendor_public_libraries());
+      linked = app_ns->Link(&target_ns.value(), vendor_libs);
       if (!linked.ok()) {
         return linked.error();
       }
     }
   }
 
-  auto& emplaced = namespaces_.emplace_back(
-      std::make_pair(env->NewWeakGlobalRef(class_loader), *app_ns));
+  const std::string product_libs =
+      filter_public_libraries(target_sdk_version, uses_libraries, product_public_libraries());
+  if (!product_libs.empty()) {
+    Result<NativeLoaderNamespace> target_ns =
+        is_product_treblelized()
+            ? NativeLoaderNamespace::GetExportedNamespace(kProductNamespaceName, is_bridged)
+            : system_ns;
+    if (target_ns.ok()) {
+      linked = app_ns->Link(&target_ns.value(), product_libs);
+      if (!linked.ok()) {
+        return linked.error();
+      }
+    } else {
+      // The linkerconfig must have a problem on defining the product namespace in the system
+      // section. Skip linking product namespace. This will not affect most of the apps. Only the
+      // apps that requires the product public libraries will fail.
+      ALOGW("Namespace for product libs not found: %s", target_ns.error().message().c_str());
+    }
+  }
+
+  std::pair<jweak, NativeLoaderNamespace>& emplaced =
+      namespaces_.emplace_back(std::make_pair(env->NewWeakGlobalRef(class_loader), *app_ns));
   if (is_main_classloader) {
     app_main_namespace_ = &emplaced.second;
   }
@@ -377,12 +486,12 @@ NativeLoaderNamespace* LibraryNamespaces::FindParentNamespaceByClassLoader(JNIEn
   return nullptr;
 }
 
-base::Result<std::string> FindApexNamespaceName(const std::string& location) {
+std::optional<std::string> FindApexNamespaceName(const std::string& location) {
   // Lots of implicit assumptions here: we expect `location` to be of the form:
   // /apex/modulename/...
   //
   // And we extract from it 'modulename', and then apply mangling rule to get namespace name for it.
-  if (android::base::StartsWith(location, kApexPath)) {
+  if (location.starts_with(kApexPath)) {
     size_t start_index = strlen(kApexPath);
     size_t slash_index = location.find_first_of('/', start_index);
     LOG_ALWAYS_FATAL_IF((slash_index == std::string::npos),
@@ -391,7 +500,7 @@ base::Result<std::string> FindApexNamespaceName(const std::string& location) {
     std::replace(name.begin(), name.end(), '.', '_');
     return name;
   }
-  return base::Error();
+  return std::nullopt;
 }
 
 }  // namespace android::nativeloader

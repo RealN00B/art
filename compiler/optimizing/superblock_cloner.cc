@@ -20,9 +20,9 @@
 #include "induction_var_range.h"
 #include "graph_checker.h"
 
-#include <iostream>
+#include <sstream>
 
-namespace art {
+namespace art HIDDEN {
 
 using HBasicBlockMap = SuperblockCloner::HBasicBlockMap;
 using HInstructionMap = SuperblockCloner::HInstructionMap;
@@ -134,7 +134,7 @@ void SuperblockCloner::DeepCloneEnvironmentWithRemapping(HInstruction* copy_inst
   if (orig_env->GetParent() != nullptr) {
     DeepCloneEnvironmentWithRemapping(copy_instr, orig_env->GetParent());
   }
-  HEnvironment* copy_env = new (arena_) HEnvironment(arena_, *orig_env, copy_instr);
+  HEnvironment* copy_env = HEnvironment::Create(arena_, *orig_env, copy_instr);
 
   for (size_t i = 0; i < orig_env->Size(); i++) {
     HInstruction* env_input = orig_env->GetInstructionAt(i);
@@ -193,7 +193,7 @@ void SuperblockCloner::RemapOrigInternalOrIncomingEdge(HBasicBlock* orig_block,
   // orig_block will be put at the end of the copy_succ's predecessors list; that corresponds
   // to the previously added phi inputs position.
   orig_block->ReplaceSuccessor(orig_succ, copy_succ);
-  DCHECK(!first_phi_met || copy_succ->GetPredecessors().size() == phi_input_count);
+  DCHECK_IMPLIES(first_phi_met, copy_succ->GetPredecessors().size() == phi_input_count);
 }
 
 void SuperblockCloner::AddCopyInternalEdge(HBasicBlock* orig_block,
@@ -227,6 +227,40 @@ void SuperblockCloner::RemapCopyInternalEdge(HBasicBlock* orig_block,
   }
 }
 
+bool SuperblockCloner::IsRemapInfoForVersioning() const {
+  return remap_incoming_->empty() &&
+         remap_orig_internal_->empty() &&
+         remap_copy_internal_->empty();
+}
+
+void SuperblockCloner::CopyIncomingEdgesForVersioning() {
+  for (uint32_t orig_block_id : orig_bb_set_.Indexes()) {
+    HBasicBlock* orig_block = GetBlockById(orig_block_id);
+    size_t incoming_edge_count = 0;
+    for (HBasicBlock* orig_pred : orig_block->GetPredecessors()) {
+      uint32_t orig_pred_id = orig_pred->GetBlockId();
+      if (IsInOrigBBSet(orig_pred_id)) {
+        continue;
+      }
+
+      HBasicBlock* copy_block = GetBlockCopy(orig_block);
+      // This corresponds to the requirement on the order of predecessors: all the incoming
+      // edges must be seen before the internal ones. This is always true for natural loops.
+      // TODO: remove this requirement.
+      DCHECK_EQ(orig_block->GetPredecessorIndexOf(orig_pred), incoming_edge_count);
+      for (HInstructionIterator it(orig_block->GetPhis()); !it.Done(); it.Advance()) {
+        HPhi* orig_phi = it.Current()->AsPhi();
+        HPhi* copy_phi = GetInstrCopy(orig_phi)->AsPhi();
+        HInstruction* orig_phi_input = orig_phi->InputAt(incoming_edge_count);
+        // Add the corresponding input of the original phi to the copy one.
+        copy_phi->AddInput(orig_phi_input);
+      }
+      copy_block->AddPredecessor(orig_pred);
+      incoming_edge_count++;
+    }
+  }
+}
+
 //
 // Local versions of CF calculation/adjustment routines.
 //
@@ -238,8 +272,6 @@ void SuperblockCloner::RemapCopyInternalEdge(HBasicBlock* orig_block,
 // FindBackEdgesInTheNaturalLoop.
 void SuperblockCloner::FindBackEdgesLocal(HBasicBlock* entry_block, ArenaBitVector* local_set) {
   ArenaBitVector visited(arena_, graph_->GetBlocks().size(), false, kArenaAllocSuperblockCloner);
-  // "visited" must be empty on entry, it's an output argument for all visited (i.e. live) blocks.
-  DCHECK_EQ(visited.GetHighestBitSet(), -1);
 
   // Nodes that we're currently visiting, indexed by block id.
   ArenaBitVector visiting(arena_, graph_->GetBlocks().size(), false, kArenaAllocGraphBuilder);
@@ -452,6 +484,12 @@ void SuperblockCloner::FindAndSetLocalAreaForAdjustments() {
 }
 
 void SuperblockCloner::RemapEdgesSuccessors() {
+  // By this stage all the blocks have been copied, copy phis - created with no inputs;
+  // no copy edges have been created so far.
+  if (IsRemapInfoForVersioning()) {
+    CopyIncomingEdgesForVersioning();
+  }
+
   // Redirect incoming edges.
   for (HEdge e : *remap_incoming_) {
     HBasicBlock* orig_block = GetBlockById(e.GetFrom());
@@ -593,7 +631,7 @@ void SuperblockCloner::ConstructSubgraphClosedSSA() {
     HPhi* phi = new (arena_) HPhi(arena_, kNoRegNumber, 0, value->GetType());
 
     if (value->GetType() == DataType::Type::kReference) {
-      phi->SetReferenceTypeInfo(value->GetReferenceTypeInfo());
+      phi->SetReferenceTypeInfoIfValid(value->GetReferenceTypeInfo());
     }
 
     exit_block->AddPhi(phi);
@@ -646,25 +684,26 @@ void DumpBB(HGraph* graph) {
     if (bb == nullptr) {
       continue;
     }
-    std::cout << bb->GetBlockId();
-    std::cout << " <- ";
+    std::ostringstream oss;
+    oss << bb->GetBlockId();
+    oss << " <- ";
     for (HBasicBlock* pred : bb->GetPredecessors()) {
-      std::cout << pred->GetBlockId() << " ";
+      oss << pred->GetBlockId() << " ";
     }
-    std::cout << " -> ";
+    oss << " -> ";
     for (HBasicBlock* succ : bb->GetSuccessors()) {
-      std::cout << succ->GetBlockId()  << " ";
+      oss << succ->GetBlockId()  << " ";
     }
 
     if (bb->GetDominator()) {
-      std::cout << " dom " << bb->GetDominator()->GetBlockId();
+      oss << " dom " << bb->GetDominator()->GetBlockId();
     }
 
     if (bb->GetLoopInformation()) {
-      std::cout <<  "\tloop: " << bb->GetLoopInformation()->GetHeader()->GetBlockId();
+      oss <<  "\tloop: " << bb->GetLoopInformation()->GetHeader()->GetBlockId();
     }
 
-    std::cout << std::endl;
+    LOG(INFO) << oss.str();
   }
 }
 
@@ -747,35 +786,35 @@ void SuperblockCloner::VerifyGraph() {
     checker.Run();
     if (!checker.IsValid()) {
       for (const std::string& error : checker.GetErrors()) {
-        std::cout << error << std::endl;
+        LOG(ERROR) << error;
       }
-      LOG(FATAL) << "GraphChecker failed: superblock cloner\n";
+      LOG(FATAL) << "GraphChecker failed: superblock cloner";
     }
   }
 }
 
 void DumpBBSet(const ArenaBitVector* set) {
   for (uint32_t idx : set->Indexes()) {
-    std::cout << idx << "\n";
+    LOG(INFO) << idx;
   }
 }
 
 void SuperblockCloner::DumpInputSets() {
-  std::cout << "orig_bb_set:\n";
+  LOG(INFO) << "orig_bb_set:";
   for (uint32_t idx : orig_bb_set_.Indexes()) {
-    std::cout << idx << "\n";
+    LOG(INFO) << idx;
   }
-  std::cout << "remap_orig_internal:\n";
+  LOG(INFO) << "remap_orig_internal:";
   for (HEdge e : *remap_orig_internal_) {
-    std::cout << e << "\n";
+    LOG(INFO) << e;
   }
-  std::cout << "remap_copy_internal:\n";
+  LOG(INFO) << "remap_copy_internal:";
   for (auto e : *remap_copy_internal_) {
-    std::cout << e << "\n";
+    LOG(INFO) << e;
   }
-  std::cout << "remap_incoming:\n";
+  LOG(INFO) << "remap_incoming:";
   for (auto e : *remap_incoming_) {
-    std::cout << e << "\n";
+    LOG(INFO) << e;
   }
 }
 
@@ -814,9 +853,18 @@ void SuperblockCloner::SetSuccessorRemappingInfo(const HEdgeSet* remap_orig_inte
 }
 
 bool SuperblockCloner::IsSubgraphClonable() const {
-  // TODO: Support irreducible graphs and graphs with try-catch.
-  if (graph_->HasIrreducibleLoops() || graph_->HasTryCatch()) {
+  // TODO: Support irreducible graphs and subgraphs with try-catch.
+  if (graph_->HasIrreducibleLoops()) {
     return false;
+  }
+
+  for (HBasicBlock* block : graph_->GetReversePostOrder()) {
+    if (!IsInOrigBBSet(block)) {
+      continue;
+    }
+    if (block->GetTryCatchInformation() != nullptr) {
+      return false;
+    }
   }
 
   HInstructionMap live_outs(
@@ -834,11 +882,23 @@ bool SuperblockCloner::IsSubgraphClonable() const {
     return false;
   }
 
+  // The values in live_outs should be defined in a block that dominates exit_block.
+  for (const auto& live_out : live_outs) {
+    DCHECK_EQ(exits.size(), 1u);
+    HInstruction* value = live_out.first;
+    if (!value->GetBlock()->Dominates(exits[0])) {
+      // This case can only happen when `value` is used in a catch phi, so the graph must contain a
+      // catch block.
+      DCHECK(graph_->HasTryCatch());
+      return false;
+    }
+  }
+
   return true;
 }
 
+// Checks that loop unrolling/peeling/versioning is being conducted.
 bool SuperblockCloner::IsFastCase() const {
-  // Check that loop unrolling/loop peeling is being conducted.
   // Check that all the basic blocks belong to the same loop.
   bool flag = false;
   HLoopInformation* common_loop_info = nullptr;
@@ -854,9 +914,13 @@ bool SuperblockCloner::IsFastCase() const {
     }
   }
 
-  // Check that orig_bb_set_ corresponds to loop peeling/unrolling.
+  // Check that orig_bb_set_ corresponds to loop peeling/unrolling/versioning.
   if (common_loop_info == nullptr || !orig_bb_set_.SameBitsSet(&common_loop_info->GetBlocks())) {
     return false;
+  }
+
+  if (IsRemapInfoForVersioning()) {
+    return true;
   }
 
   bool peeling_or_unrolling = false;
@@ -907,7 +971,8 @@ void SuperblockCloner::Run() {
     DumpInputSets();
   }
 
-  CollectLiveOutsAndCheckClonable(&live_outs_);
+  bool result = CollectLiveOutsAndCheckClonable(&live_outs_);
+  DCHECK(result);
   // Find an area in the graph for which control flow information should be adjusted.
   FindAndSetLocalAreaForAdjustments();
   ConstructSubgraphClosedSSA();
@@ -945,21 +1010,13 @@ void SuperblockCloner::CleanUp() {
   // transformation it could happen that there is such block with a phi with a single input.
   // As this is needed to be processed we also simplify phis with multiple same inputs here.
   for (auto entry : *bb_map_) {
-    HBasicBlock* orig_block = entry.first;
-    for (HInstructionIterator inst_it(orig_block->GetPhis()); !inst_it.Done(); inst_it.Advance()) {
-      HPhi* phi = inst_it.Current()->AsPhi();
-      if (ArePhiInputsTheSame(phi)) {
-        phi->ReplaceWith(phi->InputAt(0));
-        orig_block->RemovePhi(phi);
-      }
-    }
-
-    HBasicBlock* copy_block = GetBlockCopy(orig_block);
-    for (HInstructionIterator inst_it(copy_block->GetPhis()); !inst_it.Done(); inst_it.Advance()) {
-      HPhi* phi = inst_it.Current()->AsPhi();
-      if (ArePhiInputsTheSame(phi)) {
-        phi->ReplaceWith(phi->InputAt(0));
-        copy_block->RemovePhi(phi);
+    for (HBasicBlock* block : {entry.first, entry.second}) {
+      for (HInstructionIterator inst_it(block->GetPhis()); !inst_it.Done(); inst_it.Advance()) {
+        HPhi* phi = inst_it.Current()->AsPhi();
+        if (ArePhiInputsTheSame(phi)) {
+          phi->ReplaceWith(phi->InputAt(0));
+          block->RemovePhi(phi);
+        }
       }
     }
   }
@@ -1012,8 +1069,7 @@ void SuperblockCloner::CloneBasicBlocks() {
     HBasicBlock* copy_block = CloneBasicBlock(orig_block);
     bb_map_->Put(orig_block, copy_block);
     if (kSuperblockClonerLogging) {
-      std::cout << "new block :" << copy_block->GetBlockId() << ": " << orig_block->GetBlockId() <<
-                   std::endl;
+      LOG(INFO) << "new block :" << copy_block->GetBlockId() << ": " << orig_block->GetBlockId();
     }
   }
 }
@@ -1089,14 +1145,14 @@ HLoopInformation* FindCommonLoop(HLoopInformation* loop1, HLoopInformation* loop
   return current;
 }
 
-bool PeelUnrollHelper::IsLoopClonable(HLoopInformation* loop_info) {
-  PeelUnrollHelper helper(
+bool LoopClonerHelper::IsLoopClonable(HLoopInformation* loop_info) {
+  LoopClonerHelper helper(
       loop_info, /* bb_map= */ nullptr, /* hir_map= */ nullptr, /* induction_range= */ nullptr);
   return helper.IsLoopClonable();
 }
 
-HBasicBlock* PeelUnrollHelper::DoPeelUnrollImpl(bool to_unroll) {
-  // For now do peeling only for natural loops.
+HBasicBlock* LoopClonerHelper::DoLoopTransformationImpl(TransformationKind transformation) {
+  // For now do transformations only for natural loops.
   DCHECK(!loop_info_->IsIrreducible());
 
   HBasicBlock* loop_header = loop_info_->GetHeader();
@@ -1105,9 +1161,22 @@ HBasicBlock* PeelUnrollHelper::DoPeelUnrollImpl(bool to_unroll) {
   HGraph* graph = loop_header->GetGraph();
 
   if (kSuperblockClonerLogging) {
-    std::cout << "Method: " << graph->PrettyMethod() << std::endl;
-    std::cout << "Scalar loop " << (to_unroll ? "unrolling" : "peeling") <<
-                 " was applied to the loop <" << loop_header->GetBlockId() << ">." << std::endl;
+    LOG(INFO) << "Method: " << graph->PrettyMethod();
+    std::ostringstream oss;
+    oss << "Scalar loop ";
+    switch (transformation) {
+      case TransformationKind::kPeeling:
+        oss << "peeling";
+        break;
+      case TransformationKind::kUnrolling:
+        oss<< "unrolling";
+        break;
+      case TransformationKind::kVersioning:
+        oss << "versioning";
+        break;
+    }
+    oss << " was applied to the loop <" << loop_header->GetBlockId() << ">.";
+    LOG(INFO) << oss.str();
   }
 
   ArenaAllocator allocator(graph->GetAllocator()->GetArenaPool());
@@ -1116,11 +1185,14 @@ HBasicBlock* PeelUnrollHelper::DoPeelUnrollImpl(bool to_unroll) {
   HEdgeSet remap_copy_internal(graph->GetAllocator()->Adapter(kArenaAllocSuperblockCloner));
   HEdgeSet remap_incoming(graph->GetAllocator()->Adapter(kArenaAllocSuperblockCloner));
 
-  CollectRemappingInfoForPeelUnroll(to_unroll,
-                                    loop_info_,
-                                    &remap_orig_internal,
-                                    &remap_copy_internal,
-                                    &remap_incoming);
+  // No remapping needed for loop versioning.
+  if (transformation != TransformationKind::kVersioning) {
+    CollectRemappingInfoForPeelUnroll(transformation == TransformationKind::kUnrolling,
+                                      loop_info_,
+                                      &remap_orig_internal,
+                                      &remap_copy_internal,
+                                      &remap_incoming);
+  }
 
   cloner_.SetSuccessorRemappingInfo(&remap_orig_internal, &remap_copy_internal, &remap_incoming);
   cloner_.Run();
@@ -1132,7 +1204,7 @@ HBasicBlock* PeelUnrollHelper::DoPeelUnrollImpl(bool to_unroll) {
   return loop_header;
 }
 
-PeelUnrollSimpleHelper::PeelUnrollSimpleHelper(HLoopInformation* info,
+LoopClonerSimpleHelper::LoopClonerSimpleHelper(HLoopInformation* info,
                                                InductionVarRange* induction_range)
   : bb_map_(std::less<HBasicBlock*>(),
             info->GetHeader()->GetGraph()->GetAllocator()->Adapter(kArenaAllocSuperblockCloner)),

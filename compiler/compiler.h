@@ -17,11 +17,13 @@
 #ifndef ART_COMPILER_COMPILER_H_
 #define ART_COMPILER_COMPILER_H_
 
+#include "base/macros.h"
 #include "base/mutex.h"
 #include "base/os.h"
+#include "compilation_kind.h"
 #include "dex/invoke_type.h"
 
-namespace art {
+namespace art HIDDEN {
 
 namespace dex {
 struct CodeItem;
@@ -37,8 +39,8 @@ class DexCache;
 }  // namespace mirror
 
 class ArtMethod;
+class CompiledCodeStorage;
 class CompiledMethod;
-class CompiledMethodStorage;
 class CompilerOptions;
 class DexFile;
 template<class T> class Handle;
@@ -46,20 +48,13 @@ class Thread;
 
 class Compiler {
  public:
-  enum Kind {
-    kQuick,
-    kOptimizing
-  };
-
-  static Compiler* Create(const CompilerOptions& compiler_options,
-                          CompiledMethodStorage* storage,
-                          Kind kind);
+  EXPORT static Compiler* Create(const CompilerOptions& compiler_options,
+                                 CompiledCodeStorage* storage);
 
   virtual bool CanCompileMethod(uint32_t method_idx, const DexFile& dex_file) const = 0;
 
   virtual CompiledMethod* Compile(const dex::CodeItem* code_item,
                                   uint32_t access_flags,
-                                  InvokeType invoke_type,
                                   uint16_t class_def_idx,
                                   uint32_t method_idx,
                                   Handle<mirror::ClassLoader> class_loader,
@@ -71,13 +66,12 @@ class Compiler {
                                      const DexFile& dex_file,
                                      Handle<mirror::DexCache> dex_cache) const = 0;
 
-  virtual bool JitCompile(Thread* self ATTRIBUTE_UNUSED,
-                          jit::JitCodeCache* code_cache ATTRIBUTE_UNUSED,
-                          jit::JitMemoryRegion* region ATTRIBUTE_UNUSED,
-                          ArtMethod* method ATTRIBUTE_UNUSED,
-                          bool baseline ATTRIBUTE_UNUSED,
-                          bool osr ATTRIBUTE_UNUSED,
-                          jit::JitLogger* jit_logger ATTRIBUTE_UNUSED)
+  virtual bool JitCompile([[maybe_unused]] Thread* self,
+                          [[maybe_unused]] jit::JitCodeCache* code_cache,
+                          [[maybe_unused]] jit::JitMemoryRegion* region,
+                          [[maybe_unused]] ArtMethod* method,
+                          [[maybe_unused]] CompilationKind compilation_kind,
+                          [[maybe_unused]] jit::JitLogger* jit_logger)
       REQUIRES_SHARED(Locks::mutator_lock_) {
     return false;
   }
@@ -99,7 +93,7 @@ class Compiler {
 
  protected:
   Compiler(const CompilerOptions& compiler_options,
-           CompiledMethodStorage* storage,
+           CompiledCodeStorage* storage,
            uint64_t warning) :
       compiler_options_(compiler_options),
       storage_(storage),
@@ -110,13 +104,13 @@ class Compiler {
     return compiler_options_;
   }
 
-  CompiledMethodStorage* GetCompiledMethodStorage() const {
+  CompiledCodeStorage* GetCompiledCodeStorage() const {
     return storage_;
   }
 
  private:
   const CompilerOptions& compiler_options_;
-  CompiledMethodStorage* const storage_;
+  CompiledCodeStorage* const storage_;
   const uint64_t maximum_compilation_time_before_warning_;
 
   DISALLOW_COPY_AND_ASSIGN(Compiler);

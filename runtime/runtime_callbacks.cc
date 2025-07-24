@@ -25,7 +25,7 @@
 #include "monitor.h"
 #include "thread-current-inl.h"
 
-namespace art {
+namespace art HIDDEN {
 
 RuntimeCallbacks::RuntimeCallbacks()
     : callback_lock_(new ReaderWriterMutex("Runtime callbacks lock",
@@ -58,9 +58,49 @@ void RuntimeCallbacks::RemoveDdmCallback(DdmCallback* cb) {
   Remove(cb, &ddm_callbacks_);
 }
 
+void RuntimeCallbacks::AddAppInfoCallback(AppInfoCallback* cb) {
+  WriterMutexLock mu(Thread::Current(), *callback_lock_);
+  appinfo_callbacks_.push_back(cb);
+}
+
+void RuntimeCallbacks::RemoveAppInfoCallback(AppInfoCallback* cb) {
+  WriterMutexLock mu(Thread::Current(), *callback_lock_);
+  Remove(cb, &appinfo_callbacks_);
+}
+
 void RuntimeCallbacks::DdmPublishChunk(uint32_t type, const ArrayRef<const uint8_t>& data) {
   for (DdmCallback* cb : COPY(ddm_callbacks_)) {
     cb->DdmPublishChunk(type, data);
+  }
+}
+
+void RuntimeCallbacks::SetCurrentProcessName(const std::string& process_name) {
+  for (AppInfoCallback* cb : COPY(appinfo_callbacks_)) {
+    cb->SetCurrentProcessName(process_name);
+  }
+}
+
+void RuntimeCallbacks::AddApplication(const std::string& package_name) {
+  for (AppInfoCallback* cb : COPY(appinfo_callbacks_)) {
+    cb->AddApplication(package_name);
+  }
+}
+
+void RuntimeCallbacks::RemoveApplication(const std::string& package_name) {
+  for (AppInfoCallback* cb : COPY(appinfo_callbacks_)) {
+    cb->RemoveApplication(package_name);
+  }
+}
+
+void RuntimeCallbacks::SetWaitingForDebugger(bool waiting) {
+  for (AppInfoCallback* cb : COPY(appinfo_callbacks_)) {
+    cb->SetWaitingForDebugger(waiting);
+  }
+}
+
+void RuntimeCallbacks::SetUserId(int user_id) {
+  for (AppInfoCallback* cb : COPY(appinfo_callbacks_)) {
+    cb->SetUserId(user_id);
   }
 }
 
@@ -105,29 +145,9 @@ void RuntimeCallbacks::RemoveMethodInspectionCallback(MethodInspectionCallback* 
   Remove(cb, &method_inspection_callbacks_);
 }
 
-bool RuntimeCallbacks::IsMethodSafeToJit(ArtMethod* m) {
+bool RuntimeCallbacks::HaveLocalsChanged() {
   for (MethodInspectionCallback* cb : COPY(method_inspection_callbacks_)) {
-    if (!cb->IsMethodSafeToJit(m)) {
-      DCHECK(cb->IsMethodBeingInspected(m))
-          << "Contract requires that !IsMethodSafeToJit(m) -> IsMethodBeingInspected(m)";
-      return false;
-    }
-  }
-  return true;
-}
-
-bool RuntimeCallbacks::IsMethodBeingInspected(ArtMethod* m) {
-  for (MethodInspectionCallback* cb : COPY(method_inspection_callbacks_)) {
-    if (cb->IsMethodBeingInspected(m)) {
-      return true;
-    }
-  }
-  return false;
-}
-
-bool RuntimeCallbacks::MethodNeedsDebugVersion(ArtMethod* m) {
-  for (MethodInspectionCallback* cb : COPY(method_inspection_callbacks_)) {
-    if (cb->MethodNeedsDebugVersion(m)) {
+    if (cb->HaveLocalsChanged()) {
       return true;
     }
   }

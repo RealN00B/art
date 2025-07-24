@@ -17,7 +17,7 @@
 #ifndef ART_COMPILER_OPTIMIZING_NODES_X86_H_
 #define ART_COMPILER_OPTIMIZING_NODES_X86_H_
 
-namespace art {
+namespace art HIDDEN {
 
 // Compute the address of the method for X86 Constant area support.
 class HX86ComputeBaseMethodAddress final : public HExpression<0> {
@@ -142,22 +142,10 @@ class HX86AndNot final : public HBinaryOperation {
   template <typename T> static T Compute(T x, T y) { return ~x & y; }
 
   HConstant* Evaluate(HIntConstant* x, HIntConstant* y) const override {
-    return GetBlock()->GetGraph()->GetIntConstant(
-        Compute(x->GetValue(), y->GetValue()), GetDexPc());
+    return GetBlock()->GetGraph()->GetIntConstant(Compute(x->GetValue(), y->GetValue()));
   }
   HConstant* Evaluate(HLongConstant* x, HLongConstant* y) const override {
-    return GetBlock()->GetGraph()->GetLongConstant(
-        Compute(x->GetValue(), y->GetValue()), GetDexPc());
-  }
-  HConstant* Evaluate(HFloatConstant* x ATTRIBUTE_UNUSED,
-                      HFloatConstant* y ATTRIBUTE_UNUSED) const override {
-    LOG(FATAL) << DebugName() << " is not defined for float values";
-    UNREACHABLE();
-  }
-  HConstant* Evaluate(HDoubleConstant* x ATTRIBUTE_UNUSED,
-                      HDoubleConstant* y ATTRIBUTE_UNUSED) const override {
-    LOG(FATAL) << DebugName() << " is not defined for double values";
-    UNREACHABLE();
+    return GetBlock()->GetGraph()->GetLongConstant(Compute(x->GetValue(), y->GetValue()));
   }
 
   DECLARE_INSTRUCTION(X86AndNot);
@@ -191,19 +179,12 @@ class HX86MaskOrResetLeastSetBit final : public HUnaryOperation {
   }
 
   HConstant* Evaluate(HIntConstant* x) const override {
-    return GetBlock()->GetGraph()->GetIntConstant(Compute(x->GetValue()), GetDexPc());
+    return GetBlock()->GetGraph()->GetIntConstant(Compute(x->GetValue()));
   }
   HConstant* Evaluate(HLongConstant* x) const override {
-    return GetBlock()->GetGraph()->GetLongConstant(Compute(x->GetValue()), GetDexPc());
+    return GetBlock()->GetGraph()->GetLongConstant(Compute(x->GetValue()));
   }
-  HConstant* Evaluate(HFloatConstant* x ATTRIBUTE_UNUSED) const override {
-    LOG(FATAL) << DebugName() << "is not defined for float values";
-    UNREACHABLE();
-  }
-  HConstant* Evaluate(HDoubleConstant* x ATTRIBUTE_UNUSED) const override {
-    LOG(FATAL) << DebugName() << "is not defined for double values";
-    UNREACHABLE();
-  }
+
   InstructionKind GetOpKind() const { return op_kind_; }
 
   DECLARE_INSTRUCTION(X86MaskOrResetLeastSetBit);

@@ -17,7 +17,9 @@
 #ifndef ART_COMPILER_OPTIMIZING_CODE_GENERATOR_ARM_VIXL_H_
 #define ART_COMPILER_OPTIMIZING_CODE_GENERATOR_ARM_VIXL_H_
 
-#include "base/enums.h"
+#include "base/macros.h"
+#include "base/pointer_size.h"
+#include "class_root.h"
 #include "code_generator.h"
 #include "common_arm.h"
 #include "dex/string_reference.h"
@@ -27,15 +29,16 @@
 #include "parallel_move_resolver.h"
 #include "utils/arm/assembler_arm_vixl.h"
 
-// TODO(VIXL): make vixl clean wrt -Wshadow.
+// TODO(VIXL): Make VIXL compile cleanly with -Wshadow, -Wdeprecated-declarations.
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wshadow"
+#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
 #include "aarch32/constants-aarch32.h"
 #include "aarch32/instructions-aarch32.h"
 #include "aarch32/macro-assembler-aarch32.h"
 #pragma GCC diagnostic pop
 
-namespace art {
+namespace art HIDDEN {
 
 namespace linker {
 class Thumb2RelativePatcherTest;
@@ -83,7 +86,7 @@ static const vixl::aarch32::RegisterList kCoreCalleeSaves = vixl::aarch32::Regis
                                 vixl::aarch32::r6,
                                 vixl::aarch32::r7),
     // Do not consider r8 as a callee-save register with Baker read barriers.
-    ((kEmitCompilerReadBarrier && kUseBakerReadBarrier)
+    (kReserveMarkingRegister
          ? vixl::aarch32::RegisterList()
          : vixl::aarch32::RegisterList(vixl::aarch32::r8)),
     vixl::aarch32::RegisterList(vixl::aarch32::r10,
@@ -116,6 +119,88 @@ class CodeGeneratorARMVIXL;
 
 using VIXLInt32Literal = vixl::aarch32::Literal<int32_t>;
 using VIXLUInt32Literal = vixl::aarch32::Literal<uint32_t>;
+
+#define UNIMPLEMENTED_INTRINSIC_LIST_ARM(V)                                \
+  V(MathSignumFloat)                                                       \
+  V(MathSignumDouble)                                                      \
+  V(MathCopySignFloat)                                                     \
+  V(MathCopySignDouble)                                                    \
+  V(MathRoundDouble) /* Could be done by changing rounding mode, maybe? */ \
+  V(UnsafeCASLong)   /* High register pressure */                          \
+  V(SystemArrayCopyChar)                                                   \
+  V(LongDivideUnsigned)                                                    \
+  V(IntegerRemainderUnsigned)                                              \
+  V(LongRemainderUnsigned)                                                 \
+  V(CRC32Update)                                                           \
+  V(CRC32UpdateBytes)                                                      \
+  V(CRC32UpdateByteBuffer)                                                 \
+  V(FP16ToFloat)                                                           \
+  V(FP16ToHalf)                                                            \
+  V(FP16Floor)                                                             \
+  V(FP16Ceil)                                                              \
+  V(FP16Rint)                                                              \
+  V(FP16Greater)                                                           \
+  V(FP16GreaterEquals)                                                     \
+  V(FP16Less)                                                              \
+  V(FP16LessEquals)                                                        \
+  V(FP16Compare)                                                           \
+  V(FP16Min)                                                               \
+  V(FP16Max)                                                               \
+  V(MathMultiplyHigh)                                                      \
+  V(StringStringIndexOf)                                                   \
+  V(StringStringIndexOfAfter)                                              \
+  V(StringBufferAppend)                                                    \
+  V(StringBufferLength)                                                    \
+  V(StringBufferToString)                                                  \
+  V(StringBuilderAppendObject)                                             \
+  V(StringBuilderAppendString)                                             \
+  V(StringBuilderAppendCharSequence)                                       \
+  V(StringBuilderAppendCharArray)                                          \
+  V(StringBuilderAppendBoolean)                                            \
+  V(StringBuilderAppendChar)                                               \
+  V(StringBuilderAppendInt)                                                \
+  V(StringBuilderAppendLong)                                               \
+  V(StringBuilderAppendFloat)                                              \
+  V(StringBuilderAppendDouble)                                             \
+  V(StringBuilderLength)                                                   \
+  V(StringBuilderToString)                                                 \
+  V(SystemArrayCopyByte)                                                   \
+  V(SystemArrayCopyInt)                                                    \
+  V(UnsafeArrayBaseOffset)                                                 \
+  /* 1.8 */                                                                \
+  V(MathFmaDouble)                                                         \
+  V(MathFmaFloat)                                                          \
+  V(MethodHandleInvokeExact)                                               \
+  V(MethodHandleInvoke)                                                    \
+  /* OpenJDK 11 */                                                         \
+  V(JdkUnsafeArrayBaseOffset)                                              \
+  V(JdkUnsafeCASLong) /* High register pressure */                         \
+  V(JdkUnsafeCompareAndSetLong)
+
+ALWAYS_INLINE inline StoreOperandType GetStoreOperandType(DataType::Type type) {
+  switch (type) {
+    case DataType::Type::kReference:
+      return kStoreWord;
+    case DataType::Type::kBool:
+    case DataType::Type::kUint8:
+    case DataType::Type::kInt8:
+      return kStoreByte;
+    case DataType::Type::kUint16:
+    case DataType::Type::kInt16:
+      return kStoreHalfword;
+    case DataType::Type::kInt32:
+      return kStoreWord;
+    case DataType::Type::kInt64:
+      return kStoreWordPair;
+    case DataType::Type::kFloat32:
+      return kStoreSWord;
+    case DataType::Type::kFloat64:
+      return kStoreDWord;
+    default:
+      LOG(FATAL) << "Unreachable type " << type;
+      UNREACHABLE();
+  }
+}
 
 class JumpTableARMVIXL : public DeletableArenaObject<kArenaAllocSwitchTable> {
  public:
@@ -185,6 +270,30 @@ class InvokeDexCallingConventionVisitorARMVIXL : public InvokeDexCallingConventi
   uint32_t double_index_ = 0;
 
   DISALLOW_COPY_AND_ASSIGN(InvokeDexCallingConventionVisitorARMVIXL);
+};
+
+class CriticalNativeCallingConventionVisitorARMVIXL : public InvokeDexCallingConventionVisitor {
+ public:
+  explicit CriticalNativeCallingConventionVisitorARMVIXL(bool for_register_allocation)
+      : for_register_allocation_(for_register_allocation) {}
+
+  virtual ~CriticalNativeCallingConventionVisitorARMVIXL() {}
+
+  Location GetNextLocation(DataType::Type type) override;
+  Location GetReturnLocation(DataType::Type type) const override;
+  Location GetMethodLocation() const override;
+
+  size_t GetStackOffset() const { return stack_offset_; }
+
+ private:
+  // Register allocator does not support adjusting frame size, so we cannot provide final locations
+  // of stack arguments for register allocation. We ask the register allocator for any location and
+  // move these arguments to the right place after adjusting the SP when generating the call.
+  const bool for_register_allocation_;
+  size_t gpr_index_ = 0u;
+  size_t stack_offset_ = 0u;
+
+  DISALLOW_COPY_AND_ASSIGN(CriticalNativeCallingConventionVisitorARMVIXL);
 };
 
 class FieldAccessCallingConventionARMVIXL : public FieldAccessCallingConvention {
@@ -281,11 +390,12 @@ class LocationsBuilderARMVIXL : public HGraphVisitor {
   void HandleInvoke(HInvoke* invoke);
   void HandleBitwiseOperation(HBinaryOperation* operation, Opcode opcode);
   void HandleCondition(HCondition* condition);
-  void HandleIntegerRotate(LocationSummary* locations);
-  void HandleLongRotate(LocationSummary* locations);
   void HandleShift(HBinaryOperation* operation);
-  void HandleFieldSet(HInstruction* instruction, const FieldInfo& field_info);
+  void HandleFieldSet(HInstruction* instruction,
+                      const FieldInfo& field_info,
+                      WriteBarrierKind write_barrier_kind);
   void HandleFieldGet(HInstruction* instruction, const FieldInfo& field_info);
+  void HandleRotate(HBinaryOperation* rotate);
 
   Location ArithmeticZeroOrFpuRegister(HInstruction* input);
   Location ArmEncodableConstantOrRegister(HInstruction* constant, Opcode opcode);
@@ -318,6 +428,8 @@ class InstructionCodeGeneratorARMVIXL : public InstructionCodeGenerator {
   ArmVIXLAssembler* GetAssembler() const { return assembler_; }
   ArmVIXLMacroAssembler* GetVIXLAssembler() { return GetAssembler()->GetVIXLAssembler(); }
 
+  void GenerateAndConst(vixl::aarch32::Register out, vixl::aarch32::Register first, uint32_t value);
+
  private:
   // Generate code for the given suspend check. If not null, `successor`
   // is the block to branch to if the suspend check is not needed, and after
@@ -328,14 +440,14 @@ class InstructionCodeGeneratorARMVIXL : public InstructionCodeGenerator {
   void GenerateBitstringTypeCheckCompare(HTypeCheckInstruction* check,
                                          vixl::aarch32::Register temp,
                                          vixl::aarch32::FlagsUpdate flags_update);
-  void GenerateAndConst(vixl::aarch32::Register out, vixl::aarch32::Register first, uint32_t value);
   void GenerateOrrConst(vixl::aarch32::Register out, vixl::aarch32::Register first, uint32_t value);
   void GenerateEorConst(vixl::aarch32::Register out, vixl::aarch32::Register first, uint32_t value);
   void GenerateAddLongConst(Location out, Location first, uint64_t value);
   void HandleBitwiseOperation(HBinaryOperation* operation);
   void HandleCondition(HCondition* condition);
-  void HandleIntegerRotate(HRor* ror);
-  void HandleLongRotate(HRor* ror);
+  void HandleIntegerRotate(HBinaryOperation* rotate);
+  void HandleLongRotate(HBinaryOperation* rotate);
+  void HandleRotate(HBinaryOperation* rotate);
   void HandleShift(HBinaryOperation* operation);
 
   void GenerateWideAtomicStore(vixl::aarch32::Register addr,
@@ -352,7 +464,8 @@ class InstructionCodeGeneratorARMVIXL : public InstructionCodeGenerator {
 
   void HandleFieldSet(HInstruction* instruction,
                       const FieldInfo& field_info,
-                      bool value_can_be_null);
+                      bool value_can_be_null,
+                      WriteBarrierKind write_barrier_kind);
   void HandleFieldGet(HInstruction* instruction, const FieldInfo& field_info);
 
   void GenerateMinMaxInt(LocationSummary* locations, bool is_min);
@@ -405,6 +518,7 @@ class InstructionCodeGeneratorARMVIXL : public InstructionCodeGenerator {
   void GenerateDivRemWithAnyConstant(HBinaryOperation* instruction);
   void GenerateDivRemConstantIntegral(HBinaryOperation* instruction);
   void HandleGoto(HInstruction* got, HBasicBlock* successor);
+  void GenerateMethodEntryExitHook(HInstruction* instruction);
 
   vixl::aarch32::MemOperand VecAddress(
       HVecMemoryOperation* instruction,
@@ -510,12 +624,26 @@ class CodeGeneratorARMVIXL : public CodeGenerator {
                                            HInstruction* instruction,
                                            SlowPathCode* slow_path);
 
-  // Emit a write barrier.
+  // Emit a write barrier if:
+  // A) emit_null_check is false
+  // B) emit_null_check is true, and value is not null.
+  void MaybeMarkGCCard(vixl::aarch32::Register temp,
+                       vixl::aarch32::Register card,
+                       vixl::aarch32::Register object,
+                       vixl::aarch32::Register value,
+                       bool emit_null_check);
+
+  // Emit a write barrier unconditionally.
   void MarkGCCard(vixl::aarch32::Register temp,
                   vixl::aarch32::Register card,
-                  vixl::aarch32::Register object,
-                  vixl::aarch32::Register value,
-                  bool can_be_null);
+                  vixl::aarch32::Register object);
+
+  // Crash if the card table is not valid. This check is only emitted for the CC GC. We assert
+  // `(!clean || !self->is_gc_marking)`, since the card table should not be set to clean when the CC
+  // GC is marking for eliminated write barriers.
+  void CheckGCCardIsValid(vixl::aarch32::Register temp,
+                          vixl::aarch32::Register card,
+                          vixl::aarch32::Register object);
 
   void GenerateMemoryBarrier(MemBarrierKind kind);
 
@@ -530,7 +658,7 @@ class CodeGeneratorARMVIXL : public CodeGenerator {
     block_labels_.resize(GetGraph()->GetBlocks().size());
   }
 
-  void Finalize(CodeAllocator* allocator) override;
+  void Finalize() override;
 
   bool NeedsTwoRegisters(DataType::Type type) const override {
     return type == DataType::Type::kFloat64 || type == DataType::Type::kInt64;
@@ -556,6 +684,7 @@ class CodeGeneratorARMVIXL : public CodeGenerator {
       const HInvokeStaticOrDirect::DispatchInfo& desired_dispatch_info,
       ArtMethod* method) override;
 
+  void LoadMethod(MethodLoadKind load_kind, Location temp, HInvoke* invoke);
   void GenerateStaticOrDirectCall(
       HInvokeStaticOrDirect* invoke, Location temp, SlowPathCode* slow_path = nullptr) override;
   void GenerateVirtualCall(
@@ -564,7 +693,7 @@ class CodeGeneratorARMVIXL : public CodeGenerator {
   void MoveFromReturnRegister(Location trg, DataType::Type type) override;
 
   // The PcRelativePatchInfo is used for PC-relative addressing of methods/strings/types,
-  // whether through .data.bimg.rel.ro, .bss, or directly in the boot image.
+  // whether through .data.img.rel.ro, .bss, or directly in the boot image.
   //
   // The PC-relative address is loaded with three instructions,
   // MOVW+MOVT to load the offset to base_reg and then ADD base_reg, PC. The offset
@@ -574,11 +703,10 @@ class CodeGeneratorARMVIXL : public CodeGenerator {
   struct PcRelativePatchInfo {
     PcRelativePatchInfo(const DexFile* dex_file, uint32_t off_or_idx)
         : target_dex_file(dex_file), offset_or_index(off_or_idx) { }
-    PcRelativePatchInfo(PcRelativePatchInfo&& other) = default;
 
-    // Target dex file or null for .data.bmig.rel.ro patches.
+    // Target dex file or null for boot image .data.img.rel.ro patches.
     const DexFile* target_dex_file;
-    // Either the boot image offset (to write to .data.bmig.rel.ro) or string/type/method index.
+    // Either the boot image offset (to write to .data.img.rel.ro) or string/type/method index.
     uint32_t offset_or_index;
     vixl::aarch32::Label movw_label;
     vixl::aarch32::Label movt_label;
@@ -588,9 +716,11 @@ class CodeGeneratorARMVIXL : public CodeGenerator {
   PcRelativePatchInfo* NewBootImageIntrinsicPatch(uint32_t intrinsic_data);
   PcRelativePatchInfo* NewBootImageRelRoPatch(uint32_t boot_image_offset);
   PcRelativePatchInfo* NewBootImageMethodPatch(MethodReference target_method);
+  PcRelativePatchInfo* NewAppImageMethodPatch(MethodReference target_method);
   PcRelativePatchInfo* NewMethodBssEntryPatch(MethodReference target_method);
   PcRelativePatchInfo* NewBootImageTypePatch(const DexFile& dex_file, dex::TypeIndex type_index);
-  PcRelativePatchInfo* NewTypeBssEntryPatch(const DexFile& dex_file, dex::TypeIndex type_index);
+  PcRelativePatchInfo* NewAppImageTypePatch(const DexFile& dex_file, dex::TypeIndex type_index);
+  PcRelativePatchInfo* NewTypeBssEntryPatch(HLoadClass* load_class);
   PcRelativePatchInfo* NewBootImageStringPatch(const DexFile& dex_file,
                                                dex::StringIndex string_index);
   PcRelativePatchInfo* NewStringBssEntryPatch(const DexFile& dex_file,
@@ -611,8 +741,11 @@ class CodeGeneratorARMVIXL : public CodeGenerator {
                                                 dex::TypeIndex type_index,
                                                 Handle<mirror::Class> handle);
 
+  void LoadBootImageRelRoEntry(vixl::aarch32::Register reg, uint32_t boot_image_offset);
   void LoadBootImageAddress(vixl::aarch32::Register reg, uint32_t boot_image_reference);
-  void AllocateInstanceForIntrinsic(HInvokeStaticOrDirect* invoke, uint32_t boot_image_offset);
+  void LoadTypeForBootImageIntrinsic(vixl::aarch32::Register reg, TypeReference type_reference);
+  void LoadIntrinsicDeclaringClass(vixl::aarch32::Register reg, HInvoke* invoke);
+  void LoadClassRootForIntrinsic(vixl::aarch32::Register reg, ClassRoot class_root);
 
   void EmitLinkerPatches(ArenaVector<linker::LinkerPatch>* linker_patches) override;
   bool NeedsThunkCode(const linker::LinkerPatch& patch) const override;
@@ -632,11 +765,9 @@ class CodeGeneratorARMVIXL : public CodeGenerator {
                                vixl::aarch32::Register obj,
                                uint32_t offset,
                                ReadBarrierOption read_barrier_option);
-  // Generate ADD for UnsafeCASObject to reconstruct the old value from
-  // `old_value - expected` and mark it with Baker read barrier.
-  void GenerateUnsafeCasOldValueAddWithBakerReadBarrier(vixl::aarch32::Register old_value,
-                                                        vixl::aarch32::Register adjusted_old_value,
-                                                        vixl::aarch32::Register expected);
+  // Generate MOV for an intrinsic to mark the old value with Baker read barrier.
+  void GenerateIntrinsicMoveWithBakerReadBarrier(vixl::aarch32::Register marked_old_value,
+                                                 vixl::aarch32::Register old_value);
   // Fast path implementation of ReadBarrier::Barrier for a heap
   // reference field load when Baker's read barriers are used.
   // Overload suitable for Unsafe.getObject/-Volatile() intrinsic.
@@ -651,7 +782,7 @@ class CodeGeneratorARMVIXL : public CodeGenerator {
                                              Location ref,
                                              vixl::aarch32::Register obj,
                                              uint32_t offset,
-                                             Location temp,
+                                             Location maybe_temp,
                                              bool needs_null_check);
   // Fast path implementation of ReadBarrier::Barrier for a heap
   // reference array load when Baker's read barriers are used.
@@ -683,6 +814,18 @@ class CodeGeneratorARMVIXL : public CodeGenerator {
   // scratch pool.
   virtual void MaybeGenerateMarkingRegisterCheck(int code,
                                                  Location temp_loc = Location::NoLocation());
+
+  // Create slow path for a read barrier for a heap reference within `instruction`.
+  //
+  // This is a helper function for GenerateReadBarrierSlow() that has the same
+  // arguments. The creation and adding of the slow path is exposed for intrinsics
+  // that cannot use GenerateReadBarrierSlow() from their own slow paths.
+  SlowPathCodeARMVIXL* AddReadBarrierSlowPath(HInstruction* instruction,
+                                              Location out,
+                                              Location ref,
+                                              Location obj,
+                                              uint32_t offset,
+                                              Location index);
 
   // Generate a read barrier for a heap reference within `instruction`
   // using a slow path.
@@ -732,6 +875,9 @@ class CodeGeneratorARMVIXL : public CodeGenerator {
   // artReadBarrierForRootSlow.
   void GenerateReadBarrierForRootSlow(HInstruction* instruction, Location out, Location root);
 
+  void IncreaseFrame(size_t adjustment) override;
+  void DecreaseFrame(size_t adjustment) override;
+
   void GenerateNop() override;
 
   void GenerateImplicitNullCheck(HNullCheck* instruction) override;
@@ -764,17 +910,17 @@ class CodeGeneratorARMVIXL : public CodeGenerator {
   }
 
   void MaybeGenerateInlineCacheCheck(HInstruction* instruction, vixl32::Register klass);
-  void MaybeIncrementHotness(bool is_frame_entry);
+  void MaybeIncrementHotness(HSuspendCheck* suspend_check, bool is_frame_entry);
 
  private:
   // Encoding of thunk type and data for link-time generated thunks for Baker read barriers.
 
   enum class BakerReadBarrierKind : uint8_t {
-    kField,       // Field get or array get with constant offset (i.e. constant index).
-    kArray,       // Array get with index in register.
-    kGcRoot,      // GC root load.
-    kUnsafeCas,   // UnsafeCASObject intrinsic.
-    kLast = kUnsafeCas
+    kField,         // Field get or array get with constant offset (i.e. constant index).
+    kArray,         // Array get with index in register.
+    kGcRoot,        // GC root load.
+    kIntrinsicCas,  // Unsafe/VarHandle CAS intrinsic.
+    kLast = kIntrinsicCas
   };
 
   enum class BakerReadBarrierWidth : uint8_t {
@@ -813,7 +959,7 @@ class CodeGeneratorARMVIXL : public CodeGenerator {
                                                   bool narrow) {
     CheckValidReg(base_reg);
     CheckValidReg(holder_reg);
-    DCHECK(!narrow || base_reg < 8u) << base_reg;
+    DCHECK_IMPLIES(narrow, base_reg < 8u) << base_reg;
     BakerReadBarrierWidth width =
         narrow ? BakerReadBarrierWidth::kNarrow : BakerReadBarrierWidth::kWide;
     return BakerReadBarrierKindField::Encode(BakerReadBarrierKind::kField) |
@@ -832,7 +978,7 @@ class CodeGeneratorARMVIXL : public CodeGenerator {
 
   static uint32_t EncodeBakerReadBarrierGcRootData(uint32_t root_reg, bool narrow) {
     CheckValidReg(root_reg);
-    DCHECK(!narrow || root_reg < 8u) << root_reg;
+    DCHECK_IMPLIES(narrow, root_reg < 8u) << root_reg;
     BakerReadBarrierWidth width =
         narrow ? BakerReadBarrierWidth::kNarrow : BakerReadBarrierWidth::kWide;
     return BakerReadBarrierKindField::Encode(BakerReadBarrierKind::kGcRoot) |
@@ -841,9 +987,9 @@ class CodeGeneratorARMVIXL : public CodeGenerator {
            BakerReadBarrierWidthField::Encode(width);
   }
 
-  static uint32_t EncodeBakerReadBarrierUnsafeCasData(uint32_t root_reg) {
+  static uint32_t EncodeBakerReadBarrierIntrinsicCasData(uint32_t root_reg) {
     CheckValidReg(root_reg);
-    return BakerReadBarrierKindField::Encode(BakerReadBarrierKind::kUnsafeCas) |
+    return BakerReadBarrierKindField::Encode(BakerReadBarrierKind::kIntrinsicCas) |
            BakerReadBarrierFirstRegField::Encode(root_reg) |
            BakerReadBarrierSecondRegField::Encode(kBakerReadBarrierInvalidEncodedReg) |
            BakerReadBarrierWidthField::Encode(BakerReadBarrierWidth::kWide);
@@ -852,9 +998,6 @@ class CodeGeneratorARMVIXL : public CodeGenerator {
   void CompileBakerReadBarrierThunk(ArmVIXLAssembler& assembler,
                                     uint32_t encoded_data,
                                     /*out*/ std::string* debug_name);
-
-  vixl::aarch32::Register GetInvokeStaticOrDirectExtraParameter(HInvokeStaticOrDirect* invoke,
-                                                                vixl::aarch32::Register temp);
 
   using Uint32ToLiteralMap = ArenaSafeMap<uint32_t, VIXLUInt32Literal*>;
   using StringToLiteralMap = ArenaSafeMap<StringReference,
@@ -893,12 +1036,20 @@ class CodeGeneratorARMVIXL : public CodeGenerator {
 
   // PC-relative method patch info for kBootImageLinkTimePcRelative.
   ArenaDeque<PcRelativePatchInfo> boot_image_method_patches_;
+  // PC-relative method patch info for kAppImageRelRo.
+  ArenaDeque<PcRelativePatchInfo> app_image_method_patches_;
   // PC-relative method patch info for kBssEntry.
   ArenaDeque<PcRelativePatchInfo> method_bss_entry_patches_;
   // PC-relative type patch info for kBootImageLinkTimePcRelative.
   ArenaDeque<PcRelativePatchInfo> boot_image_type_patches_;
+  // PC-relative type patch info for kAppImageRelRo.
+  ArenaDeque<PcRelativePatchInfo> app_image_type_patches_;
   // PC-relative type patch info for kBssEntry.
   ArenaDeque<PcRelativePatchInfo> type_bss_entry_patches_;
+  // PC-relative public type patch info for kBssEntryPublic.
+  ArenaDeque<PcRelativePatchInfo> public_type_bss_entry_patches_;
+  // PC-relative package type patch info for kBssEntryPackage.
+  ArenaDeque<PcRelativePatchInfo> package_type_bss_entry_patches_;
   // PC-relative String patch info for kBootImageLinkTimePcRelative.
   ArenaDeque<PcRelativePatchInfo> boot_image_string_patches_;
   // PC-relative String patch info for kBssEntry.

@@ -35,16 +35,18 @@ static constexpr jlong kRedefinedObjectTag = 0xDEADBEEF;
 
 extern "C" JNIEXPORT void JNICALL
 Java_art_Test2005_UpdateFieldValuesAndResumeThreads(JNIEnv* env,
-                                                    jclass klass ATTRIBUTE_UNUSED,
+                                                    [[maybe_unused]] jclass klass,
                                                     jobjectArray threads_arr,
                                                     jclass redefined_class,
                                                     jobjectArray new_fields,
                                                     jstring default_val) {
   std::vector<jthread> threads;
+  threads.reserve(env->GetArrayLength(threads_arr));
   for (jint i = 0; i < env->GetArrayLength(threads_arr); i++) {
     threads.push_back(env->GetObjectArrayElement(threads_arr, i));
   }
   std::vector<jfieldID> fields;
+  fields.reserve(env->GetArrayLength(new_fields));
   for (jint i = 0; i < env->GetArrayLength(new_fields); i++) {
     fields.push_back(env->FromReflectedField(env->GetObjectArrayElement(new_fields, i)));
   }
@@ -52,10 +54,10 @@ Java_art_Test2005_UpdateFieldValuesAndResumeThreads(JNIEnv* env,
   CHECK_EQ(jvmti_env->IterateOverInstancesOfClass(
                redefined_class,
                JVMTI_HEAP_OBJECT_EITHER,
-               [](jlong class_tag ATTRIBUTE_UNUSED,
-                  jlong size ATTRIBUTE_UNUSED,
+               []([[maybe_unused]] jlong class_tag,
+                  [[maybe_unused]] jlong size,
                   jlong* tag_ptr,
-                  void* user_data ATTRIBUTE_UNUSED) -> jvmtiIterationControl {
+                  [[maybe_unused]] void* user_data) -> jvmtiIterationControl {
                  *tag_ptr = kRedefinedObjectTag;
                  return JVMTI_ITERATION_CONTINUE;
                },
@@ -82,6 +84,26 @@ Java_art_Test2005_UpdateFieldValuesAndResumeThreads(JNIEnv* env,
              JVMTI_ERROR_NONE);
   }
   jvmti_env->Deallocate(reinterpret_cast<unsigned char*>(objs));
+}
+
+extern "C" JNIEXPORT jobject JNICALL
+Java_Main_fastNativeSleepAndReturnInteger42(JNIEnv* env, [[maybe_unused]] jclass klass) {
+  jclass integer_class = env->FindClass("java/lang/Integer");
+  CHECK(integer_class != nullptr);
+  jmethodID integer_value_of =
+      env->GetStaticMethodID(integer_class, "valueOf", "(I)Ljava/lang/Integer;");
+  CHECK(integer_value_of != nullptr);
+  jobject value = env->CallStaticObjectMethod(integer_class, integer_value_of, 42);
+  CHECK(value != nullptr);
+  // Sleep for 500ms, blocking thread suspension (this method is @FastNative).
+  // Except for some odd thread timing, this should ensure that the suspend
+  // request from the redefinition thread is seen by the suspend check in the
+  // JNI stub when we exit this function and then processed with the JNI stub
+  // still on the stack. The instrumentation previously erroneously
+  // intercepted returning to the JNI stub and the "instrumentation exit"
+  // handler treated the return value `jobject` as `mirror::Object*`.
+  usleep(500000);
+  return value;
 }
 
 }  // namespace Test2005PauseAllRedefineMultithreaded

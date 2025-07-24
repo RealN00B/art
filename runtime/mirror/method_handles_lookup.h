@@ -18,11 +18,12 @@
 #define ART_RUNTIME_MIRROR_METHOD_HANDLES_LOOKUP_H_
 
 #include "base/utils.h"
+#include "base/macros.h"
 #include "handle.h"
 #include "obj_ptr.h"
 #include "object.h"
 
-namespace art {
+namespace art HIDDEN {
 
 struct MethodHandlesLookupOffsets;
 class RootVisitor;
@@ -35,6 +36,8 @@ class MethodType;
 // C++ mirror of java.lang.invoke.MethodHandles.Lookup
 class MANAGED MethodHandlesLookup : public Object {
  public:
+  MIRROR_CLASS("Ljava/lang/invoke/MethodHandles$Lookup;");
+
   static ObjPtr<mirror::MethodHandlesLookup> Create(Thread* const self, Handle<Class> lookup_class)
       REQUIRES_SHARED(Locks::mutator_lock_) REQUIRES(!Roles::uninterruptible_);
 

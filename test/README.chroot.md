@@ -50,29 +50,83 @@ Note that using this chroot-based approach requires root access to the device
     ```
 2. Set lunch target and ADB:
     * With a minimal `aosp/master-art` tree:
-        ```bash
-        export SOONG_ALLOW_MISSING_DEPENDENCIES=true
-        . ./build/envsetup.sh
-        lunch armv8-eng  # or arm_krait-eng for 32-bit ARM
-        export PATH="$(pwd)/prebuilts/runtime:$PATH"
-        export ADB="$ANDROID_BUILD_TOP/prebuilts/runtime/adb"
-        ```
-    * With a full Android (AOSP) `aosp/master` tree:
-        ```bash
-        export OVERRIDE_TARGET_FLATTEN_APEX=true
-        . ./build/envsetup.sh
-        lunch aosp_arm64-eng  # or aosp_arm-eng for 32-bit ARM
-        m adb
-        ```
+        1. Initialize the environment:
+            ```bash
+            export SOONG_ALLOW_MISSING_DEPENDENCIES=true
+            . ./build/envsetup.sh
+            ```
+        2. Select a lunch target corresponding to the architecture you want to
+           build and test:
+            * For (32-bit) Arm:
+                ```bash
+                lunch arm_krait-trunk_staging-eng
+                ```
+            * For (64-bit only) Arm64:
+                ```bash
+                lunch armv8-trunk_staging-eng
+                ```
+            * For (32- and 64-bit) Arm64:
+                ```bash
+                lunch arm_v7_v8-trunk_staging-eng
+                ```
+            * For (32-bit) Intel x86:
+                ```bash
+                lunch silvermont-trunk_staging-eng
+                ```
+            * For (64-bit) RISC-V:
+                ```bash
+                lunch aosp_riscv64-trunk_staging-eng
+                ```
+        3. Set up the environment to use a pre-built ADB:
+            ```bash
+            export PATH="$(pwd)/prebuilts/runtime:$PATH"
+            export ADB="$ANDROID_BUILD_TOP/prebuilts/runtime/adb"
+            ```
+    * With a full Android (AOSP) `aosp/main` tree:
+        1. Initialize the environment:
+            ```bash
+            . ./build/envsetup.sh
+            ```
+        2. Select a lunch target corresponding to the architecture you want to
+           build and test:
+            * For (32-bit) Arm:
+                ```bash
+                lunch aosp_arm-trunk_staging-eng
+                ```
+            * For (32- and 64-bit) Arm64:
+                ```bash
+                lunch aosp_arm64-trunk_staging-eng
+                ```
+            * For (32-bit) Intel x86:
+                ```bash
+                lunch aosp_x86-trunk_staging-eng
+                ```
+            * For (32- and 64-bit) Intel x86-64:
+                ```bash
+                lunch aosp_x86_64-trunk_staging-eng
+                ```
+            * For (64-bit) RISC-V:
+                ```bash
+                lunch aosp_riscv64-trunk_staging-eng
+                ```
+        3. Build ADB:
+            ```bash
+            m adb
+            ```
 3. Build ART and required dependencies:
     ```bash
     art/tools/buildbot-build.sh --target
+    ```
+    After building it is fine to see it finish with an error like:
+    ```
+    linkerconfig E [...] variableloader.cc:83] Unable to access VNDK APEX at path: <path>: No such file or directory
     ```
 4. Clean up the device:
     ```bash
     art/tools/buildbot-cleanup-device.sh
     ```
-5. Setup the device (including setting up mount points and files in the chroot directory):
+5. Setup the device (including setting up mount points and files in the chroot
+   directory):
     ```bash
     art/tools/buildbot-setup-device.sh
     ```
@@ -85,14 +139,45 @@ Note that using this chroot-based approach requires root access to the device
     ```bash
     art/tools/run-gtests.sh -j4
     ```
-    * Note: This currently fails on test
-    `test-art-target-gtest-image_space_test{32,64}` when using the full AOSP
+    * Specific tests to run can be passed on the command line, specified by
+      their absolute paths beginning with `/apex/`:
+        ```bash
+        art/tools/run-gtests.sh \
+          /apex/com.android.art/bin/art/arm64/art_cmdline_tests \
+          /apex/com.android.art/bin/art/arm64/art_dexdump_tests
+        ```
+    * Gtest options can be passed to each gtest by passing them after `--`; see
+      the following examples.
+        * To print the list of all test cases of a given gtest, use option
+          `--gtest_list_tests`:
+            ```bash
+            art/tools/run-gtests.sh \
+              /apex/com.android.art/bin/art/arm64/art_cmdline_tests \
+              -- --gtest_list_tests
+            ```
+        * To filter the test cases to execute, use option `--gtest_filter`:
+            ```bash
+            art/tools/run-gtests.sh \
+              /apex/com.android.art/bin/art/arm64/art_cmdline_tests \
+              -- --gtest_filter="*TestJdwp*"
+            ```
+        * To see all the options supported by a gtest, use option `--help`:
+            ```bash
+            art/tools/run-gtests.sh \
+              /apex/com.android.art/bin/art/arm64/art_cmdline_tests \
+              -- --help
+            ```
+    * Note: Some test cases of `art_runtime_tests` defined in
+    `art/runtime/gc/space/image_space_test.cc` may fail when using the full AOSP
     tree (b/119815008).
         * Workaround: Run `m clean-oat-host` before the build step
         (`art/tools/buildbot-build.sh --target`) above.
-    * Note: The `-j` option is not honored yet (b/129930445).
-    * Specific tests to run can be passed on the command line, specified by
-    their absolute paths beginning with `/apex/`.
+    * Note: The `-j` option of script `art/tools/run-gtests.sh` is not honored
+      yet (b/129930445). However, gtests themselves support parallel execution,
+      which can be specified via the gtest option `-j`:
+        ```bash
+        art/tools/run-gtests.sh -- -j4
+        ```
 8. Run ART run-tests:
     * On a 64-bit target:
         ```bash

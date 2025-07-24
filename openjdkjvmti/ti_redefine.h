@@ -103,8 +103,8 @@ class Redefiner {
                                       std::string* error_msg);
 
   // Helper for checking if redefinition/retransformation is allowed.
-  template<RedefinitionType kType = RedefinitionType::kNormal>
-  static jvmtiError GetClassRedefinitionError(jclass klass, /*out*/std::string* error_msg)
+  template <RedefinitionType kType = RedefinitionType::kNormal>
+  static jvmtiError CanRedefineClass(jclass klass, /*out*/ std::string* error_msg)
       REQUIRES(!art::Locks::mutator_lock_);
 
   static jvmtiError StructurallyRedefineClassDirect(jvmtiEnv* env,
@@ -126,7 +126,7 @@ class Redefiner {
     ~ClassRedefinition() NO_THREAD_SAFETY_ANALYSIS;
 
     // Move assignment so we can sort these in a vector.
-    ClassRedefinition& operator=(ClassRedefinition&& other) {
+    ClassRedefinition& operator=(ClassRedefinition&& other) noexcept {
       driver_ = other.driver_;
       klass_ = other.klass_;
       dex_file_ = std::move(other.dex_file_);
@@ -137,7 +137,7 @@ class Redefiner {
     }
 
     // Move constructor so we can put these into a vector.
-    ClassRedefinition(ClassRedefinition&& other)
+    ClassRedefinition(ClassRedefinition&& other) noexcept
         : driver_(other.driver_),
           klass_(other.klass_),
           dex_file_(std::move(other.dex_file_)),
@@ -240,12 +240,6 @@ class Redefiner {
     void UpdateClass(const RedefinitionDataIter& cur_data)
         REQUIRES(art::Locks::mutator_lock_);
 
-    void UpdateClassCommon(const RedefinitionDataIter& cur_data)
-        REQUIRES(art::Locks::mutator_lock_);
-
-    void ReverifyClass(const RedefinitionDataIter& cur_data)
-        REQUIRES_SHARED(art::Locks::mutator_lock_);
-
     void CollectNewFieldAndMethodMappings(const RedefinitionDataIter& data,
                                           std::map<art::ArtMethod*, art::ArtMethod*>* method_map,
                                           std::map<art::ArtField*, art::ArtField*>* field_map)
@@ -292,10 +286,6 @@ class Redefiner {
     bool added_fields_ = false;
     bool added_methods_ = false;
     bool has_virtuals_ = false;
-
-    // Does the class need to be reverified due to verification soft-fails possibly forcing
-    // interpreter or lock-counting?
-    bool needs_reverify_ = false;
   };
 
   ArtJvmTiEnv* env_;
@@ -332,9 +322,9 @@ class Redefiner {
   template<RedefinitionType kType = RedefinitionType::kNormal>
   static jvmtiError IsModifiableClassGeneric(jvmtiEnv* env, jclass klass, jboolean* is_redefinable);
 
-  template<RedefinitionType kType = RedefinitionType::kNormal>
-  static jvmtiError GetClassRedefinitionError(art::Handle<art::mirror::Class> klass,
-                                              /*out*/std::string* error_msg)
+  template <RedefinitionType kType = RedefinitionType::kNormal>
+  static jvmtiError CanRedefineClass(art::Handle<art::mirror::Class> klass,
+                                     /*out*/ std::string* error_msg)
       REQUIRES_SHARED(art::Locks::mutator_lock_);
 
   jvmtiError Run() REQUIRES_SHARED(art::Locks::mutator_lock_);

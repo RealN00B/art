@@ -36,13 +36,11 @@ namespace art {
   // This has a gtest dependency, which is why it's in the gtest only.
   bool operator==(const ProfileSaverOptions& lhs, const ProfileSaverOptions& rhs) {
     return lhs.enabled_ == rhs.enabled_ &&
-        lhs.min_save_period_ms_ == rhs.min_save_period_ms_ &&
-        lhs.save_resolved_classes_delay_ms_ == rhs.save_resolved_classes_delay_ms_ &&
-        lhs.hot_startup_method_samples_ == rhs.hot_startup_method_samples_ &&
-        lhs.min_methods_to_save_ == rhs.min_methods_to_save_ &&
-        lhs.min_classes_to_save_ == rhs.min_classes_to_save_ &&
-        lhs.min_notification_before_wake_ == rhs.min_notification_before_wake_ &&
-        lhs.max_notification_before_wake_ == rhs.max_notification_before_wake_;
+           lhs.min_save_period_ms_ == rhs.min_save_period_ms_ &&
+           lhs.min_methods_to_save_ == rhs.min_methods_to_save_ &&
+           lhs.min_classes_to_save_ == rhs.min_classes_to_save_ &&
+           lhs.min_notification_before_wake_ == rhs.min_notification_before_wake_ &&
+           lhs.max_notification_before_wake_ == rhs.max_notification_before_wake_;
   }
 
   bool UsuallyEquals(double expected, double actual) {
@@ -75,12 +73,13 @@ namespace art {
   // that are nevertheless equal.
   // If a test is failing because the structs aren't "equal" when they really are
   // then it's recommended to implement operator== for it instead.
-  template <typename T, typename ... Ignore>
-  bool UsuallyEquals(const T& expected, const T& actual,
-                     const Ignore& ... more ATTRIBUTE_UNUSED,
-                     typename std::enable_if<std::is_pod<T>::value>::type* = nullptr,
-                     typename std::enable_if<!detail::SupportsEqualityOperator<T>::value>::type* = nullptr
-                     ) {
+  template <typename T, typename... Ignore>
+  bool UsuallyEquals(
+      const T& expected,
+      const T& actual,
+      [[maybe_unused]] const Ignore&... more,
+      typename std::enable_if<std::is_pod<T>::value>::type* = nullptr,
+      typename std::enable_if<!detail::SupportsEqualityOperator<T>::value>::type* = nullptr) {
     return memcmp(std::addressof(expected), std::addressof(actual), sizeof(T)) == 0;
   }
 
@@ -236,7 +235,9 @@ TEST_F(CmdlineParserTest, TestSimpleSuccesses) {
   EXPECT_SINGLE_PARSE_VALUE(false, "-XX:DisableHSpaceCompactForOOM", M::EnableHSpaceCompactForOOM);
   EXPECT_SINGLE_PARSE_VALUE(0.5, "-XX:HeapTargetUtilization=0.5", M::HeapTargetUtilization);
   EXPECT_SINGLE_PARSE_VALUE(5u, "-XX:ParallelGCThreads=5", M::ParallelGCThreads);
-  EXPECT_SINGLE_PARSE_EXISTS("-Xno-dex-file-fallback", M::NoDexFileFallback);
+  EXPECT_SINGLE_PARSE_VALUE(10u,
+                            "-XX:ParallelGCThreads=5 -XX:ParallelGCThreads=10",
+                            M::ParallelGCThreads);
 }  // TEST_F
 
 TEST_F(CmdlineParserTest, TestSimpleFailures) {
@@ -327,8 +328,7 @@ TEST_F(CmdlineParserTest, TestLogVerbosity) {
   }
 }  // TEST_F
 
-// TODO: Enable this b/19274810
-TEST_F(CmdlineParserTest, DISABLED_TestXGcOption) {
+TEST_F(CmdlineParserTest, TestXGcOption) {
   /*
    * Test success
    */
@@ -480,7 +480,7 @@ TEST_F(CmdlineParserTest, TestJitOptions) {
         MemoryKiB(16 * MB), "-Xjitmaxsize:16M", M::JITCodeCacheMaxCapacity);
   }
   {
-    EXPECT_SINGLE_PARSE_VALUE(12345u, "-Xjitthreshold:12345", M::JITCompileThreshold);
+    EXPECT_SINGLE_PARSE_VALUE(12345u, "-Xjitthreshold:12345", M::JITOptimizeThreshold);
   }
 }  // TEST_F
 
@@ -493,12 +493,12 @@ TEST_F(CmdlineParserTest, ProfileSaverOptions) {
   EXPECT_SINGLE_PARSE_VALUE(opt,
                             "-Xjitsaveprofilinginfo "
                             "-Xps-min-save-period-ms:1 "
-                            "-Xps-save-resolved-classes-delay-ms:2 "
-                            "-Xps-hot-startup-method-samples:3 "
-                            "-Xps-min-methods-to-save:4 "
-                            "-Xps-min-classes-to-save:5 "
-                            "-Xps-min-notification-before-wake:6 "
-                            "-Xps-max-notification-before-wake:7 "
+                            "-Xps-min-first-save-ms:2 "
+                            "-Xps-min-methods-to-save:3 "
+                            "-Xps-min-classes-to-save:4 "
+                            "-Xps-min-notification-before-wake:5 "
+                            "-Xps-max-notification-before-wake:6 "
+                            "-Xps-inline-cache-threshold:7 "
                             "-Xps-profile-path:abc "
                             "-Xps-profile-boot-class-path",
                             M::ProfileSaverOpts);
@@ -528,10 +528,12 @@ TEST_F(CmdlineParserTest, TestVerify) {
 TEST_F(CmdlineParserTest, TestIgnoreUnrecognized) {
   RuntimeParser::Builder parserBuilder;
 
+  // clang-format off
   parserBuilder
       .Define("-help")
           .IntoKey(M::Help)
       .IgnoreUnrecognized(true);
+  // clang-format on
 
   parser_.reset(new RuntimeParser(parserBuilder.Build()));
 
@@ -575,11 +577,13 @@ TEST_F(CmdlineParserTest, MultipleArguments) {
 }  //  TEST_F
 
 TEST_F(CmdlineParserTest, TypesNotInRuntime) {
-  CmdlineType<std::vector<int32_t>> ct;
+  using ParseCommaSeparatedIntList = ParseIntList<','>;
+  CmdlineType<ParseCommaSeparatedIntList> ct;
   auto success0 =
-      CmdlineParseResult<std::vector<int32_t>>::Success(std::vector<int32_t>({1, 2, 3, 4}));
+      CmdlineParseResult<ParseCommaSeparatedIntList>::Success(ParseCommaSeparatedIntList({1, 2, 3, 4}));
   EXPECT_EQ(success0, ct.Parse("1,2,3,4"));
-  auto success1 = CmdlineParseResult<std::vector<int32_t>>::Success(std::vector<int32_t>({0}));
+  auto success1 =
+      CmdlineParseResult<ParseCommaSeparatedIntList>::Success(ParseCommaSeparatedIntList({0}));
   EXPECT_EQ(success1, ct.Parse("1"));
 
   EXPECT_FALSE(ct.Parse("").IsSuccess());

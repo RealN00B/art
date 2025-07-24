@@ -20,6 +20,7 @@
 #include "arch/arm/registers_arm.h"
 #include "arch/instruction_set.h"
 #include "arch/x86/registers_x86.h"
+#include "base/macros.h"
 #include "code_simulator.h"
 #include "code_simulator_container.h"
 #include "common_compiler_test.h"
@@ -35,6 +36,10 @@
 #include "code_generator_arm64.h"
 #endif
 
+#ifdef ART_ENABLE_CODEGEN_riscv64
+#include "code_generator_riscv64.h"
+#endif
+
 #ifdef ART_ENABLE_CODEGEN_x86
 #include "code_generator_x86.h"
 #endif
@@ -43,9 +48,9 @@
 #include "code_generator_x86_64.h"
 #endif
 
-namespace art {
+namespace art HIDDEN {
 
-typedef CodeGenerator* (*CreateCodegenFn)(HGraph*, const CompilerOptions&);
+using CreateCodegenFn = CodeGenerator* (*)(HGraph*, const CompilerOptions&);
 
 class CodegenTargetConfig {
  public:
@@ -98,8 +103,8 @@ class TestCodeGeneratorARMVIXL : public arm::CodeGeneratorARMVIXL {
     blocked_core_registers_[arm::R7] = false;
   }
 
-  void MaybeGenerateMarkingRegisterCheck(int code ATTRIBUTE_UNUSED,
-                                         Location temp_loc ATTRIBUTE_UNUSED) override {
+  void MaybeGenerateMarkingRegisterCheck([[maybe_unused]] int code,
+                                         [[maybe_unused]] Location temp_loc) override {
     // When turned on, the marking register checks in
     // CodeGeneratorARMVIXL::MaybeGenerateMarkingRegisterCheck expects the
     // Thread Register and the Marking Register to be set to
@@ -130,8 +135,8 @@ class TestCodeGeneratorARM64 : public arm64::CodeGeneratorARM64 {
   TestCodeGeneratorARM64(HGraph* graph, const CompilerOptions& compiler_options)
       : arm64::CodeGeneratorARM64(graph, compiler_options) {}
 
-  void MaybeGenerateMarkingRegisterCheck(int codem ATTRIBUTE_UNUSED,
-                                         Location temp_loc ATTRIBUTE_UNUSED) override {
+  void MaybeGenerateMarkingRegisterCheck([[maybe_unused]] int codem,
+                                         [[maybe_unused]] Location temp_loc) override {
     // When turned on, the marking register checks in
     // CodeGeneratorARM64::MaybeGenerateMarkingRegisterCheck expect the
     // Thread Register and the Marking Register to be set to
@@ -162,37 +167,30 @@ class TestCodeGeneratorX86 : public x86::CodeGeneratorX86 {
 };
 #endif
 
-class InternalCodeAllocator : public CodeAllocator {
- public:
-  InternalCodeAllocator() : size_(0) { }
-
-  uint8_t* Allocate(size_t size) override {
-    size_ = size;
-    memory_.reset(new uint8_t[size]);
-    return memory_.get();
-  }
-
-  size_t GetSize() const { return size_; }
-  ArrayRef<const uint8_t> GetMemory() const override {
-    return ArrayRef<const uint8_t>(memory_.get(), size_);
-  }
-
- private:
-  size_t size_;
-  std::unique_ptr<uint8_t[]> memory_;
-
-  DISALLOW_COPY_AND_ASSIGN(InternalCodeAllocator);
-};
-
-static bool CanExecuteOnHardware(InstructionSet target_isa) {
+// Check that the current runtime ISA matches the target ISA.
+static bool DoesHardwareSupportISA(InstructionSet target_isa) {
   return (target_isa == kRuntimeISA)
       // Handle the special case of ARM, with two instructions sets (ARM32 and Thumb-2).
       || (kRuntimeISA == InstructionSet::kArm && target_isa == InstructionSet::kThumb2);
 }
 
-static bool CanExecute(InstructionSet target_isa) {
+// Check that the current runtime ISA matches the target ISA and the ISA features requested are
+// available on the hardware.
+static bool CanExecuteOnHardware(const CodeGenerator& codegen) {
+  const InstructionSetFeatures* isa_features =
+      codegen.GetCompilerOptions().GetInstructionSetFeatures();
+  return DoesHardwareSupportISA(codegen.GetInstructionSet())
+      && InstructionSetFeatures::FromHwcap()->HasAtLeast(isa_features);
+}
+
+static bool CanExecuteISA(InstructionSet target_isa) {
   CodeSimulatorContainer simulator(target_isa);
-  return CanExecuteOnHardware(target_isa) || simulator.CanSimulate();
+  return DoesHardwareSupportISA(target_isa) || simulator.CanSimulate();
+}
+
+static bool CanExecute(const CodeGenerator& codegen) {
+  CodeSimulatorContainer simulator(codegen.GetInstructionSet());
+  return CanExecuteOnHardware(codegen) || simulator.CanSimulate();
 }
 
 template <typename Expected>
@@ -217,14 +215,14 @@ inline int64_t SimulatorExecute<int64_t>(CodeSimulator* simulator, int64_t (*f)(
 }
 
 template <typename Expected>
-static void VerifyGeneratedCode(InstructionSet target_isa,
+static void VerifyGeneratedCode(const CodeGenerator& codegen,
                                 Expected (*f)(),
                                 bool has_result,
                                 Expected expected) {
-  ASSERT_TRUE(CanExecute(target_isa)) << "Target isa is not executable.";
+  ASSERT_TRUE(CanExecute(codegen)) << "Target isa is not executable.";
 
   // Verify on simulator.
-  CodeSimulatorContainer simulator(target_isa);
+  CodeSimulatorContainer simulator(codegen.GetInstructionSet());
   if (simulator.CanSimulate()) {
     Expected result = SimulatorExecute<Expected>(simulator.Get(), f);
     if (has_result) {
@@ -233,7 +231,7 @@ static void VerifyGeneratedCode(InstructionSet target_isa,
   }
 
   // Verify on hardware.
-  if (CanExecuteOnHardware(target_isa)) {
+  if (CanExecuteOnHardware(codegen)) {
     Expected result = f();
     if (has_result) {
       ASSERT_EQ(expected, result);
@@ -242,20 +240,23 @@ static void VerifyGeneratedCode(InstructionSet target_isa,
 }
 
 template <typename Expected>
-static void Run(const InternalCodeAllocator& allocator,
-                const CodeGenerator& codegen,
+static void Run(const CodeGenerator& codegen,
                 bool has_result,
                 Expected expected) {
   InstructionSet target_isa = codegen.GetInstructionSet();
 
-  typedef Expected (*fptr)();
-  CommonCompilerTest::MakeExecutable(allocator.GetMemory().data(), allocator.GetMemory().size());
-  fptr f = reinterpret_cast<fptr>(reinterpret_cast<uintptr_t>(allocator.GetMemory().data()));
-  if (target_isa == InstructionSet::kThumb2) {
-    // For thumb we need the bottom bit set.
-    f = reinterpret_cast<fptr>(reinterpret_cast<uintptr_t>(f) + 1);
-  }
-  VerifyGeneratedCode(target_isa, f, has_result, expected);
+  struct CodeHolder : CommonCompilerTestImpl {
+   protected:
+    ClassLinker* GetClassLinker() override { return nullptr; }
+    Runtime* GetRuntime() override { return nullptr; }
+  };
+  CodeHolder code_holder;
+  const void* method_code =
+      code_holder.MakeExecutable(codegen.GetCode(), ArrayRef<const uint8_t>(), target_isa);
+
+  using fptr = Expected (*)();
+  fptr f = reinterpret_cast<fptr>(reinterpret_cast<uintptr_t>(method_code));
+  VerifyGeneratedCode(codegen, f, has_result, expected);
 }
 
 static void ValidateGraph(HGraph* graph) {
@@ -285,9 +286,8 @@ static void RunCodeNoCheck(CodeGenerator* codegen,
     register_allocator->AllocateRegisters();
   }
   hook_before_codegen(graph);
-  InternalCodeAllocator allocator;
-  codegen->Compile(&allocator);
-  Run(allocator, *codegen, has_result, expected);
+  codegen->Compile();
+  Run(*codegen, has_result, expected);
 }
 
 template <typename Expected>
@@ -313,25 +313,29 @@ static void RunCode(CodegenTargetConfig target_config,
 }
 
 #ifdef ART_ENABLE_CODEGEN_arm
-CodeGenerator* create_codegen_arm_vixl32(HGraph* graph, const CompilerOptions& compiler_options) {
+inline CodeGenerator* create_codegen_arm_vixl32(HGraph* graph, const CompilerOptions& compiler_options) {
   return new (graph->GetAllocator()) TestCodeGeneratorARMVIXL(graph, compiler_options);
 }
 #endif
 
 #ifdef ART_ENABLE_CODEGEN_arm64
-CodeGenerator* create_codegen_arm64(HGraph* graph, const CompilerOptions& compiler_options) {
+inline CodeGenerator* create_codegen_arm64(HGraph* graph, const CompilerOptions& compiler_options) {
   return new (graph->GetAllocator()) TestCodeGeneratorARM64(graph, compiler_options);
 }
 #endif
 
+#ifdef ART_ENABLE_CODEGEN_riscv64
+inline CodeGenerator* create_codegen_riscv64(HGraph*, const CompilerOptions&) { return nullptr; }
+#endif
+
 #ifdef ART_ENABLE_CODEGEN_x86
-CodeGenerator* create_codegen_x86(HGraph* graph, const CompilerOptions& compiler_options) {
+inline CodeGenerator* create_codegen_x86(HGraph* graph, const CompilerOptions& compiler_options) {
   return new (graph->GetAllocator()) TestCodeGeneratorX86(graph, compiler_options);
 }
 #endif
 
 #ifdef ART_ENABLE_CODEGEN_x86_64
-CodeGenerator* create_codegen_x86_64(HGraph* graph, const CompilerOptions& compiler_options) {
+inline CodeGenerator* create_codegen_x86_64(HGraph* graph, const CompilerOptions& compiler_options) {
   return new (graph->GetAllocator()) x86_64::CodeGeneratorX86_64(graph, compiler_options);
 }
 #endif

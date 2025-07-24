@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 
+#include "base/macros.h"
 #include "graph_checker.h"
 #include "nodes.h"
 #include "optimizing_unit_test.h"
@@ -21,7 +22,7 @@
 
 #include "gtest/gtest.h"
 
-namespace art {
+namespace art HIDDEN {
 
 using HBasicBlockMap = SuperblockCloner::HBasicBlockMap;
 using HInstructionMap = SuperblockCloner::HInstructionMap;
@@ -30,38 +31,12 @@ using HEdgeSet = SuperblockCloner::HEdgeSet;
 
 // This class provides methods and helpers for testing various cloning and copying routines:
 // individual instruction cloning and cloning of the more coarse-grain structures.
-class SuperblockClonerTest : public ImprovedOptimizingUnitTest {
- private:
-  void CreateParameters() override {
-    parameters_.push_back(new (GetAllocator()) HParameterValue(graph_->GetDexFile(),
-                                                               dex::TypeIndex(0),
-                                                               0,
-                                                               DataType::Type::kInt32));
-  }
-
- public:
-  void CreateBasicLoopControlFlow(HBasicBlock* position,
-                                  HBasicBlock* successor,
-                                  /* out */ HBasicBlock** header_p,
-                                  /* out */ HBasicBlock** body_p) {
-    HBasicBlock* loop_preheader = new (GetAllocator()) HBasicBlock(graph_);
-    HBasicBlock* loop_header = new (GetAllocator()) HBasicBlock(graph_);
-    HBasicBlock* loop_body = new (GetAllocator()) HBasicBlock(graph_);
-
-    graph_->AddBlock(loop_preheader);
-    graph_->AddBlock(loop_header);
-    graph_->AddBlock(loop_body);
-
-    position->ReplaceSuccessor(successor, loop_preheader);
-
-    loop_preheader->AddSuccessor(loop_header);
-    // Loop exit first to have a proper exit condition/target for HIf.
-    loop_header->AddSuccessor(successor);
-    loop_header->AddSuccessor(loop_body);
-    loop_body->AddSuccessor(loop_header);
-
-    *header_p = loop_header;
-    *body_p = loop_body;
+class SuperblockClonerTest : public OptimizingUnitTest {
+ protected:
+  HBasicBlock* InitGraphAndParameters() {
+    HBasicBlock* return_block = InitEntryMainExitGraphWithReturnVoid();
+    param_ = MakeParam(DataType::Type::kInt32);
+    return return_block;
   }
 
   void CreateBasicLoopDataFlow(HBasicBlock* loop_header, HBasicBlock* loop_body) {
@@ -73,56 +48,31 @@ class SuperblockClonerTest : public ImprovedOptimizingUnitTest {
     HIntConstant* const_128 = graph_->GetIntConstant(128);
 
     // Header block.
-    HPhi* phi = new (GetAllocator()) HPhi(GetAllocator(), 0, 0, DataType::Type::kInt32);
-    HInstruction* suspend_check = new (GetAllocator()) HSuspendCheck();
-    HInstruction* loop_check = new (GetAllocator()) HGreaterThanOrEqual(phi, const_128);
-
-    loop_header->AddPhi(phi);
-    loop_header->AddInstruction(suspend_check);
-    loop_header->AddInstruction(loop_check);
-    loop_header->AddInstruction(new (GetAllocator()) HIf(loop_check));
+    auto [phi, induction_inc] = MakeLinearLoopVar(loop_header, loop_body, const_0, const_1);
+    std::initializer_list<HInstruction*> common_env{phi, const_128, param_};
+    HInstruction* suspend_check = MakeSuspendCheck(loop_header, common_env);
+    HInstruction* loop_check = MakeCondition(loop_header, kCondGE, phi, const_128);
+    MakeIf(loop_header, loop_check);
 
     // Loop body block.
-    HInstruction* null_check = new (GetAllocator()) HNullCheck(parameters_[0], dex_pc);
-    HInstruction* array_length = new (GetAllocator()) HArrayLength(null_check, dex_pc);
-    HInstruction* bounds_check = new (GetAllocator()) HBoundsCheck(phi, array_length, dex_pc);
+    HInstruction* null_check = MakeNullCheck(loop_body, param_, common_env, dex_pc);
+    HInstruction* array_length = MakeArrayLength(loop_body, null_check, dex_pc);
+    HInstruction* bounds_check = MakeBoundsCheck(loop_body, phi, array_length, common_env, dex_pc);
     HInstruction* array_get =
-        new (GetAllocator()) HArrayGet(null_check, bounds_check, DataType::Type::kInt32, dex_pc);
-    HInstruction* add =  new (GetAllocator()) HAdd(DataType::Type::kInt32, array_get, const_1);
-    HInstruction* array_set = new (GetAllocator()) HArraySet(
-        null_check, bounds_check, add, DataType::Type::kInt32, dex_pc);
-    HInstruction* induction_inc = new (GetAllocator()) HAdd(DataType::Type::kInt32, phi, const_1);
-
-    loop_body->AddInstruction(null_check);
-    loop_body->AddInstruction(array_length);
-    loop_body->AddInstruction(bounds_check);
-    loop_body->AddInstruction(array_get);
-    loop_body->AddInstruction(add);
-    loop_body->AddInstruction(array_set);
-    loop_body->AddInstruction(induction_inc);
-    loop_body->AddInstruction(new (GetAllocator()) HGoto());
-
-    phi->AddInput(const_0);
-    phi->AddInput(induction_inc);
+        MakeArrayGet(loop_body, null_check, bounds_check, DataType::Type::kInt32, dex_pc);
+    HInstruction* add =  MakeBinOp<HAdd>(loop_body, DataType::Type::kInt32, array_get, const_1);
+    HInstruction* array_set =
+        MakeArraySet(loop_body, null_check, bounds_check, add, DataType::Type::kInt32, dex_pc);
 
     graph_->SetHasBoundsChecks(true);
-
-    // Adjust HEnvironment for each instruction which require that.
-    ArenaVector<HInstruction*> current_locals({phi, const_128, parameters_[0]},
-                                              GetAllocator()->Adapter(kArenaAllocInstruction));
-
-    HEnvironment* env = ManuallyBuildEnvFor(suspend_check, &current_locals);
-    null_check->CopyEnvironmentFrom(env);
-    bounds_check->CopyEnvironmentFrom(env);
   }
+
+  HParameterValue* param_ = nullptr;
 };
 
 TEST_F(SuperblockClonerTest, IndividualInstrCloner) {
-  HBasicBlock* header = nullptr;
-  HBasicBlock* loop_body = nullptr;
-
-  InitGraph();
-  CreateBasicLoopControlFlow(entry_block_, return_block_, &header, &loop_body);
+  HBasicBlock* return_block = InitGraphAndParameters();
+  auto [preheader, header, loop_body] = CreateWhileLoop(return_block);
   CreateBasicLoopDataFlow(header, loop_body);
   graph_->BuildDominatorTree();
   EXPECT_TRUE(CheckGraph());
@@ -133,12 +83,12 @@ TEST_F(SuperblockClonerTest, IndividualInstrCloner) {
 
   visitor.VisitInsertionOrder();
   size_t instr_replaced_by_clones_count = visitor.GetInstrReplacedByClonesCount();
-  EXPECT_EQ(instr_replaced_by_clones_count, 12u);
+  EXPECT_EQ(instr_replaced_by_clones_count, 14u);
   EXPECT_TRUE(CheckGraph());
 
   visitor.VisitReversePostOrder();
   instr_replaced_by_clones_count = visitor.GetInstrReplacedByClonesCount();
-  EXPECT_EQ(instr_replaced_by_clones_count, 24u);
+  EXPECT_EQ(instr_replaced_by_clones_count, 28u);
   EXPECT_TRUE(CheckGraph());
 
   HSuspendCheck* new_suspend_check = header->GetLoopInformation()->GetSuspendCheck();
@@ -149,12 +99,10 @@ TEST_F(SuperblockClonerTest, IndividualInstrCloner) {
 // Tests SuperblockCloner::CloneBasicBlocks - check instruction cloning and initial remapping of
 // instructions' inputs.
 TEST_F(SuperblockClonerTest, CloneBasicBlocks) {
-  HBasicBlock* header = nullptr;
-  HBasicBlock* loop_body = nullptr;
-  ArenaAllocator* arena = graph_->GetAllocator();
+  ArenaAllocator* arena = GetAllocator();
 
-  InitGraph();
-  CreateBasicLoopControlFlow(entry_block_, return_block_, &header, &loop_body);
+  HBasicBlock* return_block = InitGraphAndParameters();
+  auto [preheader, header, loop_body] = CreateWhileLoop(return_block);
   CreateBasicLoopDataFlow(header, loop_body);
   graph_->BuildDominatorTree();
   ASSERT_TRUE(CheckGraph());
@@ -230,12 +178,10 @@ TEST_F(SuperblockClonerTest, CloneBasicBlocks) {
 // SuperblockCloner::CleanUpControlFlow - checks algorithms of local adjustments of the control
 // flow.
 TEST_F(SuperblockClonerTest, AdjustControlFlowInfo) {
-  HBasicBlock* header = nullptr;
-  HBasicBlock* loop_body = nullptr;
-  ArenaAllocator* arena = graph_->GetAllocator();
+  ArenaAllocator* arena = GetAllocator();
 
-  InitGraph();
-  CreateBasicLoopControlFlow(entry_block_, return_block_, &header, &loop_body);
+  HBasicBlock* return_block = InitGraphAndParameters();
+  auto [preheader, header, loop_body] = CreateWhileLoop(return_block);
   CreateBasicLoopDataFlow(header, loop_body);
   graph_->BuildDominatorTree();
   ASSERT_TRUE(CheckGraph());
@@ -269,15 +215,12 @@ TEST_F(SuperblockClonerTest, AdjustControlFlowInfo) {
 
 // Tests IsSubgraphConnected function for negative case.
 TEST_F(SuperblockClonerTest, IsGraphConnected) {
-  HBasicBlock* header = nullptr;
-  HBasicBlock* loop_body = nullptr;
-  ArenaAllocator* arena = graph_->GetAllocator();
+  ArenaAllocator* arena = GetAllocator();
 
-  InitGraph();
-  CreateBasicLoopControlFlow(entry_block_, return_block_, &header, &loop_body);
+  HBasicBlock* return_block = InitGraphAndParameters();
+  auto [preheader, header, loop_body] = CreateWhileLoop(return_block);
   CreateBasicLoopDataFlow(header, loop_body);
-  HBasicBlock* unreachable_block = new (GetAllocator()) HBasicBlock(graph_);
-  graph_->AddBlock(unreachable_block);
+  HBasicBlock* unreachable_block = AddNewBlock();
 
   HBasicBlockSet bb_set(
       arena, graph_->GetBlocks().size(), false, kArenaAllocSuperblockCloner);
@@ -292,35 +235,10 @@ TEST_F(SuperblockClonerTest, IsGraphConnected) {
 
 // Tests SuperblockCloner for loop peeling case.
 //
-// Control Flow of the example (ignoring critical edges splitting).
-//
-//       Before                    After
-//
-//         |B|                      |B|
-//          |                        |
-//          v                        v
-//         |1|                      |1|
-//          |                        |
-//          v                        v
-//         |2|<-\              (6) |2A|
-//         / \  /                   / \
-//        v   v/                   /   v
-//       |4|  |3|                 /   |3A| (7)
-//        |                      /     /
-//        v                     |     v
-//       |E|                     \   |2|<-\
-//                                \ / \   /
-//                                 v   v /
-//                                |4|  |3|
-//                                 |
-//                                 v
-//                                |E|
+// See an ASCII graphics example near LoopClonerHelper::DoPeeling.
 TEST_F(SuperblockClonerTest, LoopPeeling) {
-  HBasicBlock* header = nullptr;
-  HBasicBlock* loop_body = nullptr;
-
-  InitGraph();
-  CreateBasicLoopControlFlow(entry_block_, return_block_, &header, &loop_body);
+  HBasicBlock* return_block = InitGraphAndParameters();
+  auto [preheader, header, loop_body] = CreateWhileLoop(return_block);
   CreateBasicLoopDataFlow(header, loop_body);
   graph_->BuildDominatorTree();
   EXPECT_TRUE(CheckGraph());
@@ -331,7 +249,7 @@ TEST_F(SuperblockClonerTest, LoopPeeling) {
       std::less<HInstruction*>(), graph_->GetAllocator()->Adapter(kArenaAllocSuperblockCloner));
 
   HLoopInformation* loop_info = header->GetLoopInformation();
-  PeelUnrollHelper helper(loop_info, &bb_map, &hir_map, /* induction_range= */ nullptr);
+  LoopClonerHelper helper(loop_info, &bb_map, &hir_map, /* induction_range= */ nullptr);
   EXPECT_TRUE(helper.IsLoopClonable());
   HBasicBlock* new_header = helper.DoPeeling();
   HLoopInformation* new_loop_info = new_header->GetLoopInformation();
@@ -351,35 +269,10 @@ TEST_F(SuperblockClonerTest, LoopPeeling) {
 
 // Tests SuperblockCloner for loop unrolling case.
 //
-// Control Flow of the example (ignoring critical edges splitting).
-//
-//       Before                    After
-//
-//         |B|                      |B|
-//          |                        |
-//          v                        v
-//         |1|                      |1|
-//          |                        |
-//          v                        v
-//         |2|<-\               (6) |2A|<-\
-//         / \  /                   / \    \
-//        v   v/                   /   v    \
-//       |4|  |3|                 /(7)|3A|   |
-//        |                      /     /    /
-//        v                     |     v    /
-//       |E|                     \   |2|  /
-//                                \ / \  /
-//                                 v   v/
-//                                |4| |3|
-//                                 |
-//                                 v
-//                                |E|
+// See an ASCII graphics example near LoopClonerHelper::DoUnrolling.
 TEST_F(SuperblockClonerTest, LoopUnrolling) {
-  HBasicBlock* header = nullptr;
-  HBasicBlock* loop_body = nullptr;
-
-  InitGraph();
-  CreateBasicLoopControlFlow(entry_block_, return_block_, &header, &loop_body);
+  HBasicBlock* return_block = InitGraphAndParameters();
+  auto [preheader, header, loop_body] = CreateWhileLoop(return_block);
   CreateBasicLoopDataFlow(header, loop_body);
   graph_->BuildDominatorTree();
   EXPECT_TRUE(CheckGraph());
@@ -390,7 +283,7 @@ TEST_F(SuperblockClonerTest, LoopUnrolling) {
       std::less<HInstruction*>(), graph_->GetAllocator()->Adapter(kArenaAllocSuperblockCloner));
 
   HLoopInformation* loop_info = header->GetLoopInformation();
-  PeelUnrollHelper helper(loop_info, &bb_map, &hir_map, /* induction_range= */ nullptr);
+  LoopClonerHelper helper(loop_info, &bb_map, &hir_map, /* induction_range= */ nullptr);
   EXPECT_TRUE(helper.IsLoopClonable());
   HBasicBlock* new_header = helper.DoUnrolling();
 
@@ -408,44 +301,83 @@ TEST_F(SuperblockClonerTest, LoopUnrolling) {
   EXPECT_EQ(loop_info->GetBackEdges()[0], bb_map.Get(loop_body));
 }
 
+// Tests SuperblockCloner for loop versioning case.
+//
+// See an ASCII graphics example near LoopClonerHelper::DoVersioning.
+TEST_F(SuperblockClonerTest, LoopVersioning) {
+  HBasicBlock* return_block = InitGraphAndParameters();
+  auto [preheader, header, loop_body] = CreateWhileLoop(return_block);
+  CreateBasicLoopDataFlow(header, loop_body);
+  graph_->BuildDominatorTree();
+  EXPECT_TRUE(CheckGraph());
+
+  HBasicBlockMap bb_map(
+      std::less<HBasicBlock*>(), graph_->GetAllocator()->Adapter(kArenaAllocSuperblockCloner));
+  HInstructionMap hir_map(
+      std::less<HInstruction*>(), graph_->GetAllocator()->Adapter(kArenaAllocSuperblockCloner));
+
+  HLoopInformation* loop_info = header->GetLoopInformation();
+  HBasicBlock* original_preheader = loop_info->GetPreHeader();
+  LoopClonerHelper helper(loop_info, &bb_map, &hir_map, /* induction_range= */ nullptr);
+  EXPECT_TRUE(helper.IsLoopClonable());
+  HBasicBlock* new_header = helper.DoVersioning();
+  EXPECT_EQ(header, new_header);
+
+  EXPECT_TRUE(CheckGraph());
+
+  HBasicBlock* second_header = bb_map.Get(header);
+  HBasicBlock* second_body = bb_map.Get(loop_body);
+  HLoopInformation* second_loop_info = second_header->GetLoopInformation();
+
+  // Check loop body successors.
+  EXPECT_EQ(loop_body->GetSingleSuccessor(), header);
+  EXPECT_EQ(second_body->GetSingleSuccessor(), second_header);
+
+  // Check loop structure.
+  EXPECT_EQ(loop_info, header->GetLoopInformation());
+  EXPECT_EQ(loop_info->GetHeader(), header);
+  EXPECT_EQ(second_loop_info->GetHeader(), second_header);
+
+  EXPECT_EQ(loop_info->GetBackEdges().size(), 1u);
+  EXPECT_EQ(second_loop_info->GetBackEdges().size(), 1u);
+
+  EXPECT_EQ(loop_info->GetBackEdges()[0], loop_body);
+  EXPECT_EQ(second_loop_info->GetBackEdges()[0], second_body);
+
+  EXPECT_EQ(original_preheader->GetSuccessors().size(), 2u);
+}
+
 // Checks that loop unrolling works fine for a loop with multiple back edges. Tests that after
 // the transformation the loop has a single preheader.
 TEST_F(SuperblockClonerTest, LoopPeelingMultipleBackEdges) {
-  HBasicBlock* header = nullptr;
-  HBasicBlock* loop_body = nullptr;
-
-  InitGraph();
-  CreateBasicLoopControlFlow(entry_block_, return_block_, &header, &loop_body);
+  HBasicBlock* return_block = InitGraphAndParameters();
+  auto [preheader, header, loop_body] = CreateWhileLoop(return_block);
   CreateBasicLoopDataFlow(header, loop_body);
 
   // Transform a basic loop to have multiple back edges.
   HBasicBlock* latch = header->GetSuccessors()[1];
-  HBasicBlock* if_block = new (GetAllocator()) HBasicBlock(graph_);
-  HBasicBlock* temp1 = new (GetAllocator()) HBasicBlock(graph_);
-  graph_->AddBlock(if_block);
-  graph_->AddBlock(temp1);
+  HBasicBlock* if_block = AddNewBlock();
+  HBasicBlock* temp1 = AddNewBlock();
   header->ReplaceSuccessor(latch, if_block);
   if_block->AddSuccessor(latch);
   if_block->AddSuccessor(temp1);
   temp1->AddSuccessor(header);
 
-  if_block->AddInstruction(new (GetAllocator()) HIf(parameters_[0]));
+  MakeIf(if_block, param_);
 
   HInstructionIterator it(header->GetPhis());
   DCHECK(!it.Done());
   HPhi* loop_phi = it.Current()->AsPhi();
-  HInstruction* temp_add = new (GetAllocator()) HAdd(DataType::Type::kInt32,
-                                                     loop_phi,
-                                                     graph_->GetIntConstant(2));
-  temp1->AddInstruction(temp_add);
-  temp1->AddInstruction(new (GetAllocator()) HGoto());
+  HInstruction* temp_add =
+      MakeBinOp<HAdd>(temp1, DataType::Type::kInt32, loop_phi, graph_->GetIntConstant(2));
+  MakeGoto(temp1);
   loop_phi->AddInput(temp_add);
 
   graph_->BuildDominatorTree();
   EXPECT_TRUE(CheckGraph());
 
   HLoopInformation* loop_info = header->GetLoopInformation();
-  PeelUnrollSimpleHelper helper(loop_info, /* induction_range= */ nullptr);
+  LoopClonerSimpleHelper helper(loop_info, /* induction_range= */ nullptr);
   HBasicBlock* new_header = helper.DoPeeling();
   EXPECT_EQ(header, new_header);
 
@@ -466,42 +398,36 @@ static void CheckLoopStructureForLoopPeelingNested(HBasicBlock* loop1_header,
 }
 
 TEST_F(SuperblockClonerTest, LoopPeelingNested) {
-  HBasicBlock* header = nullptr;
-  HBasicBlock* loop_body = nullptr;
-
-  InitGraph();
+  HBasicBlock* return_block = InitGraphAndParameters();
 
   // Create the following nested structure of loops
   //   Headers:  1    2 3
   //             [ ], [ [ ] ]
-  CreateBasicLoopControlFlow(entry_block_, return_block_, &header, &loop_body);
-  CreateBasicLoopDataFlow(header, loop_body);
-  HBasicBlock* loop1_header = header;
+  auto [preheader1, header1, body1] = CreateWhileLoop(return_block);
+  CreateBasicLoopDataFlow(header1, body1);
 
-  CreateBasicLoopControlFlow(header, return_block_, &header, &loop_body);
-  CreateBasicLoopDataFlow(header, loop_body);
-  HBasicBlock* loop2_header = header;
+  auto [preheader2, header2, body2_end] = CreateWhileLoop(return_block);
+  CreateBasicLoopDataFlow(header2, body2_end);
 
-  CreateBasicLoopControlFlow(header, header->GetSuccessors()[1], &header, &loop_body);
-  CreateBasicLoopDataFlow(header, loop_body);
-  HBasicBlock* loop3_header = header;
+  auto [preheader3, header3, body3] = CreateWhileLoop(body2_end);
+  CreateBasicLoopDataFlow(header3, body3);
 
   graph_->BuildDominatorTree();
   EXPECT_TRUE(CheckGraph());
 
-  HLoopInformation* loop2_info_before = loop2_header->GetLoopInformation();
-  HLoopInformation* loop3_info_before = loop3_header->GetLoopInformation();
+  HLoopInformation* loop2_info_before = header2->GetLoopInformation();
+  HLoopInformation* loop3_info_before = header3->GetLoopInformation();
 
   // Check nested loops structure.
-  CheckLoopStructureForLoopPeelingNested(loop1_header, loop2_header, loop3_header);
-  PeelUnrollSimpleHelper helper(loop1_header->GetLoopInformation(), /* induction_range= */ nullptr);
+  CheckLoopStructureForLoopPeelingNested(header1, header2, header3);
+  LoopClonerSimpleHelper helper(header1->GetLoopInformation(), /* induction_range= */ nullptr);
   helper.DoPeeling();
   // Check that nested loops structure has not changed after the transformation.
-  CheckLoopStructureForLoopPeelingNested(loop1_header, loop2_header, loop3_header);
+  CheckLoopStructureForLoopPeelingNested(header1, header2, header3);
 
   // Test that the loop info is preserved.
-  EXPECT_EQ(loop2_info_before, loop2_header->GetLoopInformation());
-  EXPECT_EQ(loop3_info_before, loop3_header->GetLoopInformation());
+  EXPECT_EQ(loop2_info_before, header2->GetLoopInformation());
+  EXPECT_EQ(loop3_info_before, header3->GetLoopInformation());
 
   EXPECT_EQ(loop3_info_before->GetPreHeader()->GetLoopInformation(), loop2_info_before);
   EXPECT_EQ(loop2_info_before->GetPreHeader()->GetLoopInformation(), nullptr);
@@ -513,46 +439,39 @@ TEST_F(SuperblockClonerTest, LoopPeelingNested) {
 
 // Checks that the loop population is correctly propagated after an inner loop is peeled.
 TEST_F(SuperblockClonerTest, OuterLoopPopulationAfterInnerPeeled) {
-  HBasicBlock* header = nullptr;
-  HBasicBlock* loop_body = nullptr;
-
-  InitGraph();
+  HBasicBlock* return_block = InitGraphAndParameters();
 
   // Create the following nested structure of loops
   //   Headers:  1 2 3        4
   //             [ [ [ ] ] ], [ ]
-  CreateBasicLoopControlFlow(entry_block_, return_block_, &header, &loop_body);
-  CreateBasicLoopDataFlow(header, loop_body);
-  HBasicBlock* loop1_header = header;
+  auto [preheader1, header1, body1_end] = CreateWhileLoop(return_block);
+  CreateBasicLoopDataFlow(header1, body1_end);
 
-  CreateBasicLoopControlFlow(header, header->GetSuccessors()[1], &header, &loop_body);
-  CreateBasicLoopDataFlow(header, loop_body);
-  HBasicBlock* loop2_header = header;
+  auto [preheader2, header2, body2_end] = CreateWhileLoop(body1_end);
+  CreateBasicLoopDataFlow(header2, body2_end);
 
-  CreateBasicLoopControlFlow(header, header->GetSuccessors()[1], &header, &loop_body);
-  CreateBasicLoopDataFlow(header, loop_body);
-  HBasicBlock* loop3_header = header;
+  auto [preheader3, header3, body3] = CreateWhileLoop(body2_end);
+  CreateBasicLoopDataFlow(header3, body3);
 
-  CreateBasicLoopControlFlow(loop1_header, return_block_, &header, &loop_body);
-  CreateBasicLoopDataFlow(header, loop_body);
-  HBasicBlock* loop4_header = header;
+  auto [preheader4, header4, body4] = CreateWhileLoop(return_block);
+  CreateBasicLoopDataFlow(header4, body4);
 
   graph_->BuildDominatorTree();
   EXPECT_TRUE(CheckGraph());
 
-  PeelUnrollSimpleHelper helper(loop3_header->GetLoopInformation(), /* induction_range= */ nullptr);
+  LoopClonerSimpleHelper helper(header3->GetLoopInformation(), /* induction_range= */ nullptr);
   helper.DoPeeling();
-  HLoopInformation* loop1 = loop1_header->GetLoopInformation();
-  HLoopInformation* loop2 = loop2_header->GetLoopInformation();
-  HLoopInformation* loop3 = loop3_header->GetLoopInformation();
-  HLoopInformation* loop4 = loop4_header->GetLoopInformation();
+  HLoopInformation* loop1 = header1->GetLoopInformation();
+  HLoopInformation* loop2 = header2->GetLoopInformation();
+  HLoopInformation* loop3 = header3->GetLoopInformation();
+  HLoopInformation* loop4 = header4->GetLoopInformation();
 
-  EXPECT_TRUE(loop1->Contains(*loop2_header));
-  EXPECT_TRUE(loop1->Contains(*loop3_header));
-  EXPECT_TRUE(loop1->Contains(*loop3_header->GetLoopInformation()->GetPreHeader()));
+  EXPECT_TRUE(loop1->Contains(*header2));
+  EXPECT_TRUE(loop1->Contains(*header3));
+  EXPECT_TRUE(loop1->Contains(*header3->GetLoopInformation()->GetPreHeader()));
 
   // Check that loop4 info has not been touched after local run of AnalyzeLoops.
-  EXPECT_EQ(loop4, loop4_header->GetLoopInformation());
+  EXPECT_EQ(loop4, header4->GetLoopInformation());
 
   EXPECT_TRUE(loop1->IsIn(*loop1));
   EXPECT_TRUE(loop2->IsIn(*loop1));
@@ -570,46 +489,39 @@ TEST_F(SuperblockClonerTest, OuterLoopPopulationAfterInnerPeeled) {
 // Checks the case when inner loop have an exit not to its immediate outer_loop but some other loop
 // in the hierarchy. Loop population information must be valid after loop peeling.
 TEST_F(SuperblockClonerTest, NestedCaseExitToOutermost) {
-  HBasicBlock* header = nullptr;
-  HBasicBlock* loop_body = nullptr;
-
-  InitGraph();
+  HBasicBlock* return_block = InitGraphAndParameters();
 
   // Create the following nested structure of loops then peel loop3.
   //   Headers:  1 2 3
   //             [ [ [ ] ] ]
-  CreateBasicLoopControlFlow(entry_block_, return_block_, &header, &loop_body);
-  CreateBasicLoopDataFlow(header, loop_body);
-  HBasicBlock* loop1_header = header;
-  HBasicBlock* loop_body1 = loop_body;
+  auto [preheader1, header1, body1_end] = CreateWhileLoop(return_block);
+  CreateBasicLoopDataFlow(header1, body1_end);
 
-  CreateBasicLoopControlFlow(header, header->GetSuccessors()[1], &header, &loop_body);
-  CreateBasicLoopDataFlow(header, loop_body);
+  auto [preheader2, header2, body2_end] = CreateWhileLoop(body1_end);
+  CreateBasicLoopDataFlow(header2, body2_end);
 
-  CreateBasicLoopControlFlow(header, header->GetSuccessors()[1], &header, &loop_body);
-  CreateBasicLoopDataFlow(header, loop_body);
-  HBasicBlock* loop3_header = header;
-  HBasicBlock* loop_body3 = loop_body;
+  auto [preheader3, header3, body3] = CreateWhileLoop(body2_end);
+  CreateBasicLoopDataFlow(header3, body3);
 
   // Change the loop3 - insert an exit which leads to loop1.
-  HBasicBlock* loop3_extra_if_block = new (GetAllocator()) HBasicBlock(graph_);
-  graph_->AddBlock(loop3_extra_if_block);
-  loop3_extra_if_block->AddInstruction(new (GetAllocator()) HIf(parameters_[0]));
+  HBasicBlock* loop3_extra_if_block = AddNewBlock();
+  MakeIf(loop3_extra_if_block, param_);
 
-  loop3_header->ReplaceSuccessor(loop_body3, loop3_extra_if_block);
-  loop3_extra_if_block->AddSuccessor(loop_body1);  // Long exit.
-  loop3_extra_if_block->AddSuccessor(loop_body3);
+  header3->ReplaceSuccessor(body3, loop3_extra_if_block);
+  // Note: After this, both edges to `body1_end` shall be critical edges.
+  loop3_extra_if_block->AddSuccessor(body1_end);  // Long exit.
+  loop3_extra_if_block->AddSuccessor(body3);
 
   graph_->BuildDominatorTree();
   EXPECT_TRUE(CheckGraph());
 
   HBasicBlock* loop3_long_exit = loop3_extra_if_block->GetSuccessors()[0];
-  EXPECT_TRUE(loop1_header->GetLoopInformation()->Contains(*loop3_long_exit));
+  EXPECT_TRUE(header1->GetLoopInformation()->Contains(*loop3_long_exit));
 
-  PeelUnrollSimpleHelper helper(loop3_header->GetLoopInformation(), /* induction_range= */ nullptr);
+  LoopClonerSimpleHelper helper(header3->GetLoopInformation(), /* induction_range= */ nullptr);
   helper.DoPeeling();
 
-  HLoopInformation* loop1 = loop1_header->GetLoopInformation();
+  HLoopInformation* loop1 = header1->GetLoopInformation();
   // Check that after the transformation the local area for CF adjustments has been chosen
   // correctly and loop population has been updated.
   loop3_long_exit = loop3_extra_if_block->GetSuccessors()[0];
@@ -617,19 +529,17 @@ TEST_F(SuperblockClonerTest, NestedCaseExitToOutermost) {
 
   EXPECT_EQ(helper.GetRegionToBeAdjusted(), loop1);
 
-  EXPECT_TRUE(loop1->Contains(*loop3_header));
-  EXPECT_TRUE(loop1->Contains(*loop3_header->GetLoopInformation()->GetPreHeader()));
+  EXPECT_TRUE(loop1->Contains(*header3));
+  EXPECT_TRUE(loop1->Contains(*header3->GetLoopInformation()->GetPreHeader()));
 
   EXPECT_TRUE(CheckGraph());
 }
 
 TEST_F(SuperblockClonerTest, FastCaseCheck) {
-  HBasicBlock* header = nullptr;
-  HBasicBlock* loop_body = nullptr;
-  ArenaAllocator* arena = graph_->GetAllocator();
+  ArenaAllocator* arena = GetAllocator();
 
-  InitGraph();
-  CreateBasicLoopControlFlow(entry_block_, return_block_, &header, &loop_body);
+  HBasicBlock* return_block = InitGraphAndParameters();
+  auto [preheader, header, loop_body] = CreateWhileLoop(return_block);
   CreateBasicLoopDataFlow(header, loop_body);
   graph_->BuildDominatorTree();
 
@@ -650,7 +560,7 @@ TEST_F(SuperblockClonerTest, FastCaseCheck) {
                                     &remap_incoming);
 
   // Insert some extra nodes and edges.
-  HBasicBlock* preheader = loop_info->GetPreHeader();
+  ASSERT_EQ(preheader, loop_info->GetPreHeader());
   orig_bb_set.SetBit(preheader->GetBlockId());
 
   // Adjust incoming edges.
@@ -683,39 +593,34 @@ TEST_F(SuperblockClonerTest, FindCommonLoop) {
   HBasicBlock* header = nullptr;
   HBasicBlock* loop_body = nullptr;
 
-  InitGraph();
+  HBasicBlock* return_block = InitGraphAndParameters();
 
   // Create the following nested structure of loops
   //   Headers:  1 2 3      4      5
   //             [ [ [ ] ], [ ] ], [ ]
-  CreateBasicLoopControlFlow(entry_block_, return_block_, &header, &loop_body);
-  CreateBasicLoopDataFlow(header, loop_body);
-  HBasicBlock* loop1_header = header;
+  auto [preheader1, header1, body1_end] = CreateWhileLoop(return_block);
+  CreateBasicLoopDataFlow(header1, body1_end);
 
-  CreateBasicLoopControlFlow(header, header->GetSuccessors()[1], &header, &loop_body);
-  CreateBasicLoopDataFlow(header, loop_body);
-  HBasicBlock* loop2_header = header;
+  auto [preheader2, header2, body2_end] = CreateWhileLoop(body1_end);
+  CreateBasicLoopDataFlow(header2, body2_end);
 
-  CreateBasicLoopControlFlow(header, header->GetSuccessors()[1], &header, &loop_body);
-  CreateBasicLoopDataFlow(header, loop_body);
-  HBasicBlock* loop3_header = header;
+  auto [preheader3, header3, body3] = CreateWhileLoop(body2_end);
+  CreateBasicLoopDataFlow(header3, body3);
 
-  CreateBasicLoopControlFlow(loop2_header, loop2_header->GetSuccessors()[0], &header, &loop_body);
-  CreateBasicLoopDataFlow(header, loop_body);
-  HBasicBlock* loop4_header = header;
+  auto [preheader4, header4, body4] = CreateWhileLoop(body1_end);
+  CreateBasicLoopDataFlow(header4, body4);
 
-  CreateBasicLoopControlFlow(loop1_header, return_block_, &header, &loop_body);
-  CreateBasicLoopDataFlow(header, loop_body);
-  HBasicBlock* loop5_header = header;
+  auto [preheader5, header5, body5] = CreateWhileLoop(return_block);
+  CreateBasicLoopDataFlow(header5, body5);
 
   graph_->BuildDominatorTree();
   EXPECT_TRUE(CheckGraph());
 
-  HLoopInformation* loop1 = loop1_header->GetLoopInformation();
-  HLoopInformation* loop2 = loop2_header->GetLoopInformation();
-  HLoopInformation* loop3 = loop3_header->GetLoopInformation();
-  HLoopInformation* loop4 = loop4_header->GetLoopInformation();
-  HLoopInformation* loop5 = loop5_header->GetLoopInformation();
+  HLoopInformation* loop1 = header1->GetLoopInformation();
+  HLoopInformation* loop2 = header2->GetLoopInformation();
+  HLoopInformation* loop3 = header3->GetLoopInformation();
+  HLoopInformation* loop4 = header4->GetLoopInformation();
+  HLoopInformation* loop5 = header5->GetLoopInformation();
 
   EXPECT_TRUE(loop1->IsIn(*loop1));
   EXPECT_TRUE(loop2->IsIn(*loop1));

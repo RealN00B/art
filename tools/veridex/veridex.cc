@@ -19,15 +19,17 @@
 #include <android-base/file.h>
 #include <android-base/strings.h>
 
+#include <cstdlib>
+#include <sstream>
+#include <string_view>
+
+#include "base/mem_map.h"
 #include "dex/dex_file.h"
 #include "dex/dex_file_loader.h"
 #include "hidden_api.h"
 #include "hidden_api_finder.h"
 #include "precise_hidden_api_finder.h"
 #include "resolver.h"
-
-#include <cstdlib>
-#include <sstream>
 
 namespace art {
 
@@ -88,30 +90,27 @@ static const char* Substr(const char* str, int index) {
   return str + index;
 }
 
-static bool StartsWith(const char* str, const char* val) {
-  return strlen(str) >= strlen(val) && memcmp(str, val, strlen(val)) == 0;
-}
-
 static void ParseArgs(VeridexOptions* options, int argc, char** argv) {
   // Skip over the command name.
   argv++;
   argc--;
 
   for (int i = 0; i < argc; ++i) {
-    if (StartsWith(argv[i], kDexFileOption)) {
+    std::string_view arg(argv[i]);
+    if (arg.starts_with(kDexFileOption)) {
       options->dex_file = Substr(argv[i], strlen(kDexFileOption));
-    } else if (StartsWith(argv[i], kStubsOption)) {
+    } else if (arg.starts_with(kStubsOption)) {
       options->core_stubs = Substr(argv[i], strlen(kStubsOption));
-    } else if (StartsWith(argv[i], kFlagsOption)) {
+    } else if (arg.starts_with(kFlagsOption)) {
       options->flags_file = Substr(argv[i], strlen(kFlagsOption));
     } else if (strcmp(argv[i], kImprecise) == 0) {
       options->precise = false;
-    } else if (StartsWith(argv[i], kTargetSdkVersion)) {
+    } else if (arg.starts_with(kTargetSdkVersion)) {
       options->target_sdk_version = atoi(Substr(argv[i], strlen(kTargetSdkVersion)));
-    } else if (StartsWith(argv[i], kAppClassFilter)) {
+    } else if (arg.starts_with(kAppClassFilter)) {
       options->app_class_name_filter = android::base::Split(
           Substr(argv[i], strlen(kAppClassFilter)), ",");
-    } else if (StartsWith(argv[i], kExcludeApiListsOption)) {
+    } else if (arg.starts_with(kExcludeApiListsOption)) {
       options->exclude_api_lists = android::base::Split(
           Substr(argv[i], strlen(kExcludeApiListsOption)), ",");
     } else {
@@ -296,23 +295,18 @@ class Veridex {
     }
 
     // TODO: once added, use an api to android::base to read a std::vector<uint8_t>.
-    if (!android::base::ReadFileToString(filename.c_str(), &content)) {
+    if (!android::base::ReadFileToString(filename, &content)) {
       *error_msg = "ReadFileToString failed for " + filename;
       return false;
     }
 
-    const DexFileLoader dex_file_loader;
     DexFileLoaderErrorCode error_code;
     static constexpr bool kVerifyChecksum = true;
     static constexpr bool kRunDexFileVerifier = true;
-    if (!dex_file_loader.OpenAll(reinterpret_cast<const uint8_t*>(content.data()),
-                                 content.size(),
-                                 filename.c_str(),
-                                 kRunDexFileVerifier,
-                                 kVerifyChecksum,
-                                 &error_code,
-                                 error_msg,
-                                 dex_files)) {
+    DexFileLoader dex_file_loader(
+        reinterpret_cast<const uint8_t*>(content.data()), content.size(), filename);
+    if (!dex_file_loader.Open(
+            kRunDexFileVerifier, kVerifyChecksum, &error_code, error_msg, dex_files)) {
       if (error_code == DexFileLoaderErrorCode::kEntryNotFound) {
         LOG(INFO) << "No .dex found, skipping analysis.";
         return true;
@@ -343,5 +337,6 @@ class Veridex {
 }  // namespace art
 
 int main(int argc, char** argv) {
+  art::MemMap::Init();
   return art::Veridex::Run(argc, argv);
 }

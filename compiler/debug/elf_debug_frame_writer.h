@@ -20,13 +20,14 @@
 #include <vector>
 
 #include "arch/instruction_set.h"
+#include "base/macros.h"
 #include "debug/method_debug_info.h"
 #include "dwarf/debug_frame_opcode_writer.h"
 #include "dwarf/dwarf_constants.h"
 #include "dwarf/headers.h"
 #include "elf/elf_builder.h"
 
-namespace art {
+namespace art HIDDEN {
 namespace debug {
 
 static constexpr bool kWriteDebugFrameHdr = false;
@@ -85,6 +86,29 @@ static void WriteCIE(InstructionSet isa, /*inout*/ std::vector<uint8_t>* buffer)
         }
       }
       auto return_reg = Reg::Arm64Core(30);  // R30(LR).
+      WriteCIE(is64bit, return_reg, opcodes, buffer);
+      return;
+    }
+    case InstructionSet::kRiscv64: {
+      dwarf::DebugFrameOpCodeWriter<> opcodes;
+      opcodes.DefCFA(Reg::Riscv64Core(2), 0);  // X2(SP).
+      // core registers.
+      for (int reg = 3; reg < 32; reg++) {  // Skip X0 (Zero), X1 (RA) and X2 (SP).
+        if ((reg >= 5 && reg < 8) || (reg >= 10 && reg < 18) || reg >= 28) {
+          opcodes.Undefined(Reg::Riscv64Core(reg));
+        } else {
+          opcodes.SameValue(Reg::Riscv64Core(reg));
+        }
+      }
+      // fp registers.
+      for (int reg = 0; reg < 32; reg++) {
+        if (reg < 8 || (reg >=10 && reg < 18) || reg >= 28) {
+          opcodes.Undefined(Reg::Riscv64Fp(reg));
+        } else {
+          opcodes.SameValue(Reg::Riscv64Fp(reg));
+        }
+      }
+      auto return_reg = Reg::Riscv64Core(1);  // X1(RA).
       WriteCIE(is64bit, return_reg, opcodes, buffer);
       return;
     }
@@ -150,8 +174,6 @@ static void WriteCIE(InstructionSet isa, /*inout*/ std::vector<uint8_t>* buffer)
 template<typename ElfTypes>
 void WriteCFISection(ElfBuilder<ElfTypes>* builder,
                      const ArrayRef<const MethodDebugInfo>& method_infos) {
-  typedef typename ElfTypes::Addr Elf_Addr;
-
   // The methods can be written in any order.
   // Let's therefore sort them in the lexicographical order of the opcodes.
   // This has no effect on its own. However, if the final .debug_frame section is
@@ -176,7 +198,8 @@ void WriteCFISection(ElfBuilder<ElfTypes>* builder,
       });
 
   std::vector<uint32_t> binary_search_table;
-  if (kWriteDebugFrameHdr) {
+  bool binary_search_table_is_valid = kWriteDebugFrameHdr;
+  if (binary_search_table_is_valid) {
     binary_search_table.reserve(2 * sorted_method_infos.size());
   }
 
@@ -192,10 +215,13 @@ void WriteCFISection(ElfBuilder<ElfTypes>* builder,
     for (const MethodDebugInfo* mi : sorted_method_infos) {
       DCHECK(!mi->deduped);
       DCHECK(!mi->cfi.empty());
-      const Elf_Addr code_address = mi->code_address +
+      uint64_t code_address = mi->code_address +
           (mi->is_code_address_text_relative ? builder->GetText()->GetAddress() : 0);
       if (kWriteDebugFrameHdr) {
-        binary_search_table.push_back(dchecked_integral_cast<uint32_t>(code_address));
+        // Defensively check that the code address really fits.
+        DCHECK_LE(code_address, std::numeric_limits<uint32_t>::max());
+        binary_search_table_is_valid &= code_address <= std::numeric_limits<uint32_t>::max();
+        binary_search_table.push_back(static_cast<uint32_t>(code_address));
         binary_search_table.push_back(cfi_section->GetPosition());
       }
       dwarf::WriteFDE(is64bit,
@@ -210,7 +236,7 @@ void WriteCFISection(ElfBuilder<ElfTypes>* builder,
     cfi_section->End();
   }
 
-  if (kWriteDebugFrameHdr && method_infos.size() > kMinDebugFrameHdrEntries) {
+  if (binary_search_table_is_valid && method_infos.size() >= kMinDebugFrameHdrEntries) {
     std::sort(binary_search_table.begin(), binary_search_table.end());
 
     // Custom Android section. It is very similar to the official .eh_frame_hdr format.
@@ -225,7 +251,8 @@ void WriteCFISection(ElfBuilder<ElfTypes>* builder,
     auto* header_section = builder->GetDebugFrameHdr();
     header_section->Start();
     header_section->WriteFully(header_buffer.data(), header_buffer.size());
-    header_section->WriteFully(binary_search_table.data(), binary_search_table.size());
+    header_section->WriteFully(binary_search_table.data(),
+                               binary_search_table.size() * sizeof(binary_search_table[0]));
     header_section->End();
   }
 }

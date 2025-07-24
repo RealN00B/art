@@ -18,12 +18,19 @@
 
 #include <gtest/gtest.h>
 
+#include <filesystem>
+#include <fstream>
+#include <optional>
+#include <vector>
+
+#include "android-base/stringprintf.h"
 #include "android-base/strings.h"
 #include "art_field-inl.h"
+#include "art_method-alloc-inl.h"
 #include "base/dchecked_vector.h"
 #include "base/stl_util.h"
 #include "class_linker.h"
-#include "class_root.h"
+#include "class_root-inl.h"
 #include "common_runtime_test.h"
 #include "dex/dex_file.h"
 #include "handle_scope-inl.h"
@@ -32,16 +39,33 @@
 #include "mirror/class_loader-inl.h"
 #include "mirror/object-inl.h"
 #include "mirror/object_array-alloc-inl.h"
-#include "oat_file_assistant.h"
+#include "oat/oat_file_assistant.h"
 #include "runtime.h"
 #include "scoped_thread_state_change-inl.h"
 #include "thread.h"
-#include "well_known_classes.h"
+#include "well_known_classes-inl.h"
 
-namespace art {
+namespace art HIDDEN {
 
 class ClassLoaderContextTest : public CommonRuntimeTest {
  public:
+  ClassLoaderContextTest() {
+    use_boot_image_ = true;  // Make the Runtime creation cheaper.
+  }
+
+  void SetUp() override {
+    CommonRuntimeTest::SetUp();
+    scratch_dir_ = std::make_unique<ScratchDir>();
+    scratch_path_ = scratch_dir_->GetPath();
+    // Remove the trailing '/';
+    scratch_path_.resize(scratch_path_.length() - 1);
+  }
+
+  void TearDown() override {
+    scratch_dir_.reset();
+    CommonRuntimeTest::TearDown();
+  }
+
   void VerifyContextSize(ClassLoaderContext* context, size_t expected_size) {
     ASSERT_TRUE(context != nullptr);
     ASSERT_EQ(expected_size, context->GetParentChainSize());
@@ -73,6 +97,15 @@ class ClassLoaderContextTest : public CommonRuntimeTest {
                                          size_t shared_library_index,
                                          const std::string& classpath) {
     VerifyClassLoaderInfoSL(
+        context, loader_index, shared_library_index, ClassLoaderContext::kPathClassLoader,
+        classpath);
+  }
+
+  void VerifyClassLoaderSharedLibraryPCLAfter(ClassLoaderContext* context,
+                                              size_t loader_index,
+                                              size_t shared_library_index,
+                                              const std::string& classpath) {
+    VerifyClassLoaderInfoSLAfter(
         context, loader_index, shared_library_index, ClassLoaderContext::kPathClassLoader,
         classpath);
   }
@@ -142,36 +175,73 @@ class ClassLoaderContextTest : public CommonRuntimeTest {
       ClassLoaderContext* context,
       size_t index,
       std::vector<std::unique_ptr<const DexFile>>* all_dex_files,
-      bool classpath_matches_dex_location = true) {
+      bool classpath_matches_dex_location = true,
+      bool only_read_checksums = false) {
     ASSERT_TRUE(context != nullptr);
-    ASSERT_TRUE(context->dex_files_open_attempted_);
-    ASSERT_TRUE(context->dex_files_open_result_);
+    if (only_read_checksums) {
+      ASSERT_EQ(context->dex_files_state_,
+                ClassLoaderContext::ContextDexFilesState::kDexFilesChecksumsRead);
+    } else {
+      ASSERT_EQ(context->dex_files_state_,
+                ClassLoaderContext::ContextDexFilesState::kDexFilesOpened);
+    }
     ClassLoaderContext::ClassLoaderInfo& info = *context->GetParent(index);
-    ASSERT_EQ(all_dex_files->size(), info.classpath.size());
-    ASSERT_EQ(all_dex_files->size(), info.opened_dex_files.size());
-    size_t cur_open_dex_index = 0;
-    for (size_t k = 0; k < all_dex_files->size(); k++) {
-      std::unique_ptr<const DexFile>& opened_dex_file =
-            info.opened_dex_files[cur_open_dex_index++];
-      std::unique_ptr<const DexFile>& expected_dex_file = (*all_dex_files)[k];
 
-      std::string expected_location = expected_dex_file->GetLocation();
+    std::vector<const DexFile*> primary_dex_files;
+    std::vector<std::optional<uint32_t>> primary_checksums;
+    for (size_t i = 0; i < all_dex_files->size();) {
+      primary_dex_files.push_back((*all_dex_files)[i].get());
+      primary_checksums.push_back(DexFileLoader::GetMultiDexChecksum(*all_dex_files, &i));
+    }
+    ASSERT_EQ(primary_dex_files.size(), info.classpath.size());
+    ASSERT_EQ(primary_dex_files.size(), info.checksums.size());
 
-      const std::string& opened_location = opened_dex_file->GetLocation();
-      if (!IsAbsoluteLocation(opened_location)) {
-        // If the opened location is relative (it was open from a relative path without a
-        // classpath_dir) it might not match the expected location which is absolute in tests).
-        // So we compare the endings (the checksum will validate it's actually the same file).
-        ASSERT_EQ(0, expected_location.compare(
-            expected_location.length() - opened_location.length(),
-            opened_location.length(),
-            opened_location));
-      } else {
-        ASSERT_EQ(expected_location, opened_location);
+    if (only_read_checksums) {
+      ASSERT_EQ(0u, info.opened_dex_files.size());
+      for (size_t k = 0; k < primary_dex_files.size(); k++) {
+        const std::string& opened_location = info.classpath[k];
+        uint32_t opened_checksum = info.checksums[k];
+
+        const DexFile* expected_dex_file = primary_dex_files[k];
+        std::string expected_location = expected_dex_file->GetLocation();
+
+        if (!IsAbsoluteLocation(opened_location)) {
+          // If the opened location is relative (it was open from a relative path without a
+          // classpath_dir) it might not match the expected location which is absolute in tests).
+          // So we compare the endings (the checksum will validate it's actually the same file).
+          ASSERT_TRUE(expected_location.ends_with(opened_location))
+              << expected_location << " " << opened_location;
+        } else {
+          ASSERT_EQ(expected_location, opened_location);
+        }
+        ASSERT_EQ(primary_checksums[k], opened_checksum);
+        if (classpath_matches_dex_location) {
+          ASSERT_EQ(info.classpath[k], opened_location);
+        }
       }
-      ASSERT_EQ(expected_dex_file->GetLocationChecksum(), opened_dex_file->GetLocationChecksum());
-      if (classpath_matches_dex_location) {
-        ASSERT_EQ(info.classpath[k], opened_location);
+    } else {
+      ASSERT_EQ(all_dex_files->size(), info.opened_dex_files.size());
+
+      for (size_t k = 0; k < all_dex_files->size(); k++) {
+        const std::string& opened_location = info.opened_dex_files[k]->GetLocation();
+        uint32_t opened_checksum = info.opened_dex_files[k]->GetLocationChecksum();
+
+        std::unique_ptr<const DexFile>& expected_dex_file = (*all_dex_files)[k];
+        std::string expected_location = expected_dex_file->GetLocation();
+
+        if (!IsAbsoluteLocation(opened_location)) {
+          // If the opened location is relative (it was open from a relative path without a
+          // classpath_dir) it might not match the expected location which is absolute in tests).
+          // So we compare the endings (the checksum will validate it's actually the same file).
+          ASSERT_TRUE(expected_location.ends_with(opened_location))
+              << expected_location << " " << opened_location;
+        } else {
+          ASSERT_EQ(expected_location, opened_location);
+        }
+        ASSERT_EQ(expected_dex_file->GetLocationChecksum(), opened_checksum);
+        if (classpath_matches_dex_location) {
+          ASSERT_EQ(info.classpath[k], opened_location);
+        }
       }
     }
   }
@@ -190,20 +260,18 @@ class ClassLoaderContextTest : public CommonRuntimeTest {
 
   void VerifyContextForClassLoader(ClassLoaderContext* context) {
     ASSERT_TRUE(context != nullptr);
-    ASSERT_TRUE(context->dex_files_open_attempted_);
-    ASSERT_TRUE(context->dex_files_open_result_);
+    ASSERT_EQ(context->dex_files_state_, ClassLoaderContext::ContextDexFilesState::kDexFilesOpened);
     ASSERT_FALSE(context->owns_the_dex_files_);
-    ASSERT_FALSE(context->special_shared_library_);
   }
 
-  void VerifyClassLoaderDexFiles(ScopedObjectAccess& soa,
+  void VerifyClassLoaderDexFiles(Thread* self,
                                  Handle<mirror::ClassLoader> class_loader,
-                                 jclass type,
+                                 ObjPtr<mirror::Class> type,
                                  std::vector<const DexFile*>& expected_dex_files)
       REQUIRES_SHARED(Locks::mutator_lock_) {
-    ASSERT_TRUE(class_loader->GetClass() == soa.Decode<mirror::Class>(type));
+    ASSERT_TRUE(class_loader->GetClass() == type);
 
-    std::vector<const DexFile*> class_loader_dex_files = GetDexFiles(soa, class_loader);
+    std::vector<const DexFile*> class_loader_dex_files = GetDexFiles(self, class_loader);
     ASSERT_EQ(expected_dex_files.size(), class_loader_dex_files.size());
 
     for (size_t i = 0; i < expected_dex_files.size(); i++) {
@@ -215,9 +283,110 @@ class ClassLoaderContextTest : public CommonRuntimeTest {
   }
 
   void PretendContextOpenedDexFiles(ClassLoaderContext* context) {
-    context->dex_files_open_attempted_ = true;
-    context->dex_files_open_result_ = true;
+    context->dex_files_state_ = ClassLoaderContext::ContextDexFilesState::kDexFilesOpened;
   }
+
+  void PretendContextOpenedDexFilesForChecksums(ClassLoaderContext* context) {
+    context->dex_files_state_ = ClassLoaderContext::ContextDexFilesState::kDexFilesChecksumsRead;
+  }
+
+  void TestOpenDexFiles(bool only_read_checksums) {
+    std::string multidex_name = GetTestDexFileName("MultiDex");
+    std::string myclass_dex_name = GetTestDexFileName("MyClass");
+    std::string dex_name = GetTestDexFileName("Main");
+
+    std::unique_ptr<ClassLoaderContext> context =
+        ClassLoaderContext::Create(
+            "PCL[" + multidex_name + ":" + myclass_dex_name + "];" +
+            "DLC[" + dex_name + "]");
+
+    ASSERT_TRUE(context->OpenDexFiles(
+        /*classpath_dir=*/ "",
+        /*context_fds=*/ std::vector<int>(),
+        only_read_checksums));
+
+    VerifyContextSize(context.get(), 2);
+
+    std::vector<std::unique_ptr<const DexFile>> all_dex_files0 = OpenTestDexFiles("MultiDex");
+    std::vector<std::unique_ptr<const DexFile>> myclass_dex_files = OpenTestDexFiles("MyClass");
+    for (size_t i = 0; i < myclass_dex_files.size(); i++) {
+      all_dex_files0.emplace_back(myclass_dex_files[i].release());
+    }
+    VerifyOpenDexFiles(context.get(),
+                       /*index=*/ 0,
+                       &all_dex_files0,
+                       /*classpath_matches_dex_location=*/ false,
+                       only_read_checksums);
+    std::vector<std::unique_ptr<const DexFile>> all_dex_files1 = OpenTestDexFiles("Main");
+    VerifyOpenDexFiles(context.get(),
+                       /*index=*/ 1,
+                       &all_dex_files1,
+                       /*classpath_matches_dex_location=*/ false,
+                       only_read_checksums);
+  }
+
+  void TestOpenValidDexFilesRelative(bool use_classpath_dir, bool only_read_checksums) {
+    char cwd_buf[4096];
+    if (getcwd(cwd_buf, arraysize(cwd_buf)) == nullptr) {
+      PLOG(FATAL) << "Could not get working directory";
+    }
+    std::string multidex_name;
+    std::string myclass_dex_name;
+    std::string dex_name;
+    if (!CreateRelativeString(GetTestDexFileName("MultiDex"), cwd_buf, &multidex_name) ||
+        !CreateRelativeString(GetTestDexFileName("MyClass"), cwd_buf, &myclass_dex_name) ||
+        !CreateRelativeString(GetTestDexFileName("Main"), cwd_buf, &dex_name)) {
+      LOG(ERROR) << "Test OpenValidDexFilesRelative cannot be run because target dex files have no "
+                << "relative path.";
+      SUCCEED();
+      return;
+    }
+
+    std::unique_ptr<ClassLoaderContext> context =
+        ClassLoaderContext::Create(
+            "PCL[" + multidex_name + ":" + myclass_dex_name + "];" +
+            "DLC[" + dex_name + "]");
+
+    ASSERT_TRUE(context->OpenDexFiles(
+        /*classpath_dir=*/ use_classpath_dir ? cwd_buf : "",
+        /*context_fds=*/ std::vector<int>(),
+        only_read_checksums));
+    VerifyContextSize(context.get(), 2);
+
+    std::vector<std::unique_ptr<const DexFile>> all_dex_files0 = OpenTestDexFiles("MultiDex");
+    std::vector<std::unique_ptr<const DexFile>> myclass_dex_files = OpenTestDexFiles("MyClass");
+    for (size_t i = 0; i < myclass_dex_files.size(); i++) {
+      all_dex_files0.emplace_back(myclass_dex_files[i].release());
+    }
+    VerifyOpenDexFiles(context.get(),
+                       /*index=*/ 0,
+                       &all_dex_files0,
+                       /*classpath_matches_dex_location=*/ false,
+                       only_read_checksums);
+
+    std::vector<std::unique_ptr<const DexFile>> all_dex_files1 = OpenTestDexFiles("Main");
+    VerifyOpenDexFiles(context.get(),
+                       /*index=*/ 1,
+                       &all_dex_files1,
+                       /*classpath_matches_dex_location=*/ false,
+                       only_read_checksums);
+  }
+
+  // Creates a relative path from cwd to 'in'. Returns false if it cannot be done.
+  // TODO We should somehow support this in all situations. b/72042237.
+  bool CreateRelativeString(const std::string& in, const char* cwd, std::string* out) {
+    int cwd_len = strlen(cwd);
+    if (!in.starts_with(cwd) || (cwd_len < 1)) {
+      return false;
+    }
+    bool contains_trailing_slash = (cwd[cwd_len - 1] == '/');
+    int start_position = cwd_len + (contains_trailing_slash ? 0 : 1);
+    *out = in.substr(start_position);
+    return true;
+  }
+
+  std::unique_ptr<ScratchDir> scratch_dir_;
+  std::string scratch_path_;
 
  private:
   void VerifyClassLoaderInfo(ClassLoaderContext* context,
@@ -244,7 +413,25 @@ class ClassLoaderContextTest : public CommonRuntimeTest {
     ASSERT_GT(info.shared_libraries.size(), shared_library_index);
     const ClassLoaderContext::ClassLoaderInfo& sl =
         *info.shared_libraries[shared_library_index].get();
-    ASSERT_EQ(type, info.type);
+    ASSERT_EQ(type, sl.type);
+    std::vector<std::string> expected_classpath;
+    Split(classpath, ':', &expected_classpath);
+    ASSERT_EQ(expected_classpath, sl.classpath);
+  }
+
+  void VerifyClassLoaderInfoSLAfter(ClassLoaderContext* context,
+                               size_t loader_index,
+                               size_t shared_library_index,
+                               ClassLoaderContext::ClassLoaderType type,
+                               const std::string& classpath) {
+    ASSERT_TRUE(context != nullptr);
+    ASSERT_GT(context->GetParentChainSize(), loader_index);
+    const ClassLoaderContext::ClassLoaderInfo& info = *context->GetParent(loader_index);
+    ASSERT_GT(info.shared_libraries_after.size(), shared_library_index);
+
+    const ClassLoaderContext::ClassLoaderInfo& sl =
+        *info.shared_libraries_after[shared_library_index].get();
+    ASSERT_EQ(type, sl.type);
     std::vector<std::string> expected_classpath;
     Split(classpath, ':', &expected_classpath);
     ASSERT_EQ(expected_classpath, sl.classpath);
@@ -277,10 +464,10 @@ TEST_F(ClassLoaderContextTest, ParseValidEmptyContext) {
   VerifyClassLoaderPCL(context.get(), 0, "");
 }
 
-TEST_F(ClassLoaderContextTest, ParseValidSharedLibraryContext) {
+TEST_F(ClassLoaderContextTest, ParseInvalidSharedLibraryContext) {
+  // '&' used to be a special context.
   std::unique_ptr<ClassLoaderContext> context = ClassLoaderContext::Create("&");
-  // An shared library context should have no class loader in the chain.
-  VerifyContextSize(context.get(), 0);
+  ASSERT_TRUE(context == nullptr);
 }
 
 TEST_F(ClassLoaderContextTest, ParseValidContextPCL) {
@@ -325,10 +512,13 @@ TEST_F(ClassLoaderContextTest, ParseValidContextChain) {
 
 TEST_F(ClassLoaderContextTest, ParseSharedLibraries) {
   std::unique_ptr<ClassLoaderContext> context = ClassLoaderContext::Create(
-      "PCL[a.dex:b.dex]{PCL[s1.dex]#PCL[s2.dex:s3.dex]};DLC[c.dex:d.dex]{DLC[s4.dex]}");
+      "PCL[a.dex:b.dex]{PCL[s1.dex]#PCL[s2.dex:s3.dex]#~PCL[s5.dex]#~PCL[s6.dex:s7.dex]};"
+      "DLC[c.dex:d.dex]{DLC[s4.dex]}");
   VerifyContextSize(context.get(), 2);
   VerifyClassLoaderSharedLibraryPCL(context.get(), 0, 0, "s1.dex");
   VerifyClassLoaderSharedLibraryPCL(context.get(), 0, 1, "s2.dex:s3.dex");
+  VerifyClassLoaderSharedLibraryPCLAfter(context.get(), 0, 0, "s5.dex");
+  VerifyClassLoaderSharedLibraryPCLAfter(context.get(), 0, 1, "s6.dex:s7.dex");
   VerifyClassLoaderDLC(context.get(), 1, "c.dex:d.dex");
   VerifyClassLoaderSharedLibraryDLC(context.get(), 1, 0, "s4.dex");
 }
@@ -373,12 +563,6 @@ TEST_F(ClassLoaderContextTest, ParseValidEmptyContextSharedLibrary) {
   VerifySharedLibrariesSize(context.get(), 0, 0);
 }
 
-TEST_F(ClassLoaderContextTest, ParseValidContextSpecialSymbol) {
-  std::unique_ptr<ClassLoaderContext> context =
-    ClassLoaderContext::Create(OatFile::kSpecialSharedLibrary);
-  VerifyContextSize(context.get(), 0);
-}
-
 TEST_F(ClassLoaderContextTest, ParseInvalidValidContexts) {
   ASSERT_TRUE(nullptr == ClassLoaderContext::Create("ABC[a.dex]"));
   ASSERT_TRUE(nullptr == ClassLoaderContext::Create("PCL"));
@@ -401,123 +585,58 @@ TEST_F(ClassLoaderContextTest, OpenInvalidDexFiles) {
   std::unique_ptr<ClassLoaderContext> context =
       ClassLoaderContext::Create("PCL[does_not_exist.dex]");
   VerifyContextSize(context.get(), 1);
-  ASSERT_FALSE(context->OpenDexFiles(InstructionSet::kArm, "."));
+  ASSERT_FALSE(context->OpenDexFiles("."));
+}
+
+TEST_F(ClassLoaderContextTest, ReadChecksumsInvalidDexFiles) {
+  std::unique_ptr<ClassLoaderContext> context =
+      ClassLoaderContext::Create("PCL[does_not_exist.dex]");
+  VerifyContextSize(context.get(), 1);
+  ASSERT_FALSE(context->OpenDexFiles(
+        /*classpath_dir=*/ ".",
+        /*context_fds=*/ std::vector<int>(),
+        /*only_read_checksums=*/ true));
 }
 
 TEST_F(ClassLoaderContextTest, OpenValidDexFiles) {
-  std::string multidex_name = GetTestDexFileName("MultiDex");
-  std::string myclass_dex_name = GetTestDexFileName("MyClass");
-  std::string dex_name = GetTestDexFileName("Main");
-
-
-  std::unique_ptr<ClassLoaderContext> context =
-      ClassLoaderContext::Create(
-          "PCL[" + multidex_name + ":" + myclass_dex_name + "];" +
-          "DLC[" + dex_name + "]");
-
-  ASSERT_TRUE(context->OpenDexFiles(InstructionSet::kArm, /*classpath_dir=*/ ""));
-
-  VerifyContextSize(context.get(), 2);
-
-  std::vector<std::unique_ptr<const DexFile>> all_dex_files0 = OpenTestDexFiles("MultiDex");
-  std::vector<std::unique_ptr<const DexFile>> myclass_dex_files = OpenTestDexFiles("MyClass");
-  for (size_t i = 0; i < myclass_dex_files.size(); i++) {
-    all_dex_files0.emplace_back(myclass_dex_files[i].release());
-  }
-  VerifyOpenDexFiles(context.get(), 0, &all_dex_files0);
-
-  std::vector<std::unique_ptr<const DexFile>> all_dex_files1 = OpenTestDexFiles("Main");
-  VerifyOpenDexFiles(context.get(), 1, &all_dex_files1);
+  TestOpenDexFiles(/*only_read_checksums=*/ false);
 }
 
-// Creates a relative path from cwd to 'in'. Returns false if it cannot be done.
-// TODO We should somehow support this in all situations. b/72042237.
-static bool CreateRelativeString(const std::string& in, const char* cwd, std::string* out) {
-  int cwd_len = strlen(cwd);
-  if (!android::base::StartsWith(in, cwd) || (cwd_len < 1)) {
-    return false;
-  }
-  bool contains_trailing_slash = (cwd[cwd_len - 1] == '/');
-  int start_position = cwd_len + (contains_trailing_slash ? 0 : 1);
-  *out = in.substr(start_position);
-  return true;
+TEST_F(ClassLoaderContextTest, ReadDexFileChecksums) {
+  TestOpenDexFiles(/*only_read_checksums=*/ true);
 }
 
 TEST_F(ClassLoaderContextTest, OpenValidDexFilesRelative) {
-  char cwd_buf[4096];
-  if (getcwd(cwd_buf, arraysize(cwd_buf)) == nullptr) {
-    PLOG(FATAL) << "Could not get working directory";
-  }
-  std::string multidex_name;
-  std::string myclass_dex_name;
-  std::string dex_name;
-  if (!CreateRelativeString(GetTestDexFileName("MultiDex"), cwd_buf, &multidex_name) ||
-      !CreateRelativeString(GetTestDexFileName("MyClass"), cwd_buf, &myclass_dex_name) ||
-      !CreateRelativeString(GetTestDexFileName("Main"), cwd_buf, &dex_name)) {
-    LOG(ERROR) << "Test OpenValidDexFilesRelative cannot be run because target dex files have no "
-               << "relative path.";
-    SUCCEED();
-    return;
-  }
+  TestOpenValidDexFilesRelative(/*use_classpath_dir=*/ false, /*only_read_checksums=*/ false);
+}
 
-  std::unique_ptr<ClassLoaderContext> context =
-      ClassLoaderContext::Create(
-          "PCL[" + multidex_name + ":" + myclass_dex_name + "];" +
-          "DLC[" + dex_name + "]");
-
-  ASSERT_TRUE(context->OpenDexFiles(InstructionSet::kArm, /*classpath_dir=*/ ""));
-
-  std::vector<std::unique_ptr<const DexFile>> all_dex_files0 = OpenTestDexFiles("MultiDex");
-  std::vector<std::unique_ptr<const DexFile>> myclass_dex_files = OpenTestDexFiles("MyClass");
-  for (size_t i = 0; i < myclass_dex_files.size(); i++) {
-    all_dex_files0.emplace_back(myclass_dex_files[i].release());
-  }
-  VerifyOpenDexFiles(context.get(), 0, &all_dex_files0);
-
-  std::vector<std::unique_ptr<const DexFile>> all_dex_files1 = OpenTestDexFiles("Main");
-  VerifyOpenDexFiles(context.get(), 1, &all_dex_files1);
+TEST_F(ClassLoaderContextTest, ReadChecksumsValidDexFilesRelative) {
+  TestOpenValidDexFilesRelative(/*use_classpath_dir=*/ false, /*only_read_checksums=*/ true);
 }
 
 TEST_F(ClassLoaderContextTest, OpenValidDexFilesClasspathDir) {
-  char cwd_buf[4096];
-  if (getcwd(cwd_buf, arraysize(cwd_buf)) == nullptr) {
-    PLOG(FATAL) << "Could not get working directory";
-  }
-  std::string multidex_name;
-  std::string myclass_dex_name;
-  std::string dex_name;
-  if (!CreateRelativeString(GetTestDexFileName("MultiDex"), cwd_buf, &multidex_name) ||
-      !CreateRelativeString(GetTestDexFileName("MyClass"), cwd_buf, &myclass_dex_name) ||
-      !CreateRelativeString(GetTestDexFileName("Main"), cwd_buf, &dex_name)) {
-    LOG(ERROR) << "Test OpenValidDexFilesClasspathDir cannot be run because target dex files have "
-               << "no relative path.";
-    SUCCEED();
-    return;
-  }
-  std::unique_ptr<ClassLoaderContext> context =
-      ClassLoaderContext::Create(
-          "PCL[" + multidex_name + ":" + myclass_dex_name + "];" +
-          "DLC[" + dex_name + "]");
+  TestOpenValidDexFilesRelative(/*use_classpath_dir=*/ true, /*only_read_checksums=*/ false);
+}
 
-  ASSERT_TRUE(context->OpenDexFiles(InstructionSet::kArm, cwd_buf));
-
-  VerifyContextSize(context.get(), 2);
-  std::vector<std::unique_ptr<const DexFile>> all_dex_files0 = OpenTestDexFiles("MultiDex");
-  std::vector<std::unique_ptr<const DexFile>> myclass_dex_files = OpenTestDexFiles("MyClass");
-  for (size_t i = 0; i < myclass_dex_files.size(); i++) {
-    all_dex_files0.emplace_back(myclass_dex_files[i].release());
-  }
-  VerifyOpenDexFiles(context.get(), 0, &all_dex_files0);
-
-  std::vector<std::unique_ptr<const DexFile>> all_dex_files1 = OpenTestDexFiles("Main");
-  VerifyOpenDexFiles(context.get(), 1, &all_dex_files1);
+TEST_F(ClassLoaderContextTest, ReadChecksumsValidDexFilesClasspathDir) {
+  TestOpenValidDexFilesRelative(/*use_classpath_dir=*/ true, /*only_read_checksums=*/ true);
 }
 
 TEST_F(ClassLoaderContextTest, OpenInvalidDexFilesMix) {
   std::string dex_name = GetTestDexFileName("Main");
   std::unique_ptr<ClassLoaderContext> context =
       ClassLoaderContext::Create("PCL[does_not_exist.dex];DLC[" + dex_name + "]");
-  ASSERT_FALSE(context->OpenDexFiles(InstructionSet::kArm, ""));
+  ASSERT_FALSE(context->OpenDexFiles());
+}
+
+TEST_F(ClassLoaderContextTest, ReadChecksumsInvalidDexFilesMix) {
+  std::string dex_name = GetTestDexFileName("Main");
+  std::unique_ptr<ClassLoaderContext> context =
+      ClassLoaderContext::Create("PCL[does_not_exist.dex];DLC[" + dex_name + "]");
+  ASSERT_FALSE(context->OpenDexFiles(
+      /*classpath_dir=*/ "",
+      /*context_fds=*/ std::vector<int>(),
+      /*only_read_checksums=*/ true));
 }
 
 TEST_F(ClassLoaderContextTest, OpenDexFilesForIMCFails) {
@@ -526,14 +645,47 @@ TEST_F(ClassLoaderContextTest, OpenDexFilesForIMCFails) {
 
   context = ParseContextWithChecksums("IMC[<unknown>*111]");
   VerifyContextSize(context.get(), 1);
-  ASSERT_FALSE(context->OpenDexFiles(InstructionSet::kArm, "."));
+  ASSERT_FALSE(context->OpenDexFiles("."));
+}
+
+// Verify that we can fully open the dex files after only reading their checksums.
+TEST_F(ClassLoaderContextTest, SubsequentOpenDexFilesOperations) {
+  std::string dex_name = GetTestDexFileName("Main");
+  std::unique_ptr<ClassLoaderContext> context =
+      ClassLoaderContext::Create("PCL[" + dex_name + "]");
+
+  std::vector<std::unique_ptr<const DexFile>> all_dex_files0 = OpenTestDexFiles("Main");
+
+  ASSERT_TRUE(context->OpenDexFiles(
+      /*classpath_dir=*/ "",
+      /*context_fds=*/ std::vector<int>(),
+      /*only_read_checksums=*/ true));
+
+  VerifyOpenDexFiles(
+      context.get(),
+      /*index=*/ 0,
+      &all_dex_files0,
+      /*classpath_matches_dex_location=*/ false,
+      /*only_read_checksums=*/ true);
+
+  ASSERT_TRUE(context->OpenDexFiles(
+      /*classpath_dir=*/ "",
+      /*context_fds=*/ std::vector<int>(),
+      /*only_read_checksums=*/ false));
+
+  VerifyOpenDexFiles(
+      context.get(),
+      /*index=*/ 0,
+      &all_dex_files0,
+      /*classpath_matches_dex_location=*/ false,
+      /*only_read_checksums=*/ false);
 }
 
 TEST_F(ClassLoaderContextTest, CreateClassLoader) {
   std::string dex_name = GetTestDexFileName("Main");
   std::unique_ptr<ClassLoaderContext> context =
       ClassLoaderContext::Create("PCL[" + dex_name + "]");
-  ASSERT_TRUE(context->OpenDexFiles(InstructionSet::kArm, ""));
+  ASSERT_TRUE(context->OpenDexFiles());
 
   std::vector<std::unique_ptr<const DexFile>> classpath_dex = OpenTestDexFiles("Main");
   std::vector<std::unique_ptr<const DexFile>> compilation_sources = OpenTestDexFiles("MultiDex");
@@ -549,10 +701,9 @@ TEST_F(ClassLoaderContextTest, CreateClassLoader) {
   Handle<mirror::ClassLoader> class_loader = hs.NewHandle(
       soa.Decode<mirror::ClassLoader>(jclass_loader));
 
-  ASSERT_TRUE(class_loader->GetClass() ==
-      soa.Decode<mirror::Class>(WellKnownClasses::dalvik_system_PathClassLoader));
+  ASSERT_TRUE(class_loader->GetClass() == WellKnownClasses::dalvik_system_PathClassLoader);
   ASSERT_TRUE(class_loader->GetParent()->GetClass() ==
-      soa.Decode<mirror::Class>(WellKnownClasses::java_lang_BootClassLoader));
+      WellKnownClasses::java_lang_BootClassLoader);
 
   // For the first class loader the class path dex files must come first and then the
   // compilation sources.
@@ -561,16 +712,16 @@ TEST_F(ClassLoaderContextTest, CreateClassLoader) {
     expected_classpath.push_back(dex);
   }
 
-  VerifyClassLoaderDexFiles(soa,
+  VerifyClassLoaderDexFiles(soa.Self(),
                             class_loader,
-                            WellKnownClasses::dalvik_system_PathClassLoader,
+                            WellKnownClasses::dalvik_system_PathClassLoader.Get(),
                             expected_classpath);
 }
 
 TEST_F(ClassLoaderContextTest, CreateClassLoaderWithEmptyContext) {
   std::unique_ptr<ClassLoaderContext> context =
       ClassLoaderContext::Create("");
-  ASSERT_TRUE(context->OpenDexFiles(InstructionSet::kArm, ""));
+  ASSERT_TRUE(context->OpenDexFiles());
 
   std::vector<std::unique_ptr<const DexFile>> compilation_sources = OpenTestDexFiles("MultiDex");
 
@@ -586,40 +737,12 @@ TEST_F(ClassLoaderContextTest, CreateClassLoaderWithEmptyContext) {
       soa.Decode<mirror::ClassLoader>(jclass_loader));
 
   // An empty context should create a single PathClassLoader with only the compilation sources.
-  VerifyClassLoaderDexFiles(soa,
+  VerifyClassLoaderDexFiles(soa.Self(),
                             class_loader,
-                            WellKnownClasses::dalvik_system_PathClassLoader,
+                            WellKnownClasses::dalvik_system_PathClassLoader.Get(),
                             compilation_sources_raw);
   ASSERT_TRUE(class_loader->GetParent()->GetClass() ==
-      soa.Decode<mirror::Class>(WellKnownClasses::java_lang_BootClassLoader));
-}
-
-TEST_F(ClassLoaderContextTest, CreateClassLoaderWithSharedLibraryContext) {
-  std::unique_ptr<ClassLoaderContext> context = ClassLoaderContext::Create("&");
-
-  ASSERT_TRUE(context->OpenDexFiles(InstructionSet::kArm, ""));
-
-  std::vector<std::unique_ptr<const DexFile>> compilation_sources = OpenTestDexFiles("MultiDex");
-
-  std::vector<const DexFile*> compilation_sources_raw =
-      MakeNonOwningPointerVector(compilation_sources);
-  jobject jclass_loader = context->CreateClassLoader(compilation_sources_raw);
-  ASSERT_TRUE(jclass_loader != nullptr);
-
-  ScopedObjectAccess soa(Thread::Current());
-
-  StackHandleScope<1> hs(soa.Self());
-  Handle<mirror::ClassLoader> class_loader = hs.NewHandle(
-      soa.Decode<mirror::ClassLoader>(jclass_loader));
-
-  // A shared library context should create a single PathClassLoader with only the compilation
-  // sources.
-  VerifyClassLoaderDexFiles(soa,
-      class_loader,
-      WellKnownClasses::dalvik_system_PathClassLoader,
-      compilation_sources_raw);
-  ASSERT_TRUE(class_loader->GetParent()->GetClass() ==
-  soa.Decode<mirror::Class>(WellKnownClasses::java_lang_BootClassLoader));
+      WellKnownClasses::java_lang_BootClassLoader);
 }
 
 TEST_F(ClassLoaderContextTest, CreateClassLoaderWithComplexChain) {
@@ -635,7 +758,7 @@ TEST_F(ClassLoaderContextTest, CreateClassLoaderWithComplexChain) {
       "PCL[" + CreateClassPath(classpath_dex_d) + "]";
 
   std::unique_ptr<ClassLoaderContext> context = ClassLoaderContext::Create(context_spec);
-  ASSERT_TRUE(context->OpenDexFiles(InstructionSet::kArm, ""));
+  ASSERT_TRUE(context->OpenDexFiles());
 
   // Setup the compilation sources.
   std::vector<std::unique_ptr<const DexFile>> compilation_sources = OpenTestDexFiles("MultiDex");
@@ -665,31 +788,31 @@ TEST_F(ClassLoaderContextTest, CreateClassLoaderWithComplexChain) {
   for (auto& dex : compilation_sources_raw) {
     class_loader_1_dex_files.push_back(dex);
   }
-  VerifyClassLoaderDexFiles(soa,
+  VerifyClassLoaderDexFiles(soa.Self(),
                             class_loader_1,
-                            WellKnownClasses::dalvik_system_PathClassLoader,
+                            WellKnownClasses::dalvik_system_PathClassLoader.Get(),
                             class_loader_1_dex_files);
 
   // Verify the second class loader
   Handle<mirror::ClassLoader> class_loader_2 = hs.NewHandle(class_loader_1->GetParent());
   std::vector<const DexFile*> class_loader_2_dex_files =
       MakeNonOwningPointerVector(classpath_dex_c);
-  VerifyClassLoaderDexFiles(soa,
+  VerifyClassLoaderDexFiles(soa.Self(),
                             class_loader_2,
-                            WellKnownClasses::dalvik_system_DelegateLastClassLoader,
+                            WellKnownClasses::dalvik_system_DelegateLastClassLoader.Get(),
                             class_loader_2_dex_files);
 
   // Verify the third class loader
   Handle<mirror::ClassLoader> class_loader_3 = hs.NewHandle(class_loader_2->GetParent());
   std::vector<const DexFile*> class_loader_3_dex_files =
       MakeNonOwningPointerVector(classpath_dex_d);
-  VerifyClassLoaderDexFiles(soa,
+  VerifyClassLoaderDexFiles(soa.Self(),
                             class_loader_3,
-                            WellKnownClasses::dalvik_system_PathClassLoader,
+                            WellKnownClasses::dalvik_system_PathClassLoader.Get(),
                             class_loader_3_dex_files);
   // The last class loader should have the BootClassLoader as a parent.
   ASSERT_TRUE(class_loader_3->GetParent()->GetClass() ==
-      soa.Decode<mirror::Class>(WellKnownClasses::java_lang_BootClassLoader));
+      WellKnownClasses::java_lang_BootClassLoader);
 }
 
 TEST_F(ClassLoaderContextTest, CreateClassLoaderWithSharedLibraries) {
@@ -705,7 +828,7 @@ TEST_F(ClassLoaderContextTest, CreateClassLoaderWithSharedLibraries) {
       "PCL[" + CreateClassPath(classpath_dex_d) + "]}";
 
   std::unique_ptr<ClassLoaderContext> context = ClassLoaderContext::Create(context_spec);
-  ASSERT_TRUE(context->OpenDexFiles(InstructionSet::kArm, ""));
+  ASSERT_TRUE(context->OpenDexFiles());
 
   // Setup the compilation sources.
   std::vector<std::unique_ptr<const DexFile>> compilation_sources = OpenTestDexFiles("MultiDex");
@@ -733,14 +856,13 @@ TEST_F(ClassLoaderContextTest, CreateClassLoaderWithSharedLibraries) {
   for (auto& dex : compilation_sources_raw) {
     class_loader_1_dex_files.push_back(dex);
   }
-  VerifyClassLoaderDexFiles(soa,
+  VerifyClassLoaderDexFiles(soa.Self(),
                             class_loader_1,
-                            WellKnownClasses::dalvik_system_PathClassLoader,
+                            WellKnownClasses::dalvik_system_PathClassLoader.Get(),
                             class_loader_1_dex_files);
 
   // Verify the shared libraries.
-  ArtField* field =
-      jni::DecodeArtField(WellKnownClasses::dalvik_system_BaseDexClassLoader_sharedLibraryLoaders);
+  ArtField* field = WellKnownClasses::dalvik_system_BaseDexClassLoader_sharedLibraryLoaders;
   ObjPtr<mirror::Object> raw_shared_libraries = field->GetObject(class_loader_1.Get());
   ASSERT_TRUE(raw_shared_libraries != nullptr);
 
@@ -752,9 +874,9 @@ TEST_F(ClassLoaderContextTest, CreateClassLoaderWithSharedLibraries) {
   Handle<mirror::ClassLoader> class_loader_2 = hs.NewHandle(shared_libraries->Get(0));
   std::vector<const DexFile*> class_loader_2_dex_files =
       MakeNonOwningPointerVector(classpath_dex_c);
-  VerifyClassLoaderDexFiles(soa,
+  VerifyClassLoaderDexFiles(soa.Self(),
                             class_loader_2,
-                            WellKnownClasses::dalvik_system_DelegateLastClassLoader,
+                            WellKnownClasses::dalvik_system_DelegateLastClassLoader.Get(),
                             class_loader_2_dex_files);
   raw_shared_libraries = field->GetObject(class_loader_2.Get());
   ASSERT_TRUE(raw_shared_libraries == nullptr);
@@ -763,20 +885,20 @@ TEST_F(ClassLoaderContextTest, CreateClassLoaderWithSharedLibraries) {
   Handle<mirror::ClassLoader> class_loader_3 = hs.NewHandle(shared_libraries->Get(1));
   std::vector<const DexFile*> class_loader_3_dex_files =
       MakeNonOwningPointerVector(classpath_dex_d);
-  VerifyClassLoaderDexFiles(soa,
+  VerifyClassLoaderDexFiles(soa.Self(),
                             class_loader_3,
-                            WellKnownClasses::dalvik_system_PathClassLoader,
+                            WellKnownClasses::dalvik_system_PathClassLoader.Get(),
                             class_loader_3_dex_files);
   raw_shared_libraries = field->GetObject(class_loader_3.Get());
   ASSERT_TRUE(raw_shared_libraries == nullptr);
 
   // All class loaders should have the BootClassLoader as a parent.
   ASSERT_TRUE(class_loader_1->GetParent()->GetClass() ==
-      soa.Decode<mirror::Class>(WellKnownClasses::java_lang_BootClassLoader));
+      WellKnownClasses::java_lang_BootClassLoader);
   ASSERT_TRUE(class_loader_2->GetParent()->GetClass() ==
-      soa.Decode<mirror::Class>(WellKnownClasses::java_lang_BootClassLoader));
+      WellKnownClasses::java_lang_BootClassLoader);
   ASSERT_TRUE(class_loader_3->GetParent()->GetClass() ==
-      soa.Decode<mirror::Class>(WellKnownClasses::java_lang_BootClassLoader));
+      WellKnownClasses::java_lang_BootClassLoader);
 }
 
 TEST_F(ClassLoaderContextTest, CreateClassLoaderWithSharedLibrariesInParentToo) {
@@ -793,7 +915,7 @@ TEST_F(ClassLoaderContextTest, CreateClassLoaderWithSharedLibrariesInParentToo) 
       "PCL[" + CreateClassPath(classpath_dex_d) + "]}";
 
   std::unique_ptr<ClassLoaderContext> context = ClassLoaderContext::Create(context_spec);
-  ASSERT_TRUE(context->OpenDexFiles(InstructionSet::kArm, ""));
+  ASSERT_TRUE(context->OpenDexFiles());
 
   // Setup the compilation sources.
   std::vector<std::unique_ptr<const DexFile>> compilation_sources = OpenTestDexFiles("MultiDex");
@@ -818,14 +940,13 @@ TEST_F(ClassLoaderContextTest, CreateClassLoaderWithSharedLibrariesInParentToo) 
   for (auto& dex : compilation_sources_raw) {
     class_loader_1_dex_files.push_back(dex);
   }
-  VerifyClassLoaderDexFiles(soa,
+  VerifyClassLoaderDexFiles(soa.Self(),
                             class_loader_1,
-                            WellKnownClasses::dalvik_system_PathClassLoader,
+                            WellKnownClasses::dalvik_system_PathClassLoader.Get(),
                             class_loader_1_dex_files);
 
   // Verify its shared library.
-  ArtField* field =
-      jni::DecodeArtField(WellKnownClasses::dalvik_system_BaseDexClassLoader_sharedLibraryLoaders);
+  ArtField* field = WellKnownClasses::dalvik_system_BaseDexClassLoader_sharedLibraryLoaders;
   ObjPtr<mirror::Object> raw_shared_libraries = field->GetObject(class_loader_1.Get());
   ASSERT_TRUE(raw_shared_libraries != nullptr);
 
@@ -836,9 +957,9 @@ TEST_F(ClassLoaderContextTest, CreateClassLoaderWithSharedLibrariesInParentToo) 
   Handle<mirror::ClassLoader> class_loader_2 = hs.NewHandle(shared_libraries->Get(0));
   std::vector<const DexFile*> class_loader_2_dex_files =
       MakeNonOwningPointerVector(classpath_dex_b);
-  VerifyClassLoaderDexFiles(soa,
+  VerifyClassLoaderDexFiles(soa.Self(),
                             class_loader_2,
-                            WellKnownClasses::dalvik_system_PathClassLoader,
+                            WellKnownClasses::dalvik_system_PathClassLoader.Get(),
                             class_loader_2_dex_files);
   raw_shared_libraries = field->GetObject(class_loader_2.Get());
   ASSERT_TRUE(raw_shared_libraries == nullptr);
@@ -847,9 +968,9 @@ TEST_F(ClassLoaderContextTest, CreateClassLoaderWithSharedLibrariesInParentToo) 
   Handle<mirror::ClassLoader> class_loader_3 = hs.NewHandle(class_loader_1->GetParent());
   std::vector<const DexFile*> class_loader_3_dex_files =
       MakeNonOwningPointerVector(classpath_dex_c);
-  VerifyClassLoaderDexFiles(soa,
+  VerifyClassLoaderDexFiles(soa.Self(),
                             class_loader_3,
-                            WellKnownClasses::dalvik_system_PathClassLoader,
+                            WellKnownClasses::dalvik_system_PathClassLoader.Get(),
                             class_loader_3_dex_files);
 
   // Verify its shared library.
@@ -863,20 +984,20 @@ TEST_F(ClassLoaderContextTest, CreateClassLoaderWithSharedLibrariesInParentToo) 
   Handle<mirror::ClassLoader> class_loader_4 = hs.NewHandle(shared_libraries_2->Get(0));
   std::vector<const DexFile*> class_loader_4_dex_files =
       MakeNonOwningPointerVector(classpath_dex_d);
-  VerifyClassLoaderDexFiles(soa,
+  VerifyClassLoaderDexFiles(soa.Self(),
                             class_loader_4,
-                            WellKnownClasses::dalvik_system_PathClassLoader,
+                            WellKnownClasses::dalvik_system_PathClassLoader.Get(),
                             class_loader_4_dex_files);
   raw_shared_libraries = field->GetObject(class_loader_4.Get());
   ASSERT_TRUE(raw_shared_libraries == nullptr);
 
   // Class loaders should have the BootClassLoader as a parent.
   ASSERT_TRUE(class_loader_2->GetParent()->GetClass() ==
-      soa.Decode<mirror::Class>(WellKnownClasses::java_lang_BootClassLoader));
+      WellKnownClasses::java_lang_BootClassLoader);
   ASSERT_TRUE(class_loader_3->GetParent()->GetClass() ==
-      soa.Decode<mirror::Class>(WellKnownClasses::java_lang_BootClassLoader));
+      WellKnownClasses::java_lang_BootClassLoader);
   ASSERT_TRUE(class_loader_4->GetParent()->GetClass() ==
-      soa.Decode<mirror::Class>(WellKnownClasses::java_lang_BootClassLoader));
+      WellKnownClasses::java_lang_BootClassLoader);
 }
 
 TEST_F(ClassLoaderContextTest, CreateClassLoaderWithSharedLibrariesDependencies) {
@@ -893,7 +1014,7 @@ TEST_F(ClassLoaderContextTest, CreateClassLoaderWithSharedLibrariesDependencies)
       "PCL[" + CreateClassPath(classpath_dex_d) + "]";
 
   std::unique_ptr<ClassLoaderContext> context = ClassLoaderContext::Create(context_spec);
-  ASSERT_TRUE(context->OpenDexFiles(InstructionSet::kArm, ""));
+  ASSERT_TRUE(context->OpenDexFiles());
 
   // Setup the compilation sources.
   std::vector<std::unique_ptr<const DexFile>> compilation_sources = OpenTestDexFiles("MultiDex");
@@ -918,14 +1039,13 @@ TEST_F(ClassLoaderContextTest, CreateClassLoaderWithSharedLibrariesDependencies)
   for (auto& dex : compilation_sources_raw) {
     class_loader_1_dex_files.push_back(dex);
   }
-  VerifyClassLoaderDexFiles(soa,
+  VerifyClassLoaderDexFiles(soa.Self(),
                             class_loader_1,
-                            WellKnownClasses::dalvik_system_PathClassLoader,
+                            WellKnownClasses::dalvik_system_PathClassLoader.Get(),
                             class_loader_1_dex_files);
 
   // Verify its shared library.
-  ArtField* field =
-      jni::DecodeArtField(WellKnownClasses::dalvik_system_BaseDexClassLoader_sharedLibraryLoaders);
+  ArtField* field = WellKnownClasses::dalvik_system_BaseDexClassLoader_sharedLibraryLoaders;
   ObjPtr<mirror::Object> raw_shared_libraries = field->GetObject(class_loader_1.Get());
   ASSERT_TRUE(raw_shared_libraries != nullptr);
 
@@ -936,9 +1056,9 @@ TEST_F(ClassLoaderContextTest, CreateClassLoaderWithSharedLibrariesDependencies)
   Handle<mirror::ClassLoader> class_loader_2 = hs.NewHandle(shared_libraries->Get(0));
   std::vector<const DexFile*> class_loader_2_dex_files =
       MakeNonOwningPointerVector(classpath_dex_b);
-  VerifyClassLoaderDexFiles(soa,
+  VerifyClassLoaderDexFiles(soa.Self(),
                             class_loader_2,
-                            WellKnownClasses::dalvik_system_PathClassLoader,
+                            WellKnownClasses::dalvik_system_PathClassLoader.Get(),
                             class_loader_2_dex_files);
 
   // Verify the shared library dependency of the shared library.
@@ -952,9 +1072,9 @@ TEST_F(ClassLoaderContextTest, CreateClassLoaderWithSharedLibrariesDependencies)
   Handle<mirror::ClassLoader> class_loader_3 = hs.NewHandle(shared_libraries_2->Get(0));
   std::vector<const DexFile*> class_loader_3_dex_files =
       MakeNonOwningPointerVector(classpath_dex_c);
-  VerifyClassLoaderDexFiles(soa,
+  VerifyClassLoaderDexFiles(soa.Self(),
                             class_loader_3,
-                            WellKnownClasses::dalvik_system_PathClassLoader,
+                            WellKnownClasses::dalvik_system_PathClassLoader.Get(),
                             class_loader_3_dex_files);
   raw_shared_libraries = field->GetObject(class_loader_3.Get());
   ASSERT_TRUE(raw_shared_libraries == nullptr);
@@ -963,20 +1083,20 @@ TEST_F(ClassLoaderContextTest, CreateClassLoaderWithSharedLibrariesDependencies)
   Handle<mirror::ClassLoader> class_loader_4 = hs.NewHandle(class_loader_1->GetParent());
   std::vector<const DexFile*> class_loader_4_dex_files =
       MakeNonOwningPointerVector(classpath_dex_d);
-  VerifyClassLoaderDexFiles(soa,
+  VerifyClassLoaderDexFiles(soa.Self(),
                             class_loader_4,
-                            WellKnownClasses::dalvik_system_PathClassLoader,
+                            WellKnownClasses::dalvik_system_PathClassLoader.Get(),
                             class_loader_4_dex_files);
   raw_shared_libraries = field->GetObject(class_loader_4.Get());
   ASSERT_TRUE(raw_shared_libraries == nullptr);
 
   // Class loaders should have the BootClassLoader as a parent.
   ASSERT_TRUE(class_loader_2->GetParent()->GetClass() ==
-      soa.Decode<mirror::Class>(WellKnownClasses::java_lang_BootClassLoader));
+      WellKnownClasses::java_lang_BootClassLoader);
   ASSERT_TRUE(class_loader_3->GetParent()->GetClass() ==
-      soa.Decode<mirror::Class>(WellKnownClasses::java_lang_BootClassLoader));
+      WellKnownClasses::java_lang_BootClassLoader);
   ASSERT_TRUE(class_loader_4->GetParent()->GetClass() ==
-      soa.Decode<mirror::Class>(WellKnownClasses::java_lang_BootClassLoader));
+      WellKnownClasses::java_lang_BootClassLoader);
 }
 
 TEST_F(ClassLoaderContextTest, RemoveSourceLocations) {
@@ -1008,7 +1128,7 @@ TEST_F(ClassLoaderContextTest, CreateClassLoaderWithSameSharedLibraries) {
       "PCL[" + CreateClassPath(classpath_dex_b) + "]}";
 
   std::unique_ptr<ClassLoaderContext> context = ClassLoaderContext::Create(context_spec);
-  ASSERT_TRUE(context->OpenDexFiles(InstructionSet::kArm, ""));
+  ASSERT_TRUE(context->OpenDexFiles());
 
   // Setup the compilation sources.
   std::vector<std::unique_ptr<const DexFile>> compilation_sources = OpenTestDexFiles("MultiDex");
@@ -1033,14 +1153,13 @@ TEST_F(ClassLoaderContextTest, CreateClassLoaderWithSameSharedLibraries) {
   for (auto& dex : compilation_sources_raw) {
     class_loader_1_dex_files.push_back(dex);
   }
-  VerifyClassLoaderDexFiles(soa,
+  VerifyClassLoaderDexFiles(soa.Self(),
                             class_loader_1,
-                            WellKnownClasses::dalvik_system_PathClassLoader,
+                            WellKnownClasses::dalvik_system_PathClassLoader.Get(),
                             class_loader_1_dex_files);
 
   // Verify its shared library.
-  ArtField* field =
-      jni::DecodeArtField(WellKnownClasses::dalvik_system_BaseDexClassLoader_sharedLibraryLoaders);
+  ArtField* field = WellKnownClasses::dalvik_system_BaseDexClassLoader_sharedLibraryLoaders;
   ObjPtr<mirror::Object> raw_shared_libraries = field->GetObject(class_loader_1.Get());
   ASSERT_TRUE(raw_shared_libraries != nullptr);
 
@@ -1051,18 +1170,18 @@ TEST_F(ClassLoaderContextTest, CreateClassLoaderWithSameSharedLibraries) {
   Handle<mirror::ClassLoader> class_loader_2 = hs.NewHandle(shared_libraries->Get(0));
   std::vector<const DexFile*> class_loader_2_dex_files =
       MakeNonOwningPointerVector(classpath_dex_b);
-  VerifyClassLoaderDexFiles(soa,
+  VerifyClassLoaderDexFiles(soa.Self(),
                             class_loader_2,
-                            WellKnownClasses::dalvik_system_PathClassLoader,
+                            WellKnownClasses::dalvik_system_PathClassLoader.Get(),
                             class_loader_2_dex_files);
 
   // Verify the parent.
   Handle<mirror::ClassLoader> class_loader_3 = hs.NewHandle(class_loader_1->GetParent());
   std::vector<const DexFile*> class_loader_3_dex_files =
       MakeNonOwningPointerVector(classpath_dex_c);
-  VerifyClassLoaderDexFiles(soa,
+  VerifyClassLoaderDexFiles(soa.Self(),
                             class_loader_3,
-                            WellKnownClasses::dalvik_system_PathClassLoader,
+                            WellKnownClasses::dalvik_system_PathClassLoader.Get(),
                             class_loader_3_dex_files);
 
   // Verify its shared library is the same as the child.
@@ -1075,9 +1194,9 @@ TEST_F(ClassLoaderContextTest, CreateClassLoaderWithSameSharedLibraries) {
 
   // Class loaders should have the BootClassLoader as a parent.
   ASSERT_TRUE(class_loader_2->GetParent()->GetClass() ==
-      soa.Decode<mirror::Class>(WellKnownClasses::java_lang_BootClassLoader));
+      WellKnownClasses::java_lang_BootClassLoader);
   ASSERT_TRUE(class_loader_3->GetParent()->GetClass() ==
-      soa.Decode<mirror::Class>(WellKnownClasses::java_lang_BootClassLoader));
+      WellKnownClasses::java_lang_BootClassLoader);
 }
 
 TEST_F(ClassLoaderContextTest, EncodeInOatFile) {
@@ -1085,7 +1204,7 @@ TEST_F(ClassLoaderContextTest, EncodeInOatFile) {
   std::string dex2_name = GetTestDexFileName("MyClass");
   std::unique_ptr<ClassLoaderContext> context =
       ClassLoaderContext::Create("PCL[" + dex1_name + ":" + dex2_name + "]");
-  ASSERT_TRUE(context->OpenDexFiles(InstructionSet::kArm, ""));
+  ASSERT_TRUE(context->OpenDexFiles());
 
   std::vector<std::unique_ptr<const DexFile>> dex1 = OpenTestDexFiles("Main");
   std::vector<std::unique_ptr<const DexFile>> dex2 = OpenTestDexFiles("MyClass");
@@ -1095,20 +1214,39 @@ TEST_F(ClassLoaderContextTest, EncodeInOatFile) {
   ASSERT_EQ(expected_encoding, context->EncodeContextForOatFile(""));
 }
 
+// Same as above, but passes `only_read_checksums=true` to `OpenDexFiles`.
+TEST_F(ClassLoaderContextTest, EncodeInOatFileOnlyReadChecksums) {
+  std::string dex1_name = GetTestDexFileName("Main");
+  std::string dex2_name = GetTestDexFileName("MyClass");
+  std::unique_ptr<ClassLoaderContext> context =
+      ClassLoaderContext::Create("PCL[" + dex1_name + ":" + dex2_name + "]");
+  ASSERT_TRUE(context->OpenDexFiles(
+      /*classpath_dir=*/"", /*context_fds=*/{}, /*only_read_checksums=*/true));
+
+  std::vector<std::unique_ptr<const DexFile>> dex1 = OpenTestDexFiles("Main");
+  std::vector<std::unique_ptr<const DexFile>> dex2 = OpenTestDexFiles("MyClass");
+  std::string encoding = context->EncodeContextForOatFile("");
+  std::string expected_encoding =
+      "PCL[" + CreateClassPathWithChecksums(dex1) + ":" + CreateClassPathWithChecksums(dex2) + "]";
+  ASSERT_EQ(expected_encoding, context->EncodeContextForOatFile(""));
+}
+
 TEST_F(ClassLoaderContextTest, EncodeInOatFileIMC) {
   jobject class_loader_a = LoadDexInPathClassLoader("Main", nullptr);
   jobject class_loader_b = LoadDexInInMemoryDexClassLoader("MyClass", class_loader_a);
 
   std::unique_ptr<ClassLoaderContext> context = CreateContextForClassLoader(class_loader_b);
-  ASSERT_TRUE(context->OpenDexFiles(InstructionSet::kArm, ""));
+  ASSERT_TRUE(context->OpenDexFiles());
 
   std::vector<std::unique_ptr<const DexFile>> dex1 = OpenTestDexFiles("Main");
   std::vector<std::unique_ptr<const DexFile>> dex2 = OpenTestDexFiles("MyClass");
   ASSERT_EQ(dex2.size(), 1u);
 
+  uint32_t expected_checksum = DexFileLoader::GetMultiDexChecksum(dex2);
+
   std::string encoding = context->EncodeContextForOatFile("");
-  std::string expected_encoding = "IMC[<unknown>*" + std::to_string(dex2[0]->GetLocationChecksum())
-      + "];PCL[" + CreateClassPathWithChecksums(dex1) + "]";
+  std::string expected_encoding = "IMC[<unknown>*" + std::to_string(expected_checksum) + "];PCL[" +
+                                  CreateClassPathWithChecksums(dex1) + "]";
   ASSERT_EQ(expected_encoding, context->EncodeContextForOatFile(""));
 }
 
@@ -1117,7 +1255,7 @@ TEST_F(ClassLoaderContextTest, EncodeForDex2oat) {
   std::string dex2_name = GetTestDexFileName("MultiDex");
   std::unique_ptr<ClassLoaderContext> context =
       ClassLoaderContext::Create("PCL[" + dex1_name + ":" + dex2_name + "]");
-  ASSERT_TRUE(context->OpenDexFiles(InstructionSet::kArm, ""));
+  ASSERT_TRUE(context->OpenDexFiles());
 
   std::string encoding = context->EncodeContextForDex2oat("");
   std::string expected_encoding = "PCL[" + dex1_name + ":" + dex2_name + "]";
@@ -1129,10 +1267,21 @@ TEST_F(ClassLoaderContextTest, EncodeForDex2oatIMC) {
   jobject class_loader_b = LoadDexInInMemoryDexClassLoader("MyClass", class_loader_a);
 
   std::unique_ptr<ClassLoaderContext> context = CreateContextForClassLoader(class_loader_b);
-  ASSERT_TRUE(context->OpenDexFiles(InstructionSet::kArm, ""));
+  ASSERT_TRUE(context->OpenDexFiles());
 
   std::string encoding = context->EncodeContextForDex2oat("");
   std::string expected_encoding = "IMC[<unknown>];PCL[" + GetTestDexFileName("Main") + "]";
+  ASSERT_EQ(expected_encoding, context->EncodeContextForDex2oat(""));
+}
+
+TEST_F(ClassLoaderContextTest, EncodeForDex2oatDuplicates) {
+  std::string dex_name = GetTestDexFileName("Main");
+  std::unique_ptr<ClassLoaderContext> context =
+      ClassLoaderContext::Create("PCL[" + dex_name + ":" + dex_name + "]");
+  ASSERT_TRUE(context->OpenDexFiles());
+
+  std::string encoding = context->EncodeContextForDex2oat("");
+  std::string expected_encoding = "PCL[" + dex_name + "]";
   ASSERT_EQ(expected_encoding, context->EncodeContextForDex2oat(""));
 }
 
@@ -1267,13 +1416,14 @@ TEST_F(ClassLoaderContextTest, EncodeContextsForSingleDex) {
 
 static jobject CreateForeignClassLoader() {
   ScopedObjectAccess soa(Thread::Current());
-  JNIEnv* env = soa.Env();
 
   // We cannot instantiate a ClassLoader directly, so instead we allocate an Object to represent
   // our foreign ClassLoader (this works because the runtime does proper instanceof checks before
   // operating on this object.
-  jmethodID ctor = env->GetMethodID(WellKnownClasses::java_lang_Object, "<init>", "()V");
-  return env->NewObject(WellKnownClasses::java_lang_Object, ctor);
+  ArtMethod* ctor =
+      GetClassRoot<mirror::Object>()->FindClassMethod("<init>", "()V", kRuntimePointerSize);
+  CHECK(ctor != nullptr);
+  return soa.AddLocalReference<jobject>(ctor->NewObject<>(soa.Self()));
 }
 
 TEST_F(ClassLoaderContextTest, EncodeContextsForUnsupportedBase) {
@@ -1389,22 +1539,12 @@ TEST_F(ClassLoaderContextTest, CreateContextForClassLoaderIMC) {
   VerifyClassLoaderPCLFromTestDex(context.get(), 3, "ForClassLoaderA");
 }
 
-TEST_F(ClassLoaderContextTest, VerifyClassLoaderContextFirstElement) {
-  std::string context_spec = "PCL[]";
-  std::unique_ptr<ClassLoaderContext> context = ParseContextWithChecksums(context_spec);
-  ASSERT_TRUE(context != nullptr);
-  PretendContextOpenedDexFiles(context.get());
-  // Ensure that the special shared library marks as verified for the first thing in the class path.
-  ASSERT_EQ(context->VerifyClassLoaderContextMatch(OatFile::kSpecialSharedLibrary),
-            ClassLoaderContext::VerificationResult::kVerifies);
-}
-
 TEST_F(ClassLoaderContextTest, VerifyClassLoaderContextMatch) {
   std::string context_spec = "PCL[a.dex*123:b.dex*456];DLC[c.dex*890]";
   std::unique_ptr<ClassLoaderContext> context = ParseContextWithChecksums(context_spec);
   // Pretend that we successfully open the dex files to pass the DCHECKS.
   // (as it's much easier to test all the corner cases without relying on actual dex files).
-  PretendContextOpenedDexFiles(context.get());
+  PretendContextOpenedDexFilesForChecksums(context.get());
 
   VerifyContextSize(context.get(), 2);
   VerifyClassLoaderPCL(context.get(), 0, "a.dex:b.dex");
@@ -1456,17 +1596,6 @@ TEST_F(ClassLoaderContextTest, VerifyClassLoaderContextWithIMCMatch) {
 
   ASSERT_EQ(context->VerifyClassLoaderContextMatch(context_spec),
             ClassLoaderContext::VerificationResult::kVerifies);
-}
-
-TEST_F(ClassLoaderContextTest, VerifyClassLoaderContextMatchSpecial) {
-  std::string context_spec = "&";
-  std::unique_ptr<ClassLoaderContext> context = ParseContextWithChecksums(context_spec);
-  // Pretend that we successfully open the dex files to pass the DCHECKS.
-  // (as it's much easier to test all the corner cases without relying on actual dex files).
-  PretendContextOpenedDexFiles(context.get());
-
-  ASSERT_EQ(context->VerifyClassLoaderContextMatch(context_spec),
-            ClassLoaderContext::VerificationResult::kForcedToSkipChecks);
 }
 
 TEST_F(ClassLoaderContextTest, VerifyClassLoaderContextMatchWithSL) {
@@ -1542,6 +1671,28 @@ TEST_F(ClassLoaderContextTest, VerifyClassLoaderContextMatchWithIMCSL) {
   VerifyClassLoaderSharedLibraryIMC(context.get(), 0, 1, "<unknown>:<unknown>");
 
   ASSERT_EQ(context->VerifyClassLoaderContextMatch(context_spec),
+            ClassLoaderContext::VerificationResult::kVerifies);
+}
+
+TEST_F(ClassLoaderContextTest, VerifyClassLoaderContextMatchAfterResolvingSymlinks) {
+  {
+    std::ofstream ofs(scratch_path_ + "/foo.jar");
+    ASSERT_TRUE(ofs);
+  }
+  std::filesystem::create_directory_symlink(scratch_path_, scratch_path_ + "/bar");
+
+  std::string context_spec =
+      android::base::StringPrintf("PCL[%s/foo.jar*123:%s/foo.jar!classes2.dex*456]",
+                                  scratch_path_.c_str(),
+                                  scratch_path_.c_str());
+  std::unique_ptr<ClassLoaderContext> context = ParseContextWithChecksums(context_spec);
+  PretendContextOpenedDexFilesForChecksums(context.get());
+
+  std::string context_spec_with_symlinks =
+      android::base::StringPrintf("PCL[%s/bar/foo.jar*123:%s/bar/foo.jar!classes2.dex*456]",
+                                  scratch_path_.c_str(),
+                                  scratch_path_.c_str());
+  ASSERT_EQ(context->VerifyClassLoaderContextMatch(context_spec_with_symlinks),
             ClassLoaderContext::VerificationResult::kVerifies);
 }
 
@@ -1637,23 +1788,44 @@ TEST_F(ClassLoaderContextTest, CreateContextForClassLoaderWithSharedLibraries) {
             ClassLoaderContext::VerificationResult::kVerifies);
 }
 
-TEST_F(ClassLoaderContextTest, CheckForDuplicateDexFiles) {
-  jobject class_loader_a = LoadDexInPathClassLoader("Main", nullptr);
-  jobject class_loader_b =
-      LoadDexInInMemoryDexClassLoader("MyClass", class_loader_a);
+TEST_F(ClassLoaderContextTest, CheckForDuplicateDexFilesNotFoundSingleCL) {
+  jobject class_loader = LoadDexInPathClassLoader("Main", nullptr);
 
-  std::unique_ptr<ClassLoaderContext> context =
-      CreateContextForClassLoader(class_loader_b);
+  std::unique_ptr<ClassLoaderContext> context = CreateContextForClassLoader(class_loader);
 
-  std::vector<const DexFile*> result = context->CheckForDuplicateDexFiles(
+  std::set<const DexFile*> result = context->CheckForDuplicateDexFiles(
       std::vector<const DexFile*>());
   ASSERT_EQ(0u, result.size());
 
-  std::vector<std::unique_ptr<const DexFile>> dex1 = OpenTestDexFiles("Main");
+  std::vector<std::unique_ptr<const DexFile>> dex1 = OpenTestDexFiles("ForClassLoaderA");
   std::vector<const DexFile*> dex1_raw = MakeNonOwningPointerVector(dex1);
   result = context->CheckForDuplicateDexFiles(dex1_raw);
-  ASSERT_EQ(1u, result.size());
-  ASSERT_EQ(dex1_raw[0], result[0]);
+  ASSERT_EQ(0u, result.size());
+}
+
+TEST_F(ClassLoaderContextTest, CheckForDuplicateDexFilesFound) {
+  jobject class_loader = LoadDexInPathClassLoader(std::vector<std::string> { "Main", "Main" }, nullptr);
+
+  std::unique_ptr<ClassLoaderContext> context = CreateContextForClassLoader(class_loader);
+
+  std::vector<std::unique_ptr<const DexFile>> dex1 = OpenTestDexFiles("Main");
+  std::vector<const DexFile*> dex1_raw = MakeNonOwningPointerVector(dex1);
+  std::set<const DexFile*> result = context->CheckForDuplicateDexFiles(dex1_raw);
+  ASSERT_EQ(1u, result.size()) << context->EncodeContextForOatFile("");
+  ASSERT_EQ(dex1_raw[0], *(result.begin()));
+}
+
+
+TEST_F(ClassLoaderContextTest, CheckForDuplicateCrossCLNotFound) {
+  jobject class_loader_a = LoadDexInPathClassLoader("ForClassLoaderA", nullptr);
+  jobject class_loader_b = LoadDexInInMemoryDexClassLoader("ForClassLoaderB", class_loader_a);
+
+  std::unique_ptr<ClassLoaderContext> context = CreateContextForClassLoader(class_loader_b);
+
+  std::vector<std::unique_ptr<const DexFile>> dex1 = OpenTestDexFiles("ForClassLoaderA");
+  std::vector<const DexFile*> dex1_raw = MakeNonOwningPointerVector(dex1);
+  std::set<const DexFile*> result = context->CheckForDuplicateDexFiles(dex1_raw);
+  ASSERT_EQ(0u, result.size());
 }
 
 }  // namespace art

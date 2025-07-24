@@ -21,25 +21,30 @@
 #include <stdio.h>
 
 #include <iosfwd>
+#include <memory>
+#include <optional>
 #include <set>
 #include <string>
 #include <utility>
-#include <memory>
 #include <vector>
 
+#include "app_info.h"
 #include "base/locks.h"
 #include "base/macros.h"
 #include "base/mem_map.h"
-#include "base/string_view_cpp20.h"
+#include "base/metrics/metrics.h"
+#include "base/os.h"
+#include "base/unix_file/fd_file.h"
+#include "compat_framework.h"
 #include "deoptimization_kind.h"
 #include "dex/dex_file_types.h"
 #include "experimental_flags.h"
-#include "gc/space/image_space_loading_order.h"
 #include "gc_root.h"
 #include "instrumentation.h"
 #include "jdwp_provider.h"
 #include "jni/jni_id_manager.h"
 #include "jni_id_type.h"
+#include "metrics/reporter.h"
 #include "obj_ptr.h"
 #include "offsets.h"
 #include "process_state.h"
@@ -47,7 +52,7 @@
 #include "reflective_value_visitor.h"
 #include "runtime_stats.h"
 
-namespace art {
+namespace art HIDDEN {
 
 namespace gc {
 class AbstractSystemWeakHolder;
@@ -64,13 +69,17 @@ class JitCodeCache;
 class JitOptions;
 }  // namespace jit
 
+namespace jni {
+class SmallLrtAllocator;
+}  // namespace jni
+
 namespace mirror {
 class Array;
 class ClassLoader;
 class DexCache;
 template<class T> class ObjectArray;
 template<class T> class PrimitiveArray;
-typedef PrimitiveArray<int8_t> ByteArray;
+using ByteArray = PrimitiveArray<int8_t>;
 class String;
 class Throwable;
 }  // namespace mirror
@@ -109,24 +118,36 @@ class ThreadList;
 class ThreadPool;
 class Trace;
 struct TraceConfig;
-class Transaction;
 
-typedef std::vector<std::pair<std::string, const void*>> RuntimeOptions;
+using RuntimeOptions = std::vector<std::pair<std::string, const void*>>;
 
 class Runtime {
  public:
   // Parse raw runtime options.
-  static bool ParseOptions(const RuntimeOptions& raw_options,
-                           bool ignore_unrecognized,
-                           RuntimeArgumentMap* runtime_options);
+  EXPORT static bool ParseOptions(const RuntimeOptions& raw_options,
+                                  bool ignore_unrecognized,
+                                  RuntimeArgumentMap* runtime_options);
 
   // Creates and initializes a new runtime.
-  static bool Create(RuntimeArgumentMap&& runtime_options)
+  EXPORT static bool Create(RuntimeArgumentMap&& runtime_options)
       SHARED_TRYLOCK_FUNCTION(true, Locks::mutator_lock_);
 
   // Creates and initializes a new runtime.
-  static bool Create(const RuntimeOptions& raw_options, bool ignore_unrecognized)
+  EXPORT static bool Create(const RuntimeOptions& raw_options, bool ignore_unrecognized)
       SHARED_TRYLOCK_FUNCTION(true, Locks::mutator_lock_);
+
+  enum class RuntimeDebugState {
+    // This doesn't support any debug features / method tracing. This is the expected state usually.
+    kNonJavaDebuggable,
+    // This supports method tracing and a restricted set of debug features (for ex: redefinition
+    // isn't supported). We transition to this state when method tracing has started or when the
+    // debugger was attached and transition back to NonDebuggable once the tracing has stopped /
+    // the debugger agent has detached..
+    kJavaDebuggable,
+    // The runtime was started as a debuggable runtime. This allows us to support the extended set
+    // of debug features (for ex: redefinition). We never transition out of this state.
+    kJavaDebuggableAtInit
+  };
 
   bool EnsurePluginLoaded(const char* plugin_name, std::string* error_msg);
   bool EnsurePerfettoPlugin(std::string* error_msg);
@@ -196,6 +217,10 @@ class Runtime {
     return is_explicit_gc_disabled_;
   }
 
+  bool IsEagerlyReleaseExplicitGcDisabled() const {
+    return is_eagerly_release_explicit_gc_disabled_;
+  }
+
   std::string GetCompilerExecutable() const;
 
   const std::vector<std::string>& GetCompilerOptions() const {
@@ -210,16 +235,22 @@ class Runtime {
     return image_compiler_options_;
   }
 
-  const std::string& GetImageLocation() const {
-    return image_location_;
+  const std::vector<std::string>& GetImageLocations() const {
+    return image_locations_;
   }
 
   // Starts a runtime, which may cause threads to be started and code to run.
   bool Start() UNLOCK_FUNCTION(Locks::mutator_lock_);
 
-  bool IsShuttingDown(Thread* self);
+  EXPORT bool IsShuttingDown(Thread* self);
   bool IsShuttingDownLocked() const REQUIRES(Locks::runtime_shutdown_lock_) {
-    return shutting_down_;
+    return shutting_down_.load(std::memory_order_relaxed);
+  }
+  bool IsShuttingDownUnsafe() const {
+    return shutting_down_.load(std::memory_order_relaxed);
+  }
+  void SetShuttingDown() REQUIRES(Locks::runtime_shutdown_lock_) {
+    shutting_down_.store(true, std::memory_order_relaxed);
   }
 
   size_t NumberOfThreadsBeingBorn() const REQUIRES(Locks::runtime_shutdown_lock_) {
@@ -230,7 +261,7 @@ class Runtime {
     threads_being_born_++;
   }
 
-  void EndThreadBirth() REQUIRES(Locks::runtime_shutdown_lock_);
+  EXPORT void EndThreadBirth() REQUIRES(Locks::runtime_shutdown_lock_);
 
   bool IsStarted() const {
     return started_;
@@ -240,39 +271,56 @@ class Runtime {
     return finished_starting_;
   }
 
-  void RunRootClinits(Thread* self) REQUIRES_SHARED(Locks::mutator_lock_);
+  EXPORT void RunRootClinits(Thread* self) REQUIRES_SHARED(Locks::mutator_lock_);
 
   static Runtime* Current() {
     return instance_;
   }
 
+  // Set the current runtime to be the given instance.
+  // Note that this function is not responsible for cleaning up the old instance or taking the
+  // ownership of the new instance.
+  //
+  // For test use only.
+  static void TestOnlySetCurrent(Runtime* instance) { instance_ = instance; }
+
+  // Set whichever abort message locations are appropriate to copies of the argument. Used by
+  // Abort() and Thread::AbortInThis().
+  static void SetAbortMessage(const char* msg) REQUIRES(!Locks::abort_lock_);
+
   // Aborts semi-cleanly. Used in the implementation of LOG(FATAL), which most
   // callers should prefer.
-  NO_RETURN static void Abort(const char* msg) REQUIRES(!Locks::abort_lock_);
+  NO_RETURN EXPORT static void Abort(const char* msg) REQUIRES(!Locks::abort_lock_);
 
   // Returns the "main" ThreadGroup, used when attaching user threads.
   jobject GetMainThreadGroup() const;
 
   // Returns the "system" ThreadGroup, used when attaching our internal threads.
-  jobject GetSystemThreadGroup() const;
+  EXPORT jobject GetSystemThreadGroup() const;
 
   // Returns the system ClassLoader which represents the CLASSPATH.
-  jobject GetSystemClassLoader() const;
+  EXPORT jobject GetSystemClassLoader() const;
 
   // Attaches the calling native thread to the runtime.
-  bool AttachCurrentThread(const char* thread_name, bool as_daemon, jobject thread_group,
-                           bool create_peer);
+  EXPORT bool AttachCurrentThread(const char* thread_name,
+                                  bool as_daemon,
+                                  jobject thread_group,
+                                  bool create_peer,
+                                  bool should_run_callbacks = true);
 
-  void CallExitHook(jint status);
+  EXPORT void CallExitHook(jint status);
 
   // Detaches the current native thread from the runtime.
-  void DetachCurrentThread() REQUIRES(!Locks::mutator_lock_);
+  void DetachCurrentThread(bool should_run_callbacks = true) REQUIRES(!Locks::mutator_lock_);
+
+  // If we are handling SIQQUIT return the time when we received it.
+  std::optional<uint64_t> SiqQuitNanoTime() const;
 
   void DumpDeoptimizations(std::ostream& os);
   void DumpForSigQuit(std::ostream& os);
   void DumpLockHolders(std::ostream& os);
 
-  ~Runtime();
+  EXPORT ~Runtime();
 
   const std::vector<std::string>& GetBootClassPath() const {
     return boot_class_path_;
@@ -284,12 +332,55 @@ class Runtime {
     return boot_class_path_locations_.empty() ? boot_class_path_ : boot_class_path_locations_;
   }
 
+  // Dynamically adds an element to boot class path.
+  EXPORT void AppendToBootClassPath(
+      const std::string& filename,
+      const std::string& location,
+      const std::vector<std::unique_ptr<const art::DexFile>>& dex_files);
+
+  // Same as above, but takes raw pointers.
+  EXPORT void AppendToBootClassPath(const std::string& filename,
+                                    const std::string& location,
+                                    const std::vector<const art::DexFile*>& dex_files);
+
+  // Same as above, but also takes a dex cache for each dex file.
+  EXPORT void AppendToBootClassPath(
+      const std::string& filename,
+      const std::string& location,
+      const std::vector<std::pair<const art::DexFile*, ObjPtr<mirror::DexCache>>>&
+          dex_files_and_cache);
+
+  // Dynamically adds an element to boot class path and takes ownership of the dex files.
+  EXPORT void AddExtraBootDexFiles(const std::string& filename,
+                                   const std::string& location,
+                                   std::vector<std::unique_ptr<const art::DexFile>>&& dex_files);
+
+  ArrayRef<File> GetBootClassPathFiles() { return ArrayRef<File>(boot_class_path_files_); }
+
+  ArrayRef<File> GetBootClassPathImageFiles() {
+    return ArrayRef<File>(boot_class_path_image_files_);
+  }
+
+  ArrayRef<File> GetBootClassPathVdexFiles() { return ArrayRef<File>(boot_class_path_vdex_files_); }
+
+  ArrayRef<File> GetBootClassPathOatFiles() { return ArrayRef<File>(boot_class_path_oat_files_); }
+
+  // Returns the checksums for the boot image, extensions and extra boot class path dex files,
+  // based on the image spaces and boot class path dex files loaded in memory.
+  const std::string& GetBootClassPathChecksums() const {
+    return boot_class_path_checksums_;
+  }
+
   const std::string& GetClassPathString() const {
     return class_path_string_;
   }
 
   ClassLinker* GetClassLinker() const {
     return class_linker_;
+  }
+
+  jni::SmallLrtAllocator* GetSmallLrtAllocator() const {
+    return small_lrt_allocator_;
   }
 
   jni::JniIdManager* GetJniIdManager() const {
@@ -335,14 +426,14 @@ class Runtime {
   // Get the special object used to mark a cleared JNI weak global.
   mirror::Object* GetClearedJniWeakGlobal() REQUIRES_SHARED(Locks::mutator_lock_);
 
-  mirror::Throwable* GetPreAllocatedOutOfMemoryErrorWhenThrowingException()
+  EXPORT mirror::Throwable* GetPreAllocatedOutOfMemoryErrorWhenThrowingException()
       REQUIRES_SHARED(Locks::mutator_lock_);
-  mirror::Throwable* GetPreAllocatedOutOfMemoryErrorWhenThrowingOOME()
+  EXPORT mirror::Throwable* GetPreAllocatedOutOfMemoryErrorWhenThrowingOOME()
       REQUIRES_SHARED(Locks::mutator_lock_);
-  mirror::Throwable* GetPreAllocatedOutOfMemoryErrorWhenHandlingStackOverflow()
+  EXPORT mirror::Throwable* GetPreAllocatedOutOfMemoryErrorWhenHandlingStackOverflow()
       REQUIRES_SHARED(Locks::mutator_lock_);
 
-  mirror::Throwable* GetPreAllocatedNoClassDefFoundError()
+  EXPORT mirror::Throwable* GetPreAllocatedNoClassDefFoundError()
       REQUIRES_SHARED(Locks::mutator_lock_);
 
   const std::vector<std::string>& GetProperties() const {
@@ -370,13 +461,13 @@ class Runtime {
 
   // Visit all the roots. If only_dirty is true then non-dirty roots won't be visited. If
   // clean_dirty is true then dirty roots will be marked as non-dirty after visiting.
-  void VisitRoots(RootVisitor* visitor, VisitRootFlags flags = kVisitRootFlagAllRoots)
+  EXPORT void VisitRoots(RootVisitor* visitor, VisitRootFlags flags = kVisitRootFlagAllRoots)
       REQUIRES(!Locks::classlinker_classes_lock_, !Locks::trace_lock_)
       REQUIRES_SHARED(Locks::mutator_lock_);
 
   // Visit image roots, only used for hprof since the GC uses the image space mod union table
   // instead.
-  void VisitImageRoots(RootVisitor* visitor) REQUIRES_SHARED(Locks::mutator_lock_);
+  EXPORT void VisitImageRoots(RootVisitor* visitor) REQUIRES_SHARED(Locks::mutator_lock_);
 
   // Visit all of the roots we can safely visit concurrently.
   void VisitConcurrentRoots(RootVisitor* visitor,
@@ -388,17 +479,14 @@ class Runtime {
   void VisitNonThreadRoots(RootVisitor* visitor)
       REQUIRES_SHARED(Locks::mutator_lock_);
 
-  void VisitTransactionRoots(RootVisitor* visitor)
-      REQUIRES_SHARED(Locks::mutator_lock_);
-
   // Sweep system weaks, the system weak is deleted if the visitor return null. Otherwise, the
   // system weak is updated to be the visitor's returned value.
-  void SweepSystemWeaks(IsMarkedVisitor* visitor)
-      REQUIRES_SHARED(Locks::mutator_lock_);
+  EXPORT void SweepSystemWeaks(IsMarkedVisitor* visitor) REQUIRES_SHARED(Locks::mutator_lock_);
 
   // Walk all reflective objects and visit their targets as well as any method/fields held by the
   // runtime threads that are marked as being reflective.
-  void VisitReflectiveTargets(ReflectiveValueVisitor* visitor) REQUIRES(Locks::mutator_lock_);
+  EXPORT void VisitReflectiveTargets(ReflectiveValueVisitor* visitor)
+      REQUIRES(Locks::mutator_lock_);
   // Helper for visiting reflective targets with lambdas for both field and method reflective
   // targets.
   template <typename FieldVis, typename MethodVis>
@@ -461,17 +549,21 @@ class Runtime {
     return OFFSETOF_MEMBER(Runtime, callee_save_methods_[static_cast<size_t>(type)]);
   }
 
+  static constexpr MemberOffset GetInstrumentationOffset() {
+    return MemberOffset(OFFSETOF_MEMBER(Runtime, instrumentation_));
+  }
+
   InstructionSet GetInstructionSet() const {
     return instruction_set_;
   }
 
-  void SetInstructionSet(InstructionSet instruction_set);
+  EXPORT void SetInstructionSet(InstructionSet instruction_set);
   void ClearInstructionSet();
 
-  void SetCalleeSaveMethod(ArtMethod* method, CalleeSaveType type);
+  EXPORT void SetCalleeSaveMethod(ArtMethod* method, CalleeSaveType type);
   void ClearCalleeSaveMethods();
 
-  ArtMethod* CreateCalleeSaveMethod() REQUIRES_SHARED(Locks::mutator_lock_);
+  EXPORT ArtMethod* CreateCalleeSaveMethod() REQUIRES_SHARED(Locks::mutator_lock_);
 
   uint64_t GetStat(int kind);
 
@@ -502,7 +594,7 @@ class Runtime {
   }
 
   // Returns true if JIT compilations are enabled. GetJit() will be not null in this case.
-  bool UseJitCompilation() const;
+  EXPORT bool UseJitCompilation() const;
 
   void PreZygoteFork();
   void PostZygoteFork();
@@ -522,67 +614,48 @@ class Runtime {
     return &instrumentation_;
   }
 
-  void RegisterAppInfo(const std::vector<std::string>& code_paths,
-                       const std::string& profile_output_filename);
+  void RegisterAppInfo(const std::string& package_name,
+                       const std::vector<std::string>& code_paths,
+                       const std::string& profile_output_filename,
+                       const std::string& ref_profile_filename,
+                       int32_t code_type);
 
-  // Transaction support.
-  bool IsActiveTransaction() const;
-  void EnterTransactionMode(bool strict, mirror::Class* root);
-  void ExitTransactionMode();
-  void RollbackAllTransactions() REQUIRES_SHARED(Locks::mutator_lock_);
-  // Transaction rollback and exit transaction are always done together, it's convenience to
-  // do them in one function.
-  void RollbackAndExitTransactionMode() REQUIRES_SHARED(Locks::mutator_lock_);
-  bool IsTransactionAborted() const;
-  const std::unique_ptr<Transaction>& GetTransaction() const;
-  bool IsActiveStrictTransactionMode() const;
+  void SetActiveTransaction() {
+    DCHECK(IsAotCompiler());
+    active_transaction_ = true;
+  }
 
-  void AbortTransactionAndThrowAbortError(Thread* self, const std::string& abort_message)
-      REQUIRES_SHARED(Locks::mutator_lock_);
-  void ThrowTransactionAbortError(Thread* self)
-      REQUIRES_SHARED(Locks::mutator_lock_);
+  void ClearActiveTransaction() {
+    DCHECK(IsAotCompiler());
+    active_transaction_ = false;
+  }
 
-  void RecordWriteFieldBoolean(mirror::Object* obj, MemberOffset field_offset, uint8_t value,
-                               bool is_volatile) const;
-  void RecordWriteFieldByte(mirror::Object* obj, MemberOffset field_offset, int8_t value,
-                            bool is_volatile) const;
-  void RecordWriteFieldChar(mirror::Object* obj, MemberOffset field_offset, uint16_t value,
-                            bool is_volatile) const;
-  void RecordWriteFieldShort(mirror::Object* obj, MemberOffset field_offset, int16_t value,
-                          bool is_volatile) const;
-  void RecordWriteField32(mirror::Object* obj, MemberOffset field_offset, uint32_t value,
-                          bool is_volatile) const;
-  void RecordWriteField64(mirror::Object* obj, MemberOffset field_offset, uint64_t value,
-                          bool is_volatile) const;
-  void RecordWriteFieldReference(mirror::Object* obj,
-                                 MemberOffset field_offset,
-                                 ObjPtr<mirror::Object> value,
-                                 bool is_volatile) const
-      REQUIRES_SHARED(Locks::mutator_lock_);
-  void RecordWriteArray(mirror::Array* array, size_t index, uint64_t value) const
-      REQUIRES_SHARED(Locks::mutator_lock_);
-  void RecordStrongStringInsertion(ObjPtr<mirror::String> s) const
-      REQUIRES(Locks::intern_table_lock_);
-  void RecordWeakStringInsertion(ObjPtr<mirror::String> s) const
-      REQUIRES(Locks::intern_table_lock_);
-  void RecordStrongStringRemoval(ObjPtr<mirror::String> s) const
-      REQUIRES(Locks::intern_table_lock_);
-  void RecordWeakStringRemoval(ObjPtr<mirror::String> s) const
-      REQUIRES(Locks::intern_table_lock_);
-  void RecordResolveString(ObjPtr<mirror::DexCache> dex_cache, dex::StringIndex string_idx) const
-      REQUIRES_SHARED(Locks::mutator_lock_);
+  bool IsActiveTransaction() {
+    if (kIsDebugBuild) {
+      DCheckNoTransactionCheckAllowed();
+    }
+    return active_transaction_;
+  }
 
   void SetFaultMessage(const std::string& message);
 
   void AddCurrentRuntimeFeaturesAsDex2OatArguments(std::vector<std::string>* arg_vector) const;
 
-  bool ExplicitStackOverflowChecks() const {
-    return !implicit_so_checks_;
+  bool GetImplicitStackOverflowChecks() const {
+    return implicit_so_checks_;
+  }
+
+  bool GetImplicitSuspendChecks() const {
+    return implicit_suspend_checks_;
+  }
+
+  bool GetImplicitNullChecks() const {
+    return implicit_null_checks_;
   }
 
   void DisableVerifier();
   bool IsVerificationEnabled() const;
-  bool IsVerificationSoftFail() const;
+  EXPORT bool IsVerificationSoftFail() const;
 
   void SetHiddenApiEnforcementPolicy(hiddenapi::EnforcementPolicy policy) {
     hidden_api_policy_ = policy;
@@ -656,10 +729,6 @@ class Runtime {
     }
   }
 
-  bool IsDexFileFallbackEnabled() const {
-    return allow_dex_file_fallback_;
-  }
-
   const std::vector<std::string>& GetCpuAbilist() const {
     return cpu_abilist_;
   }
@@ -676,17 +745,8 @@ class Runtime {
     return target_sdk_version_;
   }
 
-  void SetDisabledCompatChanges(const std::set<uint64_t>& disabled_changes) {
-    disabled_compat_changes_ = disabled_changes;
-  }
-
-  std::set<uint64_t> GetDisabledCompatChanges() const {
-    return disabled_compat_changes_;
-  }
-
-  bool isChangeEnabled(uint64_t change_id) const {
-    // TODO(145743810): add an up call to java to log to statsd
-    return disabled_compat_changes_.count(change_id) == 0;
+  CompatFramework& GetCompatFramework() {
+    return compat_framework_;
   }
 
   uint32_t GetZygoteMaxFailedBoots() const {
@@ -702,20 +762,27 @@ class Runtime {
   // Create the JIT and instrumentation and code cache.
   void CreateJit();
 
+  ArenaPool* GetLinearAllocArenaPool() {
+    return linear_alloc_arena_pool_.get();
+  }
   ArenaPool* GetArenaPool() {
+    return arena_pool_.get();
+  }
+  const ArenaPool* GetArenaPool() const {
     return arena_pool_.get();
   }
   ArenaPool* GetJitArenaPool() {
     return jit_arena_pool_.get();
   }
-  const ArenaPool* GetArenaPool() const {
-    return arena_pool_.get();
-  }
 
-  void ReclaimArenaPoolMemory();
+  EXPORT void ReclaimArenaPoolMemory();
 
   LinearAlloc* GetLinearAlloc() {
     return linear_alloc_.get();
+  }
+
+  LinearAlloc* GetStartupLinearAlloc() {
+    return startup_linear_alloc_.load(std::memory_order_relaxed);
   }
 
   jit::JitOptions* GetJITOptions() {
@@ -723,7 +790,12 @@ class Runtime {
   }
 
   bool IsJavaDebuggable() const {
-    return is_java_debuggable_;
+    return runtime_debug_state_ == RuntimeDebugState::kJavaDebuggable ||
+           runtime_debug_state_ == RuntimeDebugState::kJavaDebuggableAtInit;
+  }
+
+  bool IsJavaDebuggableAtInit() const {
+    return runtime_debug_state_ == RuntimeDebugState::kJavaDebuggableAtInit;
   }
 
   void SetProfileableFromShell(bool value) {
@@ -734,10 +806,18 @@ class Runtime {
     return is_profileable_from_shell_;
   }
 
-  void SetJavaDebuggable(bool value);
+  void SetProfileable(bool value) {
+    is_profileable_ = value;
+  }
+
+  bool IsProfileable() const {
+    return is_profileable_;
+  }
+
+  EXPORT void SetRuntimeDebugState(RuntimeDebugState state);
 
   // Deoptimize the boot image, called for Java debuggable apps.
-  void DeoptimizeBootImage() REQUIRES(Locks::mutator_lock_);
+  EXPORT void DeoptimizeBootImage() REQUIRES(Locks::mutator_lock_);
 
   bool IsNativeDebuggable() const {
     return is_native_debuggable_;
@@ -754,7 +834,7 @@ class Runtime {
   }
 
   void SetNonStandardExitsEnabled() {
-    DoAndMaybeSwitchInterpreter([=](){ non_standard_exits_enabled_ = true; });
+    non_standard_exits_enabled_ = true;
   }
 
   bool AreAsyncExceptionsThrown() const {
@@ -762,19 +842,8 @@ class Runtime {
   }
 
   void SetAsyncExceptionsThrown() {
-    DoAndMaybeSwitchInterpreter([=](){ async_exceptions_thrown_ = true; });
+    async_exceptions_thrown_ = true;
   }
-
-  // Change state and re-check which interpreter should be used.
-  //
-  // This must be called whenever there is an event that forces
-  // us to use different interpreter (e.g. debugger is attached).
-  //
-  // Changing the state using the lamda gives us some multihreading safety.
-  // It ensures that two calls do not interfere with each other and
-  // it makes it possible to DCHECK that thread local flag is correct.
-  template<typename Action>
-  static void DoAndMaybeSwitchInterpreter(Action lamda);
 
   // Returns the build fingerprint, if set. Otherwise an empty string is returned.
   std::string GetFingerprint() {
@@ -785,8 +854,7 @@ class Runtime {
   void SetSentinel(ObjPtr<mirror::Object> sentinel) REQUIRES_SHARED(Locks::mutator_lock_);
   // For testing purpose only.
   // TODO: Remove this when this is no longer needed (b/116087961).
-  GcRoot<mirror::Object> GetSentinel() REQUIRES_SHARED(Locks::mutator_lock_);
-
+  EXPORT GcRoot<mirror::Object> GetSentinel() REQUIRES_SHARED(Locks::mutator_lock_);
 
   // Use a sentinel for marking entries in a table that have been cleared.
   // This helps diagnosing in case code tries to wrongly access such
@@ -795,14 +863,13 @@ class Runtime {
     return reinterpret_cast<mirror::Class*>(0xebadbeef);
   }
 
-  // Helper for the GC to process a weak class in a table.
-  static void ProcessWeakClass(GcRoot<mirror::Class>* root_ptr,
-                               IsMarkedVisitor* visitor,
-                               mirror::Class* update)
-      REQUIRES_SHARED(Locks::mutator_lock_);
-
   // Create a normal LinearAlloc or low 4gb version if we are 64 bit AOT compiler.
-  LinearAlloc* CreateLinearAlloc();
+  EXPORT LinearAlloc* CreateLinearAlloc();
+  // Setup linear-alloc allocators to stop using the current arena so that the
+  // next allocations, which would be after zygote fork, happens in userfaultfd
+  // visited space.
+  void SetupLinearAllocForPostZygoteFork(Thread* self)
+      REQUIRES(!Locks::mutator_lock_, !Locks::classlinker_classes_lock_);
 
   OatFileManager& GetOatFileManager() const {
     DCHECK(oat_file_manager_ != nullptr);
@@ -824,15 +891,7 @@ class Runtime {
     return dump_native_stack_on_sig_quit_;
   }
 
-  bool GetPrunedDalvikCache() const {
-    return pruned_dalvik_cache_;
-  }
-
-  void SetPrunedDalvikCache(bool pruned) {
-    pruned_dalvik_cache_ = pruned;
-  }
-
-  void UpdateProcessState(ProcessState process_state);
+  EXPORT void UpdateProcessState(ProcessState process_state);
 
   // Returns true if we currently care about long mutator pause.
   bool InJankPerceptibleProcessState() const {
@@ -851,7 +910,8 @@ class Runtime {
 
   // Returns if the code can be deoptimized asynchronously. Code may be compiled with some
   // optimization that makes it impossible to deoptimize.
-  bool IsAsyncDeoptimizeable(uintptr_t code) const REQUIRES_SHARED(Locks::mutator_lock_);
+  EXPORT bool IsAsyncDeoptimizeable(ArtMethod* method, uintptr_t code) const
+      REQUIRES_SHARED(Locks::mutator_lock_);
 
   // Returns a saved copy of the environment (getenv/setenv values).
   // Used by Fork to protect against overwriting LD_LIBRARY_PATH, etc.
@@ -859,16 +919,16 @@ class Runtime {
     return env_snapshot_.GetSnapshot();
   }
 
-  void AddSystemWeakHolder(gc::AbstractSystemWeakHolder* holder);
-  void RemoveSystemWeakHolder(gc::AbstractSystemWeakHolder* holder);
+  EXPORT void AddSystemWeakHolder(gc::AbstractSystemWeakHolder* holder);
+  EXPORT void RemoveSystemWeakHolder(gc::AbstractSystemWeakHolder* holder);
 
-  void AttachAgent(JNIEnv* env, const std::string& agent_arg, jobject class_loader);
+  EXPORT void AttachAgent(JNIEnv* env, const std::string& agent_arg, jobject class_loader);
 
   const std::list<std::unique_ptr<ti::Agent>>& GetAgents() const {
     return agents_;
   }
 
-  RuntimeCallbacks* GetRuntimeCallbacks();
+  EXPORT RuntimeCallbacks* GetRuntimeCallbacks();
 
   bool HasLoadedPlugins() const {
     return !plugins_.empty();
@@ -897,10 +957,20 @@ class Runtime {
     return result;
   }
 
-  // Whether or not we use MADV_RANDOM on files that are thought to have random access patterns.
-  // This is beneficial for low RAM devices since it reduces page cache thrashing.
-  bool MAdviseRandomAccess() const {
-    return madvise_random_access_;
+  bool DenyArtApexDataFiles() const {
+    return deny_art_apex_data_files_;
+  }
+
+  size_t GetMadviseWillNeedTotalDexSize() const {
+    return madvise_willneed_total_dex_size_;
+  }
+
+  size_t GetMadviseWillNeedSizeOdex() const {
+    return madvise_willneed_odex_filesize_;
+  }
+
+  size_t GetMadviseWillNeedSizeArt() const {
+    return madvise_willneed_art_filesize_;
   }
 
   const std::string& GetJdwpOptions() {
@@ -921,7 +991,7 @@ class Runtime {
 
   // Changes the JniIdType to the given type. Only allowed if CanSetJniIdType(). All threads must be
   // suspended to call this function.
-  void SetJniIdType(JniIdType t);
+  EXPORT void SetJniIdType(JniIdType t);
 
   uint32_t GetVerifierLoggingThresholdMs() const {
     return verifier_logging_threshold_ms_;
@@ -949,6 +1019,10 @@ class Runtime {
     ThreadPool* const thread_pool_;
   };
 
+  LinearAlloc* ReleaseStartupLinearAlloc() {
+    return startup_linear_alloc_.exchange(nullptr, std::memory_order_relaxed);
+  }
+
   bool LoadAppImageStartupCache() const {
     return load_app_image_startup_cache_;
   }
@@ -959,30 +1033,119 @@ class Runtime {
 
   // Reset the startup completed status so that we can call NotifyStartupCompleted again. Should
   // only be used for testing.
-  void ResetStartupCompleted();
+  EXPORT void ResetStartupCompleted();
 
   // Notify the runtime that application startup is considered completed. Only has effect for the
-  // first call.
-  void NotifyStartupCompleted();
+  // first call. Returns whether this was the first call.
+  bool NotifyStartupCompleted();
+
+  // Notify the runtime that the application finished loading some dex/odex files. This is
+  // called everytime we load a set of dex files in a class loader.
+  void NotifyDexFileLoaded();
 
   // Return true if startup is already completed.
-  bool GetStartupCompleted() const;
-
-  gc::space::ImageSpaceLoadingOrder GetImageSpaceLoadingOrder() const {
-    return image_space_loading_order_;
-  }
+  EXPORT bool GetStartupCompleted() const;
 
   bool IsVerifierMissingKThrowFatal() const {
     return verifier_missing_kthrow_fatal_;
   }
 
-  // Return true if we should load oat files as executable or not.
+  bool IsJavaZygoteForkLoopRequired() const {
+    return force_java_zygote_fork_loop_;
+  }
+
+  bool IsPerfettoHprofEnabled() const {
+    return perfetto_hprof_enabled_;
+  }
+
+  bool IsPerfettoJavaHeapStackProfEnabled() const {
+    return perfetto_javaheapprof_enabled_;
+  }
+
+  bool IsMonitorTimeoutEnabled() const {
+    return monitor_timeout_enable_;
+  }
+
+  uint64_t GetMonitorTimeoutNs() const {
+    return monitor_timeout_ns_;
+  }
+
+  // Return whether this is system server and it is being profiled.
+  bool IsSystemServerProfiled() const;
+
+  // Return whether we should load oat files as executable or not.
   bool GetOatFilesExecutable() const;
+
+  metrics::ArtMetrics* GetMetrics() { return &metrics_; }
+
+  AppInfo* GetAppInfo() { return &app_info_; }
+
+  void RequestMetricsReport(bool synchronous = true);
+
+  static void MadviseFileForRange(size_t madvise_size_limit_bytes,
+                                  size_t map_size_bytes,
+                                  const uint8_t* map_begin,
+                                  const uint8_t* map_end,
+                                  const std::string& file_name);
+
+  const std::string& GetApexVersions() const {
+    return apex_versions_;
+  }
+
+  // Return whether a boot image has a profile. This means it's an in-memory
+  // image rather that an image loaded from disk.
+  bool HasImageWithProfile() const;
+
+  bool GetNoSigChain() const {
+    return no_sig_chain_;
+  }
+
+  void AddGeneratedCodeRange(const void* start, size_t size);
+  void RemoveGeneratedCodeRange(const void* start, size_t size)
+      REQUIRES_SHARED(Locks::mutator_lock_);
+
+  // Trigger a flag reload from system properties or device congfigs.
+  //
+  // Should only be called from runtime init and zygote post fork as
+  // we don't want to change the runtime config midway during execution.
+  //
+  // The caller argument should be the name of the function making this call
+  // and will be used to enforce the appropriate names.
+  //
+  // See Flags::ReloadAllFlags as well.
+  static void ReloadAllFlags(const std::string& caller);
+
+  // Parses /apex/apex-info-list.xml to build a string containing apex versions of boot classpath
+  // jars, which is encoded into .oat files.
+  static std::string GetApexVersions(ArrayRef<const std::string> boot_class_path_locations);
+
+  bool AllowInMemoryCompilation() const { return allow_in_memory_compilation_; }
+
+  // Used by plugin code to attach a hook for OOME.
+  void SetOutOfMemoryErrorHook(void (*hook)()) {
+    out_of_memory_error_hook_ = hook;
+  }
+
+  void OutOfMemoryErrorHook() {
+    if (out_of_memory_error_hook_ != nullptr) {
+      out_of_memory_error_hook_();
+    }
+  }
+
+  bool AreMetricsInitialized() const { return metrics_reporter_ != nullptr; }
+
+  // For `artd` only.
+  EXPORT static void AllowPageSizeAccess();
 
  private:
   static void InitPlatformSignalHandlers();
 
   Runtime();
+
+  bool HandlesSignalsInCompiledCode() const {
+    return !no_sig_chain_ &&
+           (implicit_null_checks_ || implicit_so_checks_ || implicit_suspend_checks_);
+  }
 
   void BlockSignals();
 
@@ -990,8 +1153,9 @@ class Runtime {
       SHARED_TRYLOCK_FUNCTION(true, Locks::mutator_lock_);
   void InitNativeMethods() REQUIRES(!Locks::mutator_lock_);
   void RegisterRuntimeNativeMethods(JNIEnv* env);
+  void InitMetrics();
 
-  void StartDaemonThreads();
+  void StartDaemonThreads() REQUIRES_SHARED(Locks::mutator_lock_);
   void StartSignalCatcher();
 
   void MaybeSaveJitProfilingInfo();
@@ -1018,12 +1182,17 @@ class Runtime {
   ThreadPool* AcquireThreadPool() REQUIRES(!Locks::runtime_thread_pool_lock_);
   void ReleaseThreadPool() REQUIRES(!Locks::runtime_thread_pool_lock_);
 
-  // A pointer to the active runtime or null.
-  static Runtime* instance_;
+  // Caches the apex versions produced by `GetApexVersions`.
+  void InitializeApexVersions();
 
-  // NOTE: these must match the gc::ProcessState values as they come directly from the framework.
-  static constexpr int kProfileForground = 0;
-  static constexpr int kProfileBackground = 1;
+  void AppendToBootClassPath(const std::string& filename, const std::string& location);
+
+  void DCheckNoTransactionCheckAllowed();
+
+  // Don't use EXPORT ("default" visibility), because quick_entrypoints_x86.o
+  // refers to this symbol and it can't link with R_386_PC32 relocation.
+  // A pointer to the active runtime or null.
+  LIBART_PROTECTED static Runtime* instance_;
 
   static constexpr uint32_t kCalleeSaveSize = 6u;
 
@@ -1053,15 +1222,21 @@ class Runtime {
   bool must_relocate_;
   bool is_concurrent_gc_enabled_;
   bool is_explicit_gc_disabled_;
+  bool is_eagerly_release_explicit_gc_disabled_;
   bool image_dex2oat_enabled_;
 
   std::string compiler_executable_;
   std::vector<std::string> compiler_options_;
   std::vector<std::string> image_compiler_options_;
-  std::string image_location_;
+  std::vector<std::string> image_locations_;
 
   std::vector<std::string> boot_class_path_;
   std::vector<std::string> boot_class_path_locations_;
+  std::string boot_class_path_checksums_;
+  std::vector<File> boot_class_path_files_;
+  std::vector<File> boot_class_path_image_files_;
+  std::vector<File> boot_class_path_vdex_files_;
+  std::vector<File> boot_class_path_oat_files_;
   std::string class_path_string_;
   std::vector<std::string> properties_;
 
@@ -1079,13 +1254,20 @@ class Runtime {
 
   std::unique_ptr<ArenaPool> jit_arena_pool_;
   std::unique_ptr<ArenaPool> arena_pool_;
-  // Special low 4gb pool for compiler linear alloc. We need ArtFields to be in low 4gb if we are
-  // compiling using a 32 bit image on a 64 bit compiler in case we resolve things in the image
-  // since the field arrays are int arrays in this case.
-  std::unique_ptr<ArenaPool> low_4gb_arena_pool_;
+  // This pool is used for linear alloc if we are using userfaultfd GC, or if
+  // low 4gb pool is required for compiler linear alloc. Otherwise, use
+  // arena_pool_.
+  // We need ArtFields to be in low 4gb if we are compiling using a 32 bit image
+  // on a 64 bit compiler in case we resolve things in the image since the field
+  // arrays are int arrays in this case.
+  std::unique_ptr<ArenaPool> linear_alloc_arena_pool_;
 
   // Shared linear alloc for now.
   std::unique_ptr<LinearAlloc> linear_alloc_;
+
+  // Linear alloc used for allocations during startup. Will be deleted after
+  // startup. Atomic because the pointer can be concurrently updated to null.
+  std::atomic<LinearAlloc*> startup_linear_alloc_;
 
   // The number of spins that are done before thread suspension is used to forcibly inflate.
   size_t max_spins_before_thin_lock_inflation_;
@@ -1099,6 +1281,8 @@ class Runtime {
   ClassLinker* class_linker_;
 
   SignalCatcher* signal_catcher_;
+
+  jni::SmallLrtAllocator* small_lrt_allocator_;
 
   std::unique_ptr<jni::JniIdManager> jni_id_manager_;
 
@@ -1123,8 +1307,10 @@ class Runtime {
   // Waited upon until no threads are being born.
   std::unique_ptr<ConditionVariable> shutdown_cond_ GUARDED_BY(Locks::runtime_shutdown_lock_);
 
-  // Set when runtime shutdown is past the point that new threads may attach.
-  bool shutting_down_ GUARDED_BY(Locks::runtime_shutdown_lock_);
+  // Set when runtime shutdown is past the point that new threads may attach.  Usually
+  // GUARDED_BY(Locks::runtime_shutdown_lock_). But we need to check it in Abort without the
+  // lock, because we may already own it.
+  std::atomic<bool> shutting_down_;
 
   // The runtime is starting to shutdown but is blocked waiting on shutdown_cond_.
   bool shutting_down_started_ GUARDED_BY(Locks::runtime_shutdown_lock_);
@@ -1159,18 +1345,15 @@ class Runtime {
   // If true, then we dump the GC cumulative timings on shutdown.
   bool dump_gc_performance_on_shutdown_;
 
-  // Transactions used for pre-initializing classes at compilation time.
-  // Support nested transactions, maintain a list containing all transactions. Transactions are
-  // handled under a stack discipline. Because GC needs to go over all transactions, we choose list
-  // as substantial data structure instead of stack.
-  std::list<std::unique_ptr<Transaction>> preinitialization_transactions_;
+  // Transactions are handled by the `AotClassLinker` but we keep a simple flag
+  // in the `Runtime` for quick transaction checks.
+  // Code that's not AOT-specific but needs some transaction-specific behavior
+  // shall check this flag and, for an active transaction, make virtual calls
+  // through `ClassLinker` to `AotClassLinker` to implement that behavior.
+  bool active_transaction_;
 
   // If kNone, verification is disabled. kEnable by default.
   verifier::VerifyMode verify_;
-
-  // If true, the runtime may use dex files directly with the interpreter if an oat file is not
-  // available/usable.
-  bool allow_dex_file_fallback_;
 
   // List of supported cpu abis.
   std::vector<std::string> cpu_abilist_;
@@ -1178,8 +1361,8 @@ class Runtime {
   // Specifies target SDK version to allow workarounds for certain API levels.
   uint32_t target_sdk_version_;
 
-  // A set of disabled compat changes for the running app, all other changes are enabled.
-  std::set<uint64_t> disabled_compat_changes_;
+  // ART counterpart for the compat framework (go/compat-framework).
+  CompatFramework compat_framework_;
 
   // Implicit checks flags.
   bool implicit_null_checks_;       // NullPointer checks are implicit.
@@ -1217,9 +1400,18 @@ class Runtime {
   bool non_standard_exits_enabled_;
 
   // Whether Java code needs to be debuggable.
-  bool is_java_debuggable_;
+  RuntimeDebugState runtime_debug_state_;
 
+  bool monitor_timeout_enable_;
+  uint64_t monitor_timeout_ns_;
+
+  // Whether or not this application can be profiled by the shell user,
+  // even when running on a device that is running in user mode.
   bool is_profileable_from_shell_ = false;
+
+  // Whether or not this application can be profiled by system services on a
+  // device running in user mode, but not necessarily by the shell user.
+  bool is_profileable_ = false;
 
   // The maximum number of failed boots we allow before pruning the dalvik cache
   // and trying again. This option is only inspected when we're running as a
@@ -1241,9 +1433,18 @@ class Runtime {
   // Whether or not we are on a low RAM device.
   bool is_low_memory_mode_;
 
-  // Whether or not we use MADV_RANDOM on files that are thought to have random access patterns.
-  // This is beneficial for low RAM devices since it reduces page cache thrashing.
-  bool madvise_random_access_;
+  // Limiting size (in bytes) for applying MADV_WILLNEED on vdex files
+  // or uncompressed dex files in APKs.
+  // A 0 for this will turn off madvising to MADV_WILLNEED
+  size_t madvise_willneed_total_dex_size_;
+
+  // Limiting size (in bytes) for applying MADV_WILLNEED on odex files
+  // A 0 for this will turn off madvising to MADV_WILLNEED
+  size_t madvise_willneed_odex_filesize_;
+
+  // Limiting size (in bytes) for applying MADV_WILLNEED on art files
+  // A 0 for this will turn off madvising to MADV_WILLNEED
+  size_t madvise_willneed_art_filesize_;
 
   // Whether the application should run in safe mode, that is, interpreter only.
   bool safe_mode_;
@@ -1257,8 +1458,8 @@ class Runtime {
   // Whether access checks on test API should be performed.
   hiddenapi::EnforcementPolicy test_api_policy_;
 
-  // List of signature prefixes of methods that have been removed from the blacklist, and treated
-  // as if whitelisted.
+  // List of signature prefixes of methods that have been removed from the blocklist, and treated
+  // as if SDK.
   std::vector<std::string> hidden_api_exemptions_;
 
   // Do not warn about the same hidden API access violation twice.
@@ -1277,9 +1478,6 @@ class Runtime {
 
   // Whether threads should dump their native stack on SIGQUIT.
   bool dump_native_stack_on_sig_quit_;
-
-  // Whether the dalvik cache was pruned when initializing the runtime.
-  bool pruned_dalvik_cache_;
 
   // Whether or not we currently care about pause times.
   ProcessState process_state_;
@@ -1300,6 +1498,12 @@ class Runtime {
   // Set to false in cases where we want to directly control when jni-id
   // indirection is changed. This is intended only for testing JNI id swapping.
   bool automatically_set_jni_ids_indirection_;
+
+  // True if files in /data/misc/apexdata/com.android.art are considered untrustworthy.
+  bool deny_art_apex_data_files_;
+
+  // Whether to allow compiling the boot classpath in memory when the given boot image is unusable.
+  bool allow_in_memory_compilation_ = false;
 
   // Saved environment.
   class EnvSnapshot {
@@ -1332,20 +1536,39 @@ class Runtime {
   // If startup has completed, must happen at most once.
   std::atomic<bool> startup_completed_ = false;
 
-  gc::space::ImageSpaceLoadingOrder image_space_loading_order_ =
-      gc::space::ImageSpaceLoadingOrder::kSystemFirst;
-
   bool verifier_missing_kthrow_fatal_;
+  bool force_java_zygote_fork_loop_;
+  bool perfetto_hprof_enabled_;
+  bool perfetto_javaheapprof_enabled_;
+
+  // Called on out of memory error
+  void (*out_of_memory_error_hook_)();
+
+  metrics::ArtMetrics metrics_;
+  std::unique_ptr<metrics::MetricsReporter> metrics_reporter_;
+
+  // Apex versions of boot classpath jars concatenated in a string. The format
+  // is of the type:
+  // '/apex1_version/apex2_version//'
+  //
+  // When the apex is the factory version, we don't encode it (for example in
+  // the third entry in the example above).
+  std::string apex_versions_;
+
+  // The info about the application code paths.
+  AppInfo app_info_;
 
   // Note: See comments on GetFaultMessage.
   friend std::string GetFaultMessageForAbortLogging();
   friend class Dex2oatImageTest;
   friend class ScopedThreadPoolUsage;
   friend class OatFileAssistantTest;
-  class NotifyStartupCompletedTask;
+  class SetupLinearAllocForZygoteFork;
 
   DISALLOW_COPY_AND_ASSIGN(Runtime);
 };
+
+inline metrics::ArtMetrics* GetMetrics() { return Runtime::Current()->GetMetrics(); }
 
 }  // namespace art
 

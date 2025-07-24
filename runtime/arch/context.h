@@ -20,9 +20,11 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "arch/instruction_set.h"
 #include "base/macros.h"
+#include "entrypoints/quick/runtime_entrypoints_list.h"
 
-namespace art {
+namespace art HIDDEN {
 
 class QuickMethodFrameInfo;
 
@@ -31,19 +33,21 @@ class QuickMethodFrameInfo;
 class Context {
  public:
   // Creates a context for the running architecture
-  static Context* Create();
+  EXPORT static Context* Create();
 
   virtual ~Context() {}
 
   // Re-initializes the registers for context re-use.
   virtual void Reset() = 0;
 
+  template <InstructionSet kIsa>
   static uintptr_t* CalleeSaveAddress(uint8_t* frame, int num, size_t frame_size) {
+    static constexpr size_t kPointerSize = static_cast<size_t>(GetInstructionSetPointerSize(kIsa));
     // Callee saves are held at the top of the frame
-    uint8_t* save_addr = frame + frame_size - ((num + 1) * sizeof(void*));
-#if defined(__i386__) || defined(__x86_64__)
-    save_addr -= sizeof(void*);  // account for return address
-#endif
+    uint8_t* save_addr = frame + frame_size - ((num + 1) * kPointerSize);
+    if (kIsa == InstructionSet::kX86 || kIsa == InstructionSet::kX86_64) {
+      save_addr -= kPointerSize;  // account for return address
+    }
     return reinterpret_cast<uintptr_t*>(save_addr);
   }
 
@@ -90,12 +94,11 @@ class Context {
 
   // Set `new_value` to the physical register containing the dex PC pointer in
   // an nterp frame.
-  virtual void SetNterpDexPC(uintptr_t new_value ATTRIBUTE_UNUSED) {
-    abort();
-  }
+  virtual void SetNterpDexPC([[maybe_unused]] uintptr_t new_value) { abort(); }
 
-  // Switches execution of the executing context to this context
-  NO_RETURN virtual void DoLongJump() = 0;
+  // Copies the values of GPRs and FPRs registers from this context to external buffers;
+  // the use case is to do a long jump afterwards.
+  virtual void CopyContextTo(uintptr_t* gprs, uintptr_t* fprs) = 0;
 
   enum {
     kBadGprBase = 0xebad6070,

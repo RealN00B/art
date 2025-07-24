@@ -14,6 +14,15 @@
 // limitations under the License.
 //
 
+package {
+    // See: http://go/android-license-faq
+    // A large-scale-change added 'default_applicable_licenses' to import
+    // all of the 'license_kinds' from "art_license"
+    // to get the below license kinds:
+    //   SPDX-license-identifier-Apache-2.0
+    default_applicable_licenses: ["art_license"],
+}
+
 cc_defaults {
     name: "hiddenapi-defaults",
     host_supported: true,
@@ -29,14 +38,20 @@ cc_defaults {
         },
     },
 
-    shared_libs: [
+    stl: "c++_static",
+    static_libs: [
         "libbase",
+        "libcrypto_for_art",
     ],
 }
 
 art_cc_binary {
     name: "hiddenapi",
-    defaults: ["hiddenapi-defaults"],
+    defaults: [
+        "hiddenapi-defaults",
+        "libartbase_static_defaults",
+        "libdexfile_static_defaults",
+    ],
     target: {
         host: {
             // Override the prefer32 added by art_cc_binary when
@@ -46,10 +61,6 @@ art_cc_binary {
             compile_multilib: "64",
         },
     },
-    shared_libs: [
-        "libdexfile",
-        "libartbase",
-    ],
 }
 
 art_cc_binary {
@@ -57,10 +68,8 @@ art_cc_binary {
     defaults: [
         "art_debug_defaults",
         "hiddenapi-defaults",
-    ],
-    shared_libs: [
-        "libdexfiled",
-        "libartbased",
+        "libartbased_static_defaults",
+        "libdexfiled_static_defaults",
     ],
 }
 
@@ -71,5 +80,11 @@ art_cc_test {
     defaults: [
         "art_gtest_defaults",
     ],
+    device_common_data: [
+        ":art-gtest-jars-HiddenApi",
+        ":art-gtest-jars-HiddenApiStubs",
+    ],
+    tidy_timeout_srcs: ["hiddenapi_test.cc"],
     srcs: ["hiddenapi_test.cc"],
+    required: ["hiddenapid"],
 }

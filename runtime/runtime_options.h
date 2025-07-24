@@ -23,25 +23,23 @@
 #include <vector>
 
 #include "arch/instruction_set.h"
+#include "base/macros.h"
 #include "base/variant_map.h"
 #include "cmdline_types.h"  // TODO: don't need to include this file here
 #include "gc/collector_type.h"
-#include "gc/space/image_space_loading_order.h"
 #include "gc/space/large_object_space.h"
 #include "hidden_api.h"
-#include "jit/jit.h"
 #include "jit/jit_code_cache.h"
+#include "jit/jit_options.h"
 #include "jit/profile_saver_options.h"
 #include "verifier/verifier_enums.h"
 
-namespace art {
+namespace art HIDDEN {
 
 class CompilerCallbacks;
 class DexFile;
 struct XGcOption;
 struct BackgroundGcOption;
-
-#define DECLARE_KEY(Type, Name) static const Key<Type> Name
 
 // Define a key that is usable with a RuntimeArgumentMap.
 // This key will *not* work with other subtypes of VariantMap.
@@ -62,7 +60,7 @@ struct RuntimeArgumentMapKey : VariantMapKey<TValue> {
 //    map.Set(RuntimeArgumentMap::HeapTargetUtilization, 5.0);
 //    double *target_utilization = map.Get(RuntimeArgumentMap);
 //
-struct RuntimeArgumentMap : VariantMap<RuntimeArgumentMap, RuntimeArgumentMapKey> {
+struct EXPORT RuntimeArgumentMap : VariantMap<RuntimeArgumentMap, RuntimeArgumentMapKey> {
   // This 'using' line is necessary to inherit the variadic constructor.
   using VariantMap<RuntimeArgumentMap, RuntimeArgumentMapKey>::VariantMap;
 
@@ -75,7 +73,7 @@ struct RuntimeArgumentMap : VariantMap<RuntimeArgumentMap, RuntimeArgumentMapKey
 #include "runtime_options.def"
 };
 
-#undef DECLARE_KEY
+#undef RUNTIME_OPTIONS_KEY
 
   // using RuntimeOptions = RuntimeArgumentMap;
 }  // namespace art

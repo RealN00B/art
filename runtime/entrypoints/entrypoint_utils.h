@@ -29,7 +29,7 @@
 #include "handle.h"
 #include "jvalue.h"
 
-namespace art {
+namespace art HIDDEN {
 
 namespace mirror {
 class Array;
@@ -44,6 +44,7 @@ class ArtField;
 class ArtMethod;
 class HandleScope;
 enum InvokeType : uint32_t;
+class MethodReference;
 class OatQuickMethodHeader;
 class ScopedObjectAccessAlreadyRunnable;
 class Thread;
@@ -76,7 +77,6 @@ inline ObjPtr<mirror::Object> AllocObjectFromCodeInitialized(ObjPtr<mirror::Clas
     REQUIRES(!Roles::uninterruptible_);
 
 
-template <bool kAccessCheck>
 ALWAYS_INLINE inline ObjPtr<mirror::Class> CheckArrayAlloc(dex::TypeIndex type_idx,
                                                            int32_t component_count,
                                                            ArtMethod* method,
@@ -88,7 +88,7 @@ ALWAYS_INLINE inline ObjPtr<mirror::Class> CheckArrayAlloc(dex::TypeIndex type_i
 // it cannot be resolved, throw an error. If it can, use it to create an array.
 // When verification/compiler hasn't been able to verify access, optionally perform an access
 // check.
-template <bool kAccessCheck, bool kInstrumented = true>
+template <bool kInstrumented = true>
 ALWAYS_INLINE inline ObjPtr<mirror::Array> AllocArrayFromCode(dex::TypeIndex type_idx,
                                                               int32_t component_count,
                                                               ArtMethod* method,
@@ -127,6 +127,13 @@ enum FindFieldType {
   StaticPrimitiveWrite = StaticBit | PrimitiveBit | WriteBit,
 };
 
+template<bool access_check>
+inline ArtMethod* FindSuperMethodToCall(uint32_t method_idx,
+                                        ArtMethod* resolved_method,
+                                        ArtMethod* referrer,
+                                        Thread* self)
+    REQUIRES_SHARED(Locks::mutator_lock_);
+
 template<FindFieldType type, bool access_check>
 inline ArtField* FindFieldFromCode(uint32_t field_idx,
                                    ArtMethod* referrer,
@@ -135,27 +142,15 @@ inline ArtField* FindFieldFromCode(uint32_t field_idx,
     REQUIRES_SHARED(Locks::mutator_lock_)
     REQUIRES(!Roles::uninterruptible_);
 
-template<InvokeType type, bool access_check>
-inline ArtMethod* FindMethodFromCode(uint32_t method_idx,
-                                     ObjPtr<mirror::Object>* this_object,
-                                     ArtMethod* referrer,
-                                     Thread* self)
+template<InvokeType type>
+inline ArtMethod* FindMethodToCall(Thread* self,
+                                   ArtMethod* referrer,
+                                   ObjPtr<mirror::Object>* this_object,
+                                   const Instruction& inst,
+                                   bool only_lookup_tls_cache,
+                                   /*out*/ bool* string_init)
     REQUIRES_SHARED(Locks::mutator_lock_)
     REQUIRES(!Roles::uninterruptible_);
-
-// Fast path field resolution that can't initialize classes or throw exceptions.
-inline ArtField* FindFieldFast(uint32_t field_idx,
-                               ArtMethod* referrer,
-                               FindFieldType type,
-                               size_t expected_size)
-    REQUIRES_SHARED(Locks::mutator_lock_);
-
-// Fast path method resolution that can't throw exceptions.
-template <InvokeType type, bool access_check>
-inline ArtMethod* FindMethodFast(uint32_t method_idx,
-                                 ObjPtr<mirror::Object> this_object,
-                                 ArtMethod* referrer)
-    REQUIRES_SHARED(Locks::mutator_lock_);
 
 inline ObjPtr<mirror::Class> ResolveVerifyAndClinit(dex::TypeIndex type_idx,
                                                     ArtMethod* referrer,
@@ -186,16 +181,17 @@ JValue InvokeProxyInvocationHandler(ScopedObjectAccessAlreadyRunnable& soa,
     REQUIRES_SHARED(Locks::mutator_lock_)
     REQUIRES(!Roles::uninterruptible_);
 
-bool FillArrayData(ObjPtr<mirror::Object> obj, const Instruction::ArrayDataPayload* payload)
+EXPORT bool FillArrayData(ObjPtr<mirror::Object> obj, const Instruction::ArrayDataPayload* payload)
     REQUIRES_SHARED(Locks::mutator_lock_)
     REQUIRES(!Roles::uninterruptible_);
 
 template <typename INT_TYPE, typename FLOAT_TYPE>
 inline INT_TYPE art_float_to_integral(FLOAT_TYPE f);
 
-ArtMethod* GetCalleeSaveMethodCaller(ArtMethod** sp,
-                                     CalleeSaveType type,
-                                     bool do_caller_check = false)
+ArtMethod* GetCalleeSaveMethodCallerAndDexPc(ArtMethod** sp,
+                                             CalleeSaveType type,
+                                             /* out */ uint32_t* dex_pc,
+                                             bool do_caller_check = false)
     REQUIRES_SHARED(Locks::mutator_lock_);
 
 struct CallerAndOuterMethod {
@@ -209,14 +205,20 @@ CallerAndOuterMethod GetCalleeSaveMethodCallerAndOuterMethod(Thread* self, Calle
 ArtMethod* GetCalleeSaveOuterMethod(Thread* self, CalleeSaveType type)
     REQUIRES_SHARED(Locks::mutator_lock_);
 
-// Returns whether we need to do class initialization check before invoking the method.
-// The caller is responsible for performing that check.
-bool NeedsClinitCheckBeforeCall(ArtMethod* method) REQUIRES_SHARED(Locks::mutator_lock_);
+// Returns the synchronization object for a native method for a GenericJni frame
+// we have just created or are about to exit. The synchronization object is
+// the class object for static methods and the `this` object otherwise.
+ObjPtr<mirror::Object> GetGenericJniSynchronizationObject(Thread* self, ArtMethod* called)
+    REQUIRES_SHARED(Locks::mutator_lock_);
 
-constexpr size_t kJniCookieSize = sizeof(uint32_t);
-
-inline HandleScope* GetGenericJniHandleScope(ArtMethod** managed_sp,
-                                             size_t num_handle_scope_references);
+// Update .bss method entrypoint if the `outer_method` has a valid OatFile, and either
+//   A) the `callee_reference` has the same OatFile as `outer_method`, or
+//   B) the `callee_reference` comes from a BCP DexFile that was present during `outer_method`'s
+//      OatFile compilation.
+// In both cases, we require that the oat file has a .bss entry for the `callee_reference`.
+void MaybeUpdateBssMethodEntry(ArtMethod* callee,
+                               MethodReference callee_reference,
+                               ArtMethod* outer_method) REQUIRES_SHARED(Locks::mutator_lock_);
 
 }  // namespace art
 

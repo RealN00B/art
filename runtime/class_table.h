@@ -21,14 +21,14 @@
 #include <utility>
 #include <vector>
 
-#include "base/allocator.h"
+#include "base/gc_visited_arena_pool.h"
 #include "base/hash_set.h"
 #include "base/macros.h"
 #include "base/mutex.h"
 #include "gc_root.h"
 #include "obj_ptr.h"
 
-namespace art {
+namespace art HIDDEN {
 
 class OatFile;
 
@@ -58,16 +58,29 @@ class ClassTable {
     explicit TableSlot(ObjPtr<mirror::Class> klass);
 
     TableSlot(ObjPtr<mirror::Class> klass, uint32_t descriptor_hash);
+    TableSlot(uint32_t ptr, uint32_t descriptor_hash);
 
     TableSlot& operator=(const TableSlot& copy) {
       data_.store(copy.data_.load(std::memory_order_relaxed), std::memory_order_relaxed);
       return *this;
     }
 
+    uint32_t Data() const {
+      return data_.load(std::memory_order_relaxed);
+    }
+
     bool IsNull() const REQUIRES_SHARED(Locks::mutator_lock_);
 
     uint32_t Hash() const {
       return MaskHash(data_.load(std::memory_order_relaxed));
+    }
+
+    uint32_t NonHashData() const {
+      return RemoveHash(Data());
+    }
+
+    static uint32_t RemoveHash(uint32_t hash) {
+      return hash & ~kHashMask;
     }
 
     static uint32_t MaskHash(uint32_t hash) {
@@ -78,15 +91,15 @@ class ClassTable {
       return MaskHash(other) == Hash();
     }
 
-    static uint32_t HashDescriptor(ObjPtr<mirror::Class> klass)
-        REQUIRES_SHARED(Locks::mutator_lock_);
-
     template<ReadBarrierOption kReadBarrierOption = kWithReadBarrier>
     ObjPtr<mirror::Class> Read() const REQUIRES_SHARED(Locks::mutator_lock_);
 
     // NO_THREAD_SAFETY_ANALYSIS since the visitor may require heap bitmap lock.
     template<typename Visitor>
     void VisitRoot(const Visitor& visitor) const NO_THREAD_SAFETY_ANALYSIS;
+
+    template<typename Visitor>
+    class ClassAndRootVisitor;
 
    private:
     // Extract a raw pointer from an address.
@@ -98,23 +111,28 @@ class ClassTable {
 
     // Data contains the class pointer GcRoot as well as the low bits of the descriptor hash.
     mutable Atomic<uint32_t> data_;
-    static const uint32_t kHashMask = kObjectAlignment - 1;
+    static constexpr uint32_t kHashMask = kObjectAlignment - 1;
   };
 
-  using DescriptorHashPair = std::pair<const char*, uint32_t>;
+  using DescriptorHashPair = std::pair<std::string_view, uint32_t>;
 
-  class ClassDescriptorHashEquals {
+  class ClassDescriptorHash {
    public:
     // uint32_t for cross compilation.
+    // NO_THREAD_SAFETY_ANALYSIS: Used from unannotated `HashSet<>` functions.
     uint32_t operator()(const TableSlot& slot) const NO_THREAD_SAFETY_ANALYSIS;
+    // uint32_t for cross compilation.
+    uint32_t operator()(const DescriptorHashPair& pair) const;
+  };
+
+  class ClassDescriptorEquals {
+   public:
     // Same class loader and descriptor.
     bool operator()(const TableSlot& a, const TableSlot& b) const
         NO_THREAD_SAFETY_ANALYSIS;
     // Same descriptor.
     bool operator()(const TableSlot& a, const DescriptorHashPair& b) const
         NO_THREAD_SAFETY_ANALYSIS;
-    // uint32_t for cross compilation.
-    uint32_t operator()(const DescriptorHashPair& pair) const NO_THREAD_SAFETY_ANALYSIS;
   };
 
   class TableSlotEmptyFn {
@@ -130,18 +148,13 @@ class ClassTable {
 
   // Hash set that hashes class descriptor, and compares descriptors and class loaders. Results
   // should be compared for a matching class descriptor and class loader.
-  typedef HashSet<TableSlot,
-                  TableSlotEmptyFn,
-                  ClassDescriptorHashEquals,
-                  ClassDescriptorHashEquals,
-                  TrackingAllocator<TableSlot, kAllocatorTagClassTable>> ClassSet;
+  using ClassSet = HashSet<TableSlot,
+                           TableSlotEmptyFn,
+                           ClassDescriptorHash,
+                           ClassDescriptorEquals,
+                           GcRootArenaAllocator<TableSlot, kAllocatorTagClassTable>>;
 
-  ClassTable();
-
-  // Used by image writer for checking.
-  bool Contains(ObjPtr<mirror::Class> klass)
-      REQUIRES(!lock_)
-      REQUIRES_SHARED(Locks::mutator_lock_);
+  EXPORT ClassTable();
 
   // Freeze the current class tables by allocating a new table and never updating or modifying the
   // existing table. This helps prevents dirty pages after caused by inserting after zygote fork.
@@ -160,7 +173,7 @@ class ClassTable {
       REQUIRES_SHARED(Locks::mutator_lock_);
 
   // Returns the number of classes in previous snapshots no matter the defining loader.
-  size_t NumReferencedZygoteClasses() const
+  EXPORT size_t NumReferencedZygoteClasses() const
       REQUIRES(!lock_)
       REQUIRES_SHARED(Locks::mutator_lock_);
 
@@ -169,49 +182,53 @@ class ClassTable {
       REQUIRES(!lock_)
       REQUIRES_SHARED(Locks::mutator_lock_);
 
+  // Returns the number of class-sets in the class table.
+  size_t Size() const
+      REQUIRES(!lock_)
+      REQUIRES_SHARED(Locks::mutator_lock_);
+
   // Update a class in the table with the new class. Returns the existing class which was replaced.
-  ObjPtr<mirror::Class> UpdateClass(const char* descriptor,
-                                    ObjPtr<mirror::Class> new_klass,
-                                    size_t hash)
+  ObjPtr<mirror::Class> UpdateClass(ObjPtr<mirror::Class> new_klass, size_t hash)
       REQUIRES(!lock_)
       REQUIRES_SHARED(Locks::mutator_lock_);
 
   // NO_THREAD_SAFETY_ANALYSIS for object marking requiring heap bitmap lock.
+  template <class Visitor>
+  void VisitRoots(Visitor& visitor, bool skip_classes = false) NO_THREAD_SAFETY_ANALYSIS
+      REQUIRES(!lock_) REQUIRES_SHARED(Locks::mutator_lock_);
+
+  template <class Visitor>
+  void VisitRoots(const Visitor& visitor, bool skip_classes = false) NO_THREAD_SAFETY_ANALYSIS
+      REQUIRES(!lock_) REQUIRES_SHARED(Locks::mutator_lock_);
+
   template<class Visitor>
-  void VisitRoots(Visitor& visitor)
+  void VisitClassesAndRoots(Visitor& visitor)
       NO_THREAD_SAFETY_ANALYSIS
       REQUIRES(!lock_)
       REQUIRES_SHARED(Locks::mutator_lock_);
 
-  template<class Visitor>
-  void VisitRoots(const Visitor& visitor)
-      NO_THREAD_SAFETY_ANALYSIS
-      REQUIRES(!lock_)
+  // Visit classes in those class-sets which satisfy 'cond'.
+  template <class Condition, class Visitor>
+  void VisitClassesIfConditionMet(Condition& cond, Visitor& visitor) REQUIRES(!lock_)
       REQUIRES_SHARED(Locks::mutator_lock_);
-
   // Stops visit if the visitor returns false.
-  template <typename Visitor, ReadBarrierOption kReadBarrierOption = kWithReadBarrier>
+  template <ReadBarrierOption kReadBarrierOption = kWithReadBarrier, typename Visitor>
   bool Visit(Visitor& visitor)
       REQUIRES(!lock_)
       REQUIRES_SHARED(Locks::mutator_lock_);
-  template <typename Visitor, ReadBarrierOption kReadBarrierOption = kWithReadBarrier>
+  template <ReadBarrierOption kReadBarrierOption = kWithReadBarrier, typename Visitor>
   bool Visit(const Visitor& visitor)
       REQUIRES(!lock_)
       REQUIRES_SHARED(Locks::mutator_lock_);
 
   // Return the first class that matches the descriptor. Returns null if there are none.
-  ObjPtr<mirror::Class> Lookup(const char* descriptor, size_t hash)
+  ObjPtr<mirror::Class> Lookup(std::string_view descriptor, size_t hash)
       REQUIRES(!lock_)
       REQUIRES_SHARED(Locks::mutator_lock_);
 
   // Return the first class that matches the descriptor of klass. Returns null if there are none.
+  // Used for tests and debug-build checks.
   ObjPtr<mirror::Class> LookupByDescriptor(ObjPtr<mirror::Class> klass)
-      REQUIRES(!lock_)
-      REQUIRES_SHARED(Locks::mutator_lock_);
-
-  // Try to insert a class and return the inserted class if successful. If another class
-  // with the same descriptor is already in the table, return the existing entry.
-  ObjPtr<mirror::Class> TryInsert(ObjPtr<mirror::Class> klass)
       REQUIRES(!lock_)
       REQUIRES_SHARED(Locks::mutator_lock_);
 
@@ -220,11 +237,6 @@ class ClassTable {
       REQUIRES_SHARED(Locks::mutator_lock_);
 
   void InsertWithHash(ObjPtr<mirror::Class> klass, size_t hash)
-      REQUIRES(!lock_)
-      REQUIRES_SHARED(Locks::mutator_lock_);
-
-  // Returns true if the class was found and removed, false otherwise.
-  bool Remove(const char* descriptor)
       REQUIRES(!lock_)
       REQUIRES_SHARED(Locks::mutator_lock_);
 
@@ -238,13 +250,8 @@ class ClassTable {
       REQUIRES(!lock_)
       REQUIRES_SHARED(Locks::mutator_lock_);
 
-  // Combines all of the tables into one class set.
-  size_t WriteToMemory(uint8_t* ptr) const
-      REQUIRES(!lock_)
-      REQUIRES_SHARED(Locks::mutator_lock_);
-
   // Read a table from ptr and put it at the front of the class set.
-  size_t ReadFromMemory(uint8_t* ptr)
+  EXPORT size_t ReadFromMemory(uint8_t* ptr)
       REQUIRES(!lock_)
       REQUIRES_SHARED(Locks::mutator_lock_);
 
@@ -269,10 +276,6 @@ class ClassTable {
   }
 
  private:
-  // Only copies classes.
-  void CopyWithoutLocks(const ClassTable& source_table) NO_THREAD_SAFETY_ANALYSIS;
-  void InsertWithoutLocks(ObjPtr<mirror::Class> klass) NO_THREAD_SAFETY_ANALYSIS;
-
   size_t CountDefiningLoaderClasses(ObjPtr<mirror::ClassLoader> defining_loader,
                                     const ClassSet& set) const
       REQUIRES(lock_)

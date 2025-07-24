@@ -28,13 +28,21 @@
 #include "base/systrace.h"
 #include "base/time_utils.h"
 #include "base/value_object.h"
+#include "monitor.h"
 #include "mutex-inl.h"
 #include "scoped_thread_state_change-inl.h"
 #include "thread-inl.h"
+#include "thread.h"
+#include "thread_list.h"
 
-namespace art {
+namespace art HIDDEN {
 
 using android::base::StringPrintf;
+
+static constexpr uint64_t kIntervalMillis = 50;
+static constexpr int kMonitorTimeoutTryMax = 5;
+
+static const char* kLastDumpStackTime = "LastDumpStackTime";
 
 struct AllMutexData {
   // A guard for all_mutexes_ that's not a mutex (Mutexes must CAS to acquire and busy wait).
@@ -45,19 +53,26 @@ struct AllMutexData {
 };
 static struct AllMutexData gAllMutexData[kAllMutexDataSize];
 
+struct DumpStackLastTimeTLSData : public art::TLSData {
+  explicit DumpStackLastTimeTLSData(uint64_t last_dump_time_ms)
+      : last_dump_time_ms_(last_dump_time_ms) {}
+  std::atomic<uint64_t> last_dump_time_ms_;
+};
+
 #if ART_USE_FUTEXES
+// Compute a relative timespec as *result_ts = lhs - rhs.
+// Return false (and produce an invalid *result_ts) if lhs < rhs.
 static bool ComputeRelativeTimeSpec(timespec* result_ts, const timespec& lhs, const timespec& rhs) {
   const int32_t one_sec = 1000 * 1000 * 1000;  // one second in nanoseconds.
+  static_assert(std::is_signed<decltype(result_ts->tv_sec)>::value);  // Signed on Linux.
   result_ts->tv_sec = lhs.tv_sec - rhs.tv_sec;
   result_ts->tv_nsec = lhs.tv_nsec - rhs.tv_nsec;
   if (result_ts->tv_nsec < 0) {
     result_ts->tv_sec--;
     result_ts->tv_nsec += one_sec;
-  } else if (result_ts->tv_nsec > one_sec) {
-    result_ts->tv_sec++;
-    result_ts->tv_nsec -= one_sec;
   }
-  return result_ts->tv_sec < 0;
+  DCHECK(result_ts->tv_nsec >= 0 && result_ts->tv_nsec < one_sec);
+  return result_ts->tv_sec >= 0;
 }
 #endif
 
@@ -94,7 +109,7 @@ static void BackOff(uint32_t i) {
     volatile uint32_t x = 0;
     const uint32_t spin_count = 10 * i;
     for (uint32_t spin = 0; spin < spin_count; ++spin) {
-      ++x;  // Volatile; hence should not be optimized away.
+      x = x + 1;  // Volatile; hence should not be optimized away.
     }
     // TODO: Consider adding x86 PAUSE and/or ARM YIELD here.
   } else if (i <= kYieldMax) {
@@ -231,11 +246,23 @@ void BaseMutex::DumpAll(std::ostream& os) {
 }
 
 void BaseMutex::CheckSafeToWait(Thread* self) {
-  if (self == nullptr) {
-    CheckUnattachedThread(level_);
+  if (!kDebugLocking) {
     return;
   }
-  if (kDebugLocking) {
+  // Avoid repeated reporting of the same violation in the common case.
+  // We somewhat ignore races in the duplicate elision code. The first kMaxReports and the first
+  // report for a given level_ should always appear.
+  static std::atomic<uint> last_level_reported(kLockLevelCount);
+  static constexpr int kMaxReports = 5;
+  static std::atomic<uint> num_reports(0);  // For the current level, more or less.
+
+  if (self == nullptr) {
+    CheckUnattachedThread(level_);
+  } else if (num_reports.load(std::memory_order_relaxed) > kMaxReports &&
+             last_level_reported.load(std::memory_order_relaxed) == level_) {
+    LOG(ERROR) << "Eliding probably redundant CheckSafeToWait() complaints";
+    return;
+  } else {
     CHECK(self->GetHeldMutex(level_) == this || level_ == kMonitorLock)
         << "Waiting on unacquired mutex: " << name_;
     bool bad_mutexes_held = false;
@@ -268,6 +295,12 @@ void BaseMutex::CheckSafeToWait(Thread* self) {
             bad_mutexes_held = true;
           }
         } else if (held_mutex != nullptr) {
+          if (last_level_reported.load(std::memory_order_relaxed) == level_) {
+            num_reports.fetch_add(1, std::memory_order_relaxed);
+          } else {
+            last_level_reported.store(level_, std::memory_order_relaxed);
+            num_reports.store(0, std::memory_order_relaxed);
+          }
           std::ostringstream oss;
           oss << "Holding \"" << held_mutex->name_ << "\" "
               << "(level " << LockLevel(i) << ") while performing wait on "
@@ -430,6 +463,7 @@ void Mutex::ExclusiveLock(Thread* self) {
         done = state_and_contenders_.CompareAndSetWeakAcquire(cur_state, cur_state | kHeldMask);
       } else {
         // Failed to acquire, hang up.
+        // We don't hold the mutex: GetExclusiveOwnerTid() is usually, but not always, correct.
         ScopedContentionRecorder scr(this, SafeGetTid(self), GetExclusiveOwnerTid());
         // Empirically, it appears important to spin again each time through the loop; if we
         // bother to go to sleep and wake up, we should be fairly persistent in trying for the
@@ -443,21 +477,38 @@ void Mutex::ExclusiveLock(Thread* self) {
           if (UNLIKELY(should_respond_to_empty_checkpoint_request_)) {
             self->CheckEmptyCheckpointFromMutex();
           }
+
+          uint64_t wait_start_ms = enable_monitor_timeout_ ? MilliTime() : 0;
+          uint64_t try_times = 0;
           do {
+            timespec timeout_ts;
+            timeout_ts.tv_sec = 0;
+            // NB: Some tests use the mutex without the runtime.
+            timeout_ts.tv_nsec = Runtime::Current() != nullptr
+                ? Runtime::Current()->GetMonitorTimeoutNs()
+                : Monitor::kDefaultMonitorTimeoutMs;
             if (futex(state_and_contenders_.Address(), FUTEX_WAIT_PRIVATE, cur_state,
-                      nullptr, nullptr, 0) != 0) {
+                      enable_monitor_timeout_ ? &timeout_ts : nullptr , nullptr, 0) != 0) {
               // We only went to sleep after incrementing and contenders and checking that the
               // lock is still held by someone else.  EAGAIN and EINTR both indicate a spurious
               // failure, try again from the beginning.  We don't use TEMP_FAILURE_RETRY so we can
               // intentionally retry to acquire the lock.
               if ((errno != EAGAIN) && (errno != EINTR)) {
-                PLOG(FATAL) << "futex wait failed for " << name_;
+                if (errno == ETIMEDOUT) {
+                  try_times++;
+                  if (try_times <= kMonitorTimeoutTryMax) {
+                    DumpStack(self, wait_start_ms, try_times);
+                  }
+                } else {
+                  PLOG(FATAL) << "futex wait failed for " << name_;
+                }
               }
             }
             SleepIfRuntimeDeleted(self);
             // Retry until not held. In heavy contention situations we otherwise get redundant
             // futex wakeups as a result of repeatedly decrementing and incrementing contenders.
-          } while ((state_and_contenders_.load(std::memory_order_relaxed) & kHeldMask) != 0);
+            cur_state = state_and_contenders_.load(std::memory_order_relaxed);
+          } while ((cur_state & kHeldMask) != 0);
           decrement_contenders();
         }
       }
@@ -480,6 +531,65 @@ void Mutex::ExclusiveLock(Thread* self) {
   }
 }
 
+void Mutex::DumpStack(Thread* self, uint64_t wait_start_ms, uint64_t try_times) {
+  ScopedObjectAccess soa(self);
+  Locks::thread_list_lock_->ExclusiveLock(self);
+  std::string owner_stack_dump;
+  pid_t owner_tid = GetExclusiveOwnerTid();
+  CHECK(Runtime::Current() != nullptr);
+  Thread *owner = Runtime::Current()->GetThreadList()->FindThreadByTid(owner_tid);
+  if (owner != nullptr) {
+    if (IsDumpFrequent(owner, try_times)) {
+      Locks::thread_list_lock_->ExclusiveUnlock(self);
+      LOG(WARNING) << "Contention with tid " << owner_tid << ", monitor id " << monitor_id_;
+      return;
+    }
+    struct CollectStackTrace : public Closure {
+      void Run(art::Thread* thread) override
+        REQUIRES_SHARED(art::Locks::mutator_lock_) {
+        if (IsDumpFrequent(thread)) {
+          return;
+        }
+        DumpStackLastTimeTLSData* tls_data =
+            reinterpret_cast<DumpStackLastTimeTLSData*>(thread->GetCustomTLS(kLastDumpStackTime));
+        if (tls_data == nullptr) {
+          thread->SetCustomTLS(kLastDumpStackTime, new DumpStackLastTimeTLSData(MilliTime()));
+        } else {
+          tls_data->last_dump_time_ms_.store(MilliTime());
+        }
+        thread->DumpJavaStack(oss);
+      }
+      std::ostringstream oss;
+    };
+    CollectStackTrace owner_trace;
+    owner->RequestSynchronousCheckpoint(&owner_trace);
+    owner_stack_dump = owner_trace.oss.str();
+    uint64_t wait_ms = MilliTime() - wait_start_ms;
+    LOG(WARNING) << "Monitor contention with tid " << owner_tid << ", wait time: " << wait_ms
+                 << "ms, monitor id: " << monitor_id_
+                 << "\nPerfMonitor owner thread(" << owner_tid << ") stack is:\n"
+                 << owner_stack_dump;
+  } else {
+    Locks::thread_list_lock_->ExclusiveUnlock(self);
+  }
+}
+
+bool Mutex::IsDumpFrequent(Thread* thread, uint64_t try_times) {
+  uint64_t last_dump_time_ms = 0;
+  DumpStackLastTimeTLSData* tls_data =
+      reinterpret_cast<DumpStackLastTimeTLSData*>(thread->GetCustomTLS(kLastDumpStackTime));
+  if (tls_data != nullptr) {
+     last_dump_time_ms = tls_data->last_dump_time_ms_.load();
+  }
+  uint64_t interval = MilliTime() - last_dump_time_ms;
+  if (interval < kIntervalMillis * try_times) {
+    return true;
+  } else {
+    return false;
+  }
+}
+
+template <bool kCheck>
 bool Mutex::ExclusiveTryLock(Thread* self) {
   DCHECK(self == nullptr || self == Thread::Current());
   if (kDebugLocking && !recursive_) {
@@ -510,7 +620,7 @@ bool Mutex::ExclusiveTryLock(Thread* self) {
 #endif
     DCHECK_EQ(GetExclusiveOwnerTid(), 0);
     exclusive_owner_.store(SafeGetTid(self), std::memory_order_relaxed);
-    RegisterAsLocked(self);
+    RegisterAsLocked(self, kCheck);
   }
   recursion_count_++;
   if (kDebugLocking) {
@@ -520,6 +630,9 @@ bool Mutex::ExclusiveTryLock(Thread* self) {
   }
   return true;
 }
+
+template bool Mutex::ExclusiveTryLock<false>(Thread* self);
+template bool Mutex::ExclusiveTryLock<true>(Thread* self);
 
 bool Mutex::ExclusiveTryLockWithSpinning(Thread* self) {
   // Spin a small number of times, since this affects our ability to respond to suspension
@@ -627,11 +740,12 @@ void Mutex::ExclusiveUnlock(Thread* self) {
 }
 
 void Mutex::Dump(std::ostream& os) const {
-  os << (recursive_ ? "recursive " : "non-recursive ")
-      << name_
-      << " level=" << static_cast<int>(level_)
-      << " rec=" << recursion_count_
-      << " owner=" << GetExclusiveOwnerTid() << " ";
+  os << (recursive_ ? "recursive " : "non-recursive ") << name_
+     << " level=" << static_cast<int>(level_) << " rec=" << recursion_count_
+#if ART_USE_FUTEXES
+     << " state_and_contenders = " << std::hex << state_and_contenders_ << std::dec
+#endif
+     << " owner=" << GetExclusiveOwnerTid() << " ";
   DumpContention(os);
 }
 
@@ -768,7 +882,7 @@ bool ReaderWriterMutex::ExclusiveLockWithTimeout(Thread* self, int64_t ms, int32
       timespec now_abs_ts;
       InitTimeSpec(true, CLOCK_MONOTONIC, 0, 0, &now_abs_ts);
       timespec rel_ts;
-      if (ComputeRelativeTimeSpec(&rel_ts, end_abs_ts, now_abs_ts)) {
+      if (!ComputeRelativeTimeSpec(&rel_ts, end_abs_ts, now_abs_ts)) {
         return false;  // Timed out.
       }
       ScopedContentionRecorder scr(this, SafeGetTid(self), GetExclusiveOwnerTid());
@@ -785,6 +899,7 @@ bool ReaderWriterMutex::ExclusiveLockWithTimeout(Thread* self, int64_t ms, int32
             // EAGAIN and EINTR both indicate a spurious failure,
             // recompute the relative time out from now and try again.
             // We don't use TEMP_FAILURE_RETRY so we can recompute rel_ts;
+            num_contenders_.fetch_sub(1);  // Unlikely to matter.
             PLOG(FATAL) << "timed futex wait failed for " << name_;
           }
         }
@@ -832,7 +947,7 @@ void ReaderWriterMutex::HandleSharedLockContention(Thread* self, int32_t cur_sta
 }
 #endif
 
-bool ReaderWriterMutex::SharedTryLock(Thread* self) {
+bool ReaderWriterMutex::SharedTryLock(Thread* self, bool check) {
   DCHECK(self == nullptr || self == Thread::Current());
 #if ART_USE_FUTEXES
   bool done = false;
@@ -856,7 +971,7 @@ bool ReaderWriterMutex::SharedTryLock(Thread* self) {
     PLOG(FATAL) << "pthread_mutex_trylock failed for " << name_;
   }
 #endif
-  RegisterAsLocked(self);
+  RegisterAsLocked(self, check);
   AssertSharedHeld(self);
   return true;
 }

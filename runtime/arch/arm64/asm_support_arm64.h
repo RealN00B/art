@@ -18,13 +18,19 @@
 #define ART_RUNTIME_ARCH_ARM64_ASM_SUPPORT_ARM64_H_
 
 #include "asm_support.h"
+#include "entrypoints/entrypoint_asm_constants.h"
 
-#define FRAME_SIZE_SAVE_ALL_CALLEE_SAVES 176
+// TODO(mythria): Change these to use constants from callee_save_frame_arm64.h
+#define CALLEE_SAVES_SIZE (12 * 8 + 8 * 8)
+// +8 for the ArtMethod, +8 for alignment.
+#define FRAME_SIZE_SAVE_ALL_CALLEE_SAVES (CALLEE_SAVES_SIZE + 16)
 #define FRAME_SIZE_SAVE_REFS_ONLY 96
 #define FRAME_SIZE_SAVE_REFS_AND_ARGS 224
 #define FRAME_SIZE_SAVE_EVERYTHING 512
 #define FRAME_SIZE_SAVE_EVERYTHING_FOR_CLINIT FRAME_SIZE_SAVE_EVERYTHING
 #define FRAME_SIZE_SAVE_EVERYTHING_FOR_SUSPEND_CHECK FRAME_SIZE_SAVE_EVERYTHING
+#define SAVE_EVERYTHING_FRAME_X0_OFFSET \
+    (FRAME_SIZE_SAVE_EVERYTHING - CALLEE_SAVE_EVERYTHING_NUM_CORE_SPILLS * POINTER_SIZE)
 
 // The offset from art_quick_read_barrier_mark_introspection to the array switch cases,
 // i.e. art_quick_read_barrier_mark_introspection_arrays.
@@ -35,17 +41,24 @@
 
 // The offset of the reference load LDR from the return address in LR for field loads.
 #ifdef USE_HEAP_POISONING
-#define BAKER_MARK_INTROSPECTION_FIELD_LDR_OFFSET -8
+#define BAKER_MARK_INTROSPECTION_FIELD_LDR_OFFSET (-8)
 #else
-#define BAKER_MARK_INTROSPECTION_FIELD_LDR_OFFSET -4
+#define BAKER_MARK_INTROSPECTION_FIELD_LDR_OFFSET (-4)
 #endif
 // The offset of the reference load LDR from the return address in LR for array loads.
 #ifdef USE_HEAP_POISONING
-#define BAKER_MARK_INTROSPECTION_ARRAY_LDR_OFFSET -8
+#define BAKER_MARK_INTROSPECTION_ARRAY_LDR_OFFSET (-8)
 #else
-#define BAKER_MARK_INTROSPECTION_ARRAY_LDR_OFFSET -4
+#define BAKER_MARK_INTROSPECTION_ARRAY_LDR_OFFSET (-4)
 #endif
 // The offset of the reference load LDR from the return address in LR for GC root loads.
-#define BAKER_MARK_INTROSPECTION_GC_ROOT_LDR_OFFSET -8
+#define BAKER_MARK_INTROSPECTION_GC_ROOT_LDR_OFFSET (-8)
+
+// Size of Context::gprs_.
+#define ARM64_LONG_JUMP_GPRS_SIZE 272
+// Size of Context::fprs_.
+#define ARM64_LONG_JUMP_FPRS_SIZE 256
+// Size of Context::gprs_ + Context::fprs_.
+#define ARM64_LONG_JUMP_CONTEXT_SIZE (ARM64_LONG_JUMP_GPRS_SIZE + ARM64_LONG_JUMP_FPRS_SIZE)
 
 #endif  // ART_RUNTIME_ARCH_ARM64_ASM_SUPPORT_ARM64_H_

@@ -16,17 +16,17 @@
 
 #include <android-base/logging.h>
 
+#include "base/common_art_test.h"
 #include "base/macros.h"
 #include "base/unix_file/fd_file.h"
-#include "common_runtime_test.h"
 #include "stream/buffered_output_stream.h"
 #include "stream/file_output_stream.h"
 #include "stream/vector_output_stream.h"
 
-namespace art {
+namespace art HIDDEN {
 namespace linker {
 
-class OutputStreamTest : public CommonRuntimeTest {
+class OutputStreamTest : public CommonArtTest {
  protected:
   void CheckOffset(off_t expected) {
     off_t actual = output_stream_->Seek(0, kSeekCurrent);
@@ -103,17 +103,17 @@ TEST_F(OutputStreamTest, Vector) {
 TEST_F(OutputStreamTest, BufferedFlush) {
   struct CheckingOutputStream : OutputStream {
     CheckingOutputStream()
-        : OutputStream("dummy"),
+        : OutputStream("fake-location"),
           flush_called(false) { }
     ~CheckingOutputStream() override {}
 
-    bool WriteFully(const void* buffer ATTRIBUTE_UNUSED,
-                    size_t byte_count ATTRIBUTE_UNUSED) override {
+    bool WriteFully([[maybe_unused]] const void* buffer,
+                    [[maybe_unused]] size_t byte_count) override {
       LOG(FATAL) << "UNREACHABLE";
       UNREACHABLE();
     }
 
-    off_t Seek(off_t offset ATTRIBUTE_UNUSED, Whence whence ATTRIBUTE_UNUSED) override {
+    off_t Seek([[maybe_unused]] off_t offset, [[maybe_unused]] Whence whence) override {
       LOG(FATAL) << "UNREACHABLE";
       UNREACHABLE();
     }

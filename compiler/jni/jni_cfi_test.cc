@@ -19,8 +19,9 @@
 
 #include "arch/instruction_set.h"
 #include "base/arena_allocator.h"
-#include "base/enums.h"
+#include "base/macros.h"
 #include "base/malloc_arena_pool.h"
+#include "base/pointer_size.h"
 #include "cfi_test.h"
 #include "gtest/gtest.h"
 #include "jni/quick/calling_convention.h"
@@ -30,10 +31,7 @@
 
 #include "jni/jni_cfi_test_expected.inc"
 
-namespace art {
-
-// Run the tests only on host.
-#ifndef ART_TARGET_ANDROID
+namespace art HIDDEN {
 
 class JNICFITest : public CFITest {
  public:
@@ -69,7 +67,8 @@ class JNICFITest : public CFITest {
         JniCallingConvention::Create(&allocator,
                                      is_static,
                                      is_synchronized,
-                                     /*is_critical_native*/false,
+                                     /*is_fast_native=*/ false,
+                                     /*is_critical_native=*/ false,
                                      shorty,
                                      isa));
     std::unique_ptr<ManagedRuntimeCallingConvention> mr_conv(
@@ -97,7 +96,7 @@ class JNICFITest : public CFITest {
     jni_asm->FinalizeCode();
     std::vector<uint8_t> actual_asm(jni_asm->CodeSize());
     MemoryRegion code(&actual_asm[0], actual_asm.size());
-    jni_asm->FinalizeInstructions(code);
+    jni_asm->CopyInstructions(code);
     ASSERT_EQ(jni_asm->cfi().GetCurrentCFAOffset(), frame_size);
     const std::vector<uint8_t>& actual_cfi = *(jni_asm->cfi().data());
 
@@ -124,19 +123,17 @@ class JNICFITest : public CFITest {
   }
 
 #ifdef ART_ENABLE_CODEGEN_arm
-// Run the tests for ARM only with Baker read barriers, as the
-// expected generated code contains a Marking Register refresh
-// instruction.
-#if defined(USE_READ_BARRIER) && defined(USE_BAKER_READ_BARRIER)
+// Run the tests for ARM only if the Marking Register is reserved as the
+// expected generated code contains a Marking Register refresh instruction.
+#if defined(RESERVE_MARKING_REGISTER)
 TEST_ISA(kThumb2)
 #endif
 #endif
 
 #ifdef ART_ENABLE_CODEGEN_arm64
-// Run the tests for ARM64 only with Baker read barriers, as the
-// expected generated code contains a Marking Register refresh
-// instruction.
-#if defined(USE_READ_BARRIER) && defined(USE_BAKER_READ_BARRIER)
+// Run the tests for ARM64 only if the Marking Register is reserved as the
+// expected generated code contains a Marking Register refresh instruction.
+#if defined(RESERVE_MARKING_REGISTER)
 TEST_ISA(kArm64)
 #endif
 #endif
@@ -148,7 +145,5 @@ TEST_ISA(kX86)
 #ifdef ART_ENABLE_CODEGEN_x86_64
 TEST_ISA(kX86_64)
 #endif
-
-#endif  // ART_TARGET_ANDROID
 
 }  // namespace art

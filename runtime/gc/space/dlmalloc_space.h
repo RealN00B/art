@@ -20,7 +20,7 @@
 #include "malloc_space.h"
 #include "space.h"
 
-namespace art {
+namespace art HIDDEN {
 namespace gc {
 
 namespace collector {
@@ -149,7 +149,7 @@ class DlMallocSpace : public MallocSpace {
     return this;
   }
 
-  void LogFragmentationAllocFailure(std::ostream& os, size_t failed_alloc_bytes) override
+  bool LogFragmentationAllocFailure(std::ostream& os, size_t failed_alloc_bytes) override
       REQUIRES_SHARED(Locks::mutator_lock_);
 
  protected:
@@ -188,6 +188,14 @@ class DlMallocSpace : public MallocSpace {
 };
 
 }  // namespace space
+
+namespace allocator {
+
+// Callback from dlmalloc when it needs to increase the footprint.
+// Must be implemented outside of art-dlmalloc.cc.
+void* ArtDlMallocMoreCore(void* mspace, intptr_t increment);
+
+}  // namespace allocator
 }  // namespace gc
 }  // namespace art
 

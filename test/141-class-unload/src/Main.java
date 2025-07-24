@@ -20,6 +20,10 @@ import java.io.FileReader;
 import java.lang.ref.WeakReference;
 import java.lang.reflect.Constructor;
 import java.lang.reflect.Method;
+import java.nio.ByteBuffer;
+import java.util.Arrays;
+import java.util.function.Consumer;
+import java.util.Base64;
 
 public class Main {
     static final String DEX_FILE = System.getenv("DEX_LOCATION") + "/141-class-unload-ex.jar";
@@ -49,6 +53,17 @@ public class Main {
             testOatFilesUnloaded(getPid());
             // Test that objects keep class loader live for sticky GC.
             testStickyUnload(constructor);
+            // Test that copied methods recorded in a stack trace prevents unloading.
+            testCopiedMethodInStackTrace(constructor);
+            // Test that code preventing unloading holder classes of copied methods recorded in
+            // a stack trace does not crash when processing a copied method in the boot class path.
+            testCopiedBcpMethodInStackTrace();
+            // Test that code preventing unloading holder classes of copied methods recorded in
+            // a stack trace does not crash when processing a copied method in an app image.
+            testCopiedAppImageMethodInStackTrace();
+            // Test that the runtime uses the right allocator when creating conflict methods.
+            testConflictMethod(constructor);
+            testConflictMethod2(constructor);
         } catch (Exception e) {
             e.printStackTrace(System.out);
         }
@@ -103,13 +118,12 @@ public class Main {
         System.out.println(klass2.get());
     }
 
-    private static void testUnloadLoader(Constructor<?> constructor)
-        throws Exception {
-      WeakReference<ClassLoader> loader = setUpUnloadLoader(constructor, true);
-      // No strong references to class loader, should get unloaded.
-      doUnloading();
-      // If the weak reference is cleared, then it was unloaded.
-      System.out.println(loader.get());
+    private static void testUnloadLoader(Constructor<?> constructor) throws Exception {
+        WeakReference<ClassLoader> loader = setUpUnloadLoader(constructor, true);
+        // No strong references to class loader, should get unloaded.
+        doUnloading();
+        // If the weak reference is cleared, then it was unloaded.
+        System.out.println(loader.get());
     }
 
     private static void testStackTrace(Constructor<?> constructor) throws Exception {
@@ -138,33 +152,34 @@ public class Main {
     }
 
     static class Pair {
-      public Pair(Object o, ClassLoader l) {
-        object = o;
-        classLoader = new WeakReference<ClassLoader>(l);
-      }
+        public Pair(Object o, ClassLoader l) {
+            object = o;
+            classLoader = new WeakReference<ClassLoader>(l);
+        }
 
-      public Object object;
-      public WeakReference<ClassLoader> classLoader;
+        public Object object;
+        public WeakReference<ClassLoader> classLoader;
     }
 
-    private static Pair testNoUnloadInstanceHelper(Constructor<?> constructor) throws Exception {
+    // Make the method not inline-able to prevent the compiler optimizing away the allocation.
+    private static Pair $noinline$testNoUnloadInstanceHelper(Constructor<?> constructor)
+            throws Exception {
         ClassLoader loader = (ClassLoader) constructor.newInstance(
-            DEX_FILE, LIBRARY_SEARCH_PATH, ClassLoader.getSystemClassLoader());
+                DEX_FILE, LIBRARY_SEARCH_PATH, ClassLoader.getSystemClassLoader());
         Object o = testNoUnloadHelper(loader);
         return new Pair(o, loader);
     }
 
     private static void testNoUnloadInstance(Constructor<?> constructor) throws Exception {
-        Pair p = testNoUnloadInstanceHelper(constructor);
+        Pair p = $noinline$testNoUnloadInstanceHelper(constructor);
         doUnloading();
-        // If the class loader was unloded too early due to races, just pass the test.
         boolean isNull = p.classLoader.get() == null;
         System.out.println("loader null " + isNull);
     }
 
     private static Class<?> setUpUnloadClass(Constructor<?> constructor) throws Exception {
         ClassLoader loader = (ClassLoader) constructor.newInstance(
-            DEX_FILE, LIBRARY_SEARCH_PATH, ClassLoader.getSystemClassLoader());
+                DEX_FILE, LIBRARY_SEARCH_PATH, ClassLoader.getSystemClassLoader());
         Class<?> intHolder = loader.loadClass("IntHolder");
         Method getValue = intHolder.getDeclaredMethod("getValue");
         Method setValue = intHolder.getDeclaredMethod("setValue", Integer.TYPE);
@@ -199,6 +214,208 @@ public class Main {
             o = null;
         }
         System.out.println("Too small " + (s.length() < 1000));
+    }
+
+    private static void assertStackTraceContains(Throwable t, String className, String methodName) {
+        boolean found = false;
+        for (StackTraceElement e : t.getStackTrace()) {
+            if (className.equals(e.getClassName()) && methodName.equals(e.getMethodName())) {
+                found = true;
+                break;
+            }
+        }
+        if (!found) {
+            throw new Error("Did not find " + className + "." + methodName);
+        }
+    }
+
+    private static void $noinline$callAllMethods(ConflictIface iface) {
+        // Call all methods in the interface to make sure we hit conflicts in the IMT.
+        iface.method1();
+        iface.method2();
+        iface.method3();
+        iface.method4();
+        iface.method5();
+        iface.method6();
+        iface.method7();
+        iface.method8();
+        iface.method9();
+        iface.method10();
+        iface.method11();
+        iface.method12();
+        iface.method13();
+        iface.method14();
+        iface.method15();
+        iface.method16();
+        iface.method17();
+        iface.method18();
+        iface.method19();
+        iface.method20();
+        iface.method21();
+        iface.method22();
+        iface.method23();
+        iface.method24();
+        iface.method25();
+        iface.method26();
+        iface.method27();
+        iface.method28();
+        iface.method29();
+        iface.method30();
+        iface.method31();
+        iface.method32();
+        iface.method33();
+        iface.method34();
+        iface.method35();
+        iface.method36();
+        iface.method37();
+        iface.method38();
+        iface.method39();
+        iface.method40();
+        iface.method41();
+        iface.method42();
+        iface.method43();
+        iface.method44();
+        iface.method45();
+        iface.method46();
+        iface.method47();
+        iface.method48();
+        iface.method49();
+        iface.method50();
+        iface.method51();
+        iface.method52();
+        iface.method53();
+        iface.method54();
+        iface.method55();
+        iface.method56();
+        iface.method57();
+        iface.method58();
+        iface.method59();
+        iface.method60();
+        iface.method61();
+        iface.method62();
+        iface.method63();
+        iface.method64();
+        iface.method65();
+        iface.method66();
+        iface.method67();
+        iface.method68();
+        iface.method69();
+        iface.method70();
+        iface.method71();
+        iface.method72();
+        iface.method73();
+        iface.method74();
+        iface.method75();
+        iface.method76();
+        iface.method77();
+        iface.method78();
+        iface.method79();
+    }
+
+    private static void $noinline$invokeConflictMethod(Constructor<?> constructor)
+            throws Exception {
+        ClassLoader loader = (ClassLoader) constructor.newInstance(
+                DEX_FILE, LIBRARY_SEARCH_PATH, ClassLoader.getSystemClassLoader());
+        Class<?> impl = loader.loadClass("ConflictImpl");
+        ConflictIface iface = (ConflictIface) impl.newInstance();
+        $noinline$callAllMethods(iface);
+    }
+
+    private static void testConflictMethod(Constructor<?> constructor) throws Exception {
+        // Load and unload a few class loaders to force re-use of the native memory where we
+        // used to allocate the conflict table.
+        for (int i = 0; i < 2; i++) {
+            $noinline$invokeConflictMethod(constructor);
+            doUnloading();
+        }
+        Class<?> impl = Class.forName("ConflictSuper");
+        ConflictIface iface = (ConflictIface) impl.newInstance();
+        $noinline$callAllMethods(iface);
+    }
+
+    private static void $noinline$invokeConflictMethod2(Constructor<?> constructor)
+            throws Exception {
+        // We need three class loaders to expose the issue: the main one with the top super class,
+        // then a second one with the abstract class which we used to wrongly return as an IMT
+        // owner, and the concrete class in a different class loader.
+        Class<?> cls = Class.forName("dalvik.system.InMemoryDexClassLoader");
+        Constructor<?> inMemoryConstructor =
+                cls.getDeclaredConstructor(ByteBuffer.class, ClassLoader.class);
+        ClassLoader inMemoryLoader = (ClassLoader) inMemoryConstructor.newInstance(
+                ByteBuffer.wrap(DEX_BYTES), ClassLoader.getSystemClassLoader());
+        ClassLoader loader = (ClassLoader) constructor.newInstance(
+                DEX_FILE, LIBRARY_SEARCH_PATH, inMemoryLoader);
+        Class<?> impl = loader.loadClass("ConflictImpl2");
+        ConflictIface iface = (ConflictIface) impl.newInstance();
+        $noinline$callAllMethods(iface);
+    }
+
+    private static void testConflictMethod2(Constructor<?> constructor) throws Exception {
+        // Load and unload a few class loaders to force re-use of the native memory where we
+        // used to allocate the conflict table.
+        for (int i = 0; i < 2; i++) {
+            $noinline$invokeConflictMethod2(constructor);
+            doUnloading();
+        }
+        Class<?> impl = Class.forName("ConflictSuper");
+        ConflictIface iface = (ConflictIface) impl.newInstance();
+        $noinline$callAllMethods(iface);
+    }
+
+    private static void testCopiedMethodInStackTrace(Constructor<?> constructor) throws Exception {
+        Throwable t = $noinline$createStackTraceWithCopiedMethod(constructor);
+        doUnloading();
+        assertStackTraceContains(t, "Iface", "invokeRun");
+    }
+
+    private static Throwable $noinline$createStackTraceWithCopiedMethod(Constructor<?> constructor)
+            throws Exception {
+      ClassLoader loader = (ClassLoader) constructor.newInstance(
+              DEX_FILE, LIBRARY_SEARCH_PATH, Main.class.getClassLoader());
+      Iface impl = (Iface) loader.loadClass("Impl").newInstance();
+      Runnable throwingRunnable = new Runnable() {
+          public void run() {
+              throw new Error();
+          }
+      };
+      try {
+          impl.invokeRun(throwingRunnable);
+          System.out.println("UNREACHABLE");
+          return null;
+      } catch (Error expected) {
+          return expected;
+      }
+    }
+
+    private static void testCopiedBcpMethodInStackTrace() {
+        Consumer<Object> consumer = new Consumer<Object>() {
+            public void accept(Object o) {
+                throw new Error();
+            }
+        };
+        Error err = null;
+        try {
+            Arrays.asList(new Object[] { new Object() }).iterator().forEachRemaining(consumer);
+        } catch (Error expected) {
+            err = expected;
+        }
+        assertStackTraceContains(err, "Main", "testCopiedBcpMethodInStackTrace");
+    }
+
+    private static void testCopiedAppImageMethodInStackTrace() throws Exception {
+        Iface limpl = (Iface) Class.forName("Impl2").newInstance();
+        Runnable throwingRunnable = new Runnable() {
+            public void run() {
+                throw new Error();
+            }
+        };
+        Error err = null;
+        try {
+            limpl.invokeRun(throwingRunnable);
+        } catch (Error expected) {
+            err = expected;
+        }
+        assertStackTraceContains(err, "Main", "testCopiedAppImageMethodInStackTrace");
     }
 
     private static WeakReference<Class> setUpUnloadClassWeak(Constructor<?> constructor)
@@ -241,9 +458,28 @@ public class Main {
     }
 
     private static int getPid() throws Exception {
-      return Integer.parseInt(new File("/proc/self").getCanonicalFile().getName());
+        return Integer.parseInt(new File("/proc/self").getCanonicalFile().getName());
     }
 
     public static native void stopJit();
     public static native void startJit();
+
+
+    /* Corresponds to:
+     *
+     * public abstract class AbstractClass extends ConflictSuper { }
+     *
+     */
+    private static final byte[] DEX_BYTES = Base64.getDecoder().decode(
+        "ZGV4CjAzNQAOZ0WGvUad/2dEp77oyy9K2tx8txklUZ1wAgAAcAAAAHhWNBIAAAAAAAAAANwBAAAG" +
+        "AAAAcAAAAAMAAACIAAAAAQAAAJQAAAAAAAAAAAAAAAIAAACgAAAAAQAAALAAAACgAQAA0AAAAOwA" +
+        "AAD0AAAACAEAABkBAAAqAQAALQEAAAIAAAADAAAABAAAAAQAAAACAAAAAAAAAAAAAAAAAAAAAQAA" +
+        "AAAAAAAAAAAAAQQAAAEAAAAAAAAAAQAAAAAAAADLAQAAAAAAAAEAAQABAAAA6AAAAAQAAABwEAEA" +
+        "AAAOABEADgAGPGluaXQ+ABJBYnN0cmFjdENsYXNzLmphdmEAD0xBYnN0cmFjdENsYXNzOwAPTENv" +
+        "bmZsaWN0U3VwZXI7AAFWAJsBfn5EOHsiYmFja2VuZCI6ImRleCIsImNvbXBpbGF0aW9uLW1vZGUi" +
+        "OiJkZWJ1ZyIsImhhcy1jaGVja3N1bXMiOmZhbHNlLCJtaW4tYXBpIjoxLCJzaGEtMSI6ImI3MmIx" +
+        "NWJjODQ2N2Y0M2FhNTdlYjk5ZDAyMjU0Nzg5ODYwZjRlOWEiLCJ2ZXJzaW9uIjoiOC41LjEtZGV2" +
+        "In0AAAABAACBgATQAQAAAAAAAAAMAAAAAAAAAAEAAAAAAAAAAQAAAAYAAABwAAAAAgAAAAMAAACI" +
+        "AAAAAwAAAAEAAACUAAAABQAAAAIAAACgAAAABgAAAAEAAACwAAAAASAAAAEAAADQAAAAAyAAAAEA" +
+        "AADoAAAAAiAAAAYAAADsAAAAACAAAAEAAADLAQAAAxAAAAEAAADYAQAAABAAAAEAAADcAQAA");
 }

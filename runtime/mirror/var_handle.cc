@@ -21,7 +21,7 @@
 #include "base/casts.h"
 #include "class-inl.h"
 #include "class_linker.h"
-#include "class_root.h"
+#include "class_root-inl.h"
 #include "intrinsics_enum.h"
 #include "jni/jni_internal.h"
 #include "jvalue-inl.h"
@@ -31,7 +31,7 @@
 #include "obj_ptr-inl.h"
 #include "well_known_classes.h"
 
-namespace art {
+namespace art HIDDEN {
 namespace mirror {
 
 static constexpr bool kTransactionActive = true;
@@ -92,102 +92,9 @@ const VarHandleAccessorToAccessModeEntry kAccessorToAccessMode[VarHandle::kNumbe
   { "weakCompareAndSetRelease", VarHandle::AccessMode::kWeakCompareAndSetRelease },
 };
 
-// Enumeration for describing the parameter and return types of an AccessMode.
-enum class AccessModeTemplate : uint32_t {
-  kGet,                 // T Op(C0..CN)
-  kSet,                 // void Op(C0..CN, T)
-  kCompareAndSet,       // boolean Op(C0..CN, T, T)
-  kCompareAndExchange,  // T Op(C0..CN, T, T)
-  kGetAndUpdate,        // T Op(C0..CN, T)
-};
-
-// Look up the AccessModeTemplate for a given VarHandle
-// AccessMode. This simplifies finding the correct signature for a
-// VarHandle accessor method.
-AccessModeTemplate GetAccessModeTemplate(VarHandle::AccessMode access_mode) {
-  switch (access_mode) {
-    case VarHandle::AccessMode::kGet:
-      return AccessModeTemplate::kGet;
-    case VarHandle::AccessMode::kSet:
-      return AccessModeTemplate::kSet;
-    case VarHandle::AccessMode::kGetVolatile:
-      return AccessModeTemplate::kGet;
-    case VarHandle::AccessMode::kSetVolatile:
-      return AccessModeTemplate::kSet;
-    case VarHandle::AccessMode::kGetAcquire:
-      return AccessModeTemplate::kGet;
-    case VarHandle::AccessMode::kSetRelease:
-      return AccessModeTemplate::kSet;
-    case VarHandle::AccessMode::kGetOpaque:
-      return AccessModeTemplate::kGet;
-    case VarHandle::AccessMode::kSetOpaque:
-      return AccessModeTemplate::kSet;
-    case VarHandle::AccessMode::kCompareAndSet:
-      return AccessModeTemplate::kCompareAndSet;
-    case VarHandle::AccessMode::kCompareAndExchange:
-      return AccessModeTemplate::kCompareAndExchange;
-    case VarHandle::AccessMode::kCompareAndExchangeAcquire:
-      return AccessModeTemplate::kCompareAndExchange;
-    case VarHandle::AccessMode::kCompareAndExchangeRelease:
-      return AccessModeTemplate::kCompareAndExchange;
-    case VarHandle::AccessMode::kWeakCompareAndSetPlain:
-      return AccessModeTemplate::kCompareAndSet;
-    case VarHandle::AccessMode::kWeakCompareAndSet:
-      return AccessModeTemplate::kCompareAndSet;
-    case VarHandle::AccessMode::kWeakCompareAndSetAcquire:
-      return AccessModeTemplate::kCompareAndSet;
-    case VarHandle::AccessMode::kWeakCompareAndSetRelease:
-      return AccessModeTemplate::kCompareAndSet;
-    case VarHandle::AccessMode::kGetAndSet:
-      return AccessModeTemplate::kGetAndUpdate;
-    case VarHandle::AccessMode::kGetAndSetAcquire:
-      return AccessModeTemplate::kGetAndUpdate;
-    case VarHandle::AccessMode::kGetAndSetRelease:
-      return AccessModeTemplate::kGetAndUpdate;
-    case VarHandle::AccessMode::kGetAndAdd:
-      return AccessModeTemplate::kGetAndUpdate;
-    case VarHandle::AccessMode::kGetAndAddAcquire:
-      return AccessModeTemplate::kGetAndUpdate;
-    case VarHandle::AccessMode::kGetAndAddRelease:
-      return AccessModeTemplate::kGetAndUpdate;
-    case VarHandle::AccessMode::kGetAndBitwiseOr:
-      return AccessModeTemplate::kGetAndUpdate;
-    case VarHandle::AccessMode::kGetAndBitwiseOrRelease:
-      return AccessModeTemplate::kGetAndUpdate;
-    case VarHandle::AccessMode::kGetAndBitwiseOrAcquire:
-      return AccessModeTemplate::kGetAndUpdate;
-    case VarHandle::AccessMode::kGetAndBitwiseAnd:
-      return AccessModeTemplate::kGetAndUpdate;
-    case VarHandle::AccessMode::kGetAndBitwiseAndRelease:
-      return AccessModeTemplate::kGetAndUpdate;
-    case VarHandle::AccessMode::kGetAndBitwiseAndAcquire:
-      return AccessModeTemplate::kGetAndUpdate;
-    case VarHandle::AccessMode::kGetAndBitwiseXor:
-      return AccessModeTemplate::kGetAndUpdate;
-    case VarHandle::AccessMode::kGetAndBitwiseXorRelease:
-      return AccessModeTemplate::kGetAndUpdate;
-    case VarHandle::AccessMode::kGetAndBitwiseXorAcquire:
-      return AccessModeTemplate::kGetAndUpdate;
-  }
-}
-
-int32_t GetNumberOfVarTypeParameters(AccessModeTemplate access_mode_template) {
-  switch (access_mode_template) {
-    case AccessModeTemplate::kGet:
-      return 0;
-    case AccessModeTemplate::kSet:
-    case AccessModeTemplate::kGetAndUpdate:
-      return 1;
-    case AccessModeTemplate::kCompareAndSet:
-    case AccessModeTemplate::kCompareAndExchange:
-      return 2;
-  }
-  UNREACHABLE();
-}
-
 // Returns the number of parameters associated with an
 // AccessModeTemplate and the supplied coordinate types.
-int32_t GetNumberOfParameters(AccessModeTemplate access_mode_template,
+int32_t GetNumberOfParameters(VarHandle::AccessModeTemplate access_mode_template,
                               ObjPtr<Class> coordinateType0,
                               ObjPtr<Class> coordinateType1) {
   int32_t count = 0;
@@ -197,7 +104,7 @@ int32_t GetNumberOfParameters(AccessModeTemplate access_mode_template,
       count++;
     }
   }
-  return count + GetNumberOfVarTypeParameters(access_mode_template);
+  return count + VarHandle::GetNumberOfVarTypeParameters(access_mode_template);
 }
 
 void ThrowNullPointerExceptionForCoordinate() REQUIRES_SHARED(Locks::mutator_lock_) {
@@ -205,28 +112,38 @@ void ThrowNullPointerExceptionForCoordinate() REQUIRES_SHARED(Locks::mutator_loc
 }
 
 bool CheckElementIndex(Primitive::Type type,
-                       int32_t relative_index,
+                       int32_t index,
                        int32_t start,
-                       int32_t limit) REQUIRES_SHARED(Locks::mutator_lock_) {
-  int64_t index = start + relative_index;
-  int64_t max_index = limit - Primitive::ComponentSize(type);
-  if (index < start || index > max_index) {
-    ThrowIndexOutOfBoundsException(index, limit - start);
+                       int32_t length) REQUIRES_SHARED(Locks::mutator_lock_) {
+  // The underlying memory may be shared and offset from the start of allocated region,
+  // ie buffers can be created via ByteBuffer.split().
+  //
+  // `type` is the type of the value the caller is attempting to read / write.
+  // `index` represents the position the caller is trying to access in the underlying ByteBuffer
+  //         or byte array. This is an offset from from `start` in bytes.
+  // `start` represents where the addressable memory begins relative to the base of the
+  //         the underlying ByteBuffer or byte array.
+  // `length` represents the length of the addressable region.
+  //
+  // Thus the region being operated on is:
+  //    `base` + `start` + `index` to `base` + `start` + `index` + `sizeof(type)`
+  int32_t max_index = length - start - Primitive::ComponentSize(type);
+  if (index < 0 || index > max_index) {
+    ThrowIndexOutOfBoundsException(index, length - start);
     return false;
   }
   return true;
 }
 
-bool CheckElementIndex(Primitive::Type type, int32_t index, int32_t range_limit)
+bool CheckElementIndex(Primitive::Type type, int32_t index, int32_t length)
     REQUIRES_SHARED(Locks::mutator_lock_) {
-  return CheckElementIndex(type, index, 0, range_limit);
+  return CheckElementIndex(type, index, 0, length);
 }
 
 // Returns true if access_mode only entails a memory read. False if
 // access_mode may write to memory.
 bool IsReadOnlyAccessMode(VarHandle::AccessMode access_mode) {
-  AccessModeTemplate access_mode_template = GetAccessModeTemplate(access_mode);
-  return access_mode_template == AccessModeTemplate::kGet;
+  return VarHandle::GetAccessModeTemplate(access_mode) == VarHandle::AccessModeTemplate::kGet;
 }
 
 // Writes the parameter types associated with the AccessModeTemplate
@@ -234,7 +151,7 @@ bool IsReadOnlyAccessMode(VarHandle::AccessMode access_mode) {
 // variable type and coordinate types. Returns the number of
 // parameters written.
 int32_t BuildParameterArray(ObjPtr<Class> (&parameters)[VarHandle::kMaxAccessorParameters],
-                            AccessModeTemplate access_mode_template,
+                            VarHandle::AccessModeTemplate access_mode_template,
                             ObjPtr<Class> varType,
                             ObjPtr<Class> coordinateType0,
                             ObjPtr<Class> coordinateType1)
@@ -251,34 +168,35 @@ int32_t BuildParameterArray(ObjPtr<Class> (&parameters)[VarHandle::kMaxAccessorP
   }
 
   switch (access_mode_template) {
-    case AccessModeTemplate::kCompareAndExchange:
-    case AccessModeTemplate::kCompareAndSet:
+    case VarHandle::AccessModeTemplate::kCompareAndExchange:
+    case VarHandle::AccessModeTemplate::kCompareAndSet:
       parameters[index++] = varType;
       parameters[index++] = varType;
       return index;
-    case AccessModeTemplate::kGet:
+    case VarHandle::AccessModeTemplate::kGet:
       return index;
-    case AccessModeTemplate::kGetAndUpdate:
-    case AccessModeTemplate::kSet:
+    case VarHandle::AccessModeTemplate::kGetAndUpdate:
+    case VarHandle::AccessModeTemplate::kSet:
       parameters[index++] = varType;
       return index;
   }
   return -1;
 }
 
-// Returns the return type associated with an AccessModeTemplate based
+// Returns the return type associated with an VarHandle::AccessModeTemplate based
 // on the template and the variable type specified.
-static ObjPtr<Class> GetReturnType(AccessModeTemplate access_mode_template, ObjPtr<Class> varType)
+static ObjPtr<Class> GetReturnType(VarHandle::AccessModeTemplate access_mode_template,
+                                   ObjPtr<Class> varType)
     REQUIRES_SHARED(Locks::mutator_lock_) {
   DCHECK(varType != nullptr);
   switch (access_mode_template) {
-    case AccessModeTemplate::kCompareAndSet:
+    case VarHandle::AccessModeTemplate::kCompareAndSet:
       return GetClassRoot(ClassRoot::kPrimitiveBoolean);
-    case AccessModeTemplate::kCompareAndExchange:
-    case AccessModeTemplate::kGet:
-    case AccessModeTemplate::kGetAndUpdate:
+    case VarHandle::AccessModeTemplate::kCompareAndExchange:
+    case VarHandle::AccessModeTemplate::kGet:
+    case VarHandle::AccessModeTemplate::kGetAndUpdate:
       return varType;
-    case AccessModeTemplate::kSet:
+    case VarHandle::AccessModeTemplate::kSet:
       return GetClassRoot(ClassRoot::kPrimitiveVoid);
   }
   return nullptr;
@@ -287,7 +205,7 @@ static ObjPtr<Class> GetReturnType(AccessModeTemplate access_mode_template, ObjP
 // Method to insert a read barrier for accessors to reference fields.
 inline void ReadBarrierForVarHandleAccess(ObjPtr<Object> obj, MemberOffset field_offset)
     REQUIRES_SHARED(Locks::mutator_lock_) {
-  if (kUseReadBarrier) {
+  if (gUseReadBarrier) {
     // We need to ensure that the reference stored in the field is a to-space one before attempting
     // the CompareAndSet/CompareAndExchange/Exchange operation otherwise it will fail incorrectly
     // if obj is in the process of being moved.
@@ -301,11 +219,6 @@ inline void ReadBarrierForVarHandleAccess(ObjPtr<Object> obj, MemberOffset field
         MemberOffset(field_offset),
         field_addr);
   }
-}
-
-inline MemberOffset GetMemberOffset(jfieldID field_id) REQUIRES_SHARED(Locks::mutator_lock_) {
-  ArtField* const field = jni::DecodeArtField(field_id);
-  return field->GetOffset();
 }
 
 //
@@ -1422,45 +1335,51 @@ int32_t VarHandle::GetAccessModesBitMask() {
   return GetField32(AccessModesBitMaskOffset());
 }
 
-VarHandle::MatchKind VarHandle::GetMethodTypeMatchForAccessMode(AccessMode access_mode,
-                                                                ObjPtr<MethodType> method_type) {
+template <typename MethodTypeType>
+VarHandle::MatchKind VarHandle::GetMethodTypeMatchForAccessModeImpl(
+    AccessMode access_mode, ObjPtr<VarHandle> var_handle, MethodTypeType method_type) {
   MatchKind match = MatchKind::kExact;
 
-  ObjPtr<VarHandle> vh = this;
-  ObjPtr<Class> var_type = vh->GetVarType();
-  ObjPtr<Class> mt_rtype = method_type->GetRType();
+  ObjPtr<Class> var_type = var_handle->GetVarType();
+  ObjPtr<Class> mt_rtype = MethodType::GetRType(method_type);
+  ObjPtr<Class> void_type = WellKnownClasses::ToClass(WellKnownClasses::java_lang_Void);
   AccessModeTemplate access_mode_template = GetAccessModeTemplate(access_mode);
 
-  // Check return type first. If the return type of the method
-  // of the VarHandle is immaterial.
-  if (mt_rtype->GetPrimitiveType() != Primitive::Type::kPrimVoid) {
-    ObjPtr<Class> vh_rtype = GetReturnType(access_mode_template, var_type);
-    if (vh_rtype != mt_rtype) {
-      if (!IsReturnTypeConvertible(vh_rtype, mt_rtype)) {
-        return MatchKind::kNone;
-      }
-      match = MatchKind::kWithConversions;
+  // Check return type first.
+  ObjPtr<Class> vh_rtype = GetReturnType(access_mode_template, var_type);
+  if (mt_rtype->GetPrimitiveType() != Primitive::Type::kPrimVoid &&
+      !mt_rtype->IsAssignableFrom(vh_rtype)) {
+    // Call-site is an expression (expects a return value) and the value returned by the accessor
+    // is not assignable to the expected return type.
+    if (!IsReturnTypeConvertible(vh_rtype, mt_rtype)) {
+      return MatchKind::kNone;
     }
+    match = MatchKind::kWithConversions;
   }
 
   // Check the number of parameters matches.
-  ObjPtr<Class> vh_ptypes[VarHandle::kMaxAccessorParameters];
+  ObjPtr<Class> vh_ptypes[kMaxAccessorParameters];
   const int32_t vh_ptypes_count = BuildParameterArray(vh_ptypes,
                                                       access_mode_template,
                                                       var_type,
-                                                      GetCoordinateType0(),
-                                                      GetCoordinateType1());
-  if (vh_ptypes_count != method_type->GetPTypes()->GetLength()) {
+                                                      var_handle->GetCoordinateType0(),
+                                                      var_handle->GetCoordinateType1());
+  auto mt_ptypes = MethodType::GetPTypes(method_type);
+  if (vh_ptypes_count != mt_ptypes.GetLength()) {
     return MatchKind::kNone;
   }
 
   // Check the parameter types are compatible.
-  ObjPtr<ObjectArray<Class>> mt_ptypes = method_type->GetPTypes();
   for (int32_t i = 0; i < vh_ptypes_count; ++i) {
-    if (mt_ptypes->Get(i) == vh_ptypes[i]) {
+    if (vh_ptypes[i]->IsAssignableFrom(mt_ptypes.Get(i))) {
       continue;
     }
-    if (!IsParameterTypeConvertible(mt_ptypes->Get(i), vh_ptypes[i])) {
+    if (mt_ptypes.Get(i) == void_type && !vh_ptypes[i]->IsPrimitive()) {
+      // The expected parameter is a reference and the parameter type from the call site is j.l.Void
+      // which means the value is null. It is always valid for a reference parameter to be null.
+      continue;
+    }
+    if (!IsParameterTypeConvertible(mt_ptypes.Get(i), vh_ptypes[i])) {
       return MatchKind::kNone;
     }
     match = MatchKind::kWithConversions;
@@ -1468,80 +1387,46 @@ VarHandle::MatchKind VarHandle::GetMethodTypeMatchForAccessMode(AccessMode acces
   return match;
 }
 
-bool VarHandle::IsInvokerMethodTypeCompatible(AccessMode access_mode,
-                                              ObjPtr<MethodType> method_type) {
-  StackHandleScope<3> hs(Thread::Current());
-  Handle<Class> mt_rtype(hs.NewHandle(method_type->GetRType()));
-  Handle<VarHandle> vh(hs.NewHandle(this));
-  Handle<Class> var_type(hs.NewHandle(vh->GetVarType()));
-  AccessModeTemplate access_mode_template = GetAccessModeTemplate(access_mode);
-
-  // Check return type first.
-  if (mt_rtype->GetPrimitiveType() == Primitive::Type::kPrimVoid) {
-    // The result of the operation will be discarded. The return type
-    // of the VarHandle is immaterial.
-  } else {
-    ObjPtr<Class> vh_rtype(GetReturnType(access_mode_template, var_type.Get()));
-    if (!IsReturnTypeConvertible(vh_rtype, mt_rtype.Get())) {
-      return false;
-    }
-  }
-
-  // Check the number of parameters matches (ignoring the VarHandle parameter).
-  static const int32_t kVarHandleParameters = 1;
-  ObjPtr<Class> vh_ptypes[VarHandle::kMaxAccessorParameters];
-  const int32_t vh_ptypes_count = BuildParameterArray(vh_ptypes,
-                                                      access_mode_template,
-                                                      var_type.Get(),
-                                                      GetCoordinateType0(),
-                                                      GetCoordinateType1());
-  if (vh_ptypes_count != method_type->GetPTypes()->GetLength() - kVarHandleParameters) {
-    return false;
-  }
-
-  // Check the parameter types are compatible (ignoring the VarHandle parameter).
-  ObjPtr<ObjectArray<Class>> mt_ptypes = method_type->GetPTypes();
-  for (int32_t i = 0; i < vh_ptypes_count; ++i) {
-    if (!IsParameterTypeConvertible(mt_ptypes->Get(i + kVarHandleParameters), vh_ptypes[i])) {
-      return false;
-    }
-  }
-  return true;
+VarHandle::MatchKind VarHandle::GetMethodTypeMatchForAccessMode(
+    AccessMode access_mode, ObjPtr<MethodType> method_type) {
+  return GetMethodTypeMatchForAccessModeImpl(access_mode, this, method_type);
 }
 
-ObjPtr<MethodType> VarHandle::GetMethodTypeForAccessMode(Thread* self,
-                                                         ObjPtr<VarHandle> var_handle,
-                                                         AccessMode access_mode) {
-  // This is a static method as the var_handle might be moved by the GC during it's execution.
-  AccessModeTemplate access_mode_template = GetAccessModeTemplate(access_mode);
+VarHandle::MatchKind VarHandle::GetMethodTypeMatchForAccessMode(
+    AccessMode access_mode, Handle<MethodType> method_type) {
+  return GetMethodTypeMatchForAccessMode(access_mode, method_type.Get());
+}
 
-  StackHandleScope<3> hs(self);
-  Handle<VarHandle> vh = hs.NewHandle(var_handle);
-  Handle<Class> rtype = hs.NewHandle(GetReturnType(access_mode_template, vh->GetVarType()));
-  const int32_t ptypes_count = GetNumberOfParameters(access_mode_template,
-                                                     vh->GetCoordinateType0(),
-                                                     vh->GetCoordinateType1());
-  ObjPtr<Class> array_of_class = GetClassRoot<ObjectArray<Class>>();
-  Handle<ObjectArray<Class>> ptypes =
-      hs.NewHandle(ObjectArray<Class>::Alloc(Thread::Current(), array_of_class, ptypes_count));
-  if (ptypes == nullptr) {
-    return nullptr;
-  }
-
-  ObjPtr<Class> ptypes_array[VarHandle::kMaxAccessorParameters];
-  BuildParameterArray(ptypes_array,
-                      access_mode_template,
-                      vh->GetVarType(),
-                      vh->GetCoordinateType0(),
-                      vh->GetCoordinateType1());
-  for (int32_t i = 0; i < ptypes_count; ++i) {
-    ptypes->Set(i, ptypes_array[i]);
-  }
-  return MethodType::Create(self, rtype, ptypes);
+VarHandle::MatchKind VarHandle::GetMethodTypeMatchForAccessMode(
+    AccessMode access_mode, RawMethodType method_type) {
+  return GetMethodTypeMatchForAccessModeImpl(access_mode, this, method_type);
 }
 
 ObjPtr<MethodType> VarHandle::GetMethodTypeForAccessMode(Thread* self, AccessMode access_mode) {
-  return GetMethodTypeForAccessMode(self, this, access_mode);
+  VariableSizedHandleScope method_type_hs(self);
+  RawMethodType method_type(&method_type_hs);
+  GetMethodTypeForAccessMode(access_mode, method_type);
+  return MethodType::Create(self, method_type);
+}
+
+void VarHandle::GetMethodTypeForAccessMode(AccessMode access_mode,
+                                           /*out*/ RawMethodType method_type) {
+  DCHECK(!method_type.IsValid());
+  AccessModeTemplate access_mode_template = GetAccessModeTemplate(access_mode);
+
+  // Store return type in `method_type`.
+  method_type.SetRType(GetReturnType(access_mode_template, GetVarType()));
+
+  // Store parameter types in `method_type`.
+  ObjPtr<Class> ptypes_array[kMaxAccessorParameters];
+  int32_t ptypes_count = BuildParameterArray(ptypes_array,
+                                             access_mode_template,
+                                             GetVarType(),
+                                             GetCoordinateType0(),
+                                             GetCoordinateType1());
+  for (int32_t i = 0; i < ptypes_count; ++i) {
+    method_type.AddPType(ptypes_array[i]);
+  }
 }
 
 std::string VarHandle::PrettyDescriptorForAccessMode(AccessMode access_mode) {
@@ -1582,16 +1467,19 @@ bool VarHandle::Access(AccessMode access_mode,
   ObjPtr<ObjectArray<Class>> class_roots = Runtime::Current()->GetClassLinker()->GetClassRoots();
   ObjPtr<Class> klass = GetClass();
   if (klass == GetClassRoot<FieldVarHandle>(class_roots)) {
-    auto vh = reinterpret_cast<FieldVarHandle*>(this);
+    auto vh = ObjPtr<FieldVarHandle>::DownCast(this);
+    return vh->Access(access_mode, shadow_frame, operands, result);
+  } else if (klass == GetClassRoot<StaticFieldVarHandle>(class_roots)) {
+    auto vh = ObjPtr<StaticFieldVarHandle>::DownCast(this);
     return vh->Access(access_mode, shadow_frame, operands, result);
   } else if (klass == GetClassRoot<ArrayElementVarHandle>(class_roots)) {
-    auto vh = reinterpret_cast<ArrayElementVarHandle*>(this);
+    auto vh = ObjPtr<ArrayElementVarHandle>::DownCast(this);
     return vh->Access(access_mode, shadow_frame, operands, result);
   } else if (klass == GetClassRoot<ByteArrayViewVarHandle>(class_roots)) {
-    auto vh = reinterpret_cast<ByteArrayViewVarHandle*>(this);
+    auto vh = ObjPtr<ByteArrayViewVarHandle>::DownCast(this);
     return vh->Access(access_mode, shadow_frame, operands, result);
   } else if (klass == GetClassRoot<ByteBufferViewVarHandle>(class_roots)) {
-    auto vh = reinterpret_cast<ByteBufferViewVarHandle*>(this);
+    auto vh = ObjPtr<ByteBufferViewVarHandle>::DownCast(this);
     return vh->Access(access_mode, shadow_frame, operands, result);
   } else {
     LOG(FATAL) << "Unknown varhandle kind";
@@ -1660,7 +1548,7 @@ VarHandle::AccessMode VarHandle::GetAccessModeByIntrinsic(Intrinsics intrinsic) 
     default:
       break;
   }
-  LOG(FATAL) << "Unknown VarHandle instrinsic: " << static_cast<int>(intrinsic);
+  LOG(FATAL) << "Unknown VarHandle intrinsic: " << static_cast<int>(intrinsic);
   UNREACHABLE();
 }
 
@@ -1668,7 +1556,8 @@ bool VarHandle::GetAccessModeByMethodName(const char* method_name, AccessMode* a
   if (method_name == nullptr) {
     return false;
   }
-  VarHandleAccessorToAccessModeEntry target = { method_name, /*dummy*/VarHandle::AccessMode::kGet };
+  const auto kUnusedAccessMode = VarHandle::AccessMode::kGet;  // arbitrary value.
+  VarHandleAccessorToAccessModeEntry target = { method_name, kUnusedAccessMode };
   auto last = std::cend(kAccessorToAccessMode);
   auto it = std::lower_bound(std::cbegin(kAccessorToAccessMode),
                              last,
@@ -1681,8 +1570,92 @@ bool VarHandle::GetAccessModeByMethodName(const char* method_name, AccessMode* a
   return true;
 }
 
-ArtField* FieldVarHandle::GetField() {
-  return reinterpret_cast64<ArtField*>(GetField64(ArtFieldOffset()));
+// Look up the AccessModeTemplate for a given VarHandle
+// AccessMode. This simplifies finding the correct signature for a
+// VarHandle accessor method.
+VarHandle::AccessModeTemplate VarHandle::GetAccessModeTemplate(VarHandle::AccessMode access_mode) {
+  switch (access_mode) {
+    case VarHandle::AccessMode::kGet:
+      return AccessModeTemplate::kGet;
+    case VarHandle::AccessMode::kSet:
+      return AccessModeTemplate::kSet;
+    case VarHandle::AccessMode::kGetVolatile:
+      return AccessModeTemplate::kGet;
+    case VarHandle::AccessMode::kSetVolatile:
+      return AccessModeTemplate::kSet;
+    case VarHandle::AccessMode::kGetAcquire:
+      return AccessModeTemplate::kGet;
+    case VarHandle::AccessMode::kSetRelease:
+      return AccessModeTemplate::kSet;
+    case VarHandle::AccessMode::kGetOpaque:
+      return AccessModeTemplate::kGet;
+    case VarHandle::AccessMode::kSetOpaque:
+      return AccessModeTemplate::kSet;
+    case VarHandle::AccessMode::kCompareAndSet:
+      return AccessModeTemplate::kCompareAndSet;
+    case VarHandle::AccessMode::kCompareAndExchange:
+      return AccessModeTemplate::kCompareAndExchange;
+    case VarHandle::AccessMode::kCompareAndExchangeAcquire:
+      return AccessModeTemplate::kCompareAndExchange;
+    case VarHandle::AccessMode::kCompareAndExchangeRelease:
+      return AccessModeTemplate::kCompareAndExchange;
+    case VarHandle::AccessMode::kWeakCompareAndSetPlain:
+      return AccessModeTemplate::kCompareAndSet;
+    case VarHandle::AccessMode::kWeakCompareAndSet:
+      return AccessModeTemplate::kCompareAndSet;
+    case VarHandle::AccessMode::kWeakCompareAndSetAcquire:
+      return AccessModeTemplate::kCompareAndSet;
+    case VarHandle::AccessMode::kWeakCompareAndSetRelease:
+      return AccessModeTemplate::kCompareAndSet;
+    case VarHandle::AccessMode::kGetAndSet:
+      return AccessModeTemplate::kGetAndUpdate;
+    case VarHandle::AccessMode::kGetAndSetAcquire:
+      return AccessModeTemplate::kGetAndUpdate;
+    case VarHandle::AccessMode::kGetAndSetRelease:
+      return AccessModeTemplate::kGetAndUpdate;
+    case VarHandle::AccessMode::kGetAndAdd:
+      return AccessModeTemplate::kGetAndUpdate;
+    case VarHandle::AccessMode::kGetAndAddAcquire:
+      return AccessModeTemplate::kGetAndUpdate;
+    case VarHandle::AccessMode::kGetAndAddRelease:
+      return AccessModeTemplate::kGetAndUpdate;
+    case VarHandle::AccessMode::kGetAndBitwiseOr:
+      return AccessModeTemplate::kGetAndUpdate;
+    case VarHandle::AccessMode::kGetAndBitwiseOrRelease:
+      return AccessModeTemplate::kGetAndUpdate;
+    case VarHandle::AccessMode::kGetAndBitwiseOrAcquire:
+      return AccessModeTemplate::kGetAndUpdate;
+    case VarHandle::AccessMode::kGetAndBitwiseAnd:
+      return AccessModeTemplate::kGetAndUpdate;
+    case VarHandle::AccessMode::kGetAndBitwiseAndRelease:
+      return AccessModeTemplate::kGetAndUpdate;
+    case VarHandle::AccessMode::kGetAndBitwiseAndAcquire:
+      return AccessModeTemplate::kGetAndUpdate;
+    case VarHandle::AccessMode::kGetAndBitwiseXor:
+      return AccessModeTemplate::kGetAndUpdate;
+    case VarHandle::AccessMode::kGetAndBitwiseXorRelease:
+      return AccessModeTemplate::kGetAndUpdate;
+    case VarHandle::AccessMode::kGetAndBitwiseXorAcquire:
+      return AccessModeTemplate::kGetAndUpdate;
+  }
+}
+
+VarHandle::AccessModeTemplate VarHandle::GetAccessModeTemplateByIntrinsic(Intrinsics ordinal) {
+  AccessMode access_mode = GetAccessModeByIntrinsic(ordinal);
+  return GetAccessModeTemplate(access_mode);
+}
+
+int32_t VarHandle::GetNumberOfVarTypeParameters(AccessModeTemplate access_mode_template) {
+  switch (access_mode_template) {
+    case AccessModeTemplate::kGet:
+      return 0;
+    case AccessModeTemplate::kSet:
+    case AccessModeTemplate::kGetAndUpdate:
+      return 1;
+    case AccessModeTemplate::kCompareAndSet:
+    case AccessModeTemplate::kCompareAndExchange:
+      return 2;
+  }
 }
 
 bool FieldVarHandle::Access(AccessMode access_mode,
@@ -1690,7 +1663,7 @@ bool FieldVarHandle::Access(AccessMode access_mode,
                             const InstructionOperands* const operands,
                             JValue* result) {
   ShadowFrameGetter getter(*shadow_frame, operands);
-  ArtField* field = GetField();
+  ArtField* field = GetArtField();
   ObjPtr<Object> obj;
   if (field->IsStatic()) {
     DCHECK_LE(operands->GetNumberOfOperands(),
@@ -1736,6 +1709,29 @@ bool FieldVarHandle::Access(AccessMode access_mode,
   UNREACHABLE();
 }
 
+bool ArrayElementVarHandle::CheckArrayStore(AccessMode access_mode,
+                                            ShadowFrameGetter getter,
+                                            ObjPtr<ObjectArray<Object>> array) {
+  // This method checks the element being inserted into the array is correctly assignable.
+  // NB This method assumes it is called from `ArrayElementVarHandle::Access()` and `getter`
+  // has already consumed the array and index arguments.
+  ObjPtr<Object> new_element;
+  switch (GetAccessModeTemplate(access_mode)) {
+    case AccessModeTemplate::kGet:
+      return true;  // Not a store.
+    case AccessModeTemplate::kCompareAndExchange:
+    case AccessModeTemplate::kCompareAndSet:
+      getter.GetReference();  // Skip the comperand.
+      new_element = getter.GetReference();
+      break;
+    case AccessModeTemplate::kGetAndUpdate:
+    case AccessModeTemplate::kSet:
+      new_element = getter.GetReference();
+      break;
+  }
+  return array->CheckAssignable(new_element);
+}
+
 bool ArrayElementVarHandle::Access(AccessMode access_mode,
                                    ShadowFrame* shadow_frame,
                                    const InstructionOperands* const operands,
@@ -1749,7 +1745,7 @@ bool ArrayElementVarHandle::Access(AccessMode access_mode,
     return false;
   }
 
-  ObjPtr<Array> target_array(raw_array->AsArray());
+  ObjPtr<Array> target_array = raw_array->AsArray();
 
   // The target array element is the second co-ordinate type preceeding var type arguments.
   const int target_element = getter.Get();
@@ -1761,8 +1757,12 @@ bool ArrayElementVarHandle::Access(AccessMode access_mode,
   const Primitive::Type primitive_type = GetVarType()->GetPrimitiveType();
   switch (primitive_type) {
     case Primitive::Type::kPrimNot: {
-      MemberOffset target_element_offset =
-          target_array->AsObjectArray<Object>()->OffsetOfElement(target_element);
+      ObjPtr<ObjectArray<Object>> object_array = target_array->AsObjectArray<Object>();
+      if (!CheckArrayStore(access_mode, getter, object_array)) {
+        DCHECK(Thread::Current()->IsExceptionPending());
+        return false;
+      }
+      MemberOffset target_element_offset = object_array->OffsetOfElement(target_element);
       return FieldAccessor<ObjPtr<Object>>::Dispatch(access_mode,
                                                      target_array,
                                                      target_element_offset,
@@ -1935,7 +1935,7 @@ bool ByteBufferViewVarHandle::Access(AccessMode access_mode,
 
   // Check access_mode is compatible with ByteBuffer's read-only property.
   bool is_read_only = byte_buffer->GetFieldBoolean(
-      GetMemberOffset(WellKnownClasses::java_nio_ByteBuffer_isReadOnly));
+      WellKnownClasses::java_nio_ByteBuffer_isReadOnly->GetOffset());
   if (is_read_only && !IsReadOnlyAccessMode(access_mode)) {
     ThrowReadOnlyBufferException();
     return false;
@@ -1943,23 +1943,24 @@ bool ByteBufferViewVarHandle::Access(AccessMode access_mode,
 
   // The native_address is only set for ByteBuffer instances backed by native memory.
   const int64_t native_address =
-      byte_buffer->GetField64(GetMemberOffset(WellKnownClasses::java_nio_ByteBuffer_address));
+      byte_buffer->GetField64(WellKnownClasses::java_nio_Buffer_address->GetOffset());
 
   // Determine offset and limit for accesses.
   int32_t byte_buffer_offset;
   if (native_address == 0L) {
     // Accessing a heap allocated byte buffer.
     byte_buffer_offset = byte_buffer->GetField32(
-        GetMemberOffset(WellKnownClasses::java_nio_ByteBuffer_offset));
+        WellKnownClasses::java_nio_ByteBuffer_offset->GetOffset());
   } else {
     // Accessing direct memory.
     byte_buffer_offset = 0;
   }
-  const int32_t byte_buffer_limit = byte_buffer->GetField32(
-      GetMemberOffset(WellKnownClasses::java_nio_ByteBuffer_limit));
+  const int32_t byte_buffer_limit =
+      byte_buffer->GetField32(WellKnownClasses::java_nio_Buffer_limit->GetOffset());
+  const int32_t byte_buffer_length = byte_buffer_offset + byte_buffer_limit;
 
   const Primitive::Type primitive_type = GetVarType()->GetPrimitiveType();
-  if (!CheckElementIndex(primitive_type, byte_index, byte_buffer_offset, byte_buffer_limit)) {
+  if (!CheckElementIndex(primitive_type, byte_index, byte_buffer_offset, byte_buffer_length)) {
     return false;
   }
   const int32_t checked_offset32 = byte_buffer_offset + byte_index;
@@ -1967,7 +1968,7 @@ bool ByteBufferViewVarHandle::Access(AccessMode access_mode,
   int8_t* data;
   if (native_address == 0) {
     ObjPtr<ByteArray> heap_byte_array = byte_buffer->GetFieldObject<ByteArray>(
-        GetMemberOffset(WellKnownClasses::java_nio_ByteBuffer_hb));
+        WellKnownClasses::java_nio_ByteBuffer_hb->GetOffset());
     data = heap_byte_array->GetData();
   } else {
     data = reinterpret_cast<int8_t*>(static_cast<uint32_t>(native_address));
@@ -2033,15 +2034,23 @@ bool ByteBufferViewVarHandle::Access(AccessMode access_mode,
 }
 
 void FieldVarHandle::VisitTarget(ReflectiveValueVisitor* v) {
-  ArtField* orig = GetField();
+  ArtField* orig = GetArtField();
   ArtField* new_value =
       v->VisitField(orig, HeapReflectiveSourceInfo(kSourceJavaLangInvokeFieldVarHandle, this));
   if (orig != new_value) {
-    SetField64</*kTransactionActive*/ false>(ArtFieldOffset(),
-                                             reinterpret_cast<uintptr_t>(new_value));
+    SetArtField(new_value);
   }
 }
 
+void StaticFieldVarHandle::VisitTarget(ReflectiveValueVisitor* v) {
+  ArtField* orig = GetArtField();
+  ArtField* new_value =
+      v->VisitField(orig, HeapReflectiveSourceInfo(kSourceJavaLangInvokeFieldVarHandle, this));
+  if (orig != new_value) {
+    SetArtField(new_value);
+    SetFieldObject<false>(DeclaringClassOffset(), new_value->GetDeclaringClass());
+  }
+}
 
 }  // namespace mirror
 }  // namespace art

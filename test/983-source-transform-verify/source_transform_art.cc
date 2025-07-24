@@ -41,12 +41,9 @@ void VerifyClassData(jint class_data_len, const unsigned char* class_data) {
   CHECK_LE(static_cast<jint>(header_file_size), class_data_len);
   class_data_len = static_cast<jint>(header_file_size);
 
-  const ArtDexFileLoader dex_file_loader;
+  ArtDexFileLoader dex_file_loader(class_data, class_data_len, "fake_location.dex");
   std::string error;
-  std::unique_ptr<const DexFile> dex(dex_file_loader.Open(class_data,
-                                                          class_data_len,
-                                                          "fake_location.dex",
-                                                          /*location_checksum*/ 0,
+  std::unique_ptr<const DexFile> dex(dex_file_loader.Open(/*location_checksum*/ 0,
                                                           /*oat_dex_file*/ nullptr,
                                                           /*verify*/ true,
                                                           /*verify_checksum*/ true,
@@ -57,9 +54,8 @@ void VerifyClassData(jint class_data_len, const unsigned char* class_data) {
     for (const ClassAccessor::Method& method : accessor.GetMethods()) {
       for (const DexInstructionPcPair& pair : method.GetInstructions()) {
         const Instruction& inst = pair.Inst();
-        int forbidden_flags = (Instruction::kVerifyError | Instruction::kVerifyRuntimeOnly);
-        if (inst.Opcode() == Instruction::RETURN_VOID_NO_BARRIER ||
-            (inst.GetVerifyExtraFlags() & forbidden_flags) != 0) {
+        int forbidden_flags = Instruction::kVerifyError;
+        if ((inst.GetVerifyExtraFlags() & forbidden_flags) != 0) {
           LOG(FATAL) << "Unexpected instruction found in " << dex->PrettyMethod(method.GetIndex())
                      << " [Dex PC: 0x" << std::hex << pair.DexPc() << std::dec << "] : "
                      << inst.DumpString(dex.get()) << std::endl;

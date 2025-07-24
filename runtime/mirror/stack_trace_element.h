@@ -17,9 +17,10 @@
 #ifndef ART_RUNTIME_MIRROR_STACK_TRACE_ELEMENT_H_
 #define ART_RUNTIME_MIRROR_STACK_TRACE_ELEMENT_H_
 
+#include "base/macros.h"
 #include "object.h"
 
-namespace art {
+namespace art HIDDEN {
 
 template<class T> class Handle;
 struct StackTraceElementOffsets;
@@ -29,6 +30,8 @@ namespace mirror {
 // C++ mirror of java.lang.StackTraceElement
 class MANAGED StackTraceElement final : public Object {
  public:
+  MIRROR_CLASS("Ljava/lang/StackTraceElement;");
+
   ObjPtr<String> GetDeclaringClass() REQUIRES_SHARED(Locks::mutator_lock_);
 
   ObjPtr<String> GetMethodName() REQUIRES_SHARED(Locks::mutator_lock_);

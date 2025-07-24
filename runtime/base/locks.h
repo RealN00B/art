@@ -25,7 +25,7 @@
 #include "base/atomic.h"
 #include "base/macros.h"
 
-namespace art {
+namespace art HIDDEN {
 
 class BaseMutex;
 class ConditionVariable;
@@ -48,8 +48,8 @@ enum LockLevel : uint8_t {
   kJniIdLock,
   kNativeDebugInterfaceLock,
   kSignalHandlingLock,
-  // A generic lock level for mutexs that should not allow any additional mutexes to be gained after
-  // acquiring it.
+  // A generic lock level for mutexes that should not allow any additional mutexes to be gained
+  // after acquiring it.
   kGenericBottomLock,
   // Tracks the second acquisition at the same lock level for kThreadWaitLock. This is an exception
   // to the normal lock ordering, used to implement Monitor::Wait - while holding one kThreadWait
@@ -67,13 +67,13 @@ enum LockLevel : uint8_t {
   kMarkSweepMarkStackLock,
   // Can be held while GC related work is done, and thus must be above kMarkSweepMarkStackLock
   kThreadWaitLock,
-  kCHALock,
-  kJitCodeCacheLock,
+  kJitCodeCacheMutatorAndCHALock,
   kRosAllocGlobalLock,
   kRosAllocBracketLock,
   kRosAllocBulkFreeLock,
   kAllocSpaceLock,
   kTaggingLockLevel,
+  kJitCodeCacheLock,
   kTransactionLogLock,
   kCustomTlsLock,
   kJniFunctionTableLock,
@@ -95,8 +95,10 @@ enum LockLevel : uint8_t {
   kOatFileManagerLock,
   kTracingUniqueMethodsLock,
   kTracingStreamingLock,
+  kJniLoadLibraryLock,
   kClassLoaderClassesLock,
   kDefaultMutexLevel,
+  kDexCacheLock,
   kDexLock,
   kMarkSweepLargeObjectLock,
   kJdwpObjectRegistryLock,
@@ -104,15 +106,9 @@ enum LockLevel : uint8_t {
   kAllocatedThreadIdsLock,
   kMonitorPoolLock,
   kClassLinkerClassesLock,  // TODO rename.
-  kDexToDexCompilerLock,
   kSubtypeCheckLock,
   kBreakpointLock,
-  // This is a generic lock level for a lock meant to be gained after having a
-  // monitor lock.
-  kPostMonitorLock,
-  kMonitorLock,
   kMonitorListLock,
-  kJniLoadLibraryLock,
   kThreadListLock,
   kAllocTrackerLock,
   kDeoptimizationLock,
@@ -125,7 +121,10 @@ enum LockLevel : uint8_t {
   kRuntimeShutdownLock,
   kTraceLock,
   kHeapBitmapLock,
-
+  // This is a generic lock level for a lock meant to be gained after having a
+  // monitor lock.
+  kPostMonitorLock,
+  kMonitorLock,
   // This is a generic lock level for a top-level lock meant to be gained after having the
   // mutator_lock_.
   kPostMutatorTopLockLevel,
@@ -138,7 +137,7 @@ enum LockLevel : uint8_t {
   kUserCodeSuspensionLock,
   kZygoteCreationLock,
 
-  // The highest valid lock level. Use this if there is code that should only be called with no
+  // The highest valid lock level. Use this for locks that should only be acquired with no
   // other locks held. Since this is the highest lock level we also allow it to be held even if the
   // runtime or current thread is not fully set-up yet (for example during thread attach). Note that
   // this lock also has special behavior around the mutator_lock_. Since the mutator_lock_ is not
@@ -150,7 +149,7 @@ enum LockLevel : uint8_t {
 
   kLockLevelCount  // Must come last.
 };
-std::ostream& operator<<(std::ostream& os, const LockLevel& rhs);
+EXPORT std::ostream& operator<<(std::ostream& os, LockLevel rhs);
 
 // For StartNoThreadSuspension and EndNoThreadSuspension.
 class CAPABILITY("role") Role {
@@ -164,7 +163,7 @@ class Uninterruptible : public Role {
 };
 
 // Global mutexes corresponding to the levels above.
-class Locks {
+class EXPORT Locks {
  public:
   static void Init();
   static void InitConditions() NO_THREAD_SAFETY_ANALYSIS;  // Condition variables.
@@ -290,6 +289,8 @@ class Locks {
 
   static ReaderWriterMutex* dex_lock_ ACQUIRED_AFTER(modify_ldt_lock_);
 
+  static Mutex* dex_cache_lock_ ACQUIRED_AFTER(dex_lock_);
+
   // Guards opened oat files in OatFileManager.
   static ReaderWriterMutex* oat_file_manager_lock_ ACQUIRED_AFTER(dex_lock_);
 
@@ -335,8 +336,11 @@ class Locks {
   // GetThreadLocalStorage.
   static Mutex* custom_tls_lock_ ACQUIRED_AFTER(jni_function_table_lock_);
 
-  // Guard access to any JIT data structure.
+  // Guard access to JIT data structures mostly used by the JIT thread.
   static Mutex* jit_lock_ ACQUIRED_AFTER(custom_tls_lock_);
+
+  // Guard access to any JIT data structure that mutators can also access.
+  static ReaderWriterMutex* jit_mutator_lock_ ACQUIRED_AFTER(custom_tls_lock_);
 
   // Guards Class Hierarchy Analysis (CHA).
   static Mutex* cha_lock_ ACQUIRED_AFTER(jit_lock_);
@@ -379,7 +383,7 @@ class Locks {
 class Roles {
  public:
   // Uninterruptible means that the thread may not become suspended.
-  static Uninterruptible uninterruptible_;
+  EXPORT static Uninterruptible uninterruptible_;
 };
 
 }  // namespace art

@@ -17,10 +17,12 @@
 #ifndef ART_COMPILER_OPTIMIZING_LOOP_ANALYSIS_H_
 #define ART_COMPILER_OPTIMIZING_LOOP_ANALYSIS_H_
 
+#include "base/macros.h"
 #include "nodes.h"
 
-namespace art {
+namespace art HIDDEN {
 
+class CodeGenerator;
 class InductionVarRange;
 class LoopAnalysis;
 
@@ -132,11 +134,12 @@ class LoopAnalysis : public ValueObject {
 //
 class ArchNoOptsLoopHelper : public ArenaObject<kArenaAllocOptimization> {
  public:
+  explicit ArchNoOptsLoopHelper(const CodeGenerator& codegen) : codegen_(codegen) {}
   virtual ~ArchNoOptsLoopHelper() {}
 
   // Creates an instance of specialised helper for the target or default helper if the target
   // doesn't support loop peeling and unrolling.
-  static ArchNoOptsLoopHelper* Create(InstructionSet isa, ArenaAllocator* allocator);
+  static ArchNoOptsLoopHelper* Create(const CodeGenerator& codegen, ArenaAllocator* allocator);
 
   // Returns whether the loop is not beneficial for loop peeling/unrolling.
   //
@@ -145,13 +148,15 @@ class ArchNoOptsLoopHelper : public ArenaObject<kArenaAllocOptimization> {
   //
   // Returns 'true' by default, should be overridden by particular target loop helper.
   virtual bool IsLoopNonBeneficialForScalarOpts(
-      LoopAnalysisInfo* loop_analysis_info ATTRIBUTE_UNUSED) const { return true; }
+      [[maybe_unused]] LoopAnalysisInfo* loop_analysis_info) const {
+    return true;
+  }
 
   // Returns optimal scalar unrolling factor for the loop.
   //
   // Returns kNoUnrollingFactor by default, should be overridden by particular target loop helper.
   virtual uint32_t GetScalarUnrollingFactor(
-      const LoopAnalysisInfo* analysis_info ATTRIBUTE_UNUSED) const {
+      [[maybe_unused]] const LoopAnalysisInfo* analysis_info) const {
     return LoopAnalysisInfo::kNoUnrollingFactor;
   }
 
@@ -163,19 +168,22 @@ class ArchNoOptsLoopHelper : public ArenaObject<kArenaAllocOptimization> {
   // Returns whether it is beneficial to fully unroll the loop.
   //
   // Returns 'false' by default, should be overridden by particular target loop helper.
-  virtual bool IsFullUnrollingBeneficial(LoopAnalysisInfo* analysis_info ATTRIBUTE_UNUSED) const {
+  virtual bool IsFullUnrollingBeneficial([[maybe_unused]] LoopAnalysisInfo* analysis_info) const {
     return false;
   }
 
   // Returns optimal SIMD unrolling factor for the loop.
   //
   // Returns kNoUnrollingFactor by default, should be overridden by particular target loop helper.
-  virtual uint32_t GetSIMDUnrollingFactor(HBasicBlock* block ATTRIBUTE_UNUSED,
-                                          int64_t trip_count ATTRIBUTE_UNUSED,
-                                          uint32_t max_peel ATTRIBUTE_UNUSED,
-                                          uint32_t vector_length ATTRIBUTE_UNUSED) const {
+  virtual uint32_t GetSIMDUnrollingFactor([[maybe_unused]] HBasicBlock* block,
+                                          [[maybe_unused]] int64_t trip_count,
+                                          [[maybe_unused]] uint32_t max_peel,
+                                          [[maybe_unused]] uint32_t vector_length) const {
     return LoopAnalysisInfo::kNoUnrollingFactor;
   }
+
+ protected:
+  const CodeGenerator& codegen_;
 };
 
 }  // namespace art

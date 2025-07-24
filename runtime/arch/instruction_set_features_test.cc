@@ -28,7 +28,7 @@
 #include <android-base/logging.h>
 #include <android-base/stringprintf.h>
 
-namespace art {
+namespace art HIDDEN {
 
 #ifdef ART_TARGET_ANDROID
 
@@ -173,6 +173,20 @@ TEST(InstructionSetFeaturesTest, FeaturesFromAssembly) {
       InstructionSetFeatures::FromAssembly());
   EXPECT_TRUE(assembly_features->HasAtLeast(instruction_set_features.get()))
       << "Assembly features: " << *assembly_features.get()
+      << "\nFeatures from build: " << *instruction_set_features.get();
+}
+
+TEST(InstructionSetFeaturesTest, FeaturestFromCpuFeatures) {
+  // Take the default set of instruction features from the build.
+  std::unique_ptr<const InstructionSetFeatures> instruction_set_features(
+      InstructionSetFeatures::FromCppDefines());
+
+  // Check we get the same instruction set features using the cpu_features library
+  std::unique_ptr<const InstructionSetFeatures> library_features(
+      InstructionSetFeatures::FromCpuFeatures());
+
+  EXPECT_TRUE(library_features->HasAtLeast(instruction_set_features.get()))
+      << "Library features: " << *library_features.get()
       << "\nFeatures from build: " << *instruction_set_features.get();
 }
 

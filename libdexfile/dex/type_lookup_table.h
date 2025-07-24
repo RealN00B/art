@@ -70,7 +70,7 @@ class TypeLookupTable {
 
   // Method search class_def_idx by class descriptor and it's hash.
   // If no data found then the method returns dex::kDexNoIndex.
-  uint32_t Lookup(const char* str, uint32_t hash) const;
+  uint32_t Lookup(std::string_view str, uint32_t hash) const;
 
   // Method returns pointer to binary data of lookup table. Used by the oat writer.
   const uint8_t* RawData() const {
@@ -86,6 +86,8 @@ class TypeLookupTable {
 
   // Method returns length of binary data for the specified number of class definitions.
   static uint32_t RawDataLength(uint32_t num_class_defs);
+
+  void Dump(std::ostream& os) const;
 
  private:
   /**
@@ -145,7 +147,7 @@ class TypeLookupTable {
 
     uint32_t GetHashBits(uint32_t mask_bits) const {
       DCHECK_LE(mask_bits, 16u);
-      return data_ >> (2u * mask_bits);
+      return static_cast<uint64_t>(data_) >> (2u * mask_bits);
     }
 
     static uint32_t GetMask(uint32_t mask_bits) {
@@ -167,7 +169,7 @@ class TypeLookupTable {
                   const Entry* entries,
                   std::unique_ptr<Entry[]> owned_entries);
 
-  const char* GetStringData(const Entry& entry) const;
+  std::string_view GetStringData(const Entry& entry) const;
 
   const uint8_t* dex_data_begin_;
   uint32_t mask_bits_;

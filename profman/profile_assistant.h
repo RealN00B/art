@@ -22,47 +22,65 @@
 
 #include "base/scoped_flock.h"
 #include "profile/profile_compilation_info.h"
+#include "profman/profman_result.h"
 
 namespace art {
 
 class ProfileAssistant {
  public:
-  // These also serve as return codes of profman and are processed by installd
-  // (frameworks/native/cmds/installd/commands.cpp)
-  enum ProcessingResult {
-    kSuccess = 0,  // Generic success code for non-analysis runs.
-    kCompile = 1,
-    kSkipCompilation = 2,
-    kErrorBadProfiles = 3,
-    kErrorIO = 4,
-    kErrorCannotLock = 5,
-    kErrorDifferentVersions = 6,
-  };
-
   class Options {
    public:
     static constexpr bool kForceMergeDefault = false;
     static constexpr bool kBootImageMergeDefault = false;
+    static constexpr uint32_t kMinNewMethodsPercentChangeForCompilation = 2;
+    static constexpr uint32_t kMinNewClassesPercentChangeForCompilation = 2;
 
     Options()
         : force_merge_(kForceMergeDefault),
-          boot_image_merge_(kBootImageMergeDefault) {
+          force_merge_and_analyze_(kForceMergeDefault),
+          boot_image_merge_(kBootImageMergeDefault),
+          min_new_methods_percent_change_for_compilation_(
+              kMinNewMethodsPercentChangeForCompilation),
+          min_new_classes_percent_change_for_compilation_(
+              kMinNewClassesPercentChangeForCompilation) {
     }
 
+    // Only for S and T uses. U+ should use `IsForceMergeAndAnalyze`.
     bool IsForceMerge() const { return force_merge_; }
+    bool IsForceMergeAndAnalyze() const { return force_merge_and_analyze_; }
     bool IsBootImageMerge() const { return boot_image_merge_; }
+    uint32_t GetMinNewMethodsPercentChangeForCompilation() const {
+        return min_new_methods_percent_change_for_compilation_;
+    }
+    uint32_t GetMinNewClassesPercentChangeForCompilation() const {
+        return min_new_classes_percent_change_for_compilation_;
+    }
 
     void SetForceMerge(bool value) { force_merge_ = value; }
+    void SetForceMergeAndAnalyze(bool value) { force_merge_and_analyze_ = value; }
     void SetBootImageMerge(bool value) { boot_image_merge_ = value; }
+    void SetMinNewMethodsPercentChangeForCompilation(uint32_t value) {
+      min_new_methods_percent_change_for_compilation_ = value;
+    }
+    void SetMinNewClassesPercentChangeForCompilation(uint32_t value) {
+      min_new_classes_percent_change_for_compilation_ = value;
+    }
 
    private:
-    // If true, performs a forced merge, without analyzing if there is a
-    // significant difference between the current profile and the reference profile.
+    // If true, performs a forced merge, without analyzing if there is a significant difference
+    // between before and after the merge.
     // See ProfileAssistant#ProcessProfile.
+    // Only for S and T uses. U+ should use `force_merge_and_analyze_`.
     bool force_merge_;
+    // If true, performs a forced merge and analyzes if there is any difference between before and
+    // after the merge.
+    // See ProfileAssistant#ProcessProfile.
+    bool force_merge_and_analyze_;
     // Signals that the merge is for boot image profiles. It will ignore differences
     // in profile versions (instead of aborting).
     bool boot_image_merge_;
+    uint32_t min_new_methods_percent_change_for_compilation_;
+    uint32_t min_new_classes_percent_change_for_compilation_;
   };
 
   // Process the profile information present in the given files. Returns one of
@@ -75,18 +93,19 @@ class ProfileAssistant {
   // reference_profile will be updated with the profiling info obtain after
   // merging all profiles.
   //
-  // When the returned value is kSkipCompilation, the difference between the
-  // merge of the current profiles and the reference one is insignificant. In
-  // this case no file will be updated.
-  //
-  static ProcessingResult ProcessProfiles(
+  // When the returned value is kSkipCompilationSmallDelta, the difference between
+  // the merge of the current profiles and the reference one is insignificant. In
+  // this case no file will be updated. A variation of this code is
+  // kSkipCompilationEmptyProfiles which indicates that all the profiles are empty.
+  // This allow the caller to make fine grain decisions on the compilation strategy.
+  static ProfmanResult::ProcessingResult ProcessProfiles(
       const std::vector<std::string>& profile_files,
       const std::string& reference_profile_file,
       const ProfileCompilationInfo::ProfileLoadFilterFn& filter_fn
           = ProfileCompilationInfo::ProfileFilterFnAcceptAll,
       const Options& options = Options());
 
-  static ProcessingResult ProcessProfiles(
+  static ProfmanResult::ProcessingResult ProcessProfiles(
       const std::vector<int>& profile_files_fd_,
       int reference_profile_file_fd,
       const ProfileCompilationInfo::ProfileLoadFilterFn& filter_fn
@@ -94,7 +113,7 @@ class ProfileAssistant {
       const Options& options = Options());
 
  private:
-  static ProcessingResult ProcessProfilesInternal(
+  static ProfmanResult::ProcessingResult ProcessProfilesInternal(
       const std::vector<ScopedFlock>& profile_files,
       const ScopedFlock& reference_profile_file,
       const ProfileCompilationInfo::ProfileLoadFilterFn& filter_fn,

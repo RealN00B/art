@@ -21,14 +21,16 @@
 
 #include <android-base/logging.h>
 
-namespace art {
+#include "base/macros.h"
+
+namespace art HIDDEN {
 namespace verifier {
 
 // RAII to inject a newline after a message.
 struct ScopedNewLine {
   explicit ScopedNewLine(std::ostream& os) : stream(os) {}
 
-  ScopedNewLine(ScopedNewLine&& other) : stream(other.stream), active(other.active) {
+  ScopedNewLine(ScopedNewLine&& other) noexcept : stream(other.stream), active(other.active) {
     other.active = false;
   }
 

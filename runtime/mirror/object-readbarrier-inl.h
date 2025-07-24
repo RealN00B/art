@@ -20,13 +20,14 @@
 #include "object.h"
 
 #include "base/atomic.h"
+#include "class_linker.h"
 #include "heap_poisoning.h"
 #include "lock_word-inl.h"
 #include "object_reference-inl.h"
 #include "read_barrier.h"
 #include "runtime.h"
 
-namespace art {
+namespace art HIDDEN {
 namespace mirror {
 
 template<VerifyObjectFlags kVerifyFlags>
@@ -46,16 +47,18 @@ inline bool Object::CasField32(MemberOffset field_offset,
   if (kCheckTransaction) {
     DCHECK_EQ(kTransactionActive, Runtime::Current()->IsActiveTransaction());
   }
-  if (kTransactionActive) {
-    Runtime::Current()->RecordWriteField32(this, field_offset, old_value, true);
-  }
   if (kVerifyFlags & kVerifyThis) {
     VerifyObject(this);
   }
   uint8_t* raw_addr = reinterpret_cast<uint8_t*>(this) + field_offset.Int32Value();
   AtomicInteger* atomic_addr = reinterpret_cast<AtomicInteger*>(raw_addr);
 
-  return atomic_addr->CompareAndSet(old_value, new_value, mode, memory_order);
+  bool success = atomic_addr->CompareAndSet(old_value, new_value, mode, memory_order);
+  if (kTransactionActive && success) {
+    Runtime::Current()->GetClassLinker()->RecordWriteField32(
+        this, field_offset, old_value, /*is_volatile=*/ true);
+  }
+  return success;
 }
 
 inline bool Object::CasLockWord(LockWord old_val,
@@ -107,7 +110,8 @@ inline uint32_t Object::GetReadBarrierState(uintptr_t* fake_address_dependency) 
   LockWord lw(static_cast<uint32_t>(result));
   uint32_t rb_state = lw.ReadBarrierState();
   return rb_state;
-#elif defined(__i386__) || defined(__x86_64__)
+#elif defined(__i386__) || defined(__x86_64__) || defined(__riscv)
+  // TODO(riscv64): add arch-specific implementation
   LockWord lw = GetLockWord(false);
   // i386/x86_64 don't need fake address dependency. Use a compiler fence to avoid compiler
   // reordering.
@@ -145,8 +149,9 @@ inline uint32_t Object::GetReadBarrierStateAcquire() {
   return rb_state;
 }
 
-template<std::memory_order kMemoryOrder>
-inline bool Object::AtomicSetReadBarrierState(uint32_t expected_rb_state, uint32_t rb_state) {
+inline bool Object::AtomicSetReadBarrierState(uint32_t expected_rb_state,
+                                              uint32_t rb_state,
+                                              std::memory_order order) {
   if (!kUseBakerReadBarrier) {
     LOG(FATAL) << "Unreachable";
     UNREACHABLE();
@@ -170,7 +175,7 @@ inline bool Object::AtomicSetReadBarrierState(uint32_t expected_rb_state, uint32
     // If `kMemoryOrder` == `std::memory_order_release`, use a CAS release so that when GC updates
     // all the fields of an object and then changes the object from gray to black (non-gray), the
     // field updates (stores) will be visible (won't be reordered after this CAS.)
-  } while (!CasLockWord(expected_lw, new_lw, CASMode::kWeak, kMemoryOrder));
+  } while (!CasLockWord(expected_lw, new_lw, CASMode::kWeak, order));
   return true;
 }
 

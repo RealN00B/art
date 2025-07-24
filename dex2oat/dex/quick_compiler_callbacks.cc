@@ -16,15 +16,26 @@
 
 #include "quick_compiler_callbacks.h"
 
+#include "aot_class_linker.h"
 #include "dex/verification_results.h"
 #include "driver/compiler_driver.h"
 #include "mirror/class-inl.h"
 
 namespace art {
 
-void QuickCompilerCallbacks::MethodVerified(verifier::MethodVerifier* verifier) {
+ClassLinker* QuickCompilerCallbacks::CreateAotClassLinker(InternTable* intern_table) {
+  return new AotClassLinker(intern_table);
+}
+
+void QuickCompilerCallbacks::AddUncompilableMethod(MethodReference ref) {
   if (verification_results_ != nullptr) {
-    verification_results_->ProcessVerifiedMethod(verifier);
+    verification_results_->AddUncompilableMethod(ref);
+  }
+}
+
+void QuickCompilerCallbacks::AddUncompilableClass(ClassReference ref) {
+  if (verification_results_ != nullptr) {
+    verification_results_->AddUncompilableClass(ref);
   }
 }
 
@@ -41,8 +52,6 @@ ClassStatus QuickCompilerCallbacks::GetPreviousClassState(ClassReference ref) {
     return ClassStatus::kNotReady;
   }
   DCHECK(compiler_driver_ != nullptr);
-  // In the case of the quicken filter: avoiding verification of quickened instructions, which the
-  // verifier doesn't currently support.
   // In the case of the verify filter, avoiding verifiying twice.
   return compiler_driver_->GetClassStatus(ref);
 }

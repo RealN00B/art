@@ -37,17 +37,26 @@ public class TestCharShort {
   /// CHECK-START-{ARM64}: int other.TestCharShort.testDotProdSimple(short[], short[]) loop_optimization (after)
   /// CHECK-DAG: <<Const0:i\d+>>  IntConstant 0                                         loop:none
   /// CHECK-DAG: <<Const1:i\d+>>  IntConstant 1                                         loop:none
-  /// CHECK-DAG: <<Const8:i\d+>>  IntConstant 8                                         loop:none
-  /// CHECK-DAG: <<Set:d\d+>>     VecSetScalars [<<Const1>>]                            loop:none
-  /// CHECK-DAG: <<Phi1:i\d+>>    Phi [<<Const0>>,{{i\d+}}]                             loop:<<Loop:B\d+>> outer_loop:none
-  /// CHECK-DAG: <<Phi2:d\d+>>    Phi [<<Set>>,{{d\d+}}]                                loop:<<Loop>>      outer_loop:none
-  /// CHECK-DAG: <<Load1:d\d+>>   VecLoad [{{l\d+}},<<Phi1>>]                           loop:<<Loop>>      outer_loop:none
-  /// CHECK-DAG: <<Load2:d\d+>>   VecLoad [{{l\d+}},<<Phi1>>]                           loop:<<Loop>>      outer_loop:none
-  /// CHECK-DAG:                  VecDotProd [<<Phi2>>,<<Load1>>,<<Load2>>] type:Int16  loop:<<Loop>>      outer_loop:none
-  /// CHECK-DAG:                  Add [<<Phi1>>,<<Const8>>]                             loop:<<Loop>>      outer_loop:none
+  /// CHECK-IF:     hasIsaFeature("sve") and os.environ.get('ART_FORCE_TRY_PREDICATED_SIMD') == 'true'
   //
-  /// CHECK-DAG: <<Reduce:d\d+>>  VecReduce [<<Phi2>>]                                  loop:none
-  /// CHECK-DAG:                  VecExtractScalar [<<Reduce>>]                         loop:none
+  //      16-bit DotProd is not supported for SVE.
+  ///     CHECK-NOT:                  VecDotProd
+  //
+  /// CHECK-ELSE:
+  //
+  ///     CHECK-DAG: <<Const8:i\d+>>  IntConstant 8                                         loop:none
+  ///     CHECK-DAG: <<Set:d\d+>>     VecSetScalars [<<Const1>>]                            loop:none
+  ///     CHECK-DAG: <<Phi1:i\d+>>    Phi [<<Const0>>,{{i\d+}}]                             loop:<<Loop:B\d+>> outer_loop:none
+  ///     CHECK-DAG: <<Phi2:d\d+>>    Phi [<<Set>>,{{d\d+}}]                                loop:<<Loop>>      outer_loop:none
+  ///     CHECK-DAG: <<Load1:d\d+>>   VecLoad [{{l\d+}},<<Phi1>>]                           loop:<<Loop>>      outer_loop:none
+  ///     CHECK-DAG: <<Load2:d\d+>>   VecLoad [{{l\d+}},<<Phi1>>]                           loop:<<Loop>>      outer_loop:none
+  ///     CHECK-DAG:                  VecDotProd [<<Phi2>>,<<Load1>>,<<Load2>>] type:Int16  loop:<<Loop>>      outer_loop:none
+  ///     CHECK-DAG:                  Add [<<Phi1>>,<<Const8>>]                             loop:<<Loop>>      outer_loop:none
+  //
+  ///     CHECK-DAG: <<Reduce:d\d+>>  VecReduce [<<Phi2>>]                                  loop:none
+  ///     CHECK-DAG:                  VecExtractScalar [<<Reduce>>]                         loop:none
+  //
+  /// CHECK-FI:
   public static final int testDotProdSimple(short[] a, short[] b) {
     int s = 1;
     for (int i = 0; i < b.length; i++) {
@@ -75,20 +84,29 @@ public class TestCharShort {
   /// CHECK-START-{ARM64}: int other.TestCharShort.testDotProdComplex(short[], short[]) loop_optimization (after)
   /// CHECK-DAG: <<Const0:i\d+>>  IntConstant 0                                         loop:none
   /// CHECK-DAG: <<Const1:i\d+>>  IntConstant 1                                         loop:none
-  /// CHECK-DAG: <<Const8:i\d+>>  IntConstant 8                                         loop:none
-  /// CHECK-DAG: <<Repl:d\d+>>    VecReplicateScalar [<<Const1>>]                       loop:none
-  /// CHECK-DAG: <<Set:d\d+>>     VecSetScalars [<<Const1>>]                            loop:none
-  /// CHECK-DAG: <<Phi1:i\d+>>    Phi [<<Const0>>,{{i\d+}}]                             loop:<<Loop:B\d+>> outer_loop:none
-  /// CHECK-DAG: <<Phi2:d\d+>>    Phi [<<Set>>,{{d\d+}}]                                loop:<<Loop>>      outer_loop:none
-  /// CHECK-DAG: <<Load1:d\d+>>   VecLoad [{{l\d+}},<<Phi1>>]                           loop:<<Loop>>      outer_loop:none
-  /// CHECK-DAG: <<VAdd1:d\d+>>   VecAdd [<<Load1>>,<<Repl>>]                           loop:<<Loop>>      outer_loop:none
-  /// CHECK-DAG: <<Load2:d\d+>>   VecLoad [{{l\d+}},<<Phi1>>]                           loop:<<Loop>>      outer_loop:none
-  /// CHECK-DAG: <<VAdd2:d\d+>>   VecAdd [<<Load2>>,<<Repl>>]                           loop:<<Loop>>      outer_loop:none
-  /// CHECK-DAG:                  VecDotProd [<<Phi2>>,<<VAdd1>>,<<VAdd2>>] type:Int16  loop:<<Loop>>      outer_loop:none
-  /// CHECK-DAG:                  Add [<<Phi1>>,<<Const8>>]                             loop:<<Loop>>      outer_loop:none
+  /// CHECK-IF:     hasIsaFeature("sve") and os.environ.get('ART_FORCE_TRY_PREDICATED_SIMD') == 'true'
   //
-  /// CHECK-DAG: <<Reduce:d\d+>>  VecReduce [<<Phi2>>]                                  loop:none
-  /// CHECK-DAG:                  VecExtractScalar [<<Reduce>>]                         loop:none
+  //      16-bit DotProd is not supported for SVE.
+  ///     CHECK-NOT:                  VecDotProd
+  //
+  /// CHECK-ELSE:
+  //
+  ///     CHECK-DAG: <<Const8:i\d+>>  IntConstant 8                                         loop:none
+  ///     CHECK-DAG: <<Repl:d\d+>>    VecReplicateScalar [<<Const1>>]                       loop:none
+  ///     CHECK-DAG: <<Set:d\d+>>     VecSetScalars [<<Const1>>]                            loop:none
+  ///     CHECK-DAG: <<Phi1:i\d+>>    Phi [<<Const0>>,{{i\d+}}]                             loop:<<Loop:B\d+>> outer_loop:none
+  ///     CHECK-DAG: <<Phi2:d\d+>>    Phi [<<Set>>,{{d\d+}}]                                loop:<<Loop>>      outer_loop:none
+  ///     CHECK-DAG: <<Load1:d\d+>>   VecLoad [{{l\d+}},<<Phi1>>]                           loop:<<Loop>>      outer_loop:none
+  ///     CHECK-DAG: <<VAdd1:d\d+>>   VecAdd [<<Load1>>,<<Repl>>]                           loop:<<Loop>>      outer_loop:none
+  ///     CHECK-DAG: <<Load2:d\d+>>   VecLoad [{{l\d+}},<<Phi1>>]                           loop:<<Loop>>      outer_loop:none
+  ///     CHECK-DAG: <<VAdd2:d\d+>>   VecAdd [<<Load2>>,<<Repl>>]                           loop:<<Loop>>      outer_loop:none
+  ///     CHECK-DAG:                  VecDotProd [<<Phi2>>,<<VAdd1>>,<<VAdd2>>] type:Int16  loop:<<Loop>>      outer_loop:none
+  ///     CHECK-DAG:                  Add [<<Phi1>>,<<Const8>>]                             loop:<<Loop>>      outer_loop:none
+  //
+  ///     CHECK-DAG: <<Reduce:d\d+>>  VecReduce [<<Phi2>>]                                  loop:none
+  ///     CHECK-DAG:                  VecExtractScalar [<<Reduce>>]                         loop:none
+  //
+  /// CHECK-FI:
   public static final int testDotProdComplex(short[] a, short[] b) {
     int s = 1;
     for (int i = 0; i < b.length; i++) {
@@ -112,17 +130,26 @@ public class TestCharShort {
   /// CHECK-START-{ARM64}: int other.TestCharShort.testDotProdSimpleUnsigned(char[], char[]) loop_optimization (after)
   /// CHECK-DAG: <<Const0:i\d+>>  IntConstant 0                                         loop:none
   /// CHECK-DAG: <<Const1:i\d+>>  IntConstant 1                                         loop:none
-  /// CHECK-DAG: <<Const8:i\d+>>  IntConstant 8                                         loop:none
-  /// CHECK-DAG: <<Set:d\d+>>     VecSetScalars [<<Const1>>]                            loop:none
-  /// CHECK-DAG: <<Phi1:i\d+>>    Phi [<<Const0>>,{{i\d+}}]                             loop:<<Loop:B\d+>> outer_loop:none
-  /// CHECK-DAG: <<Phi2:d\d+>>    Phi [<<Set>>,{{d\d+}}]                                loop:<<Loop>>      outer_loop:none
-  /// CHECK-DAG: <<Load1:d\d+>>   VecLoad [{{l\d+}},<<Phi1>>]                           loop:<<Loop>>      outer_loop:none
-  /// CHECK-DAG: <<Load2:d\d+>>   VecLoad [{{l\d+}},<<Phi1>>]                           loop:<<Loop>>      outer_loop:none
-  /// CHECK-DAG:                  VecDotProd [<<Phi2>>,<<Load1>>,<<Load2>>] type:Uint16 loop:<<Loop>>      outer_loop:none
-  /// CHECK-DAG:                  Add [<<Phi1>>,<<Const8>>]                             loop:<<Loop>>      outer_loop:none
+  /// CHECK-IF:     hasIsaFeature("sve") and os.environ.get('ART_FORCE_TRY_PREDICATED_SIMD') == 'true'
   //
-  /// CHECK-DAG: <<Reduce:d\d+>>  VecReduce [<<Phi2>>]                                  loop:none
-  /// CHECK-DAG:                  VecExtractScalar [<<Reduce>>]                         loop:none
+  //      16-bit DotProd is not supported for SVE.
+  ///     CHECK-NOT:                  VecDotProd
+  //
+  /// CHECK-ELSE:
+  //
+  ///     CHECK-DAG: <<Const8:i\d+>>  IntConstant 8                                         loop:none
+  ///     CHECK-DAG: <<Set:d\d+>>     VecSetScalars [<<Const1>>]                            loop:none
+  ///     CHECK-DAG: <<Phi1:i\d+>>    Phi [<<Const0>>,{{i\d+}}]                             loop:<<Loop:B\d+>> outer_loop:none
+  ///     CHECK-DAG: <<Phi2:d\d+>>    Phi [<<Set>>,{{d\d+}}]                                loop:<<Loop>>      outer_loop:none
+  ///     CHECK-DAG: <<Load1:d\d+>>   VecLoad [{{l\d+}},<<Phi1>>]                           loop:<<Loop>>      outer_loop:none
+  ///     CHECK-DAG: <<Load2:d\d+>>   VecLoad [{{l\d+}},<<Phi1>>]                           loop:<<Loop>>      outer_loop:none
+  ///     CHECK-DAG:                  VecDotProd [<<Phi2>>,<<Load1>>,<<Load2>>] type:Uint16 loop:<<Loop>>      outer_loop:none
+  ///     CHECK-DAG:                  Add [<<Phi1>>,<<Const8>>]                             loop:<<Loop>>      outer_loop:none
+  //
+  ///     CHECK-DAG: <<Reduce:d\d+>>  VecReduce [<<Phi2>>]                                  loop:none
+  ///     CHECK-DAG:                  VecExtractScalar [<<Reduce>>]                         loop:none
+  //
+  /// CHECK-FI:
   public static final int testDotProdSimpleUnsigned(char[] a, char[] b) {
     int s = 1;
     for (int i = 0; i < b.length; i++) {
@@ -150,20 +177,29 @@ public class TestCharShort {
   /// CHECK-START-{ARM64}: int other.TestCharShort.testDotProdComplexUnsigned(char[], char[]) loop_optimization (after)
   /// CHECK-DAG: <<Const0:i\d+>>  IntConstant 0                                         loop:none
   /// CHECK-DAG: <<Const1:i\d+>>  IntConstant 1                                         loop:none
-  /// CHECK-DAG: <<Const8:i\d+>>  IntConstant 8                                         loop:none
-  /// CHECK-DAG: <<Repl:d\d+>>    VecReplicateScalar [<<Const1>>]                       loop:none
-  /// CHECK-DAG: <<Set:d\d+>>     VecSetScalars [<<Const1>>]                            loop:none
-  /// CHECK-DAG: <<Phi1:i\d+>>    Phi [<<Const0>>,{{i\d+}}]                             loop:<<Loop:B\d+>> outer_loop:none
-  /// CHECK-DAG: <<Phi2:d\d+>>    Phi [<<Set>>,{{d\d+}}]                                loop:<<Loop>>      outer_loop:none
-  /// CHECK-DAG: <<Load1:d\d+>>   VecLoad [{{l\d+}},<<Phi1>>]                           loop:<<Loop>>      outer_loop:none
-  /// CHECK-DAG: <<VAdd1:d\d+>>   VecAdd [<<Load1>>,<<Repl>>]                           loop:<<Loop>>      outer_loop:none
-  /// CHECK-DAG: <<Load2:d\d+>>   VecLoad [{{l\d+}},<<Phi1>>]                           loop:<<Loop>>      outer_loop:none
-  /// CHECK-DAG: <<VAdd2:d\d+>>   VecAdd [<<Load2>>,<<Repl>>]                           loop:<<Loop>>      outer_loop:none
-  /// CHECK-DAG:                  VecDotProd [<<Phi2>>,<<VAdd1>>,<<VAdd2>>] type:Uint16 loop:<<Loop>>      outer_loop:none
-  /// CHECK-DAG:                  Add [<<Phi1>>,<<Const8>>]                             loop:<<Loop>>      outer_loop:none
+  /// CHECK-IF:     hasIsaFeature("sve") and os.environ.get('ART_FORCE_TRY_PREDICATED_SIMD') == 'true'
   //
-  /// CHECK-DAG: <<Reduce:d\d+>>  VecReduce [<<Phi2>>]                                  loop:none
-  /// CHECK-DAG:                  VecExtractScalar [<<Reduce>>]                         loop:none
+  //      16-bit DotProd is not supported for SVE.
+  ///     CHECK-NOT:                  VecDotProd
+  //
+  /// CHECK-ELSE:
+  //
+  ///     CHECK-DAG: <<Const8:i\d+>>  IntConstant 8                                         loop:none
+  ///     CHECK-DAG: <<Repl:d\d+>>    VecReplicateScalar [<<Const1>>]                       loop:none
+  ///     CHECK-DAG: <<Set:d\d+>>     VecSetScalars [<<Const1>>]                            loop:none
+  ///     CHECK-DAG: <<Phi1:i\d+>>    Phi [<<Const0>>,{{i\d+}}]                             loop:<<Loop:B\d+>> outer_loop:none
+  ///     CHECK-DAG: <<Phi2:d\d+>>    Phi [<<Set>>,{{d\d+}}]                                loop:<<Loop>>      outer_loop:none
+  ///     CHECK-DAG: <<Load1:d\d+>>   VecLoad [{{l\d+}},<<Phi1>>]                           loop:<<Loop>>      outer_loop:none
+  ///     CHECK-DAG: <<VAdd1:d\d+>>   VecAdd [<<Load1>>,<<Repl>>]                           loop:<<Loop>>      outer_loop:none
+  ///     CHECK-DAG: <<Load2:d\d+>>   VecLoad [{{l\d+}},<<Phi1>>]                           loop:<<Loop>>      outer_loop:none
+  ///     CHECK-DAG: <<VAdd2:d\d+>>   VecAdd [<<Load2>>,<<Repl>>]                           loop:<<Loop>>      outer_loop:none
+  ///     CHECK-DAG:                  VecDotProd [<<Phi2>>,<<VAdd1>>,<<VAdd2>>] type:Uint16 loop:<<Loop>>      outer_loop:none
+  ///     CHECK-DAG:                  Add [<<Phi1>>,<<Const8>>]                             loop:<<Loop>>      outer_loop:none
+  //
+  ///     CHECK-DAG: <<Reduce:d\d+>>  VecReduce [<<Phi2>>]                                  loop:none
+  ///     CHECK-DAG:                  VecExtractScalar [<<Reduce>>]                         loop:none
+  //
+  /// CHECK-FI:
   public static final int testDotProdComplexUnsigned(char[] a, char[] b) {
     int s = 1;
     for (int i = 0; i < b.length; i++) {
@@ -173,7 +209,7 @@ public class TestCharShort {
     return s - 1;
   }
 
-  /// CHECK-START: int other.TestCharShort.testDotProdComplexUnsignedCastedToSigned(char[], char[]) loop_optimization (before)
+  /// CHECK-START: int other.TestCharShort.testDotProdComplexUnsignedCastToSigned(char[], char[]) loop_optimization (before)
   /// CHECK-DAG: <<Const0:i\d+>>  IntConstant 0                                         loop:none
   /// CHECK-DAG: <<Const1:i\d+>>  IntConstant 1                                         loop:none
   /// CHECK-DAG: <<Phi1:i\d+>>    Phi [<<Const0>>,{{i\d+}}]                             loop:<<Loop:B\d+>> outer_loop:none
@@ -188,24 +224,33 @@ public class TestCharShort {
   /// CHECK-DAG:                  Add [<<Phi2>>,<<Mul>>]                                loop:<<Loop>>      outer_loop:none
   /// CHECK-DAG:                  Add [<<Phi1>>,<<Const1>>]                             loop:<<Loop>>      outer_loop:none
 
-  /// CHECK-START-{ARM64}: int other.TestCharShort.testDotProdComplexUnsignedCastedToSigned(char[], char[]) loop_optimization (after)
+  /// CHECK-START-{ARM64}: int other.TestCharShort.testDotProdComplexUnsignedCastToSigned(char[], char[]) loop_optimization (after)
   /// CHECK-DAG: <<Const0:i\d+>>  IntConstant 0                                         loop:none
   /// CHECK-DAG: <<Const1:i\d+>>  IntConstant 1                                         loop:none
-  /// CHECK-DAG: <<Const8:i\d+>>  IntConstant 8                                         loop:none
-  /// CHECK-DAG: <<Repl:d\d+>>    VecReplicateScalar [<<Const1>>]                       loop:none
-  /// CHECK-DAG: <<Set:d\d+>>     VecSetScalars [<<Const1>>]                            loop:none
-  /// CHECK-DAG: <<Phi1:i\d+>>    Phi [<<Const0>>,{{i\d+}}]                             loop:<<Loop:B\d+>> outer_loop:none
-  /// CHECK-DAG: <<Phi2:d\d+>>    Phi [<<Set>>,{{d\d+}}]                                loop:<<Loop>>      outer_loop:none
-  /// CHECK-DAG: <<Load1:d\d+>>   VecLoad [{{l\d+}},<<Phi1>>]                           loop:<<Loop>>      outer_loop:none
-  /// CHECK-DAG: <<VAdd1:d\d+>>   VecAdd [<<Load1>>,<<Repl>>]                           loop:<<Loop>>      outer_loop:none
-  /// CHECK-DAG: <<Load2:d\d+>>   VecLoad [{{l\d+}},<<Phi1>>]                           loop:<<Loop>>      outer_loop:none
-  /// CHECK-DAG: <<VAdd2:d\d+>>   VecAdd [<<Load2>>,<<Repl>>]                           loop:<<Loop>>      outer_loop:none
-  /// CHECK-DAG:                  VecDotProd [<<Phi2>>,<<VAdd1>>,<<VAdd2>>] type:Int16  loop:<<Loop>>      outer_loop:none
-  /// CHECK-DAG:                  Add [<<Phi1>>,<<Const8>>]                             loop:<<Loop>>      outer_loop:none
+  /// CHECK-IF:     hasIsaFeature("sve") and os.environ.get('ART_FORCE_TRY_PREDICATED_SIMD') == 'true'
   //
-  /// CHECK-DAG: <<Reduce:d\d+>>  VecReduce [<<Phi2>>]                                  loop:none
-  /// CHECK-DAG:                  VecExtractScalar [<<Reduce>>]                         loop:none
-  public static final int testDotProdComplexUnsignedCastedToSigned(char[] a, char[] b) {
+  //      16-bit DotProd is not supported for SVE.
+  ///     CHECK-NOT:                  VecDotProd
+  //
+  /// CHECK-ELSE:
+  //
+  ///     CHECK-DAG: <<Const8:i\d+>>  IntConstant 8                                         loop:none
+  ///     CHECK-DAG: <<Repl:d\d+>>    VecReplicateScalar [<<Const1>>]                       loop:none
+  ///     CHECK-DAG: <<Set:d\d+>>     VecSetScalars [<<Const1>>]                            loop:none
+  ///     CHECK-DAG: <<Phi1:i\d+>>    Phi [<<Const0>>,{{i\d+}}]                             loop:<<Loop:B\d+>> outer_loop:none
+  ///     CHECK-DAG: <<Phi2:d\d+>>    Phi [<<Set>>,{{d\d+}}]                                loop:<<Loop>>      outer_loop:none
+  ///     CHECK-DAG: <<Load1:d\d+>>   VecLoad [{{l\d+}},<<Phi1>>]                           loop:<<Loop>>      outer_loop:none
+  ///     CHECK-DAG: <<VAdd1:d\d+>>   VecAdd [<<Load1>>,<<Repl>>]                           loop:<<Loop>>      outer_loop:none
+  ///     CHECK-DAG: <<Load2:d\d+>>   VecLoad [{{l\d+}},<<Phi1>>]                           loop:<<Loop>>      outer_loop:none
+  ///     CHECK-DAG: <<VAdd2:d\d+>>   VecAdd [<<Load2>>,<<Repl>>]                           loop:<<Loop>>      outer_loop:none
+  ///     CHECK-DAG:                  VecDotProd [<<Phi2>>,<<VAdd1>>,<<VAdd2>>] type:Int16  loop:<<Loop>>      outer_loop:none
+  ///     CHECK-DAG:                  Add [<<Phi1>>,<<Const8>>]                             loop:<<Loop>>      outer_loop:none
+  //
+  ///     CHECK-DAG: <<Reduce:d\d+>>  VecReduce [<<Phi2>>]                                  loop:none
+  ///     CHECK-DAG:                  VecExtractScalar [<<Reduce>>]                         loop:none
+  //
+  /// CHECK-FI:
+  public static final int testDotProdComplexUnsignedCastToSigned(char[] a, char[] b) {
     int s = 1;
     for (int i = 0; i < b.length; i++) {
       int temp = ((short)(a[i] + 1)) * ((short)(b[i] + 1));
@@ -214,7 +259,7 @@ public class TestCharShort {
     return s - 1;
   }
 
-  /// CHECK-START: int other.TestCharShort.testDotProdComplexSignedCastedToUnsigned(short[], short[]) loop_optimization (before)
+  /// CHECK-START: int other.TestCharShort.testDotProdComplexSignedCastToUnsigned(short[], short[]) loop_optimization (before)
   /// CHECK-DAG: <<Const0:i\d+>>  IntConstant 0                                         loop:none
   /// CHECK-DAG: <<Const1:i\d+>>  IntConstant 1                                         loop:none
   /// CHECK-DAG: <<Phi1:i\d+>>    Phi [<<Const0>>,{{i\d+}}]                             loop:<<Loop:B\d+>> outer_loop:none
@@ -229,24 +274,33 @@ public class TestCharShort {
   /// CHECK-DAG:                  Add [<<Phi2>>,<<Mul>>]                                loop:<<Loop>>      outer_loop:none
   /// CHECK-DAG:                  Add [<<Phi1>>,<<Const1>>]                             loop:<<Loop>>      outer_loop:none
 
-  /// CHECK-START-{ARM64}: int other.TestCharShort.testDotProdComplexSignedCastedToUnsigned(short[], short[]) loop_optimization (after)
+  /// CHECK-START-{ARM64}: int other.TestCharShort.testDotProdComplexSignedCastToUnsigned(short[], short[]) loop_optimization (after)
   /// CHECK-DAG: <<Const0:i\d+>>  IntConstant 0                                         loop:none
   /// CHECK-DAG: <<Const1:i\d+>>  IntConstant 1                                         loop:none
-  /// CHECK-DAG: <<Const8:i\d+>>  IntConstant 8                                         loop:none
-  /// CHECK-DAG: <<Repl:d\d+>>    VecReplicateScalar [<<Const1>>]                       loop:none
-  /// CHECK-DAG: <<Set:d\d+>>     VecSetScalars [<<Const1>>]                            loop:none
-  /// CHECK-DAG: <<Phi1:i\d+>>    Phi [<<Const0>>,{{i\d+}}]                             loop:<<Loop:B\d+>> outer_loop:none
-  /// CHECK-DAG: <<Phi2:d\d+>>    Phi [<<Set>>,{{d\d+}}]                                loop:<<Loop>>      outer_loop:none
-  /// CHECK-DAG: <<Load1:d\d+>>   VecLoad [{{l\d+}},<<Phi1>>]                           loop:<<Loop>>      outer_loop:none
-  /// CHECK-DAG: <<VAdd1:d\d+>>   VecAdd [<<Load1>>,<<Repl>>]                           loop:<<Loop>>      outer_loop:none
-  /// CHECK-DAG: <<Load2:d\d+>>   VecLoad [{{l\d+}},<<Phi1>>]                           loop:<<Loop>>      outer_loop:none
-  /// CHECK-DAG: <<VAdd2:d\d+>>   VecAdd [<<Load2>>,<<Repl>>]                           loop:<<Loop>>      outer_loop:none
-  /// CHECK-DAG:                  VecDotProd [<<Phi2>>,<<VAdd1>>,<<VAdd2>>] type:Uint16 loop:<<Loop>>      outer_loop:none
-  /// CHECK-DAG:                  Add [<<Phi1>>,<<Const8>>]                             loop:<<Loop>>      outer_loop:none
+  /// CHECK-IF:     hasIsaFeature("sve") and os.environ.get('ART_FORCE_TRY_PREDICATED_SIMD') == 'true'
   //
-  /// CHECK-DAG: <<Reduce:d\d+>>  VecReduce [<<Phi2>>]                                  loop:none
-  /// CHECK-DAG:                  VecExtractScalar [<<Reduce>>]                         loop:none
-  public static final int testDotProdComplexSignedCastedToUnsigned(short[] a, short[] b) {
+  //      16-bit DotProd is not supported for SVE.
+  ///     CHECK-NOT:                  VecDotProd
+  //
+  /// CHECK-ELSE:
+  //
+  ///     CHECK-DAG: <<Const8:i\d+>>  IntConstant 8                                         loop:none
+  ///     CHECK-DAG: <<Repl:d\d+>>    VecReplicateScalar [<<Const1>>]                       loop:none
+  ///     CHECK-DAG: <<Set:d\d+>>     VecSetScalars [<<Const1>>]                            loop:none
+  ///     CHECK-DAG: <<Phi1:i\d+>>    Phi [<<Const0>>,{{i\d+}}]                             loop:<<Loop:B\d+>> outer_loop:none
+  ///     CHECK-DAG: <<Phi2:d\d+>>    Phi [<<Set>>,{{d\d+}}]                                loop:<<Loop>>      outer_loop:none
+  ///     CHECK-DAG: <<Load1:d\d+>>   VecLoad [{{l\d+}},<<Phi1>>]                           loop:<<Loop>>      outer_loop:none
+  ///     CHECK-DAG: <<VAdd1:d\d+>>   VecAdd [<<Load1>>,<<Repl>>]                           loop:<<Loop>>      outer_loop:none
+  ///     CHECK-DAG: <<Load2:d\d+>>   VecLoad [{{l\d+}},<<Phi1>>]                           loop:<<Loop>>      outer_loop:none
+  ///     CHECK-DAG: <<VAdd2:d\d+>>   VecAdd [<<Load2>>,<<Repl>>]                           loop:<<Loop>>      outer_loop:none
+  ///     CHECK-DAG:                  VecDotProd [<<Phi2>>,<<VAdd1>>,<<VAdd2>>] type:Uint16 loop:<<Loop>>      outer_loop:none
+  ///     CHECK-DAG:                  Add [<<Phi1>>,<<Const8>>]                             loop:<<Loop>>      outer_loop:none
+  //
+  ///     CHECK-DAG: <<Reduce:d\d+>>  VecReduce [<<Phi2>>]                                  loop:none
+  ///     CHECK-DAG:                  VecExtractScalar [<<Reduce>>]                         loop:none
+  //
+  /// CHECK-FI:
+  public static final int testDotProdComplexSignedCastToUnsigned(short[] a, short[] b) {
     int s = 1;
     for (int i = 0; i < b.length; i++) {
       int temp = ((char)(a[i] + 1)) * ((char)(b[i] + 1));
@@ -256,7 +310,16 @@ public class TestCharShort {
   }
 
   /// CHECK-START-{ARM64}: int other.TestCharShort.testDotProdSignedToInt(short[], short[]) loop_optimization (after)
-  /// CHECK-DAG:                  VecDotProd type:Int16
+  /// CHECK-IF:     hasIsaFeature("sve") and os.environ.get('ART_FORCE_TRY_PREDICATED_SIMD') == 'true'
+  //
+  //      16-bit DotProd is not supported for SVE.
+  ///     CHECK-NOT:                  VecDotProd
+  //
+  /// CHECK-ELSE:
+  //
+  ///     CHECK-DAG:                  VecDotProd type:Int16
+  //
+  /// CHECK-FI:
   public static final int testDotProdSignedToInt(short[] a, short[] b) {
     int s = 1;
     for (int i = 0; i < b.length; i++) {
@@ -267,7 +330,16 @@ public class TestCharShort {
   }
 
   /// CHECK-START-{ARM64}: int other.TestCharShort.testDotProdParamSigned(int, short[]) loop_optimization (after)
-  /// CHECK-DAG:                  VecDotProd type:Int16
+  /// CHECK-IF:     hasIsaFeature("sve") and os.environ.get('ART_FORCE_TRY_PREDICATED_SIMD') == 'true'
+  //
+  //      16-bit DotProd is not supported for SVE.
+  ///     CHECK-NOT:                  VecDotProd
+  //
+  /// CHECK-ELSE:
+  //
+  ///     CHECK-DAG:                  VecDotProd type:Int16
+  //
+  /// CHECK-FI:
   public static final int testDotProdParamSigned(int x, short[] b) {
     int s = 1;
     for (int i = 0; i < b.length; i++) {
@@ -278,7 +350,16 @@ public class TestCharShort {
   }
 
   /// CHECK-START-{ARM64}: int other.TestCharShort.testDotProdParamUnsigned(int, char[]) loop_optimization (after)
-  /// CHECK-DAG:                  VecDotProd type:Uint16
+  /// CHECK-IF:     hasIsaFeature("sve") and os.environ.get('ART_FORCE_TRY_PREDICATED_SIMD') == 'true'
+  //
+  //      16-bit DotProd is not supported for SVE.
+  ///     CHECK-NOT:                  VecDotProd
+  //
+  /// CHECK-ELSE:
+  //
+  ///     CHECK-DAG:                  VecDotProd type:Uint16
+  //
+  /// CHECK-FI:
   public static final int testDotProdParamUnsigned(int x, char[] b) {
     int s = 1;
     for (int i = 0; i < b.length; i++) {
@@ -300,7 +381,16 @@ public class TestCharShort {
   }
 
   /// CHECK-START-{ARM64}: int other.TestCharShort.testDotProdSignedToChar(short[], short[]) loop_optimization (after)
-  /// CHECK-DAG:                  VecDotProd type:Uint16
+  /// CHECK-IF:     hasIsaFeature("sve") and os.environ.get('ART_FORCE_TRY_PREDICATED_SIMD') == 'true'
+  //
+  //      16-bit DotProd is not supported for SVE.
+  ///     CHECK-NOT:                  VecDotProd
+  //
+  /// CHECK-ELSE:
+  //
+  ///     CHECK-DAG:                  VecDotProd type:Uint16
+  //
+  /// CHECK-FI:
   public static final int testDotProdSignedToChar(short[] a, short[] b) {
     int s = 1;
     for (int i = 0; i < b.length; i++) {
@@ -312,9 +402,9 @@ public class TestCharShort {
 
   // Cases when result of Mul is type-converted are not supported.
 
-  /// CHECK-START: int other.TestCharShort.testDotProdSimpleMulCastedToSigned(short[], short[]) loop_optimization (after)
+  /// CHECK-START: int other.TestCharShort.testDotProdSimpleMulCastToSigned(short[], short[]) loop_optimization (after)
   /// CHECK-NOT:                  VecDotProd type:Uint16
-  public static final int testDotProdSimpleMulCastedToSigned(short[] a, short[] b) {
+  public static final int testDotProdSimpleMulCastToSigned(short[] a, short[] b) {
     int s = 1;
     for (int i = 0; i < b.length; i++) {
       short temp = (short)(a[i] * b[i]);
@@ -323,10 +413,9 @@ public class TestCharShort {
     return s - 1;
   }
 
-
-  /// CHECK-START: int other.TestCharShort.testDotProdSimpleMulCastedToUnsigned(short[], short[]) loop_optimization (after)
+  /// CHECK-START: int other.TestCharShort.testDotProdSimpleMulCastToUnsigned(short[], short[]) loop_optimization (after)
   /// CHECK-NOT:                  VecDotProd
-  public static final int testDotProdSimpleMulCastedToUnsigned(short[] a, short[] b) {
+  public static final int testDotProdSimpleMulCastToUnsigned(short[] a, short[] b) {
     int s = 1;
     for (int i = 0; i < b.length; i++) {
       char temp = (char)(a[i] * b[i]);
@@ -335,9 +424,9 @@ public class TestCharShort {
     return s - 1;
   }
 
-  /// CHECK-START: int other.TestCharShort.testDotProdSimpleUnsignedMulCastedToSigned(char[], char[]) loop_optimization (after)
+  /// CHECK-START: int other.TestCharShort.testDotProdSimpleUnsignedMulCastToSigned(char[], char[]) loop_optimization (after)
   /// CHECK-NOT:                  VecDotProd
-  public static final int testDotProdSimpleUnsignedMulCastedToSigned(char[] a, char[] b) {
+  public static final int testDotProdSimpleUnsignedMulCastToSigned(char[] a, char[] b) {
     int s = 1;
     for (int i = 0; i < b.length; i++) {
       short temp = (short)(a[i] * b[i]);
@@ -346,9 +435,9 @@ public class TestCharShort {
     return s - 1;
   }
 
-  /// CHECK-START: int other.TestCharShort.testDotProdSimpleUnsignedMulCastedToUnsigned(char[], char[]) loop_optimization (after)
+  /// CHECK-START: int other.TestCharShort.testDotProdSimpleUnsignedMulCastToUnsigned(char[], char[]) loop_optimization (after)
   /// CHECK-NOT:                  VecDotProd
-  public static final int testDotProdSimpleUnsignedMulCastedToUnsigned(char[] a, char[] b) {
+  public static final int testDotProdSimpleUnsignedMulCastToUnsigned(char[] a, char[] b) {
     int s = 1;
     for (int i = 0; i < b.length; i++) {
       char temp = (char)(a[i] * b[i]);
@@ -357,9 +446,9 @@ public class TestCharShort {
     return s - 1;
   }
 
-  /// CHECK-START: int other.TestCharShort.testDotProdSimpleCastedToShort(short[], short[]) loop_optimization (after)
+  /// CHECK-START: int other.TestCharShort.testDotProdSimpleCastToShort(short[], short[]) loop_optimization (after)
   /// CHECK-NOT:                  VecDotProd
-  public static final int testDotProdSimpleCastedToShort(short[] a, short[] b) {
+  public static final int testDotProdSimpleCastToShort(short[] a, short[] b) {
     int s = 1;
     for (int i = 0; i < b.length; i++) {
       short temp = (short)(a[i] * b[i]);
@@ -368,9 +457,9 @@ public class TestCharShort {
     return s - 1;
   }
 
-  /// CHECK-START: int other.TestCharShort.testDotProdSimpleCastedToChar(short[], short[]) loop_optimization (after)
+  /// CHECK-START: int other.TestCharShort.testDotProdSimpleCastToChar(short[], short[]) loop_optimization (after)
   /// CHECK-NOT:                  VecDotProd
-  public static final int testDotProdSimpleCastedToChar(short[] a, short[] b) {
+  public static final int testDotProdSimpleCastToChar(short[] a, short[] b) {
     int s = 1;
     for (int i = 0; i < b.length; i++) {
       char temp = (char)(a[i] * b[i]);
@@ -379,9 +468,9 @@ public class TestCharShort {
     return s - 1;
   }
 
-  /// CHECK-START: int other.TestCharShort.testDotProdSimpleUnsignedCastedToShort(char[], char[]) loop_optimization (after)
+  /// CHECK-START: int other.TestCharShort.testDotProdSimpleUnsignedCastToShort(char[], char[]) loop_optimization (after)
   /// CHECK-NOT:                  VecDotProd
-  public static final int testDotProdSimpleUnsignedCastedToShort(char[] a, char[] b) {
+  public static final int testDotProdSimpleUnsignedCastToShort(char[] a, char[] b) {
     int s = 1;
     for (int i = 0; i < b.length; i++) {
       short temp = (short)(a[i] * b[i]);
@@ -390,9 +479,9 @@ public class TestCharShort {
     return s - 1;
   }
 
-  /// CHECK-START: int other.TestCharShort.testDotProdSimpleUnsignedCastedToChar(char[], char[]) loop_optimization (after)
+  /// CHECK-START: int other.TestCharShort.testDotProdSimpleUnsignedCastToChar(char[], char[]) loop_optimization (after)
   /// CHECK-NOT:                  VecDotProd
-  public static final int testDotProdSimpleUnsignedCastedToChar(char[] a, char[] b) {
+  public static final int testDotProdSimpleUnsignedCastToChar(char[] a, char[] b) {
     int s = 1;
     for (int i = 0; i < b.length; i++) {
       char temp = (char)(a[i] * b[i]);
@@ -401,9 +490,9 @@ public class TestCharShort {
     return s - 1;
   }
 
-  /// CHECK-START: int other.TestCharShort.testDotProdSimpleUnsignedCastedToLong(char[], char[]) loop_optimization (after)
+  /// CHECK-START: int other.TestCharShort.testDotProdSimpleUnsignedCastToLong(char[], char[]) loop_optimization (after)
   /// CHECK-NOT:                  VecDotProd
-  public static final int testDotProdSimpleUnsignedCastedToLong(char[] a, char[] b) {
+  public static final int testDotProdSimpleUnsignedCastToLong(char[] a, char[] b) {
     int s = 1;
     for (int i = 0; i < b.length; i++) {
       long temp = (long)(a[i] * b[i]);
@@ -480,22 +569,22 @@ public class TestCharShort {
     expectEquals(results[1], testDotProdComplex(s1, s2));
     expectEquals(results[2], testDotProdSimpleUnsigned(c1, c2));
     expectEquals(results[3], testDotProdComplexUnsigned(c1, c2));
-    expectEquals(results[4], testDotProdComplexUnsignedCastedToSigned(c1, c2));
-    expectEquals(results[5], testDotProdComplexSignedCastedToUnsigned(s1, s2));
+    expectEquals(results[4], testDotProdComplexUnsignedCastToSigned(c1, c2));
+    expectEquals(results[5], testDotProdComplexSignedCastToUnsigned(s1, s2));
     expectEquals(results[6], testDotProdSignedToInt(s1, s2));
     expectEquals(results[7], testDotProdParamSigned(-32768, s2));
     expectEquals(results[8], testDotProdParamUnsigned(-32768, c2));
     expectEquals(results[9], testDotProdIntParam(-32768, s2));
     expectEquals(results[10], testDotProdSignedToChar(s1, s2));
-    expectEquals(results[11], testDotProdSimpleMulCastedToSigned(s1, s2));
-    expectEquals(results[12], testDotProdSimpleMulCastedToUnsigned(s1, s2));
-    expectEquals(results[13], testDotProdSimpleUnsignedMulCastedToSigned(c1, c2));
-    expectEquals(results[14], testDotProdSimpleUnsignedMulCastedToUnsigned(c1, c2));
-    expectEquals(results[15], testDotProdSimpleCastedToShort(s1, s2));
-    expectEquals(results[16], testDotProdSimpleCastedToChar(s1, s2));
-    expectEquals(results[17], testDotProdSimpleUnsignedCastedToShort(c1, c2));
-    expectEquals(results[18], testDotProdSimpleUnsignedCastedToChar(c1, c2));
-    expectEquals(results[19], testDotProdSimpleUnsignedCastedToLong(c1, c2));
+    expectEquals(results[11], testDotProdSimpleMulCastToSigned(s1, s2));
+    expectEquals(results[12], testDotProdSimpleMulCastToUnsigned(s1, s2));
+    expectEquals(results[13], testDotProdSimpleUnsignedMulCastToSigned(c1, c2));
+    expectEquals(results[14], testDotProdSimpleUnsignedMulCastToUnsigned(c1, c2));
+    expectEquals(results[15], testDotProdSimpleCastToShort(s1, s2));
+    expectEquals(results[16], testDotProdSimpleCastToChar(s1, s2));
+    expectEquals(results[17], testDotProdSimpleUnsignedCastToShort(c1, c2));
+    expectEquals(results[18], testDotProdSimpleUnsignedCastToChar(c1, c2));
+    expectEquals(results[19], testDotProdSimpleUnsignedCastToLong(c1, c2));
     expectEquals(results[20], testDotProdSignedNarrowerSigned(s1, s2));
     expectEquals(results[21], testDotProdSignedNarrowerUnsigned(s1, s2));
     expectEquals(results[22], testDotProdUnsignedNarrowerSigned(c1, c2));

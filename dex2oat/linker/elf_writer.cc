@@ -17,7 +17,7 @@
 #include "elf_writer.h"
 
 #include "base/unix_file/fd_file.h"
-#include "elf_file.h"
+#include "oat/elf_file.h"
 
 namespace art {
 namespace linker {
@@ -46,18 +46,6 @@ void ElfWriter::GetOatElfInformation(File* file,
   CHECK_NE(0U, *oat_loaded_size);
   *oat_data_offset = GetOatDataAddress(elf_file.get());
   CHECK_NE(0U, *oat_data_offset);
-}
-
-bool ElfWriter::Fixup(File* file, uintptr_t oat_data_begin) {
-  std::string error_msg;
-  std::unique_ptr<ElfFile> elf_file(ElfFile::Open(file, true, false, /*low_4gb*/false, &error_msg));
-  CHECK(elf_file.get() != nullptr) << error_msg;
-
-  // Lookup "oatdata" symbol address.
-  uintptr_t oatdata_address = ElfWriter::GetOatDataAddress(elf_file.get());
-  uintptr_t base_address = oat_data_begin - oatdata_address;
-
-  return elf_file->Fixup(base_address);
 }
 
 }  // namespace linker

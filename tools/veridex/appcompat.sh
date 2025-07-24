@@ -28,7 +28,7 @@ if [[ -e ${SCRIPT_DIR}/veridex && \
   exec ${SCRIPT_DIR}/veridex \
     --core-stubs=${SCRIPT_DIR}/system-stubs.zip:${SCRIPT_DIR}/org.apache.http.legacy-stubs.zip \
     --api-flags=${SCRIPT_DIR}/hiddenapi-flags.csv \
-    --exclude-api-lists=whitelist,invalid \
+    --exclude-api-lists=sdk,invalid \
     $@
 fi
 
@@ -70,9 +70,9 @@ if [[ "$@" != "*--api-flags=*" ]]; then
   extra_flags="--api-flags=$file"
 fi
 
-# If --exclude-api-lists is not passed directly, exclude whitelist APIs.
+# If --exclude-api-lists is not passed directly, exclude SDK APIs.
 if [[ "$@" != "*--exclude-api-lists=*" ]]; then
-  extra_flags="${extra_flags} --exclude-api-lists=whitelist,invalid"
+  extra_flags="${extra_flags} --exclude-api-lists=sdk,invalid"
 fi
 
 ${ANDROID_HOST_OUT}/bin/veridex \

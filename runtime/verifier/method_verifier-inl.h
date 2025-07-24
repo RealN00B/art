@@ -19,7 +19,7 @@
 
 #include "method_verifier.h"
 
-namespace art {
+namespace art HIDDEN {
 namespace verifier {
 
 inline RegisterLine* MethodVerifier::GetRegLine(uint32_t dex_pc) {
@@ -32,10 +32,6 @@ inline const InstructionFlags& MethodVerifier::GetInstructionFlags(size_t index)
 
 inline MethodReference MethodVerifier::GetMethodReference() const {
   return MethodReference(dex_file_, dex_method_idx_);
-}
-
-inline bool MethodVerifier::HasCheckCasts() const {
-  return has_check_casts_;
 }
 
 inline bool MethodVerifier::HasFailures() const {

@@ -18,6 +18,7 @@
 #define ART_LIBARTBASE_BASE_BIT_VECTOR_H_
 
 #include <stdint.h>
+
 #include <iterator>
 
 #include "bit_utils.h"
@@ -26,13 +27,19 @@
 namespace art {
 
 class Allocator;
+class ArenaBitVector;
 
 /*
- * Expanding bitmap, used for tracking resources.  Bits are numbered starting
- * from zero.  All operations on a BitVector are unsynchronized.
+ * Expanding bitmap. Bits are numbered starting from zero. All operations on a BitVector are
+ * unsynchronized. New BitVectors are not necessarily zeroed out. If the used allocator doesn't do
+ * clear the vector (e.g. ScopedArenaAllocator), the responsibility of clearing it relies on the
+ * caller (e.g. ArenaBitVector).
  */
 class BitVector {
  public:
+  static constexpr uint32_t kWordBytes = sizeof(uint32_t);
+  static constexpr uint32_t kWordBits = kWordBytes * 8;
+
   class IndexContainer;
 
   /**
@@ -46,9 +53,14 @@ class BitVector {
    *     // Use idx.
    *   }
    */
-  class IndexIterator :
-      std::iterator<std::forward_iterator_tag, uint32_t, ptrdiff_t, void, uint32_t> {
+  class IndexIterator {
    public:
+    using iterator_category = std::forward_iterator_tag;
+    using value_type = uint32_t;
+    using difference_type = ptrdiff_t;
+    using pointer = void;
+    using reference = void;
+
     bool operator==(const IndexIterator& other) const;
 
     bool operator!=(const IndexIterator& other) const {
@@ -104,7 +116,7 @@ class BitVector {
   BitVector(const BitVector& other) = delete;
   BitVector& operator=(const BitVector& other) = delete;
 
-  BitVector(BitVector&& other)
+  BitVector(BitVector&& other) noexcept
       : storage_(other.storage_),
         storage_size_(other.storage_size_),
         allocator_(other.allocator_),
@@ -226,10 +238,21 @@ class BitVector {
     return storage_size_ * kWordBytes;
   }
 
+  size_t GetBitSizeOf() const {
+    return storage_size_ * kWordBits;
+  }
+
   /**
    * @return the highest bit set, -1 if none are set
    */
   int GetHighestBitSet() const;
+
+  /**
+   * @return true if there are any bits set, false otherwise.
+   */
+  bool IsAnyBitSet() const {
+    return GetHighestBitSet() != -1;
+  }
 
   // Minimum number of bits required to store this vector, 0 if none are set.
   size_t GetNumberOfBits() const {
@@ -281,15 +304,11 @@ class BitVector {
     return 1 << (idx & 0x1f);
   }
 
-  static constexpr uint32_t kWordBytes = sizeof(uint32_t);
-  static constexpr uint32_t kWordBits = kWordBytes * 8;
-
   uint32_t*  storage_;            // The storage for the bit vector.
   uint32_t   storage_size_;       // Current size, in 32-bit words.
   Allocator* const allocator_;    // Allocator if expandable.
   const bool expandable_;         // Should the bitmap expand if too small?
 };
-
 
 }  // namespace art
 

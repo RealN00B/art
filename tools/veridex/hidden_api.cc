@@ -29,14 +29,22 @@ HiddenApi::HiddenApi(const char* filename, const ApiListFilter& api_list_filter)
   CHECK(filename != nullptr);
 
   std::ifstream in(filename);
+  bool errors = false;
   for (std::string str; std::getline(in, str);) {
     std::vector<std::string> values = android::base::Split(str, ",");
     const std::string& signature = values[0];
 
     hiddenapi::ApiList membership;
     bool success = hiddenapi::ApiList::FromNames(values.begin() + 1, values.end(), &membership);
-    CHECK(success) << "Unknown ApiList flag: " << str;
-    CHECK(membership.IsValid()) << "Invalid ApiList: " << membership;
+    if (!success) {
+      LOG(ERROR) << "Unknown ApiList flag: " << str;
+      errors = true;
+      continue;
+    } else if (!membership.IsValid()) {
+      LOG(ERROR) << "Invalid ApiList: " << membership;
+      errors = true;
+      continue;
+    }
 
     AddSignatureToApiList(signature, membership);
     size_t pos = signature.find("->");
@@ -55,6 +63,7 @@ HiddenApi::HiddenApi(const char* filename, const ApiListFilter& api_list_filter)
       }
     }
   }
+  CHECK(!errors) << "Errors encountered while parsing file " << filename;
 }
 
 void HiddenApi::AddSignatureToApiList(const std::string& signature, hiddenapi::ApiList membership) {
@@ -73,7 +82,7 @@ void HiddenApi::AddSignatureToApiList(const std::string& signature, hiddenapi::A
 std::string HiddenApi::GetApiMethodName(const DexFile& dex_file, uint32_t method_index) {
   std::stringstream ss;
   const dex::MethodId& method_id = dex_file.GetMethodId(method_index);
-  ss << dex_file.StringByTypeIdx(method_id.class_idx_)
+  ss << dex_file.GetTypeDescriptorView(method_id.class_idx_)
      << "->"
      << dex_file.GetMethodName(method_id)
      << dex_file.GetMethodSignature(method_id).ToString();
@@ -83,7 +92,7 @@ std::string HiddenApi::GetApiMethodName(const DexFile& dex_file, uint32_t method
 std::string HiddenApi::GetApiFieldName(const DexFile& dex_file, uint32_t field_index) {
   std::stringstream ss;
   const dex::FieldId& field_id = dex_file.GetFieldId(field_index);
-  ss << dex_file.StringByTypeIdx(field_id.class_idx_)
+  ss << dex_file.GetTypeDescriptorView(field_id.class_idx_)
      << "->"
      << dex_file.GetFieldName(field_id)
      << ":"

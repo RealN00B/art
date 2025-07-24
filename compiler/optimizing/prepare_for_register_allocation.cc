@@ -19,37 +19,69 @@
 #include "dex/dex_file_types.h"
 #include "driver/compiler_options.h"
 #include "jni/jni_internal.h"
+#include "nodes.h"
 #include "optimizing_compiler_stats.h"
 #include "well_known_classes.h"
 
-namespace art {
+namespace art HIDDEN {
 
-void PrepareForRegisterAllocation::Run() {
+class PrepareForRegisterAllocationVisitor final : public HGraphDelegateVisitor {
+ public:
+  PrepareForRegisterAllocationVisitor(HGraph* graph,
+                                      const CompilerOptions& compiler_options,
+                                      OptimizingCompilerStats* stats)
+      : HGraphDelegateVisitor(graph, stats),
+        compiler_options_(compiler_options) {}
+
+ private:
+  void VisitCheckCast(HCheckCast* check_cast) override;
+  void VisitInstanceOf(HInstanceOf* instance_of) override;
+  void VisitNullCheck(HNullCheck* check) override;
+  void VisitDivZeroCheck(HDivZeroCheck* check) override;
+  void VisitBoundsCheck(HBoundsCheck* check) override;
+  void VisitBoundType(HBoundType* bound_type) override;
+  void VisitArraySet(HArraySet* instruction) override;
+  void VisitClinitCheck(HClinitCheck* check) override;
+  void VisitCondition(HCondition* condition) override;
+  void VisitConstructorFence(HConstructorFence* constructor_fence) override;
+  void VisitInvokeStaticOrDirect(HInvokeStaticOrDirect* invoke) override;
+  void VisitDeoptimize(HDeoptimize* deoptimize) override;
+  void VisitTypeConversion(HTypeConversion* instruction) override;
+
+  bool CanMoveClinitCheck(HInstruction* input, HInstruction* user) const;
+  bool CanEmitConditionAt(HCondition* condition, HInstruction* user) const;
+
+  const CompilerOptions& compiler_options_;
+};
+
+bool PrepareForRegisterAllocation::Run() {
+  PrepareForRegisterAllocationVisitor visitor(graph_, compiler_options_, stats_);
   // Order does not matter.
-  for (HBasicBlock* block : GetGraph()->GetReversePostOrder()) {
+  for (HBasicBlock* block : graph_->GetReversePostOrder()) {
     // No need to visit the phis.
     for (HInstructionIteratorHandleChanges inst_it(block->GetInstructions()); !inst_it.Done();
          inst_it.Advance()) {
-      inst_it.Current()->Accept(this);
+      inst_it.Current()->Accept(&visitor);
     }
   }
+  return true;
 }
 
-void PrepareForRegisterAllocation::VisitCheckCast(HCheckCast* check_cast) {
+void PrepareForRegisterAllocationVisitor::VisitCheckCast(HCheckCast* check_cast) {
   // Record only those bitstring type checks that make it to the codegen stage.
   if (check_cast->GetTypeCheckKind() == TypeCheckKind::kBitstringCheck) {
     MaybeRecordStat(stats_, MethodCompilationStat::kBitstringTypeCheck);
   }
 }
 
-void PrepareForRegisterAllocation::VisitInstanceOf(HInstanceOf* instance_of) {
+void PrepareForRegisterAllocationVisitor::VisitInstanceOf(HInstanceOf* instance_of) {
   // Record only those bitstring type checks that make it to the codegen stage.
   if (instance_of->GetTypeCheckKind() == TypeCheckKind::kBitstringCheck) {
     MaybeRecordStat(stats_, MethodCompilationStat::kBitstringTypeCheck);
   }
 }
 
-void PrepareForRegisterAllocation::VisitNullCheck(HNullCheck* check) {
+void PrepareForRegisterAllocationVisitor::VisitNullCheck(HNullCheck* check) {
   check->ReplaceWith(check->InputAt(0));
   if (compiler_options_.GetImplicitNullChecks()) {
     HInstruction* next = check->GetNext();
@@ -66,11 +98,11 @@ void PrepareForRegisterAllocation::VisitNullCheck(HNullCheck* check) {
   }
 }
 
-void PrepareForRegisterAllocation::VisitDivZeroCheck(HDivZeroCheck* check) {
+void PrepareForRegisterAllocationVisitor::VisitDivZeroCheck(HDivZeroCheck* check) {
   check->ReplaceWith(check->InputAt(0));
 }
 
-void PrepareForRegisterAllocation::VisitDeoptimize(HDeoptimize* deoptimize) {
+void PrepareForRegisterAllocationVisitor::VisitDeoptimize(HDeoptimize* deoptimize) {
   if (deoptimize->GuardsAnInput()) {
     // Replace the uses with the actual guarded instruction.
     deoptimize->ReplaceWith(deoptimize->GuardedInput());
@@ -78,43 +110,43 @@ void PrepareForRegisterAllocation::VisitDeoptimize(HDeoptimize* deoptimize) {
   }
 }
 
-void PrepareForRegisterAllocation::VisitBoundsCheck(HBoundsCheck* check) {
+void PrepareForRegisterAllocationVisitor::VisitBoundsCheck(HBoundsCheck* check) {
   check->ReplaceWith(check->InputAt(0));
   if (check->IsStringCharAt()) {
     // Add a fake environment for String.charAt() inline info as we want the exception
     // to appear as being thrown from there. Skip if we're compiling String.charAt() itself.
-    ArtMethod* char_at_method = jni::DecodeArtMethod(WellKnownClasses::java_lang_String_charAt);
+    ArtMethod* char_at_method = WellKnownClasses::java_lang_String_charAt;
     if (GetGraph()->GetArtMethod() != char_at_method) {
       ArenaAllocator* allocator = GetGraph()->GetAllocator();
-      HEnvironment* environment = new (allocator) HEnvironment(allocator,
-                                                               /* number_of_vregs= */ 0u,
-                                                               char_at_method,
-                                                               /* dex_pc= */ dex::kDexNoIndex,
-                                                               check);
+      HEnvironment* environment = HEnvironment::Create(allocator,
+                                                       /* number_of_vregs= */ 0u,
+                                                       char_at_method,
+                                                       /* dex_pc= */ dex::kDexNoIndex,
+                                                       check);
       check->InsertRawEnvironment(environment);
     }
   }
 }
 
-void PrepareForRegisterAllocation::VisitBoundType(HBoundType* bound_type) {
+void PrepareForRegisterAllocationVisitor::VisitBoundType(HBoundType* bound_type) {
   bound_type->ReplaceWith(bound_type->InputAt(0));
   bound_type->GetBlock()->RemoveInstruction(bound_type);
 }
 
-void PrepareForRegisterAllocation::VisitArraySet(HArraySet* instruction) {
+void PrepareForRegisterAllocationVisitor::VisitArraySet(HArraySet* instruction) {
   HInstruction* value = instruction->GetValue();
-  // PrepareForRegisterAllocation::VisitBoundType may have replaced a
+  // PrepareForRegisterAllocationVisitor::VisitBoundType may have replaced a
   // BoundType (as value input of this ArraySet) with a NullConstant.
   // If so, this ArraySet no longer needs a type check.
   if (value->IsNullConstant()) {
     DCHECK_EQ(value->GetType(), DataType::Type::kReference);
     if (instruction->NeedsTypeCheck()) {
-      instruction->ClearNeedsTypeCheck();
+      instruction->ClearTypeCheck();
     }
   }
 }
 
-void PrepareForRegisterAllocation::VisitClinitCheck(HClinitCheck* check) {
+void PrepareForRegisterAllocationVisitor::VisitClinitCheck(HClinitCheck* check) {
   // Try to find a static invoke or a new-instance from which this check originated.
   HInstruction* implicit_clinit = nullptr;
   for (const HUseListNode<HInstruction*>& use : check->GetUses()) {
@@ -166,7 +198,6 @@ void PrepareForRegisterAllocation::VisitClinitCheck(HClinitCheck* check) {
     }
   } else if (can_merge_with_load_class &&
              load_class->GetLoadKind() != HLoadClass::LoadKind::kRuntimeCall) {
-    DCHECK(!load_class->NeedsAccessCheck());
     // Pass the initialization duty to the `HLoadClass` instruction,
     // and remove the instruction from the graph.
     DCHECK(load_class->HasEnvironment());
@@ -175,9 +206,14 @@ void PrepareForRegisterAllocation::VisitClinitCheck(HClinitCheck* check) {
   }
 }
 
-bool PrepareForRegisterAllocation::CanEmitConditionAt(HCondition* condition,
-                                                      HInstruction* user) const {
+bool PrepareForRegisterAllocationVisitor::CanEmitConditionAt(HCondition* condition,
+                                                             HInstruction* user) const {
   if (condition->GetNext() != user) {
+    return false;
+  }
+
+  if (GetGraph()->IsCompilingBaseline() && compiler_options_.ProfileBranches()) {
+    // To do branch profiling, we cannot emit conditions at use site.
     return false;
   }
 
@@ -192,7 +228,7 @@ bool PrepareForRegisterAllocation::CanEmitConditionAt(HCondition* condition,
   return false;
 }
 
-void PrepareForRegisterAllocation::VisitCondition(HCondition* condition) {
+void PrepareForRegisterAllocationVisitor::VisitCondition(HCondition* condition) {
   if (condition->HasOnlyOneNonEnvironmentUse()) {
     HInstruction* user = condition->GetUses().front().GetUser();
     if (CanEmitConditionAt(condition, user)) {
@@ -201,7 +237,8 @@ void PrepareForRegisterAllocation::VisitCondition(HCondition* condition) {
   }
 }
 
-void PrepareForRegisterAllocation::VisitConstructorFence(HConstructorFence* constructor_fence) {
+void PrepareForRegisterAllocationVisitor::VisitConstructorFence(
+    HConstructorFence* constructor_fence) {
   // Trivially remove redundant HConstructorFence when it immediately follows an HNewInstance
   // to an uninitialized class. In this special case, the art_quick_alloc_object_resolved
   // will already have the 'dmb' which is strictly stronger than an HConstructorFence.
@@ -241,7 +278,8 @@ void PrepareForRegisterAllocation::VisitConstructorFence(HConstructorFence* cons
   constructor_fence->RemoveAllInputs();
 }
 
-void PrepareForRegisterAllocation::VisitInvokeStaticOrDirect(HInvokeStaticOrDirect* invoke) {
+void PrepareForRegisterAllocationVisitor::VisitInvokeStaticOrDirect(
+    HInvokeStaticOrDirect* invoke) {
   if (invoke->IsStaticWithExplicitClinitCheck()) {
     HInstruction* last_input = invoke->GetInputs().back();
     DCHECK(last_input->IsLoadClass())
@@ -257,8 +295,8 @@ void PrepareForRegisterAllocation::VisitInvokeStaticOrDirect(HInvokeStaticOrDire
   }
 }
 
-bool PrepareForRegisterAllocation::CanMoveClinitCheck(HInstruction* input,
-                                                      HInstruction* user) const {
+bool PrepareForRegisterAllocationVisitor::CanMoveClinitCheck(HInstruction* input,
+                                                             HInstruction* user) const {
   // Determine if input and user come from the same dex instruction, so that we can move
   // the clinit check responsibility from one to the other, i.e. from HClinitCheck (user)
   // to HLoadClass (input), or from HClinitCheck (input) to HInvokeStaticOrDirect (user),
@@ -266,6 +304,10 @@ bool PrepareForRegisterAllocation::CanMoveClinitCheck(HInstruction* input,
 
   // Start with a quick dex pc check.
   if (user->GetDexPc() != input->GetDexPc()) {
+    return false;
+  }
+
+  if (user->IsNewInstance() && user->AsNewInstance()->IsPartialMaterialization()) {
     return false;
   }
 
@@ -292,19 +334,20 @@ bool PrepareForRegisterAllocation::CanMoveClinitCheck(HInstruction* input,
     return false;
   }
 
-  // In debug mode, check that we have not inserted a throwing instruction
-  // or an instruction with side effects between input and user.
-  if (kIsDebugBuild) {
-    for (HInstruction* between = input->GetNext(); between != user; between = between->GetNext()) {
-      CHECK(between != nullptr);  // User must be after input in the same block.
-      CHECK(!between->CanThrow());
-      CHECK(!between->HasSideEffects());
+  // If there's a instruction between them that can throw or it has side effects, we cannot move the
+  // responsibility.
+  for (HInstruction* between = input->GetNext(); between != user; between = between->GetNext()) {
+    DCHECK(between != nullptr) << " User must be after input in the same block. input: " << *input
+                               << ", user: " << *user;
+    if (between->CanThrow() || between->HasSideEffects()) {
+      return false;
     }
   }
+
   return true;
 }
 
-void PrepareForRegisterAllocation::VisitTypeConversion(HTypeConversion* instruction) {
+void PrepareForRegisterAllocationVisitor::VisitTypeConversion(HTypeConversion* instruction) {
   // For simplicity, our code generators don't handle implicit type conversion, so ensure
   // there are none before hitting codegen.
   if (instruction->IsImplicitConversion()) {

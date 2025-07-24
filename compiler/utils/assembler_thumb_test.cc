@@ -18,187 +18,80 @@
 #include <errno.h>
 #include <string.h>
 #include <sys/types.h>
+
 #include <fstream>
 #include <map>
+#include <regex>
 
 #include "gtest/gtest.h"
 
 #include "jni/quick/calling_convention.h"
 #include "utils/arm/jni_macro_assembler_arm_vixl.h"
+#include "utils/assembler_test_base.h"
 
 #include "base/hex_dump.h"
+#include "base/macros.h"
 #include "base/malloc_arena_pool.h"
 #include "common_runtime_test.h"
 
-namespace art {
+namespace art HIDDEN {
 namespace arm {
 
 // Include results file (generated manually)
 #include "assembler_thumb_test_expected.cc.inc"
 
-#ifndef ART_TARGET_ANDROID
-// This controls whether the results are printed to the
-// screen or compared against the expected output.
-// To generate new expected output, set this to true and
-// copy the output into the .cc.inc file in the form
-// of the other results.
-//
-// When this is false, the results are not printed to the
-// output, but are compared against the expected results
-// in the .cc.inc file.
-static constexpr bool kPrintResults = false;
-#endif
-
-void SetAndroidData() {
-  const char* data = getenv("ANDROID_DATA");
-  if (data == nullptr) {
-    setenv("ANDROID_DATA", "/tmp", 1);
-  }
-}
-
-int CompareIgnoringSpace(const char* s1, const char* s2) {
-  while (*s1 != '\0') {
-    while (isspace(*s1)) ++s1;
-    while (isspace(*s2)) ++s2;
-    if (*s1 == '\0' || *s1 != *s2) {
-      break;
-    }
-    ++s1;
-    ++s2;
-  }
-  return *s1 - *s2;
-}
-
-void InitResults() {
-  if (test_results.empty()) {
-    setup_results();
-  }
-}
-
-std::string GetToolsDir() {
-#ifndef ART_TARGET_ANDROID
-  // This will only work on the host.  There is no as, objcopy or objdump on the device.
-  static std::string toolsdir;
-
-  if (toolsdir.empty()) {
-    setup_results();
-    toolsdir = CommonRuntimeTest::GetAndroidTargetToolsDir(InstructionSet::kThumb2);
-    SetAndroidData();
-  }
-
-  return toolsdir;
-#else
-  return std::string();
-#endif
-}
-
-void DumpAndCheck(std::vector<uint8_t>& code, const char* testname, const char* const* results) {
-#ifndef ART_TARGET_ANDROID
-  static std::string toolsdir = GetToolsDir();
-
-  ScratchFile file;
-
-  const char* filename = file.GetFilename().c_str();
-
-  std::ofstream out(filename);
-  if (out) {
-    out << ".section \".text\"\n";
-    out << ".syntax unified\n";
-    out << ".arch armv7-a\n";
-    out << ".thumb\n";
-    out << ".thumb_func\n";
-    out << ".type " << testname << ", #function\n";
-    out << ".global " << testname << "\n";
-    out << testname << ":\n";
-    out << ".fnstart\n";
-
-    for (uint32_t i = 0 ; i < code.size(); ++i) {
-      out << ".byte " << (static_cast<int>(code[i]) & 0xff) << "\n";
-    }
-    out << ".fnend\n";
-    out << ".size " << testname << ", .-" << testname << "\n";
-  }
-  out.close();
-
-  char cmd[1024];
-
-  // Assemble the .S
-  snprintf(cmd, sizeof(cmd), "%sas %s -o %s.o", toolsdir.c_str(), filename, filename);
-  int cmd_result = system(cmd);
-  ASSERT_EQ(cmd_result, 0) << cmd << strerror(errno);
-
-  // Disassemble.
-  snprintf(cmd, sizeof(cmd), "%sobjdump -D -M force-thumb --section=.text %s.o  | grep '^  *[0-9a-f][0-9a-f]*:'",
-    toolsdir.c_str(), filename);
-  if (kPrintResults) {
-    // Print the results only, don't check. This is used to generate new output for inserting
-    // into the .inc file, so let's add the appropriate prefix/suffix needed in the C++ code.
-    strcat(cmd, " | sed '-es/^/  \"/' | sed '-es/$/\\\\n\",/'");
-    int cmd_result3 = system(cmd);
-    ASSERT_EQ(cmd_result3, 0) << strerror(errno);
-  } else {
-    // Check the results match the appropriate results in the .inc file.
-    FILE *fp = popen(cmd, "r");
-    ASSERT_TRUE(fp != nullptr);
-
-    uint32_t lineindex = 0;
-
-    while (!feof(fp)) {
-      char testline[256];
-      char *s = fgets(testline, sizeof(testline), fp);
-      if (s == nullptr) {
-        break;
-      }
-      if (CompareIgnoringSpace(results[lineindex], testline) != 0) {
-        LOG(FATAL) << "Output is not as expected at line: " << lineindex
-          << results[lineindex] << "/" << testline << ", test name: " << testname;
-      }
-      ++lineindex;
-    }
-    // Check that we are at the end.
-    ASSERT_TRUE(results[lineindex] == nullptr);
-    fclose(fp);
-  }
-
-  char buf[FILENAME_MAX];
-  snprintf(buf, sizeof(buf), "%s.o", filename);
-  unlink(buf);
-#endif  // ART_TARGET_ANDROID
-}
-
-class ArmVIXLAssemblerTest : public ::testing::Test {
+class ArmVIXLAssemblerTest : public AssemblerTestBase {
  public:
   ArmVIXLAssemblerTest() : pool(), allocator(&pool), assembler(&allocator) { }
+
+ protected:
+  InstructionSet GetIsa() override { return InstructionSet::kThumb2; }
+
+  void DumpAndCheck(std::vector<uint8_t>& code, const char* testname, const std::string& expected) {
+#ifndef ART_TARGET_ANDROID
+    std::string obj_file = scratch_dir_->GetPath() + testname + ".o";
+    WriteElf</*IsElf64=*/false>(obj_file, InstructionSet::kThumb2, code);
+    std::string disassembly;
+    ASSERT_TRUE(Disassemble(obj_file, &disassembly));
+
+    // objdump on buildbot seems to sometimes add annotation like in "bne #226 <.text+0x1e8>".
+    // It is unclear why it does not reproduce locally. As work-around, remove the annotation.
+    std::regex annotation_re(" <\\.text\\+\\w+>");
+    disassembly = std::regex_replace(disassembly, annotation_re, "");
+
+    std::string expected2 = "\n" +
+        obj_file + ": file format elf32-littlearm\n\n"
+        "Disassembly of section .text:\n\n"
+        "00000000 <.text>:\n" +
+        expected;
+    EXPECT_EQ(expected2, disassembly);
+    if (expected2 != disassembly) {
+      std::string out = "  \"" + Replace(disassembly, "\n", "\\n\"\n  \"") + "\"";
+      printf("C++ formatted disassembler output for %s:\n%s\n", testname, out.c_str());
+    }
+#endif  // ART_TARGET_ANDROID
+  }
+
+#define __ assembler.
+
+  void EmitAndCheck(const char* testname, const char* expected) {
+    __ FinalizeCode();
+    size_t cs = __ CodeSize();
+    std::vector<uint8_t> managed_code(cs);
+    MemoryRegion code(&managed_code[0], managed_code.size());
+    __ CopyInstructions(code);
+
+    DumpAndCheck(managed_code, testname, expected);
+  }
+
+#undef __
+
+#define __ assembler.
 
   MallocArenaPool pool;
   ArenaAllocator allocator;
   ArmVIXLJNIMacroAssembler assembler;
 };
-
-#define __ assembler->
-
-void EmitAndCheck(ArmVIXLJNIMacroAssembler* assembler, const char* testname,
-                  const char* const* results) {
-  __ FinalizeCode();
-  size_t cs = __ CodeSize();
-  std::vector<uint8_t> managed_code(cs);
-  MemoryRegion code(&managed_code[0], managed_code.size());
-  __ FinalizeInstructions(code);
-
-  DumpAndCheck(managed_code, testname, results);
-}
-
-void EmitAndCheck(ArmVIXLJNIMacroAssembler* assembler, const char* testname) {
-  InitResults();
-  std::map<std::string, const char* const*>::iterator results = test_results.find(testname);
-  ASSERT_NE(results, test_results.end());
-
-  EmitAndCheck(assembler, testname, results->second);
-}
-
-#undef __
-
-#define __ assembler.
 
 TEST_F(ArmVIXLAssemblerTest, VixlJniHelpers) {
   // Run the test only with Baker read barriers, as the expected
@@ -207,6 +100,7 @@ TEST_F(ArmVIXLAssemblerTest, VixlJniHelpers) {
 
   const bool is_static = true;
   const bool is_synchronized = false;
+  const bool is_fast_native = false;
   const bool is_critical_native = false;
   const char* shorty = "IIFII";
 
@@ -214,6 +108,7 @@ TEST_F(ArmVIXLAssemblerTest, VixlJniHelpers) {
       JniCallingConvention::Create(&allocator,
                                    is_static,
                                    is_synchronized,
+                                   is_fast_native,
                                    is_critical_native,
                                    shorty,
                                    InstructionSet::kThumb2));
@@ -249,7 +144,6 @@ TEST_F(ArmVIXLAssemblerTest, VixlJniHelpers) {
   __ Load(scratch_register, FrameOffset(4092), 4);
   __ Load(scratch_register, FrameOffset(4096), 4);
   __ LoadRawPtrFromThread(scratch_register, ThreadOffset32(512));
-  __ LoadRef(method_register, scratch_register, MemberOffset(128), /* unpoison_reference= */ false);
 
   // Stores
   __ Store(FrameOffset(32), method_register, 4);
@@ -259,33 +153,83 @@ TEST_F(ArmVIXLAssemblerTest, VixlJniHelpers) {
   __ Store(FrameOffset(1024), method_register, 4);
   __ Store(FrameOffset(4092), scratch_register, 4);
   __ Store(FrameOffset(4096), scratch_register, 4);
-  __ StoreImmediateToFrame(FrameOffset(48), 0xFF);
-  __ StoreImmediateToFrame(FrameOffset(48), 0xFFFFFF);
   __ StoreRawPtr(FrameOffset(48), scratch_register);
-  __ StoreRef(FrameOffset(48), scratch_register);
-  __ StoreSpanning(FrameOffset(48), method_register, FrameOffset(48));
-  __ StoreStackOffsetToThread(ThreadOffset32(512), FrameOffset(4096));
-  __ StoreStackPointerToThread(ThreadOffset32(512));
+  __ StoreStackPointerToThread(ThreadOffset32(512), false);
+  __ StoreStackPointerToThread(ThreadOffset32(512), true);
+
+  // MoveArguments
+  static constexpr FrameOffset kInvalidReferenceOffset =
+      JNIMacroAssembler<kArmPointerSize>::kInvalidReferenceOffset;
+  static constexpr size_t kNativePointerSize = static_cast<size_t>(kArmPointerSize);
+  // Normal or @FastNative with parameters (Object, long, long, int, Object).
+  // Note: This shall not spill the reference R1 to [sp, #36]. The JNI compiler spills
+  // references in an separate initial pass before moving arguments and creating `jobject`s.
+  ArgumentLocation move_dests1[] = {
+      ArgumentLocation(ArmManagedRegister::FromCoreRegister(R2), kNativePointerSize),
+      ArgumentLocation(FrameOffset(0), 2 * kVRegSize),
+      ArgumentLocation(FrameOffset(8), 2 * kVRegSize),
+      ArgumentLocation(FrameOffset(16), kVRegSize),
+      ArgumentLocation(FrameOffset(20), kNativePointerSize),
+  };
+  ArgumentLocation move_srcs1[] = {
+      ArgumentLocation(ArmManagedRegister::FromCoreRegister(R1), kVRegSize),
+      ArgumentLocation(ArmManagedRegister::FromRegisterPair(R2_R3), 2 * kVRegSize),
+      ArgumentLocation(FrameOffset(48), 2 * kVRegSize),
+      ArgumentLocation(FrameOffset(56), kVRegSize),
+      ArgumentLocation(FrameOffset(60), kVRegSize),
+  };
+  FrameOffset move_refs1[] {
+      FrameOffset(36),
+      FrameOffset(kInvalidReferenceOffset),
+      FrameOffset(kInvalidReferenceOffset),
+      FrameOffset(kInvalidReferenceOffset),
+      FrameOffset(60),
+  };
+  __ MoveArguments(ArrayRef<ArgumentLocation>(move_dests1),
+                   ArrayRef<ArgumentLocation>(move_srcs1),
+                   ArrayRef<FrameOffset>(move_refs1));
+  // @CriticalNative with parameters (long, long, long, int).
+  ArgumentLocation move_dests2[] = {
+      ArgumentLocation(ArmManagedRegister::FromRegisterPair(R0_R1), 2 * kVRegSize),
+      ArgumentLocation(ArmManagedRegister::FromRegisterPair(R2_R3), 2 * kVRegSize),
+      ArgumentLocation(FrameOffset(0), 2 * kVRegSize),
+      ArgumentLocation(FrameOffset(8), kVRegSize),
+  };
+  ArgumentLocation move_srcs2[] = {
+      ArgumentLocation(ArmManagedRegister::FromRegisterPair(R2_R3), 2 * kVRegSize),
+      ArgumentLocation(FrameOffset(28), kVRegSize),
+      ArgumentLocation(FrameOffset(32), 2 * kVRegSize),
+      ArgumentLocation(FrameOffset(40), kVRegSize),
+  };
+  FrameOffset move_refs2[] {
+      FrameOffset(kInvalidReferenceOffset),
+      FrameOffset(kInvalidReferenceOffset),
+      FrameOffset(kInvalidReferenceOffset),
+      FrameOffset(kInvalidReferenceOffset),
+  };
+  __ MoveArguments(ArrayRef<ArgumentLocation>(move_dests2),
+                   ArrayRef<ArgumentLocation>(move_srcs2),
+                   ArrayRef<FrameOffset>(move_refs2));
 
   // Other
   __ Call(method_register, FrameOffset(48));
   __ Copy(FrameOffset(48), FrameOffset(44), 4);
-  __ CopyRawPtrFromThread(FrameOffset(44), ThreadOffset32(512));
-  __ CopyRef(FrameOffset(48), FrameOffset(44));
   __ GetCurrentThread(method_register);
   __ GetCurrentThread(FrameOffset(48));
   __ Move(hidden_arg_register, method_register, 4);
   __ VerifyObject(scratch_register, false);
 
-  __ CreateHandleScopeEntry(scratch_register, FrameOffset(48), scratch_register, true);
-  __ CreateHandleScopeEntry(scratch_register, FrameOffset(48), scratch_register, false);
-  __ CreateHandleScopeEntry(method_register, FrameOffset(48), scratch_register, true);
-  __ CreateHandleScopeEntry(FrameOffset(48), FrameOffset(64), true);
-  __ CreateHandleScopeEntry(method_register, FrameOffset(0), scratch_register, true);
-  __ CreateHandleScopeEntry(method_register, FrameOffset(1025), scratch_register, true);
-  __ CreateHandleScopeEntry(scratch_register, FrameOffset(1025), scratch_register, true);
+  // Note: `CreateJObject()` may need the scratch register IP. Test with another high register.
+  const ManagedRegister high_register = ArmManagedRegister::FromCoreRegister(R11);
+  __ CreateJObject(high_register, FrameOffset(48), high_register, true);
+  __ CreateJObject(high_register, FrameOffset(48), high_register, false);
+  __ CreateJObject(method_register, FrameOffset(48), high_register, true);
+  __ CreateJObject(method_register, FrameOffset(0), high_register, true);
+  __ CreateJObject(method_register, FrameOffset(1028), high_register, true);
+  __ CreateJObject(high_register, FrameOffset(1028), high_register, true);
 
-  __ ExceptionPoll(0);
+  std::unique_ptr<JNIMacroLabel> exception_slow_path = __ CreateLabel();
+  __ ExceptionPoll(exception_slow_path.get());
 
   // Push the target out of range of branch emitted by ExceptionPoll.
   for (int i = 0; i < 64; i++) {
@@ -296,7 +240,10 @@ TEST_F(ArmVIXLAssemblerTest, VixlJniHelpers) {
   __ DecreaseFrameSize(32);
   __ RemoveFrame(frame_size, callee_save_regs, /* may_suspend= */ true);
 
-  EmitAndCheck(&assembler, "VixlJniHelpers");
+  __ Bind(exception_slow_path.get());
+  __ DeliverPendingException();
+
+  EmitAndCheck("VixlJniHelpers", VixlJniHelpersResults);
 }
 
 #undef __
@@ -339,7 +286,7 @@ TEST_F(ArmVIXLAssemblerTest, VixlLoadFromOffset) {
   __ LoadFromOffset(kLoadUnsignedByte, R2, R4, 12);
   __ LoadFromOffset(kLoadSignedHalfword, R2, R4, 12);
 
-  EmitAndCheck(&assembler, "VixlLoadFromOffset");
+  EmitAndCheck("VixlLoadFromOffset", VixlLoadFromOffsetResults);
 }
 
 TEST_F(ArmVIXLAssemblerTest, VixlStoreToOffset) {
@@ -370,7 +317,7 @@ TEST_F(ArmVIXLAssemblerTest, VixlStoreToOffset) {
 
   __ StoreToOffset(kStoreByte, R2, R4, 12);
 
-  EmitAndCheck(&assembler, "VixlStoreToOffset");
+  EmitAndCheck("VixlStoreToOffset", VixlStoreToOffsetResults);
 }
 
 #undef __

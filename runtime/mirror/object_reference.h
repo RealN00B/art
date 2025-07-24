@@ -17,13 +17,18 @@
 #ifndef ART_RUNTIME_MIRROR_OBJECT_REFERENCE_H_
 #define ART_RUNTIME_MIRROR_OBJECT_REFERENCE_H_
 
+#include <array>
+#include <string_view>
+
 #include "base/atomic.h"
+#include "base/casts.h"
 #include "base/locks.h"  // For Locks::mutator_lock_.
+#include "base/macros.h"
 #include "heap_poisoning.h"
 #include "obj_ptr.h"
 #include "runtime_globals.h"
 
-namespace art {
+namespace art HIDDEN {
 namespace mirror {
 
 class Object;
@@ -31,20 +36,75 @@ class Object;
 // Classes shared with the managed side of the world need to be packed so that they don't have
 // extra platform specific padding.
 #define MANAGED PACKED(4)
+#define MIRROR_CLASS(desc) \
+  static_assert(::art::mirror::IsMirroredDescriptor(desc), \
+                desc " is not a known mirror class. Please update" \
+                " IsMirroredDescriptor to include it!")
+
+constexpr bool IsMirroredDescriptor(std::string_view desc) {
+  if (desc[0] != 'L') {
+    // All primitives and arrays are mirrored
+    return true;
+  }
+#define MIRROR_DESCRIPTORS(vis)                       \
+    vis("Ljava/lang/Class;")                          \
+    vis("Ljava/lang/ClassLoader;")                    \
+    vis("Ljava/lang/ClassNotFoundException;")         \
+    vis("Ljava/lang/DexCache;")                       \
+    vis("Ljava/lang/Object;")                         \
+    vis("Ljava/lang/StackFrameInfo;")                 \
+    vis("Ljava/lang/StackTraceElement;")              \
+    vis("Ljava/lang/String;")                         \
+    vis("Ljava/lang/Throwable;")                      \
+    vis("Ljava/lang/invoke/ArrayElementVarHandle;")   \
+    vis("Ljava/lang/invoke/ByteArrayViewVarHandle;")  \
+    vis("Ljava/lang/invoke/ByteBufferViewVarHandle;") \
+    vis("Ljava/lang/invoke/CallSite;")                \
+    vis("Ljava/lang/invoke/FieldVarHandle;")          \
+    vis("Ljava/lang/invoke/StaticFieldVarHandle;")    \
+    vis("Ljava/lang/invoke/MethodHandle;")            \
+    vis("Ljava/lang/invoke/MethodHandleImpl;")        \
+    vis("Ljava/lang/invoke/MethodHandles$Lookup;")    \
+    vis("Ljava/lang/invoke/MethodType;")              \
+    vis("Ljava/lang/invoke/VarHandle;")               \
+    vis("Ljava/lang/ref/FinalizerReference;")         \
+    vis("Ljava/lang/ref/Reference;")                  \
+    vis("Ljava/lang/reflect/AccessibleObject;")       \
+    vis("Ljava/lang/reflect/Constructor;")            \
+    vis("Ljava/lang/reflect/Executable;")             \
+    vis("Ljava/lang/reflect/Field;")                  \
+    vis("Ljava/lang/reflect/Method;")                 \
+    vis("Ljava/lang/reflect/Proxy;")                  \
+    vis("Ldalvik/system/ClassExt;")                   \
+    vis("Ldalvik/system/EmulatedStackFrame;")
+  // TODO: Once we are C++ 20 we can just have a constexpr array and std::find.
+  // constexpr std::array<std::string_view, 28> kMirrorTypes{
+  //    // Fill in
+  // };
+  // return std::find(kMirrorTypes.begin(), kMirrorTypes.end(), desc) != kMirrorTypes.end();
+#define CHECK_DESCRIPTOR(descriptor)          \
+  if (std::string_view(descriptor) == desc) { \
+    return true;                              \
+  }
+  MIRROR_DESCRIPTORS(CHECK_DESCRIPTOR)
+#undef CHECK_DESCRIPTOR
+  return false;
+#undef MIRROR_DESCRIPTORS
+}
 
 template<bool kPoisonReferences, class MirrorType>
 class PtrCompression {
  public:
   // Compress reference to its bit representation.
   static uint32_t Compress(MirrorType* mirror_ptr) {
-    uintptr_t as_bits = reinterpret_cast<uintptr_t>(mirror_ptr);
-    return static_cast<uint32_t>(kPoisonReferences ? -as_bits : as_bits);
+    uint32_t as_bits = reinterpret_cast32<uint32_t>(mirror_ptr);
+    return kPoisonReferences ? -as_bits : as_bits;
   }
 
   // Uncompress an encoded reference from its bit representation.
   static MirrorType* Decompress(uint32_t ref) {
-    uintptr_t as_bits = kPoisonReferences ? -ref : ref;
-    return reinterpret_cast<MirrorType*>(as_bits);
+    uint32_t as_bits = kPoisonReferences ? -ref : ref;
+    return reinterpret_cast32<MirrorType*>(as_bits);
   }
 
   // Convert an ObjPtr to a compressed reference.
@@ -86,10 +146,6 @@ class MANAGED ObjectReference {
     return reference_ == 0;
   }
 
-  uint32_t AsVRegValue() const {
-    return reference_;
-  }
-
   static ObjectReference<kPoisonReferences, MirrorType> FromMirrorPtr(MirrorType* mirror_ptr)
       REQUIRES_SHARED(Locks::mutator_lock_) {
     return ObjectReference<kPoisonReferences, MirrorType>(mirror_ptr);
@@ -98,6 +154,9 @@ class MANAGED ObjectReference {
  protected:
   explicit ObjectReference(MirrorType* mirror_ptr) REQUIRES_SHARED(Locks::mutator_lock_)
       : reference_(Compression::Compress(mirror_ptr)) {
+  }
+  ObjectReference() : reference_(0u) {
+    DCHECK(IsNull());
   }
 
   // The encoded reference to a mirror::Object.
@@ -164,17 +223,27 @@ static_assert(sizeof(mirror::HeapReference<mirror::Object>) == kHeapReferenceSiz
 template<class MirrorType>
 class MANAGED CompressedReference : public mirror::ObjectReference<false, MirrorType> {
  public:
-  CompressedReference<MirrorType>() REQUIRES_SHARED(Locks::mutator_lock_)
-      : mirror::ObjectReference<false, MirrorType>(nullptr) {}
+  CompressedReference<MirrorType>()
+      : mirror::ObjectReference<false, MirrorType>() {}
 
   static CompressedReference<MirrorType> FromMirrorPtr(MirrorType* p)
       REQUIRES_SHARED(Locks::mutator_lock_) {
     return CompressedReference<MirrorType>(p);
   }
 
+  static CompressedReference<MirrorType> FromVRegValue(uint32_t vreg_value) {
+    CompressedReference<MirrorType> result;
+    result.reference_ = vreg_value;
+    return result;
+  }
+
+  uint32_t AsVRegValue() const {
+    return this->reference_;
+  }
+
  private:
   explicit CompressedReference(MirrorType* p) REQUIRES_SHARED(Locks::mutator_lock_)
-      : mirror::ObjectReference<false, MirrorType>(p) {}
+      : ObjectReference<false, MirrorType>(p) {}
 };
 
 }  // namespace mirror

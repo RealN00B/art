@@ -23,7 +23,7 @@
 #include "base/macros.h"
 #include "registers_arm.h"
 
-namespace art {
+namespace art HIDDEN {
 namespace arm {
 
 class ArmContext final : public Context {
@@ -44,6 +44,10 @@ class ArmContext final : public Context {
 
   void SetPC(uintptr_t new_pc) override {
     SetGPR(PC, new_pc);
+  }
+
+  void SetNterpDexPC(uintptr_t dex_pc_ptr) override {
+    SetGPR(R11, dex_pc_ptr);
   }
 
   void SetArg0(uintptr_t new_arg0_value) override {
@@ -82,7 +86,7 @@ class ArmContext final : public Context {
   void SetFPR(uint32_t reg, uintptr_t value) override;
 
   void SmashCallerSaves() override;
-  NO_RETURN void DoLongJump() override;
+  void CopyContextTo(uintptr_t* gprs, uintptr_t* fprs) override;
 
  private:
   // Pointers to register locations, initialized to null or the specific registers below.

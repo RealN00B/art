@@ -14,20 +14,38 @@
 // limitations under the License.
 //
 
+package {
+    // See: http://go/android-license-faq
+    // A large-scale-change added 'default_applicable_licenses' to import
+    // all of the 'license_kinds' from "art_license"
+    // to get the below license kinds:
+    //   SPDX-license-identifier-Apache-2.0
+    default_applicable_licenses: ["art_license"],
+    default_team: "trendy_team_art_performance",
+}
+
 art_cc_defaults {
     name: "libart-dex2oat-defaults",
     defaults: ["art_defaults"],
     host_supported: true,
     srcs: [
-        "dex/dex_to_dex_compiler.cc",
+        "aot_class_linker.cc",
         "dex/quick_compiler_callbacks.cc",
+        "dex/verification_results.cc",
+        "driver/compiled_method.cc",
+        "driver/compiled_method_storage.cc",
         "driver/compiler_driver.cc",
+        "interpreter/interpreter_switch_impl1.cc",
+        "linker/code_info_table_deduper.cc",
         "linker/elf_writer.cc",
         "linker/elf_writer_quick.cc",
         "linker/image_writer.cc",
         "linker/multi_oat_relative_patcher.cc",
         "linker/oat_writer.cc",
         "linker/relative_patcher.cc",
+        "sdk_checker.cc",
+        "transaction.cc",
+        "utils/swap_space.cc",
     ],
 
     codegen: {
@@ -40,6 +58,11 @@ art_cc_defaults {
         arm64: {
             srcs: [
                 "linker/arm64/relative_patcher_arm64.cc",
+            ],
+        },
+        riscv64: {
+            srcs: [
+                "linker/riscv64/relative_patcher_riscv64.cc",
             ],
         },
         x86: {
@@ -55,35 +78,17 @@ art_cc_defaults {
         },
     },
 
-    target: {
-        android: {
-            static_libs: [
-                "libz",
-            ],
-        },
-        host: {
-            shared_libs: [
-                "libz",
-            ],
-        },
-    },
     generated_sources: ["art_dex2oat_operator_srcs"],
     shared_libs: [
         "libbase",
-
-        // For SHA-1 checksumming of build ID
-        "libcrypto",
-    ],
-    export_include_dirs: ["."],
-}
-
-cc_defaults {
-    name: "libart-dex2oat_static_base_defaults",
-    static_libs: [
-        "libbase",
-        "libcrypto",
+        "liblog",
+        "liblz4",
         "libz",
     ],
+    static_libs: [
+        "libcrypto_for_art", // For SHA-1 checksumming of build ID
+    ],
+    export_include_dirs: ["."],
 }
 
 gensrcs {
@@ -91,25 +96,39 @@ gensrcs {
     cmd: "$(location generate_operator_out) art/dex2oat $(in) > $(out)",
     tools: ["generate_operator_out"],
     srcs: [
-        "dex/dex_to_dex_compiler.h",
-        "driver/compiler_driver.h",
         "linker/image_writer.h",
     ],
     output_extension: "operator_out.cc",
+}
+
+cc_defaults {
+    name: "libart-dex2oat_static_base_defaults",
+    whole_static_libs: [
+        "libbase",
+        "liblog",
+        "liblz4",
+        "libz",
+    ],
+    static_libs: [
+        // Cannot use whole_static_libs for libcrypto_for_art since it's a
+        // subset that contains unused functions that depend on missing symbols.
+        "libcrypto_for_art",
+    ],
 }
 
 art_cc_library_static {
     name: "libart-dex2oat",
     defaults: ["libart-dex2oat-defaults"],
     shared_libs: [
-        "libart-compiler",
-        "libart-dexlayout",
         "libart",
         "libartpalette",
         "libprofile",
     ],
+    static_libs: [
+        "libelffile",
+    ],
     apex_available: [
-        "com.android.art.release",
+        "com.android.art",
         "com.android.art.debug",
     ],
 }
@@ -121,10 +140,24 @@ cc_defaults {
         "libart_static_defaults",
         "libprofile_static_defaults",
     ],
-    static_libs: [
-        "libart-compiler",
-        "libart-dexlayout",
+    whole_static_libs: [
         "libart-dex2oat",
+    ],
+}
+
+// Collect all the static defaults and build a host-only static library, which
+// is then used for the (mostly) static host dex2oat binary.
+art_cc_library_static {
+    name: "libdex2oat_static",
+    device_supported: false,
+    host_supported: true,
+    defaults: [
+        "art_defaults",
+        "libart-dex2oat_static_defaults",
+        "libart_static_defaults",
+        "libartbase_static_defaults",
+        "libdexfile_static_defaults",
+        "libprofile_static_defaults",
     ],
 }
 
@@ -135,11 +168,12 @@ art_cc_library_static {
         "libart-dex2oat-defaults",
     ],
     shared_libs: [
-        "libartd-compiler",
-        "libartd-dexlayout",
         "libartd",
         "libartpalette",
         "libprofiled",
+    ],
+    static_libs: [
+        "libelffiled",
     ],
     apex_available: [
         "com.android.art.debug",
@@ -153,73 +187,52 @@ cc_defaults {
         "libartd_static_defaults",
         "libprofiled_static_defaults",
     ],
-    static_libs: [
-        "libartd-compiler",
-        "libartd-dexlayout",
+    whole_static_libs: [
         "libartd-dex2oat",
     ],
 }
 
-cc_library_headers {
-    name: "dex2oat_headers",
-    visibility: [
-        // TODO(b/133140750): Clean this up.
-        "//frameworks/native/cmds/installd",
-    ],
+art_cc_library_static {
+    name: "libdex2oatd_static",
+    device_supported: false,
     host_supported: true,
-    export_include_dirs: ["include"],
+    defaults: [
+        "art_debug_defaults",
+        "libartbased_static_defaults",
+        "libartd-dex2oat_static_defaults",
+        "libartd_static_defaults",
+        "libdexfiled_static_defaults",
+        "libprofiled_static_defaults",
+    ],
 }
 
 cc_defaults {
     name: "dex2oat-defaults",
     host_supported: true,
     defaults: ["art_defaults"],
+
     srcs: [
         "dex2oat_options.cc",
         "dex2oat.cc",
+    ],
+    header_libs: [
+        "art_cmdlineparser_headers",
     ],
 
     target: {
         android: {
             compile_multilib: "both",
-        },
-    },
-    header_libs: [
-        "dex2oat_headers",
-        "art_cmdlineparser_headers",
-    ],
-}
-
-cc_defaults {
-    name: "dex2oat-pgo-defaults",
-    defaults_visibility: [
-        "//art:__subpackages__",
-        "//external/vixl",
-    ],
-    pgo: {
-        instrumentation: true,
-        benchmarks: ["dex2oat"],
-    },
-    target: {
-        android_arm64: {
-            pgo: {
-                profile_file: "art/dex2oat_arm_arm64.profdata",
-            },
-        },
-        android_arm: {
-            pgo: {
-                profile_file: "art/dex2oat_arm_arm64.profdata",
-            },
-        },
-        android_x86_64: {
-            pgo: {
-                profile_file: "art/dex2oat_x86_x86_64.profdata",
-            },
-        },
-        android_x86: {
-            pgo: {
-                profile_file: "art/dex2oat_x86_x86_64.profdata",
-            },
+            shared_libs: [
+                "libartpalette",
+                "libbase",
+                "liblz4", // libart(d)-dex2oat dependency; must be repeated here since it's a static lib.
+                "liblog",
+                "libsigchain",
+                "libz",
+            ],
+            static_libs: [
+                "libcrypto_for_art",
+            ],
         },
     },
 }
@@ -228,26 +241,10 @@ art_cc_binary {
     name: "dex2oat",
     defaults: [
         "dex2oat-defaults",
-        "dex2oat-pgo-defaults",
     ],
     // Modules that do dexpreopting, e.g. android_app, depend implicitly on
     // either dex2oat or dex2oatd in ART source builds.
     visibility: ["//visibility:public"],
-    shared_libs: [
-        "libprofile",
-        "libart-compiler",
-        "libart-dexlayout",
-        "libart",
-        "libcrypto",
-        "libdexfile",
-        "libartbase",
-        "libartpalette",
-        "libbase",
-        "libsigchain",
-    ],
-    static_libs: [
-        "libart-dex2oat",
-    ],
 
     multilib: {
         lib32: {
@@ -257,28 +254,36 @@ art_cc_binary {
             suffix: "64",
         },
     },
+    symlink_preferred_arch: true,
 
-    pgo: {
-        // Additional cflags just for dex2oat during PGO instrumentation
-        cflags: [
-            // Ignore frame-size increase resulting from instrumentation.
-            "-Wno-frame-larger-than=",
-            "-DART_PGO_INSTRUMENTATION",
-        ],
-    },
     target: {
         android: {
+            shared_libs: [
+                "libart",
+                "libartbase",
+                "libdexfile#impl",
+                "libprofile",
+            ],
+            static_libs: [
+                "libart-dex2oat",
+                "libelffile",
+            ],
             lto: {
                 thin: true,
             },
-            static_libs: [
-                "libz",
-            ],
         },
         host: {
-            shared_libs: [
-                "libz",
+            static_libs: [
+                // Since libcrypto_for_art cannot be a whole_static_libs in
+                // libart-dex2oat_static_base_defaults, and we cannot use a
+                // defaults directly only for host here, we have to repeat this
+                // dependency.
+                "libcrypto_for_art",
+                // Make the host binary static, except for system libraries.
+                // This avoids having to bundle host dynamic libs in prebuilts.
+                "libdex2oat_static",
             ],
+            stl: "c++_static",
             // Override the prefer32 added by art_cc_binary when
             // HOST_PREFER_32_BIT is in use. Necessary because the logic in
             // Soong for setting ctx.Config().BuildOSTarget (used in
@@ -287,12 +292,13 @@ art_cc_binary {
             // it'd get overridden by the load hook even when it uses
             // PrependProperties.
             compile_multilib: "64",
-            symlink_preferred_arch: true,
         },
     },
+
     apex_available: [
-        "com.android.art.release",
+        "com.android.art",
         "com.android.art.debug",
+        "test_broken_com.android.art",
     ],
 }
 
@@ -305,45 +311,6 @@ art_cc_binary {
     // Modules that do dexpreopting, e.g. android_app, depend implicitly on
     // either dex2oat or dex2oatd in ART source builds.
     visibility: ["//visibility:public"],
-    shared_libs: [
-        "libprofiled",
-        "libartd-compiler",
-        "libartd-dexlayout",
-        "libartd",
-        "libcrypto",
-        "libdexfiled",
-        "libartbased",
-        "libartpalette",
-        "libbase",
-        "libsigchain",
-    ],
-    static_libs: [
-        "libartd-dex2oat",
-    ],
-    target: {
-        android: {
-            static_libs: [
-                "libz",
-            ],
-        },
-        host: {
-            shared_libs: [
-                "libz",
-            ],
-            // Override the prefer32 added by art_cc_binary when
-            // HOST_PREFER_32_BIT is in use. Necessary because the logic in
-            // Soong for setting ctx.Config().BuildOSTarget (used in
-            // dexpreopt.RegisterToolDeps) doesn't take host prefer32 into
-            // account. Note that this override cannot be in cc_defaults because
-            // it'd get overridden by the load hook even when it uses
-            // PrependProperties.
-            compile_multilib: "64",
-            symlink_preferred_arch: true,
-        },
-    },
-    apex_available: [
-        "com.android.art.debug",
-    ],
 
     multilib: {
         lib32: {
@@ -353,6 +320,35 @@ art_cc_binary {
             suffix: "64",
         },
     },
+    symlink_preferred_arch: true,
+
+    target: {
+        android: {
+            shared_libs: [
+                "libartbased",
+                "libartd",
+                "libdexfiled#impl",
+                "libprofiled",
+            ],
+            static_libs: [
+                "libartd-dex2oat",
+                "libelffiled",
+            ],
+        },
+        host: {
+            // Comments for host in dex2oat apply here too.
+            static_libs: [
+                "libcrypto_for_art",
+                "libdex2oatd_static",
+            ],
+            stl: "c++_static",
+            compile_multilib: "64",
+        },
+    },
+
+    apex_available: [
+        "com.android.art.debug",
+    ],
 }
 
 cc_defaults {
@@ -375,25 +371,16 @@ cc_defaults {
         // Try to get rid of it.
         "-z muldefs",
     ],
-    static_libs: [
-        "libbase",
-        "libsigchain_dummy",
-        "libz",
-    ],
 }
 
 art_cc_binary {
     name: "dex2oats",
-    defaults: [
-        "dex2oats-defaults",
-        "libart_static_defaults",
-        "libart-compiler_static_defaults",
-        "libart-dexlayout_static_defaults",
-        "libartbase_static_defaults",
-        "libdexfile_static_defaults",
-        "libprofile_static_defaults",
-        "libart-dex2oat_static_defaults",
+    defaults: ["dex2oats-defaults"],
+    static_libs: [
+        "libcrypto_for_art",
+        "libdex2oat_static",
     ],
+    visibility: ["//tools/vendor/google_prebuilts/arc"],
 }
 
 art_cc_binary {
@@ -401,19 +388,11 @@ art_cc_binary {
     defaults: [
         "art_debug_defaults",
         "dex2oats-defaults",
-        "libartd_static_defaults",
-        "libartd-compiler_static_defaults",
-        "libartd-dexlayout_static_defaults",
-        "libartbased_static_defaults",
-        "libdexfiled_static_defaults",
-        "libprofiled_static_defaults",
-        "libartd-dex2oat_static_defaults",
     ],
-    target: {
-        linux_glibc_x86_64: {
-            use_clang_lld: true,
-        },
-    },
+    static_libs: [
+        "libcrypto_for_art",
+        "libdex2oatd_static",
+    ],
 }
 
 art_cc_library_static {
@@ -421,37 +400,95 @@ art_cc_library_static {
     defaults: ["libart-gtest-defaults"],
     srcs: [
         "common_compiler_driver_test.cc",
-    ],
-    shared_libs: [
-        "libartd-compiler",
-        "libartd-disassembler",
-        "libart-compiler-gtest",
-        "libart-runtime-gtest",
-        "libbase",
+        "common_transaction_test.cc",
     ],
     static_libs: [
-        "libartd-dex2oat",
+        "libart-dex2oat",
+        "libart-gtest",
     ],
 }
 
-art_cc_test {
-    name: "art_dex2oat_tests",
+art_cc_library_static {
+    name: "libartd-dex2oat-gtest",
     defaults: [
-        "art_gtest_defaults",
+        "art_debug_defaults",
+        "libart-gtest-defaults",
+    ],
+    srcs: [
+        "common_compiler_driver_test.cc",
+        "common_transaction_test.cc",
+    ],
+    static_libs: [
+        "libartd-dex2oat",
+        "libartd-gtest",
+    ],
+}
+
+art_cc_defaults {
+    name: "art_dex2oat_tests_defaults",
+    device_common_data: [
+        ":art-gtest-jars-AbstractMethod",
+        ":art-gtest-jars-ArrayClassWithUnresolvedComponent",
+        ":art-gtest-jars-DefaultMethods",
+        ":art-gtest-jars-Dex2oatVdexPublicSdkDex",
+        ":art-gtest-jars-Dex2oatVdexTestDex",
+        ":art-gtest-jars-ImageLayoutA",
+        ":art-gtest-jars-ImageLayoutB",
+        ":art-gtest-jars-LinkageTest",
+        ":art-gtest-jars-Main",
+        ":art-gtest-jars-MainEmptyUncompressed",
+        ":art-gtest-jars-MainEmptyUncompressedAligned",
+        ":art-gtest-jars-MainStripped",
+        ":art-gtest-jars-MainUncompressedAligned",
+        ":art-gtest-jars-ManyMethods",
+        ":art-gtest-jars-MultiDex",
+        ":art-gtest-jars-MultiDexModifiedSecondary",
+        ":art-gtest-jars-MultiDexUncompressedAligned",
+        ":art-gtest-jars-MyClassNatives",
+        ":art-gtest-jars-Nested",
+        ":art-gtest-jars-ProfileTestMultiDex",
+        ":art-gtest-jars-StaticLeafMethods",
+        ":art-gtest-jars-Statics",
+        ":art-gtest-jars-StringLiterals",
+        ":art-gtest-jars-SuperWithAccessChecks",
+        ":art-gtest-jars-Transaction",
+        ":art-gtest-jars-VerifierDeps",
+        ":art-gtest-jars-VerifierDepsMulti",
+        ":art-gtest-jars-VerifySoftFailDuringClinit",
+    ],
+    tidy_timeout_srcs: [
+        "dex2oat_test.cc",
+        "transaction_test.cc",
+        "verifier_deps_test.cc",
+        "linker/arm/relative_patcher_thumb2_test.cc",
+        "linker/arm64/relative_patcher_arm64_test.cc",
     ],
     srcs: [
         "dex2oat_test.cc",
+        "dex2oat_vdex_test.cc",
         "dex2oat_image_test.cc",
-        "dex/dex_to_dex_decompiler_test.cc",
+        "driver/compiled_method_storage_test.cc",
         "driver/compiler_driver_test.cc",
+        "interpreter/unstarted_runtime_transaction_test.cc",
+        "linker/code_info_table_deduper_test.cc",
         "linker/elf_writer_test.cc",
         "linker/image_test.cc",
         "linker/image_write_read_test.cc",
         "linker/index_bss_mapping_encoder_test.cc",
         "linker/multi_oat_relative_patcher_test.cc",
         "linker/oat_writer_test.cc",
+        "transaction_test.cc",
         "verifier_deps_test.cc",
+        "utils/swap_space_test.cc",
     ],
+    target: {
+        host: {
+            required: [
+                "dex2oatd",
+                "art_boot_images",
+            ],
+        },
+    },
 
     codegen: {
         arm: {
@@ -462,6 +499,11 @@ art_cc_test {
         arm64: {
             srcs: [
                 "linker/arm64/relative_patcher_arm64_test.cc",
+            ],
+        },
+        riscv64: {
+            srcs: [
+                "linker/riscv64/relative_patcher_riscv64_test.cc",
             ],
         },
         x86: {
@@ -476,20 +518,60 @@ art_cc_test {
         },
     },
 
-    header_libs: ["dex2oat_headers"],
     shared_libs: [
-        "libartbased",
-        "libartd-compiler",
-        "libartd-dexlayout",
-        "libartpalette",
-        "libbase",
-        "libcrypto",
-        "libprofiled",
-        "libsigchain",
-        "libziparchive",
+        "liblog",
     ],
     static_libs: [
-        "libart-dex2oat-gtest",
+        "libcrypto_for_art",
+        "libgmock",
+        "liblz4", // libart(d)-dex2oat dependency; must be repeated here since it's a static lib.
+    ],
+}
+
+// Version of ART gtest `art_dex2oat_tests` bundled with the ART APEX on target.
+// TODO(b/192274705): Remove this module when the migration to standalone ART gtests is complete.
+art_cc_test {
+    name: "art_dex2oat_tests",
+    defaults: [
+        "art_gtest_defaults",
+        "art_dex2oat_tests_defaults",
+    ],
+    static_libs: [
         "libartd-dex2oat",
+        "libartd-dex2oat-gtest",
+        "libvixld",
+    ],
+}
+
+// Standalone version of ART gtest `art_dex2oat_tests`, not bundled with the ART APEX on target.
+art_cc_test {
+    name: "art_standalone_dex2oat_tests",
+    defaults: [
+        "art_standalone_gtest_defaults",
+        "art_dex2oat_tests_defaults",
+    ],
+    data: [":generate-boot-image"],
+    static_libs: [
+        "libart-dex2oat",
+        "libart-dex2oat-gtest",
+        "libvixl",
+    ],
+    test_config: "art_standalone_dex2oat_tests.xml",
+}
+
+// Counterpart to art_standalone_dex2oat_tests for tests that go into CTS/MCTS.
+art_cc_test {
+    name: "art_standalone_dex2oat_cts_tests",
+    defaults: ["art_standalone_gtest_defaults"],
+    srcs: ["dex2oat_cts_test.cc"],
+    data: [
+        ":art-gtest-jars-Main",
+        ":generate-boot-image",
+    ],
+    test_config: "art_standalone_dex2oat_cts_tests.xml",
+    test_suites: [
+        "cts",
+        "mts-art",
+        "mcts-art",
     ],
 }

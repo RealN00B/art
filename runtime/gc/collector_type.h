@@ -19,7 +19,9 @@
 
 #include <iosfwd>
 
-namespace art {
+#include "base/macros.h"
+
+namespace art HIDDEN {
 namespace gc {
 
 // Which types of collections are able to be performed.
@@ -30,6 +32,10 @@ enum CollectorType {
   kCollectorTypeMS,
   // Concurrent mark-sweep.
   kCollectorTypeCMS,
+  // Concurrent mark-compact.
+  kCollectorTypeCMC,
+  // The background compaction of the Concurrent mark-compact GC.
+  kCollectorTypeCMCBackground,
   // Semi-space / mark-sweep hybrid, enables compaction.
   kCollectorTypeSS,
   // Heap trimming collector, doesn't do any actual collecting.
@@ -60,15 +66,16 @@ enum CollectorType {
   // Fake collector type for ScopedGCCriticalSection
   kCollectorTypeCriticalSection,
 };
-std::ostream& operator<<(std::ostream& os, const CollectorType& collector_type);
+std::ostream& operator<<(std::ostream& os, CollectorType collector_type);
 
 static constexpr CollectorType kCollectorTypeDefault =
-#if ART_DEFAULT_GC_TYPE_IS_CMS
-    kCollectorTypeCMS
+#if ART_DEFAULT_GC_TYPE_IS_CMC
+    kCollectorTypeCMC
 #elif ART_DEFAULT_GC_TYPE_IS_SS
     kCollectorTypeSS
-#else
+#elif ART_DEFAULT_GC_TYPE_IS_CMS
     kCollectorTypeCMS
+#else
 #error "ART default GC type must be set"
 #endif
     ;  // NOLINT [whitespace/semicolon] [5]

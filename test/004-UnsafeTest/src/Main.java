@@ -136,6 +136,14 @@ public class Main {
     check(t.objectVar, objectValue, "Unsafe.putObject(Object, long, Object)");
     check(unsafe.getObject(t, objectOffset), objectValue, "Unsafe.getObject(Object, long)");
 
+    byte byteValue = 123;
+    Field byteField = TestClass.class.getDeclaredField("byteVar");
+    long byteOffset = unsafe.objectFieldOffset(byteField);
+    check(unsafe.getByte(t, byteOffset), 0, "Unsafe.getByte(Object, long) - initial");
+    unsafe.putByte(t, byteOffset, byteValue);
+    check(t.byteVar, byteValue, "Unsafe.putByte(Object, long, byte)");
+    check(unsafe.getByte(t, byteOffset), byteValue, "Unsafe.getByte(Object, long)");
+
     if (unsafe.compareAndSwapInt(t, intOffset, 0, 1)) {
       System.out.println("Unexpectedly succeeding compareAndSwapInt(t, intOffset, 0, 1)");
     }
@@ -252,6 +260,26 @@ public class Main {
           "Unsafe.getObjectVolatile(Object, long)");
   }
 
+  private static void testGetAndPutAbsoluteAddress(Unsafe unsafe) throws NoSuchFieldException {
+    long address = 0;
+    try {
+        address = unsafe.allocateMemory(8);
+
+        unsafe.putByte(address, (byte) 17);
+        check(unsafe.getByte(address), (byte) 17, "Unsafe.getByte(long)");
+
+        unsafe.putInt(address, 0xDEADBEEF);
+        check(unsafe.getInt(address), 0xDEADBEEF, "Unsafe.getInt(long)");
+
+        unsafe.putLong(address, 0xFEEDFACEDECAFBADL);
+        check(unsafe.getInt(address), 0xFEEDFACEDECAFBADL, "Unsafe.getLong(long)");
+    } finally {
+        if (address != 0) {
+            unsafe.freeMemory(address);
+        }
+    }
+  }
+
   // Regression test for "copyMemory" operations hitting a DCHECK() for float/double arrays.
   private static void testCopyMemoryPrimitiveArrays(Unsafe unsafe) {
     int size = 4 * 1024;
@@ -288,6 +316,7 @@ public class Main {
     public int intVar = 0;
     public long longVar = 0;
     public Object objectVar = null;
+    public byte byteVar = 0;
   }
 
   private static class TestVolatileClass {

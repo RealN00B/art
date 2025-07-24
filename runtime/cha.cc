@@ -30,7 +30,7 @@
 #include "thread_list.h"
 #include "thread_pool.h"
 
-namespace art {
+namespace art HIDDEN {
 
 void ClassHierarchyAnalysis::AddDependency(ArtMethod* method,
                                            ArtMethod* dependent_method,
@@ -144,14 +144,14 @@ void ClassHierarchyAnalysis::ResetSingleImplementationInHierarchy(ObjPtr<mirror:
       ArtMethod* super_method = super_it->
           GetVTableEntry<kDefaultVerifyFlags, kWithoutReadBarrier>(vtbl_index, pointer_size);
       if (super_method->IsAbstract() &&
-          super_method->HasSingleImplementation<kWithoutReadBarrier>() &&
+          super_method->HasSingleImplementation() &&
           super_method->GetSingleImplementation(pointer_size) == method) {
         // Do like there was no single implementation defined previously
         // for this method of the superclass.
         super_method->SetSingleImplementation(nullptr, pointer_size);
       } else {
         // No related SingleImplementations could possibly be found any further.
-        DCHECK(!super_method->HasSingleImplementation<kWithoutReadBarrier>());
+        DCHECK(!super_method->HasSingleImplementation());
         break;
       }
     }
@@ -168,7 +168,7 @@ void ClassHierarchyAnalysis::ResetSingleImplementationInHierarchy(ObjPtr<mirror:
          j < count;
          ++j) {
       ArtMethod* method = interface->GetVirtualMethod(j, pointer_size);
-      if (method->HasSingleImplementation<kWithoutReadBarrier>() &&
+      if (method->HasSingleImplementation() &&
           alloc->ContainsUnsafe(method->GetSingleImplementation(pointer_size)) &&
           !method->IsDefault()) {
         // Do like there was no single implementation defined previously for this method.
@@ -219,27 +219,12 @@ class CHAStackVisitor final  : public StackVisitor {
     }
 
     // The compiled code on stack is not valid anymore. Need to deoptimize.
-    SetShouldDeoptimizeFlag();
+    SetShouldDeoptimizeFlag(DeoptimizeFlagValue::kCHA);
 
     return true;
   }
 
  private:
-  void SetShouldDeoptimizeFlag() REQUIRES_SHARED(Locks::mutator_lock_) {
-    QuickMethodFrameInfo frame_info = GetCurrentQuickFrameInfo();
-    size_t frame_size = frame_info.FrameSizeInBytes();
-    uint8_t* sp = reinterpret_cast<uint8_t*>(GetCurrentQuickFrame());
-    size_t core_spill_size = POPCOUNT(frame_info.CoreSpillMask()) *
-        GetBytesPerGprSpillLocation(kRuntimeISA);
-    size_t fpu_spill_size = POPCOUNT(frame_info.FpSpillMask()) *
-        GetBytesPerFprSpillLocation(kRuntimeISA);
-    size_t offset = frame_size - core_spill_size - fpu_spill_size - kShouldDeoptimizeFlagSize;
-    uint8_t* should_deoptimize_addr = sp + offset;
-    // Set deoptimization flag to 1.
-    DCHECK(*should_deoptimize_addr == 0 || *should_deoptimize_addr == 1);
-    *should_deoptimize_addr = 1;
-  }
-
   // Set of method headers for compiled code that should be deoptimized.
   const std::unordered_set<OatQuickMethodHeader*>& method_headers_;
 
@@ -252,11 +237,10 @@ class CHACheckpoint final : public Closure {
       : barrier_(0),
         method_headers_(method_headers) {}
 
-  void Run(Thread* thread) override {
+  void Run(Thread* thread) override REQUIRES_SHARED(Locks::mutator_lock_) {
     // Note thread and self may not be equal if thread was already suspended at
     // the point of the request.
     Thread* self = Thread::Current();
-    ScopedObjectAccess soa(self);
     CHAStackVisitor visitor(thread, nullptr, method_headers_);
     visitor.WalkStack();
     barrier_.Pass(self);
@@ -264,7 +248,7 @@ class CHACheckpoint final : public Closure {
 
   void WaitForThreadsToRunThroughCheckpoint(size_t threads_running_checkpoint) {
     Thread* self = Thread::Current();
-    ScopedThreadStateChange tsc(self, kWaitingForCheckPointsToRun);
+    ScopedThreadStateChange tsc(self, ThreadState::kWaitingForCheckPointsToRun);
     barrier_.Increment(self, threads_running_checkpoint);
   }
 
@@ -305,7 +289,7 @@ static void VerifyNonSingleImplementation(ObjPtr<mirror::Class> verify_class,
         std::string tmp = in->PrettyClass();
         while (in != failed) {
           in = in->GetSuperClass();
-          tmp = tmp + "->" + in->PrettyClass();
+          tmp += "->" + in->PrettyClass();
         }
         return tmp;
       };
@@ -332,7 +316,7 @@ void ClassHierarchyAnalysis::CheckVirtualMethodSingleImplementationInfo(
   // even if it overrides, it doesn't invalidate single-implementation
   // assumption.
 
-  DCHECK((virtual_method != method_in_super) || virtual_method->IsAbstract());
+  DCHECK_IMPLIES(virtual_method == method_in_super, virtual_method->IsAbstract());
   DCHECK(method_in_super->GetDeclaringClass()->IsResolved()) << "class isn't resolved";
   // If virtual_method doesn't come from a default interface method, it should
   // be supplied by klass.
@@ -395,7 +379,8 @@ void ClassHierarchyAnalysis::CheckVirtualMethodSingleImplementationInfo(
     } else {
       // SUPER: abstract, VIRTUAL: non-abstract.
       // A non-abstract method overrides an abstract method.
-      if (method_in_super->GetSingleImplementation(pointer_size) == nullptr) {
+      if (!virtual_method->IsDefaultConflicting() &&
+          method_in_super->GetSingleImplementation(pointer_size) == nullptr) {
         // Abstract method_in_super has no implementation yet.
         // We need to grab cha_lock_ since there may be multiple class linking
         // going on that can check/modify the single-implementation flag/method
@@ -481,11 +466,13 @@ void ClassHierarchyAnalysis::CheckInterfaceMethodSingleImplementationInfo(
     return;
   }
 
-  if (implementation_method->IsAbstract()) {
-    // An instantiable class doesn't supply an implementation for
-    // interface_method. Invoking the interface method on the class will throw
-    // AbstractMethodError. This is an uncommon case, so we simply treat
-    // interface_method as not having single-implementation.
+  if (!implementation_method->IsInvokable()) {
+    DCHECK(implementation_method->IsAbstract() || implementation_method->IsDefaultConflicting());
+    // An instantiable class doesn't supply an implementation for interface_method,
+    // or has conflicting default method implementations. Invoking the interface method
+    // on the  class will throw AbstractMethodError or IncompatibleClassChangeError.
+    // (Note: The RI throws AME instead of ICCE for default conflict.) This is an uncommon
+    // case, so we simply treat interface_method as not having single-implementation.
     invalidated_single_impl_methods.insert(interface_method);
     return;
   }
@@ -507,9 +494,8 @@ void ClassHierarchyAnalysis::CheckInterfaceMethodSingleImplementationInfo(
     // Keep interface_method's single-implementation status.
     return;
   }
-  DCHECK(!single_impl->IsAbstract());
-  if ((single_impl->GetDeclaringClass() == implementation_method->GetDeclaringClass()) &&
-      !implementation_method->IsDefaultConflicting()) {
+  DCHECK(single_impl->IsInvokable());
+  if ((single_impl->GetDeclaringClass() == implementation_method->GetDeclaringClass())) {
     // Same implementation. Since implementation_method may be a copy of a default
     // method, we need to check the declaring class for equality.
     return;
@@ -543,7 +529,8 @@ void ClassHierarchyAnalysis::InitSingleImplementationFlag(Handle<mirror::Class> 
       // Abstract method starts with single-implementation flag set and null
       // implementation method.
       method->SetHasSingleImplementation(true);
-      DCHECK(method->GetSingleImplementation(pointer_size) == nullptr);
+      DCHECK(!method->HasCodeItem()) << method->PrettyMethod();
+      DCHECK(method->GetSingleImplementation(pointer_size) == nullptr) << method->PrettyMethod();
     }
   // Default conflicting methods cannot be treated with single implementations,
   // as we need to call them (and not inline them) in case of ICCE.
@@ -704,8 +691,9 @@ void ClassHierarchyAnalysis::InvalidateSingleImplementationMethods(
   }
 }
 
-void ClassHierarchyAnalysis::RemoveDependenciesForLinearAlloc(const LinearAlloc* linear_alloc) {
-  MutexLock mu(Thread::Current(), *Locks::cha_lock_);
+void ClassHierarchyAnalysis::RemoveDependenciesForLinearAlloc(Thread* self,
+                                                              const LinearAlloc* linear_alloc) {
+  MutexLock mu(self, *Locks::cha_lock_);
   for (auto it = cha_dependency_map_.begin(); it != cha_dependency_map_.end(); ) {
     // Use unsafe to avoid locking since the allocator is going to be deleted.
     if (linear_alloc->ContainsUnsafe(it->first)) {

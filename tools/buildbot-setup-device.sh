@@ -17,13 +17,7 @@
 # The work does by this script is (mostly) undone by tools/buildbot-teardown-device.sh.
 # Make sure to keep these files in sync.
 
-if [ -t 1 ]; then
-  # Color sequences if terminal is a tty.
-  red='\033[0;31m'
-  green='\033[0;32m'
-  yellow='\033[0;33m'
-  nc='\033[0m'
-fi
+. "$(dirname $0)/buildbot-utils.sh"
 
 if [ "$1" = --verbose ]; then
   verbose=true
@@ -31,18 +25,57 @@ else
   verbose=false
 fi
 
-# Setup as root, as some actions performed here require it.
+# Testing on a Linux VM requires special setup.
+if [[ -n "$ART_TEST_ON_VM" ]]; then
+  [[ -d "$ART_TEST_VM_DIR" ]] || { msgfatal "no VM found in $ART_TEST_VM_DIR"; }
+  $ART_SSH_CMD "true" || { msgerror "no VM (tried \"$ART_SSH_CMD true\""; }
+  $ART_SSH_CMD "
+    mkdir $ART_TEST_CHROOT
+
+    mkdir $ART_TEST_CHROOT/apex
+    mkdir $ART_TEST_CHROOT/bin
+    mkdir -p $ART_TEST_CHROOT/data/local/tmp
+    mkdir -p $ART_TEST_CHROOT/data/misc/trace
+    mkdir $ART_TEST_CHROOT/dev
+    mkdir $ART_TEST_CHROOT/etc
+    mkdir $ART_TEST_CHROOT/lib
+    mkdir $ART_TEST_CHROOT/linkerconfig
+    mkdir $ART_TEST_CHROOT/proc
+    mkdir $ART_TEST_CHROOT/sys
+    mkdir $ART_TEST_CHROOT/system
+    mkdir $ART_TEST_CHROOT/tmp
+    mkdir -p $ART_TEST_CHROOT/usr/lib
+    mkdir -p $ART_TEST_CHROOT/usr/share/gdb
+
+    sudo mount -t proc /proc $ART_TEST_CHROOT_BASENAME/proc
+    sudo mount -t sysfs /sys $ART_TEST_CHROOT_BASENAME/sys
+    sudo mount --bind /dev $ART_TEST_CHROOT_BASENAME/dev
+    sudo mount --bind /bin $ART_TEST_CHROOT_BASENAME/bin
+    sudo mount --bind /lib $ART_TEST_CHROOT_BASENAME/lib
+    sudo mount --bind /lib $ART_TEST_CHROOT_BASENAME/usr/lib
+    sudo mount --bind /usr/share/gdb $ART_TEST_CHROOT_BASENAME/usr/share/gdb
+    $ART_CHROOT_CMD echo \"Hello from chroot! I am \$(uname -a).\"
+  "
+  exit 0
+fi
+
+# Regular Android device. Setup as root, as some actions performed here require it.
+adb version
 adb root
 adb wait-for-device
 
-echo -e "${green}Date on host${nc}"
+msginfo "Date on host"
 date
 
-echo -e "${green}Date on device${nc}"
+msginfo "Date on device"
 adb shell date
 
 host_seconds_since_epoch=$(date -u +%s)
-device_seconds_since_epoch=$(adb shell date -u +%s)
+
+# Get the device time in seconds, but filter the output as some
+# devices emit CRLF at the end of the command which then breaks the
+# time comparisons in this script (Hammerhead, MRA59G 2457013).
+device_seconds_since_epoch=$(adb shell date -u +%s | tr -c -d '[:digit:]')
 
 abs_time_difference_in_seconds=$(expr $host_seconds_since_epoch - $device_seconds_since_epoch)
 if [ $abs_time_difference_in_seconds -lt 0 ]; then
@@ -51,58 +84,67 @@ fi
 
 seconds_per_hour=3600
 
-# Kill logd first, so that when we set the adb buffer size later in this file,
-# it is brought up again.
-echo -e "${green}Killing logd, seen leaking on fugu/N${nc}"
-adb shell pkill -9 -U logd logd && echo -e "${green}...logd killed${nc}"
+# b/187295147 : Disable live-lock kill daemon.
+# It can confuse long running processes for issues and kill them.
+# This usually manifests as temporarily lost adb connection.
+msginfo "Killing llkd, seen killing adb"
+adb shell setprop ctl.stop llkd-0
+adb shell setprop ctl.stop llkd-1
+
+product_name=$(adb shell getprop ro.build.product)
+
+if [ "x$product_name" = xfugu ]; then
+  # Kill logd first, so that when we set the adb buffer size later in this file,
+  # it is brought up again.
+  msginfo "Killing logd, seen leaking on fugu/N"
+  adb shell pkill -9 -U logd logd && msginfo "...logd killed"
+fi
 
 # Update date on device if the difference with host is more than one hour.
 if [ $abs_time_difference_in_seconds -gt $seconds_per_hour ]; then
-  echo -e "${green}Update date on device${nc}"
+  msginfo "Update date on device"
   adb shell date -u @$host_seconds_since_epoch
 fi
 
-echo -e "${green}Turn off selinux${nc}"
+msginfo "Turn off selinux"
 adb shell setenforce 0
 $verbose && adb shell getenforce
 
-echo -e "${green}Setting local loopback${nc}"
+msginfo "Setting local loopback"
 adb shell ifconfig lo up
 $verbose && adb shell ifconfig
 
 if $verbose; then
-  echo -e "${green}List properties${nc}"
+  msginfo "List properties"
   adb shell getprop
 
-  echo -e "${green}Uptime${nc}"
+  msginfo "Uptime"
   adb shell uptime
 
-  echo -e "${green}Battery info${nc}"
+  msginfo "Battery info"
   adb shell dumpsys battery
 fi
 
 # Fugu only handles buffer size up to 16MB.
-product_name=$(adb shell getprop ro.build.product)
-
 if [ "x$product_name" = xfugu ]; then
   buffer_size=16MB
 else
   buffer_size=32MB
 fi
 
-echo -e "${green}Setting adb buffer size to ${buffer_size}${nc}"
+msginfo "Setting adb buffer size to ${buffer_size}"
 adb logcat -G ${buffer_size}
 $verbose && adb logcat -g
 
-echo -e "${green}Removing adb spam filter${nc}"
+msginfo "Removing adb spam filter"
 adb logcat -P ""
 $verbose && adb logcat -p
 
-echo -e "${green}Kill stalled dalvikvm processes${nc}"
+msginfo "Kill stalled dalvikvm processes"
 # 'ps' on M can sometimes hang.
-timeout 2s adb shell "ps" >/dev/null
-if [ $? = 124 ]; then
-  echo -e "${green}Rebooting device to fix 'ps'${nc}"
+timeout 5s adb shell "ps" >/dev/null
+if [[ $? == 124 ]] && [[ "$ART_TEST_RUN_ON_ARM_FVP" != true ]]; then
+  msginfo "Rebooting device to fix 'ps'"
   adb reboot
   adb wait-for-device root
 else
@@ -115,7 +157,7 @@ fi
 
 if [[ -n "$ART_TEST_CHROOT" ]]; then
   # Prepare the chroot dir.
-  echo -e "${green}Prepare the chroot dir in $ART_TEST_CHROOT${nc}"
+  msginfo "Prepare the chroot dir in $ART_TEST_CHROOT"
 
   # Check that ART_TEST_CHROOT is correctly defined.
   [[ "x$ART_TEST_CHROOT" = x/* ]] || { echo "$ART_TEST_CHROOT is not an absolute path"; exit 1; }
@@ -148,7 +190,8 @@ if [[ -n "$ART_TEST_CHROOT" ]]; then
 
   # Populate /etc in chroot with required files.
   adb shell mkdir -p "$ART_TEST_CHROOT/system/etc"
-  adb shell "cd $ART_TEST_CHROOT && ln -sf system/etc etc"
+  adb shell test -L "$ART_TEST_CHROOT/etc" \
+    || adb shell ln -s system/etc "$ART_TEST_CHROOT/etc"
 
   # Provide /proc in chroot.
   adb shell mkdir -p "$ART_TEST_CHROOT/proc"
@@ -162,15 +205,28 @@ if [[ -n "$ART_TEST_CHROOT" ]]; then
   # Provide /sys/kernel/debug in chroot.
   adb shell mount | grep -q "^debugfs on $ART_TEST_CHROOT/sys/kernel/debug type debugfs " \
     || adb shell mount -t debugfs debugfs "$ART_TEST_CHROOT/sys/kernel/debug"
+  # Provide /sys/kernel/tracing in chroot. Using a bind mount is important,
+  # otherwise mounting tracefs multiple times confuses the
+  # android.hardware.atrace service.
+  adb shell mount | grep -q "^tracefs on $ART_TEST_CHROOT/sys/kernel/tracing type tracefs " \
+    || adb shell mount -o bind /sys/kernel/tracing "$ART_TEST_CHROOT/sys/kernel/tracing"
 
   # Provide /dev in chroot.
   adb shell mkdir -p "$ART_TEST_CHROOT/dev"
   adb shell mount | grep -q "^tmpfs on $ART_TEST_CHROOT/dev type tmpfs " \
     || adb shell mount -o bind /dev "$ART_TEST_CHROOT/dev"
+  adb shell mount | grep -q "^devpts on $ART_TEST_CHROOT/dev/pts type devpts " \
+    || adb shell mount -o bind /dev/pts "$ART_TEST_CHROOT/dev/pts"
+  adb shell mount | grep -q " on $ART_TEST_CHROOT/dev/cpuset type cgroup " \
+    || adb shell mount -o bind /dev/cpuset "$ART_TEST_CHROOT/dev/cpuset"
 
   # Create /apex directory in chroot.
   adb shell mkdir -p "$ART_TEST_CHROOT/apex"
 
   # Create /linkerconfig directory in chroot.
   adb shell mkdir -p "$ART_TEST_CHROOT/linkerconfig"
+
+  # Create /bin symlink for shebang compatibility.
+  adb shell test -L "$ART_TEST_CHROOT/bin" \
+    || adb shell ln -s system/bin "$ART_TEST_CHROOT/bin"
 fi

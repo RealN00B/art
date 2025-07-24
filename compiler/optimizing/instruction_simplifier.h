@@ -17,11 +17,12 @@
 #ifndef ART_COMPILER_OPTIMIZING_INSTRUCTION_SIMPLIFIER_H_
 #define ART_COMPILER_OPTIMIZING_INSTRUCTION_SIMPLIFIER_H_
 
+#include "base/macros.h"
 #include "nodes.h"
 #include "optimization.h"
 #include "optimizing_compiler_stats.h"
 
-namespace art {
+namespace art HIDDEN {
 
 class CodeGenerator;
 
@@ -40,9 +41,11 @@ class InstructionSimplifier : public HOptimization {
   InstructionSimplifier(HGraph* graph,
                         CodeGenerator* codegen,
                         OptimizingCompilerStats* stats = nullptr,
-                        const char* name = kInstructionSimplifierPassName)
+                        const char* name = kInstructionSimplifierPassName,
+                        bool use_all_optimizations = false)
       : HOptimization(graph, name, stats),
-        codegen_(codegen) {}
+        codegen_(codegen),
+        use_all_optimizations_(use_all_optimizations) {}
 
   static constexpr const char* kInstructionSimplifierPassName = "instruction_simplifier";
 
@@ -51,8 +54,24 @@ class InstructionSimplifier : public HOptimization {
  private:
   CodeGenerator* codegen_;
 
+  // Use all optimizations without restrictions.
+  bool use_all_optimizations_;
+
   DISALLOW_COPY_AND_ASSIGN(InstructionSimplifier);
 };
+
+// For bitwise operations (And/Or/Xor) with a negated input, try to use
+// a negated bitwise instruction.
+bool TryMergeNegatedInput(HBinaryOperation* op);
+
+// Convert
+// i1: AND a, b
+//     SUB a, i1
+// into:
+//     BIC a, a, b
+//
+// It also works if `i1` is AND b, a
+bool TryMergeWithAnd(HSub* instruction);
 
 }  // namespace art
 

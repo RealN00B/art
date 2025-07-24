@@ -19,16 +19,16 @@ import java.util.Arrays;
 import java.util.Comparator;
 import java.util.HashMap;
 
-class DummyObject {
+class SampleObject {
     public static boolean sHashCodeInvoked = false;
     private int i;
 
-    public DummyObject(int i) {
+    public SampleObject(int i) {
         this.i = i;
     }
 
     public boolean equals(Object obj) {
-        return (obj instanceof DummyObject) && (i == ((DummyObject)obj).i);
+        return (obj instanceof SampleObject) && (i == ((SampleObject)obj).i);
     }
 
     public int hashCode() {
@@ -64,7 +64,7 @@ public class Main {
         ensureJitCompiled(Main.class, "$noinline$run2");
         ensureJitCompiled(Main.class, "$noinline$run3A");
         ensureJitCompiled(Main.class, "$noinline$run3B");
-        ensureJitCompiled(DummyObject.class, "hashCode");
+        ensureJitCompiled(SampleObject.class, "hashCode");
     }
 
     public static void main(String[] args) throws Exception {
@@ -74,9 +74,11 @@ public class Main {
           disableStackFrameAsserts();
         }
 
+        // Just declare a new int array so that the int arrays are resolved properly when JITing.
+        int[] tmp = new int[3];
         ensureAllJitCompiled();
 
-        final HashMap<DummyObject, Long> map = new HashMap<DummyObject, Long>();
+        final HashMap<SampleObject, Long> map = new HashMap<SampleObject, Long>();
 
         // Single-frame deoptimization that covers partial fragment.
         execute(new Runnable() {
@@ -156,7 +158,7 @@ public class Main {
             public void runInternal() {
                 try {
                     assertIsManaged();
-                    map.put(new DummyObject(10), Long.valueOf(100));
+                    map.put(new SampleObject(10), Long.valueOf(100));
                     assertIsInterpreted();  // Every deoptimizeable method is deoptimized.
                 } catch (Exception e) {
                     e.printStackTrace(System.out);
@@ -167,10 +169,10 @@ public class Main {
         undeoptimizeAll();  // Make compiled code useable again.
         ensureAllJitCompiled();
 
-        if (!DummyObject.sHashCodeInvoked) {
+        if (!SampleObject.sHashCodeInvoked) {
             System.out.println("hashCode() method not invoked!");
         }
-        if (map.get(new DummyObject(10)) != 100) {
+        if (map.get(new SampleObject(10)) != 100) {
             System.out.println("Wrong hashmap value!");
         }
         System.out.println("Finishing");

@@ -17,21 +17,23 @@
 #ifndef ART_COMPILER_OPTIMIZING_COMMON_ARM64_H_
 #define ART_COMPILER_OPTIMIZING_COMMON_ARM64_H_
 
+#include "base/macros.h"
 #include "code_generator.h"
 #include "instruction_simplifier_shared.h"
 #include "locations.h"
 #include "nodes.h"
 #include "utils/arm64/assembler_arm64.h"
 
-// TODO(VIXL): Make VIXL compile with -Wshadow.
+// TODO(VIXL): Make VIXL compile cleanly with -Wshadow, -Wdeprecated-declarations.
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wshadow"
+#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
 #include "aarch64/disasm-aarch64.h"
 #include "aarch64/macro-assembler-aarch64.h"
 #include "aarch64/simulator-aarch64.h"
 #pragma GCC diagnostic pop
 
-namespace art {
+namespace art HIDDEN {
 
 using helpers::CanFitInShifterOperand;
 using helpers::HasShifterOperand;
@@ -65,12 +67,12 @@ inline int ARTRegCodeFromVIXL(int code) {
 
 inline vixl::aarch64::Register XRegisterFrom(Location location) {
   DCHECK(location.IsRegister()) << location;
-  return vixl::aarch64::Register::GetXRegFromCode(VIXLRegCodeFromART(location.reg()));
+  return vixl::aarch64::XRegister(VIXLRegCodeFromART(location.reg()));
 }
 
 inline vixl::aarch64::Register WRegisterFrom(Location location) {
   DCHECK(location.IsRegister()) << location;
-  return vixl::aarch64::Register::GetWRegFromCode(VIXLRegCodeFromART(location.reg()));
+  return vixl::aarch64::WRegister(VIXLRegCodeFromART(location.reg()));
 }
 
 inline vixl::aarch64::Register RegisterFrom(Location location, DataType::Type type) {
@@ -89,27 +91,32 @@ inline vixl::aarch64::Register InputRegisterAt(HInstruction* instr, int input_in
 
 inline vixl::aarch64::VRegister DRegisterFrom(Location location) {
   DCHECK(location.IsFpuRegister()) << location;
-  return vixl::aarch64::VRegister::GetDRegFromCode(location.reg());
+  return vixl::aarch64::DRegister(location.reg());
 }
 
 inline vixl::aarch64::VRegister QRegisterFrom(Location location) {
   DCHECK(location.IsFpuRegister()) << location;
-  return vixl::aarch64::VRegister::GetQRegFromCode(location.reg());
+  return vixl::aarch64::QRegister(location.reg());
 }
 
 inline vixl::aarch64::VRegister VRegisterFrom(Location location) {
   DCHECK(location.IsFpuRegister()) << location;
-  return vixl::aarch64::VRegister::GetVRegFromCode(location.reg());
+  return vixl::aarch64::VRegister(location.reg());
+}
+
+inline vixl::aarch64::ZRegister ZRegisterFrom(Location location) {
+  DCHECK(location.IsFpuRegister()) << location;
+  return vixl::aarch64::ZRegister(location.reg());
 }
 
 inline vixl::aarch64::VRegister SRegisterFrom(Location location) {
   DCHECK(location.IsFpuRegister()) << location;
-  return vixl::aarch64::VRegister::GetSRegFromCode(location.reg());
+  return vixl::aarch64::SRegister(location.reg());
 }
 
 inline vixl::aarch64::VRegister HRegisterFrom(Location location) {
   DCHECK(location.IsFpuRegister()) << location;
-  return vixl::aarch64::VRegister::GetHRegFromCode(location.reg());
+  return vixl::aarch64::HRegister(location.reg());
 }
 
 inline vixl::aarch64::VRegister FPRegisterFrom(Location location, DataType::Type type) {
@@ -148,7 +155,7 @@ inline vixl::aarch64::CPURegister InputCPURegisterOrZeroRegAt(HInstruction* inst
                                                                      int index) {
   HInstruction* input = instr->InputAt(index);
   DataType::Type input_type = input->GetType();
-  if (input->IsConstant() && input->AsConstant()->IsZeroBitPattern()) {
+  if (IsZeroBitPattern(input)) {
     return (DataType::Size(input_type) >= vixl::aarch64::kXRegSizeInBytes)
         ? vixl::aarch64::Register(vixl::aarch64::xzr)
         : vixl::aarch64::Register(vixl::aarch64::wzr);
@@ -175,6 +182,10 @@ inline vixl::aarch64::Operand InputOperandAt(HInstruction* instr, int input_inde
 
 inline vixl::aarch64::MemOperand StackOperandFrom(Location location) {
   return vixl::aarch64::MemOperand(vixl::aarch64::sp, location.GetStackIndex());
+}
+
+inline vixl::aarch64::SVEMemOperand SveStackOperandFrom(Location location) {
+  return vixl::aarch64::SVEMemOperand(vixl::aarch64::sp, location.GetStackIndex());
 }
 
 inline vixl::aarch64::MemOperand HeapOperand(const vixl::aarch64::Register& base,
@@ -208,6 +219,10 @@ inline Location LocationFrom(const vixl::aarch64::Register& reg) {
 
 inline Location LocationFrom(const vixl::aarch64::VRegister& fpreg) {
   return Location::FpuRegisterLocation(fpreg.GetCode());
+}
+
+inline Location LocationFrom(const vixl::aarch64::ZRegister& zreg) {
+  return Location::FpuRegisterLocation(zreg.GetCode());
 }
 
 inline vixl::aarch64::Operand OperandFromMemOperand(
@@ -297,11 +312,9 @@ inline bool Arm64CanEncodeConstantAsImmediate(HConstant* constant, HInstruction*
   }
 }
 
-inline Location ARM64EncodableConstantOrRegister(HInstruction* constant,
-                                                        HInstruction* instr) {
-  if (constant->IsConstant()
-      && Arm64CanEncodeConstantAsImmediate(constant->AsConstant(), instr)) {
-    return Location::ConstantLocation(constant->AsConstant());
+inline Location ARM64EncodableConstantOrRegister(HInstruction* constant, HInstruction* instr) {
+  if (constant->IsConstant() && Arm64CanEncodeConstantAsImmediate(constant->AsConstant(), instr)) {
+    return Location::ConstantLocation(constant);
   }
 
   return Location::RequiresRegister();
@@ -337,7 +350,6 @@ inline vixl::aarch64::Shift ShiftFromOpKind(HDataProcWithShifterOp::OpKind op_ki
     default:
       LOG(FATAL) << "Unexpected op kind " << op_kind;
       UNREACHABLE();
-      return vixl::aarch64::NO_SHIFT;
   }
 }
 
@@ -352,7 +364,6 @@ inline vixl::aarch64::Extend ExtendFromOpKind(HDataProcWithShifterOp::OpKind op_
     default:
       LOG(FATAL) << "Unexpected op kind " << op_kind;
       UNREACHABLE();
-      return vixl::aarch64::NO_EXTEND;
   }
 }
 
@@ -365,10 +376,6 @@ inline bool ShifterOperandSupportsExtension(HInstruction* instruction) {
   // the other form `shifted register, the register with code 31 is interpreted
   // as the zero register.
   return instruction->IsAdd() || instruction->IsSub();
-}
-
-inline bool IsConstantZeroBitPattern(const HInstruction* instruction) {
-  return instruction->IsConstant() && instruction->AsConstant()->IsZeroBitPattern();
 }
 
 }  // namespace helpers

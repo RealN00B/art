@@ -18,13 +18,13 @@
 
 #include "class-alloc-inl.h"
 #include "class.h"
-#include "class_root.h"
+#include "class_root-inl.h"
 #include "gc/accounting/card_table-inl.h"
 #include "handle_scope-inl.h"
 #include "object-inl.h"
 #include "string.h"
 
-namespace art {
+namespace art HIDDEN {
 namespace mirror {
 
 ObjPtr<StackTraceElement> StackTraceElement::Alloc(Thread* self,

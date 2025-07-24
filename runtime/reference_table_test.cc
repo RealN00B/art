@@ -22,6 +22,7 @@
 
 #include "art_method-inl.h"
 #include "class_linker.h"
+#include "class_root-inl.h"
 #include "common_runtime_test.h"
 #include "dex/primitive.h"
 #include "handle_scope-inl.h"
@@ -34,16 +35,22 @@
 #include "runtime.h"
 #include "scoped_thread_state_change-inl.h"
 #include "thread-current-inl.h"
-#include "well_known_classes.h"
 
-namespace art {
+namespace art HIDDEN {
 
 using android::base::StringPrintf;
 
-class ReferenceTableTest : public CommonRuntimeTest {};
+class ReferenceTableTest : public CommonRuntimeTest {
+ protected:
+  ReferenceTableTest() {
+    use_boot_image_ = true;  // Make the Runtime creation cheaper.
+  }
 
-static ObjPtr<mirror::Object> CreateWeakReference(ObjPtr<mirror::Object> referent)
-    REQUIRES_SHARED(Locks::mutator_lock_) {
+  ObjPtr<mirror::Object> CreateWeakReference(ObjPtr<mirror::Object> referent)
+      REQUIRES_SHARED(Locks::mutator_lock_);
+};
+
+ObjPtr<mirror::Object> ReferenceTableTest::CreateWeakReference(ObjPtr<mirror::Object> referent) {
   Thread* self = Thread::Current();
   ClassLinker* class_linker = Runtime::Current()->GetClassLinker();
 
@@ -51,9 +58,7 @@ static ObjPtr<mirror::Object> CreateWeakReference(ObjPtr<mirror::Object> referen
   Handle<mirror::Object> h_referent(scope.NewHandle<mirror::Object>(referent));
 
   Handle<mirror::Class> h_ref_class(scope.NewHandle<mirror::Class>(
-      class_linker->FindClass(self,
-                              "Ljava/lang/ref/WeakReference;",
-                              ScopedNullHandle<mirror::ClassLoader>())));
+      FindClass("Ljava/lang/ref/WeakReference;", ScopedNullHandle<mirror::ClassLoader>())));
   CHECK(h_ref_class != nullptr);
   CHECK(class_linker->EnsureInitialized(self, h_ref_class, true, true));
 
@@ -109,7 +114,7 @@ TEST_F(ReferenceTableTest, Basics) {
     EXPECT_EQ(oss.str().find("short[]"), std::string::npos) << oss.str();
   }
 
-  // Add a second object 10 times and check dumping is sane.
+  // Add a second object 10 times so we can then check dumping works as expected.
   Handle<mirror::ShortArray> o2 = hs.NewHandle(mirror::ShortArray::Alloc(soa.Self(), 0));
   for (size_t i = 0; i < 10; ++i) {
     rt.Add(o2.Get());
@@ -194,18 +199,12 @@ TEST_F(ReferenceTableTest, Basics) {
     // avoids having to create the low-level args array ourselves.
     Handle<mirror::Object> h_with_trace;
     {
-      jmethodID substr = soa.Env()->GetMethodID(WellKnownClasses::java_lang_String,
-                                                "substring",
-                                                "(II)Ljava/lang/String;");
+      ArtMethod* substr = GetClassRoot<mirror::String>()->FindClassMethod(
+          "substring", "(II)Ljava/lang/String;", kRuntimePointerSize);
       ASSERT_TRUE(substr != nullptr);
-      jobject jobj = soa.Env()->AddLocalReference<jobject>(h_without_trace.Get());
-      ASSERT_TRUE(jobj != nullptr);
-      jobject result = soa.Env()->CallObjectMethod(jobj,
-                                                   substr,
-                                                   static_cast<jint>(0),
-                                                   static_cast<jint>(4));
-      ASSERT_TRUE(result != nullptr);
-      h_with_trace = hs.NewHandle(soa.Self()->DecodeJObject(result));
+      h_with_trace = hs.NewHandle(
+          substr->InvokeFinal<'L', 'I', 'I'>(soa.Self(), h_without_trace.Get(), 0, 4));
+      ASSERT_TRUE(h_with_trace != nullptr);
     }
 
     Handle<mirror::Object> h_ref;

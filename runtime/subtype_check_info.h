@@ -18,12 +18,14 @@
 #define ART_RUNTIME_SUBTYPE_CHECK_INFO_H_
 
 #include "base/bit_string.h"
+#include "base/logging.h"
+#include "base/macros.h"
 #include "subtype_check_bits.h"
 
 // Forward-declare for testing purposes.
 struct SubtypeCheckInfoTest;
 
-namespace art {
+namespace art HIDDEN {
 
 /**
  * SubtypeCheckInfo is a logical label for the class SubtypeCheck data, which is necessary to
@@ -152,7 +154,7 @@ struct SubtypeCheckInfo {
   // Create from the depth and the bitstring+of state.
   // This is done for convenience to avoid passing in "depth" everywhere,
   // since our current state is almost always a function of depth.
-  static SubtypeCheckInfo Create(SubtypeCheckBits compressed_value, size_t depth) {
+  static SubtypeCheckInfo Create(const SubtypeCheckBits& compressed_value, size_t depth) {
     SubtypeCheckInfo io;
     io.depth_ = depth;
     io.bitstring_and_of_ = compressed_value;
@@ -167,9 +169,8 @@ struct SubtypeCheckInfo {
   //
   // Normally, return kSubtypeOf or kNotSubtypeOf.
   Result IsSubtypeOf(const SubtypeCheckInfo& target) {
-    if (target.GetState() != SubtypeCheckInfo::kAssigned) {
-      return Result::kUnknownSubtypeOf;
-    } else if (GetState() == SubtypeCheckInfo::kUninitialized) {
+    if (target.GetState() != SubtypeCheckInfo::kAssigned ||
+        GetState() == SubtypeCheckInfo::kUninitialized) {
       return Result::kUnknownSubtypeOf;
     }
 
@@ -280,9 +281,9 @@ struct SubtypeCheckInfo {
     // Either Assigned or Initialized.
     BitString path_to_root = GetPathToRoot();
 
-    DCHECK(!HasNext() || GetNext() != 0u)
-        << "Expected (Assigned|Initialized) state to have >0 Next value: "
-        << GetNext() << " path: " << path_to_root;
+    DCHECK_IMPLIES(HasNext(), GetNext() != 0u)
+        << "Expected (Assigned|Initialized) state to have >0 Next value: " << GetNext()
+        << " path: " << path_to_root;
 
     if (path_to_root.Length() == depth_) {
       return kAssigned;

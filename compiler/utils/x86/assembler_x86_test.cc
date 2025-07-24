@@ -17,11 +17,12 @@
 #include "assembler_x86.h"
 
 #include "base/arena_allocator.h"
+#include "base/macros.h"
 #include "base/malloc_arena_pool.h"
 #include "base/stl_util.h"
 #include "utils/assembler_test.h"
 
-namespace art {
+namespace art HIDDEN {
 
 TEST(AssemblerX86, CreateBuffer) {
   MallocArenaPool pool;
@@ -33,6 +34,12 @@ TEST(AssemblerX86, CreateBuffer) {
   buffer.Emit<int32_t>(42);
   ASSERT_EQ(static_cast<size_t>(5), buffer.Size());
 }
+
+struct X86RegisterCompare {
+    bool operator()(const x86::Register& a, const x86::Register& b) const {
+        return static_cast<int32_t>(a) < static_cast<int32_t>(b);
+    }
+};
 
 //
 // Test fixture.
@@ -51,101 +58,105 @@ class AssemblerX86Test : public AssemblerTest<x86::X86Assembler,
                              x86::Immediate>;
 
  protected:
-  std::string GetArchitectureString() override {
-    return "x86";
+  AssemblerX86Test() : Base() {
+    require_same_encoding_ = false;  // Allow different encoding with the same size and disassembly.
   }
 
-  std::string GetAssemblerParameters() override {
-    return " --32";
-  }
-
-  std::string GetDisassembleParameters() override {
-    return " -D -bbinary -mi386 --no-show-raw-insn";
+  InstructionSet GetIsa() override {
+    return InstructionSet::kX86;
   }
 
   void SetUpHelpers() override {
     if (addresses_singleton_.size() == 0) {
       // One addressing mode to test the repeat drivers.
-      addresses_singleton_.push_back(x86::Address(x86::EAX, x86::EBX, x86::TIMES_1, 2));
+      addresses_singleton_.push_back(x86::Address(x86::EAX, x86::EBX, TIMES_1, 2));
     }
 
     if (addresses_.size() == 0) {
       // Several addressing modes.
-      addresses_.push_back(x86::Address(x86::EDI, x86::EAX, x86::TIMES_1, 15));
-      addresses_.push_back(x86::Address(x86::EDI, x86::EBX, x86::TIMES_2, 16));
-      addresses_.push_back(x86::Address(x86::EDI, x86::ECX, x86::TIMES_4, 17));
-      addresses_.push_back(x86::Address(x86::EDI, x86::EDX, x86::TIMES_8, 18));
+      addresses_.push_back(x86::Address(x86::EDI, x86::EAX, TIMES_1, 15));
+      addresses_.push_back(x86::Address(x86::EDI, x86::EBX, TIMES_2, 16));
+      addresses_.push_back(x86::Address(x86::EDI, x86::ECX, TIMES_4, 17));
+      addresses_.push_back(x86::Address(x86::EDI, x86::EDX, TIMES_8, 18));
       addresses_.push_back(x86::Address(x86::EAX, -1));
       addresses_.push_back(x86::Address(x86::EBX, 0));
       addresses_.push_back(x86::Address(x86::ESI, 1));
       addresses_.push_back(x86::Address(x86::EDI, 987654321));
       // Several addressing modes with the special ESP.
-      addresses_.push_back(x86::Address(x86::ESP, x86::EAX, x86::TIMES_1, 15));
-      addresses_.push_back(x86::Address(x86::ESP, x86::EBX, x86::TIMES_2, 16));
-      addresses_.push_back(x86::Address(x86::ESP, x86::ECX, x86::TIMES_4, 17));
-      addresses_.push_back(x86::Address(x86::ESP, x86::EDX, x86::TIMES_8, 18));
+      addresses_.push_back(x86::Address(x86::ESP, x86::EAX, TIMES_1, 15));
+      addresses_.push_back(x86::Address(x86::ESP, x86::EBX, TIMES_2, 16));
+      addresses_.push_back(x86::Address(x86::ESP, x86::ECX, TIMES_4, 17));
+      addresses_.push_back(x86::Address(x86::ESP, x86::EDX, TIMES_8, 18));
       addresses_.push_back(x86::Address(x86::ESP, -1));
       addresses_.push_back(x86::Address(x86::ESP, 0));
       addresses_.push_back(x86::Address(x86::ESP, 1));
       addresses_.push_back(x86::Address(x86::ESP, 987654321));
     }
-    if (registers_.size() == 0) {
-      registers_.insert(end(registers_),
-                        {
-                          new x86::Register(x86::EAX),
-                          new x86::Register(x86::EBX),
-                          new x86::Register(x86::ECX),
-                          new x86::Register(x86::EDX),
-                          new x86::Register(x86::EBP),
-                          new x86::Register(x86::ESP),
-                          new x86::Register(x86::ESI),
-                          new x86::Register(x86::EDI)
-                        });
-    }
 
-    if (fp_registers_.size() == 0) {
-      fp_registers_.insert(end(fp_registers_),
-                           {
-                             new x86::XmmRegister(x86::XMM0),
-                             new x86::XmmRegister(x86::XMM1),
-                             new x86::XmmRegister(x86::XMM2),
-                             new x86::XmmRegister(x86::XMM3),
-                             new x86::XmmRegister(x86::XMM4),
-                             new x86::XmmRegister(x86::XMM5),
-                             new x86::XmmRegister(x86::XMM6),
-                             new x86::XmmRegister(x86::XMM7)
-                           });
+    if (secondary_register_names_.empty()) {
+      secondary_register_names_.emplace(x86::Register(x86::EAX), "ax");
+      secondary_register_names_.emplace(x86::Register(x86::EBX), "bx");
+      secondary_register_names_.emplace(x86::Register(x86::ECX), "cx");
+      secondary_register_names_.emplace(x86::Register(x86::EDX), "dx");
+      secondary_register_names_.emplace(x86::Register(x86::EBP), "bp");
+      secondary_register_names_.emplace(x86::Register(x86::ESP), "sp");
+      secondary_register_names_.emplace(x86::Register(x86::ESI), "si");
+      secondary_register_names_.emplace(x86::Register(x86::EDI), "di");
+
+      tertiary_register_names_.emplace(x86::Register(x86::EAX), "al");
+      tertiary_register_names_.emplace(x86::Register(x86::EBX), "bl");
+      tertiary_register_names_.emplace(x86::Register(x86::ECX), "cl");
+      tertiary_register_names_.emplace(x86::Register(x86::EDX), "dl");
+      // FIXME: Refactor RepeatAw() to only use the tertiary for EAX, EBX, ECX, EDX
+      tertiary_register_names_.emplace(x86::Register(x86::EBP), "ch");
+      tertiary_register_names_.emplace(x86::Register(x86::ESP), "ah");
+      tertiary_register_names_.emplace(x86::Register(x86::ESI), "dh");
+      tertiary_register_names_.emplace(x86::Register(x86::EDI), "bh");
     }
   }
 
   void TearDown() override {
     AssemblerTest::TearDown();
-    STLDeleteElements(&registers_);
-    STLDeleteElements(&fp_registers_);
   }
 
   std::vector<x86::Address> GetAddresses() override {
     return addresses_;
   }
 
-  std::vector<x86::Register*> GetRegisters() override {
-    return registers_;
+  ArrayRef<const x86::Register> GetRegisters() override {
+    static constexpr x86::Register kRegisters[] = {
+        x86::EAX, x86::EBX, x86::ECX, x86::EDX, x86::EBP, x86::ESP, x86::ESI, x86::EDI
+    };
+    return ArrayRef<const x86::Register>(kRegisters);
   }
 
-  std::vector<x86::XmmRegister*> GetFPRegisters() override {
-    return fp_registers_;
+  ArrayRef<const x86::XmmRegister> GetFPRegisters() override {
+    static constexpr x86::XmmRegister kFPRegisters[] = {
+        x86::XMM0, x86::XMM1, x86::XMM2, x86::XMM3, x86::XMM4, x86::XMM5, x86::XMM6, x86::XMM7
+    };
+    return ArrayRef<const x86::XmmRegister>(kFPRegisters);
   }
 
   x86::Immediate CreateImmediate(int64_t imm_value) override {
     return x86::Immediate(imm_value);
   }
 
+  std::string GetSecondaryRegisterName(const x86::Register& reg) override {
+    CHECK(secondary_register_names_.find(reg) != secondary_register_names_.end());
+    return secondary_register_names_[reg];
+  }
+
+  std::string GetTertiaryRegisterName(const x86::Register& reg) override {
+    CHECK(tertiary_register_names_.find(reg) != tertiary_register_names_.end());
+    return tertiary_register_names_[reg];
+  }
+
   std::vector<x86::Address> addresses_singleton_;
 
  private:
   std::vector<x86::Address> addresses_;
-  std::vector<x86::Register*> registers_;
-  std::vector<x86::XmmRegister*> fp_registers_;
+  std::map<x86::Register, std::string, X86RegisterCompare> secondary_register_names_;
+  std::map<x86::Register, std::string, X86RegisterCompare> tertiary_register_names_;
 };
 
 class AssemblerX86AVXTest : public AssemblerX86Test {
@@ -236,28 +247,28 @@ TEST_F(AssemblerX86Test, RepeatAF) {
 TEST_F(AssemblerX86Test, PoplAllAddresses) {
   // Make sure all addressing modes combinations are tested at least once.
   std::vector<x86::Address> all_addresses;
-  for (x86::Register* base : GetRegisters()) {
+  for (x86::Register base : GetRegisters()) {
     // Base only.
-    all_addresses.push_back(x86::Address(*base, -1));
-    all_addresses.push_back(x86::Address(*base, 0));
-    all_addresses.push_back(x86::Address(*base, 1));
-    all_addresses.push_back(x86::Address(*base, 123456789));
-    for (x86::Register* index : GetRegisters()) {
-      if (*index == x86::ESP) {
+    all_addresses.push_back(x86::Address(base, -1));
+    all_addresses.push_back(x86::Address(base, 0));
+    all_addresses.push_back(x86::Address(base, 1));
+    all_addresses.push_back(x86::Address(base, 123456789));
+    for (x86::Register index : GetRegisters()) {
+      if (index == x86::ESP) {
         // Index cannot be ESP.
         continue;
-      } else if (*base == *index) {
+      } else if (base == index) {
        // Index only.
-       all_addresses.push_back(x86::Address(*index, x86::TIMES_1, -1));
-       all_addresses.push_back(x86::Address(*index, x86::TIMES_2, 0));
-       all_addresses.push_back(x86::Address(*index, x86::TIMES_4, 1));
-       all_addresses.push_back(x86::Address(*index, x86::TIMES_8, 123456789));
+       all_addresses.push_back(x86::Address(index, TIMES_1, -1));
+       all_addresses.push_back(x86::Address(index, TIMES_2, 0));
+       all_addresses.push_back(x86::Address(index, TIMES_4, 1));
+       all_addresses.push_back(x86::Address(index, TIMES_8, 123456789));
       }
       // Base and index.
-      all_addresses.push_back(x86::Address(*base, *index, x86::TIMES_1, -1));
-      all_addresses.push_back(x86::Address(*base, *index, x86::TIMES_2, 0));
-      all_addresses.push_back(x86::Address(*base, *index, x86::TIMES_4, 1));
-      all_addresses.push_back(x86::Address(*base, *index, x86::TIMES_8, 123456789));
+      all_addresses.push_back(x86::Address(base, index, TIMES_1, -1));
+      all_addresses.push_back(x86::Address(base, index, TIMES_2, 0));
+      all_addresses.push_back(x86::Address(base, index, TIMES_4, 1));
+      all_addresses.push_back(x86::Address(base, index, TIMES_8, 123456789));
     }
   }
   DriverStr(RepeatA(&x86::X86Assembler::popl, all_addresses, "popl {mem}"), "popq");
@@ -271,8 +282,20 @@ TEST_F(AssemblerX86Test, MovlLoad) {
   DriverStr(RepeatRA(&x86::X86Assembler::movl, "movl {mem}, %{reg}"), "movl-load");
 }
 
-TEST_F(AssemblerX86Test, Addw) {
+TEST_F(AssemblerX86Test, AddwMem) {
   DriverStr(RepeatAI(&x86::X86Assembler::addw, /*imm_bytes*/ 2U, "addw ${imm}, {mem}"), "addw");
+}
+
+TEST_F(AssemblerX86Test, AddwImm) {
+  DriverStr(RepeatrI(&x86::X86Assembler::addw, /*imm_bytes*/ 2U, "addw ${imm}, %{reg}"), "addw");
+}
+
+TEST_F(AssemblerX86Test, Andw) {
+  DriverStr(RepeatAI(&x86::X86Assembler::andw, /*imm_bytes*/ 2U, "andw ${imm}, {mem}"), "andw");
+}
+
+TEST_F(AssemblerX86Test, MovwStore) {
+  DriverStr(RepeatAr(&x86::X86Assembler::movw, "movw %{reg}, {mem}"), "movw-store");
 }
 
 TEST_F(AssemblerX86Test, MovlStore) {
@@ -293,6 +316,56 @@ TEST_F(AssemblerX86Test, LoadLongConstant) {
   DriverStr(expected, "LoadLongConstant");
 }
 
+TEST_F(AssemblerX86Test, XchgbReg) {
+  DriverStr(Repeatww(&x86::X86Assembler::xchgb, "xchgb %{reg2}, %{reg1}"), "xchgb");
+}
+
+TEST_F(AssemblerX86Test, XchgbMem) {
+  DriverStr(RepeatwA(&x86::X86Assembler::xchgb, "xchgb {mem}, %{reg}"), "xchgb");
+}
+
+TEST_F(AssemblerX86Test, XchgwReg) {
+  DriverStr(Repeatrr(&x86::X86Assembler::xchgw, "xchgw %{reg2}, %{reg1}"), "xchgw");
+}
+
+TEST_F(AssemblerX86Test, XchgwMem) {
+  DriverStr(RepeatrA(&x86::X86Assembler::xchgw, "xchgw {mem}, %{reg}"), "xchgw");
+}
+
+TEST_F(AssemblerX86Test, XchglReg) {
+  DriverStr(RepeatRR(&x86::X86Assembler::xchgl, "xchgl %{reg2}, %{reg1}"), "xchgl");
+}
+
+TEST_F(AssemblerX86Test, XchglMem) {
+  DriverStr(RepeatRA(&x86::X86Assembler::xchgl, "xchgl {mem}, %{reg}"), "xchgl");
+}
+
+TEST_F(AssemblerX86Test, Cmpxchgb) {
+  DriverStr(RepeatAw(&x86::X86Assembler::cmpxchgb, "cmpxchgb %{reg}, {mem}"), "cmpxchgb");
+}
+
+TEST_F(AssemblerX86Test, Cmpxchgw) {
+  DriverStr(RepeatAr(&x86::X86Assembler::cmpxchgw, "cmpxchgw %{reg}, {mem}"), "cmpxchgw");
+}
+
+TEST_F(AssemblerX86Test, Cmpxchgl) {
+  DriverStr(RepeatAR(&x86::X86Assembler::cmpxchgl, "cmpxchgl %{reg}, {mem}"), "cmpxchgl");
+}
+
+TEST_F(AssemblerX86Test, Cmpxchg8b) {
+  DriverStr(RepeatA(&x86::X86Assembler::cmpxchg8b, "cmpxchg8b {mem}"), "cmpxchg8b");
+}
+
+TEST_F(AssemblerX86Test, LockCmpxchgb) {
+  DriverStr(RepeatAw(&x86::X86Assembler::LockCmpxchgb,
+                     "lock cmpxchgb %{reg}, {mem}"), "lock_cmpxchgb");
+}
+
+TEST_F(AssemblerX86Test, LockCmpxchgw) {
+  DriverStr(RepeatAr(&x86::X86Assembler::LockCmpxchgw,
+                     "lock cmpxchgw %{reg}, {mem}"), "lock_cmpxchgw");
+}
+
 TEST_F(AssemblerX86Test, LockCmpxchgl) {
   DriverStr(RepeatAR(&x86::X86Assembler::LockCmpxchgl,
                      "lock cmpxchgl %{reg}, {mem}"), "lock_cmpxchgl");
@@ -301,6 +374,21 @@ TEST_F(AssemblerX86Test, LockCmpxchgl) {
 TEST_F(AssemblerX86Test, LockCmpxchg8b) {
   DriverStr(RepeatA(&x86::X86Assembler::LockCmpxchg8b,
                     "lock cmpxchg8b {mem}"), "lock_cmpxchg8b");
+}
+
+TEST_F(AssemblerX86Test, LockXaddb) {
+  DriverStr(RepeatAw(&x86::X86Assembler::LockXaddb,
+                     "lock xaddb %{reg}, {mem}"), "lock_xaddb");
+}
+
+TEST_F(AssemblerX86Test, LockXaddw) {
+  DriverStr(RepeatAr(&x86::X86Assembler::LockXaddw,
+                     "lock xaddw %{reg}, {mem}"), "lock_xaddw");
+}
+
+TEST_F(AssemblerX86Test, LockXaddl) {
+  DriverStr(RepeatAR(&x86::X86Assembler::LockXaddl,
+                     "lock xaddl %{reg}, {mem}"), "lock_xaddl");
 }
 
 TEST_F(AssemblerX86Test, FPUIntegerLoadS) {
@@ -361,6 +449,12 @@ TEST_F(AssemblerX86Test, RepMovsw) {
   DriverStr(expected, "rep_movsw");
 }
 
+TEST_F(AssemblerX86Test, RepMovsl) {
+  GetAssembler()->rep_movsl();
+  const char* expected = "rep movsl\n";
+  DriverStr(expected, "rep_movsl");
+}
+
 TEST_F(AssemblerX86Test, Blsmask) {
   DriverStr(RepeatRR(&x86::X86Assembler::blsmsk, "blsmsk %{reg2}, %{reg1}"), "blsmsk");
 }
@@ -400,11 +494,11 @@ TEST_F(AssemblerX86Test, PopcntlAddress) {
 // Rorl only allows CL as the shift count.
 std::string rorl_fn(AssemblerX86Test::Base* assembler_test, x86::X86Assembler* assembler) {
   std::ostringstream str;
-  std::vector<x86::Register*> registers = assembler_test->GetRegisters();
+  ArrayRef<const x86::Register> registers = assembler_test->GetRegisters();
   x86::Register shifter(x86::ECX);
-  for (auto reg : registers) {
-    assembler->rorl(*reg, shifter);
-    str << "rorl %cl, %" << assembler_test->GetRegisterName(*reg) << "\n";
+  for (auto&& reg : registers) {
+    assembler->rorl(reg, shifter);
+    str << "rorl %cl, %" << assembler_test->GetRegisterName(reg) << "\n";
   }
   return str.str();
 }
@@ -420,11 +514,11 @@ TEST_F(AssemblerX86Test, RorlImm) {
 // Roll only allows CL as the shift count.
 std::string roll_fn(AssemblerX86Test::Base* assembler_test, x86::X86Assembler* assembler) {
   std::ostringstream str;
-  std::vector<x86::Register*> registers = assembler_test->GetRegisters();
+  ArrayRef<const x86::Register> registers = assembler_test->GetRegisters();
   x86::Register shifter(x86::ECX);
-  for (auto reg : registers) {
-    assembler->roll(*reg, shifter);
-    str << "roll %cl, %" << assembler_test->GetRegisterName(*reg) << "\n";
+  for (auto&& reg : registers) {
+    assembler->roll(reg, shifter);
+    str << "roll %cl, %" << assembler_test->GetRegisterName(reg) << "\n";
   }
   return str.str();
 }
@@ -473,11 +567,11 @@ TEST_F(AssemblerX86Test, RoundSD) {
 
 TEST_F(AssemblerX86Test, CmovlAddress) {
   GetAssembler()->cmovl(x86::kEqual, x86::Register(x86::EAX), x86::Address(
-      x86::Register(x86::EDI), x86::Register(x86::EBX), x86::TIMES_4, 12));
+      x86::Register(x86::EDI), x86::Register(x86::EBX), TIMES_4, 12));
   GetAssembler()->cmovl(x86::kNotEqual, x86::Register(x86::EDI), x86::Address(
-      x86::Register(x86::ESI), x86::Register(x86::EBX), x86::TIMES_4, 12));
+      x86::Register(x86::ESI), x86::Register(x86::EBX), TIMES_4, 12));
   GetAssembler()->cmovl(x86::kEqual, x86::Register(x86::EDI), x86::Address(
-      x86::Register(x86::EDI), x86::Register(x86::EAX), x86::TIMES_4, 12));
+      x86::Register(x86::EDI), x86::Register(x86::EAX), TIMES_4, 12));
   const char* expected =
     "cmovzl 0xc(%EDI,%EBX,4), %eax\n"
     "cmovnzl 0xc(%ESI,%EBX,4), %edi\n"
@@ -970,6 +1064,18 @@ TEST_F(AssemblerX86AVXTest, VPMAddWD) {
       RepeatFFF(&x86::X86Assembler::vpmaddwd, "vpmaddwd %{reg3}, %{reg2}, %{reg1}"), "vpmaddwd");
 }
 
+TEST_F(AssemblerX86AVXTest, VFMadd213SS) {
+  DriverStr(
+      RepeatFFF(&x86::X86Assembler::vfmadd213ss,
+                "vfmadd213ss %{reg3}, %{reg2}, %{reg1}"), "vfmadd213ss");
+}
+
+TEST_F(AssemblerX86AVXTest, VFMadd213SD) {
+  DriverStr(
+      RepeatFFF(&x86::X86Assembler::vfmadd213sd,
+                "vfmadd213sd %{reg3}, %{reg2}, %{reg1}"), "vfmadd213sd");
+}
+
 TEST_F(AssemblerX86Test, PHAddW) {
   DriverStr(RepeatFF(&x86::X86Assembler::phaddw, "phaddw %{reg2}, %{reg1}"), "phaddw");
 }
@@ -1228,6 +1334,65 @@ TEST_F(AssemblerX86Test, Cmpb) {
 
 TEST_F(AssemblerX86Test, Cmpw) {
   DriverStr(RepeatAI(&x86::X86Assembler::cmpw, /*imm_bytes*/ 2U, "cmpw ${imm}, {mem}"), "cmpw");
+}
+
+TEST_F(AssemblerX86Test, Idiv) {
+  DriverStr(RepeatR(&x86::X86Assembler::idivl, "idivl %{reg}"), "idivl");
+}
+
+TEST_F(AssemblerX86Test, Div) {
+  DriverStr(RepeatR(&x86::X86Assembler::divl, "divl %{reg}"), "divl");
+}
+
+TEST_F(AssemblerX86Test, Negl) {
+  DriverStr(RepeatR(&x86::X86Assembler::negl, "negl %{reg}"), "negl");
+}
+
+TEST_F(AssemblerX86Test, Notl) {
+  DriverStr(RepeatR(&x86::X86Assembler::notl, "notl %{reg}"), "notl");
+}
+
+// Test that displacing an existing address is the same as constructing a new one with the same
+// initial displacement.
+TEST_F(AssemblerX86Test, AddressDisplaceBy) {
+  // Test different displacements, including some 8-bit and 32-bit ones, so that changing
+  // displacement may require a different addressing mode.
+  static const std::vector<int32_t> displacements = {0, 42, -42, 140, -140};
+  // Test with all scale factors.
+  static const std::vector<ScaleFactor> scales = {TIMES_1, TIMES_2, TIMES_4, TIMES_8};
+
+  for (int32_t disp0 : displacements) {  // initial displacement
+    for (int32_t disp : displacements) {  // extra displacement
+      for (x86::Register reg : GetRegisters()) {
+        // Test non-SIB addressing.
+        EXPECT_EQ(x86::Address::displace(x86::Address(reg, disp0), disp),
+                  x86::Address(reg, disp0 + disp));
+
+        // Test SIB addressing with EBP base.
+        if (reg != x86::ESP) {
+          for (ScaleFactor scale : scales) {
+            EXPECT_EQ(x86::Address::displace(x86::Address(reg, scale, disp0), disp),
+                      x86::Address(reg, scale, disp0 + disp));
+          }
+        }
+
+        // Test SIB addressing with different base.
+        for (x86::Register index : GetRegisters()) {
+          if (index == x86::ESP) {
+            continue;  // Skip ESP as it cannot be used with this address constructor.
+          }
+          for (ScaleFactor scale : scales) {
+            EXPECT_EQ(x86::Address::displace(x86::Address(reg, index, scale, disp0), disp),
+                      x86::Address(reg, index, scale, disp0 + disp));
+          }
+        }
+
+        // Test absolute addressing.
+        EXPECT_EQ(x86::Address::displace(x86::Address::Absolute(disp0), disp),
+                  x86::Address::Absolute(disp0 + disp));
+      }
+    }
+  }
 }
 
 }  // namespace art

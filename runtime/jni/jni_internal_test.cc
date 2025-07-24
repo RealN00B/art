@@ -19,15 +19,16 @@
 #include "android-base/stringprintf.h"
 
 #include "art_method-inl.h"
+#include "base/mem_map.h"
 #include "common_runtime_test.h"
-#include "indirect_reference_table.h"
+#include "local_reference_table.h"
 #include "java_vm_ext.h"
 #include "jni_env_ext.h"
 #include "mirror/string-inl.h"
 #include "nativehelper/scoped_local_ref.h"
 #include "scoped_thread_state_change-inl.h"
 
-namespace art {
+namespace art HIDDEN {
 
 using android::base::StringPrintf;
 
@@ -623,7 +624,7 @@ class JniInternalTest : public CommonRuntimeTest {
         StackHandleScope<1> hs(soa.Self());
         Handle<mirror::ClassLoader> loader(
             hs.NewHandle(soa.Decode<mirror::ClassLoader>(class_loader_)));
-        ObjPtr<mirror::Class> c = class_linker_->FindClass(soa.Self(), "LMyClassNatives;", loader);
+        ObjPtr<mirror::Class> c = FindClass("LMyClassNatives;", loader);
         const auto pointer_size = class_linker_->GetImagePointerSize();
         ArtMethod* method = c->FindClassMethod(method_name, method_sig, pointer_size);
         ASSERT_TRUE(method != nullptr) << method_name << " " << method_sig;
@@ -784,7 +785,7 @@ TEST_F(JniInternalTest, GetMethodID) {
   jclass jlnsme = env_->FindClass("java/lang/NoSuchMethodError");
   jclass jncrbc = env_->FindClass("java/nio/channels/ReadableByteChannel");
 
-  // Sanity check that no exceptions are pending.
+  // Check that no exceptions are pending.
   ASSERT_FALSE(env_->ExceptionCheck());
 
   // Check that java.lang.Object.foo() doesn't exist and NoSuchMethodError is
@@ -905,7 +906,7 @@ TEST_F(JniInternalTest, GetStaticMethodID) {
   jclass jlobject = env_->FindClass("java/lang/Object");
   jclass jlnsme = env_->FindClass("java/lang/NoSuchMethodError");
 
-  // Sanity check that no exceptions are pending
+  // Check that no exceptions are pending
   ASSERT_FALSE(env_->ExceptionCheck());
 
   // Check that java.lang.Object.foo() doesn't exist and NoSuchMethodError is
@@ -1035,7 +1036,7 @@ TEST_F(JniInternalTest, RegisterAndUnregisterNatives) {
   jclass jlnsme = env_->FindClass("java/lang/NoSuchMethodError");
   void* native_function = reinterpret_cast<void*>(BogusMethod);
 
-  // Sanity check that no exceptions are pending.
+  // Check that no exceptions are pending.
   ASSERT_FALSE(env_->ExceptionCheck());
 
   // The following can print errors to the log we'd like to ignore.
@@ -1550,6 +1551,128 @@ TEST_F(JniInternalTest, NewStringUTF) {
   EXPECT_EQ(13, env_->GetStringUTFLength(s));
 }
 
+TEST_F(JniInternalTest, NewStringUTF_Validation) {
+  // For the following tests, allocate two pages, one R/W and the next inaccessible.
+  std::string error_msg;
+  MemMap head_map = MemMap::MapAnonymous(
+      "head", 2 * gPageSize, PROT_READ | PROT_WRITE, /*low_4gb=*/ false, &error_msg);
+  ASSERT_TRUE(head_map.IsValid()) << error_msg;
+  MemMap tail_map = head_map.RemapAtEnd(
+      head_map.Begin() + gPageSize, "tail", PROT_NONE, &error_msg);
+  ASSERT_TRUE(tail_map.IsValid()) << error_msg;
+  char* utf_src = reinterpret_cast<char*>(head_map.Begin());
+
+  // Prepare for checking the `count` field.
+  jclass c = env_->FindClass("java/lang/String");
+  ASSERT_NE(c, nullptr);
+  jfieldID count_fid = env_->GetFieldID(c, "count", "I");
+  ASSERT_TRUE(count_fid != nullptr);
+
+  // Prepare for testing with the unchecked interface.
+  const JNINativeInterface* base_env = down_cast<JNIEnvExt*>(env_)->GetUncheckedFunctions();
+
+  // Start with a simple ASCII string consisting of 4095 characters 'x'.
+  memset(utf_src, 'x', gPageSize - 1u);
+  utf_src[gPageSize - 1u] = 0u;
+  jstring s = base_env->NewStringUTF(env_, utf_src);
+  ASSERT_EQ(mirror::String::GetFlaggedCount(gPageSize - 1u, /* compressible= */ true),
+            env_->GetIntField(s, count_fid));
+  const char* chars = env_->GetStringUTFChars(s, nullptr);
+  for (size_t pos = 0; pos != gPageSize - 1u; ++pos) {
+    ASSERT_EQ('x', chars[pos]) << pos;
+  }
+  env_->ReleaseStringUTFChars(s, chars);
+
+  // Replace the last character with invalid character that requires continuation.
+  for (char invalid : { '\xc0', '\xe0', '\xf0' }) {
+    utf_src[gPageSize - 2u] = invalid;
+    s = base_env->NewStringUTF(env_, utf_src);
+    ASSERT_EQ(mirror::String::GetFlaggedCount(gPageSize - 1u, /* compressible= */ true),
+              env_->GetIntField(s, count_fid));
+    chars = env_->GetStringUTFChars(s, nullptr);
+    for (size_t pos = 0; pos != gPageSize - 2u; ++pos) {
+      ASSERT_EQ('x', chars[pos]) << pos;
+    }
+    EXPECT_EQ('?', chars[gPageSize - 2u]);
+    env_->ReleaseStringUTFChars(s, chars);
+  }
+
+  // Replace the first two characters with a valid two-byte sequence yielding one character.
+  utf_src[0] = '\xc2';
+  utf_src[1] = '\x80';
+  s = base_env->NewStringUTF(env_, utf_src);
+  ASSERT_EQ(mirror::String::GetFlaggedCount(gPageSize - 2u, /* compressible= */ false),
+            env_->GetIntField(s, count_fid));
+  const jchar* jchars = env_->GetStringChars(s, nullptr);
+  EXPECT_EQ(jchars[0], 0x80u);
+  for (size_t pos = 1; pos != gPageSize - 3u; ++pos) {
+    ASSERT_EQ('x', jchars[pos]) << pos;
+  }
+  EXPECT_EQ('?', jchars[gPageSize - 3u]);
+  env_->ReleaseStringChars(s, jchars);
+
+  // Replace the leading two-byte sequence with a two-byte sequence that decodes as ASCII (0x40).
+  utf_src[0] = '\xc1';
+  utf_src[1] = '\x80';
+  s = base_env->NewStringUTF(env_, utf_src);
+  // Note: All invalid characters are replaced by ASCII replacement character.
+  ASSERT_EQ(mirror::String::GetFlaggedCount(gPageSize - 2u, /* compressible= */ true),
+            env_->GetIntField(s, count_fid));
+  jchars = env_->GetStringChars(s, nullptr);
+  EXPECT_EQ('\x40', jchars[0]);
+  for (size_t pos = 1; pos != gPageSize - 3u; ++pos) {
+    ASSERT_EQ('x', jchars[pos]) << pos;
+  }
+  EXPECT_EQ('?', jchars[gPageSize - 3u]);
+  env_->ReleaseStringChars(s, jchars);
+
+  // Replace the leading three bytes with a three-byte sequence that decodes as ASCII (0x40).
+  utf_src[0] = '\xe0';
+  utf_src[1] = '\x81';
+  utf_src[2] = '\x80';
+  s = base_env->NewStringUTF(env_, utf_src);
+  // Note: All invalid characters are replaced by ASCII replacement character.
+  ASSERT_EQ(mirror::String::GetFlaggedCount(gPageSize - 3u, /* compressible= */ true),
+            env_->GetIntField(s, count_fid));
+  jchars = env_->GetStringChars(s, nullptr);
+  EXPECT_EQ('\x40', jchars[0]);
+  for (size_t pos = 1; pos != gPageSize - 4u; ++pos) {
+    ASSERT_EQ('x', jchars[pos]) << pos;
+  }
+  EXPECT_EQ('?', jchars[gPageSize - 4u]);
+  env_->ReleaseStringChars(s, jchars);
+
+  // Replace the last two characters with a valid two-byte sequence that decodes as 0.
+  utf_src[gPageSize - 3u] = '\xc0';
+  utf_src[gPageSize - 2u] = '\x80';
+  s = base_env->NewStringUTF(env_, utf_src);
+  ASSERT_EQ(mirror::String::GetFlaggedCount(gPageSize - 4u, /* compressible= */ false),
+            env_->GetIntField(s, count_fid));
+  jchars = env_->GetStringChars(s, nullptr);
+  EXPECT_EQ('\x40', jchars[0]);
+  for (size_t pos = 1; pos != gPageSize - 5u; ++pos) {
+    ASSERT_EQ('x', jchars[pos]) << pos;
+  }
+  EXPECT_EQ('\0', jchars[gPageSize - 5u]);
+  env_->ReleaseStringChars(s, jchars);
+
+  // Replace the last three characters with a three-byte sequence that decodes as 0.
+  // This is an incorrect encoding but `NewStringUTF()` is permissive.
+  utf_src[gPageSize - 4u] = '\xe0';
+  utf_src[gPageSize - 3u] = '\x80';
+  utf_src[gPageSize - 2u] = '\x80';
+  s = base_env->NewStringUTF(env_, utf_src);
+  ASSERT_EQ(mirror::String::GetFlaggedCount(gPageSize - 5u, /* compressible= */ false),
+            env_->GetIntField(s, count_fid));
+  jchars = env_->GetStringChars(s, nullptr);
+  EXPECT_EQ('\x40', jchars[0]);
+  for (size_t pos = 1; pos != gPageSize - 6u; ++pos) {
+    ASSERT_EQ('x', jchars[pos]) << pos;
+  }
+  EXPECT_EQ('\0', jchars[gPageSize - 6u]);
+  env_->ReleaseStringChars(s, jchars);
+}
+
 TEST_F(JniInternalTest, NewString) {
   jchar chars[] = { 'h', 'i' };
   jstring s;
@@ -1637,18 +1760,27 @@ TEST_F(JniInternalTest, GetStringRegion_GetStringUTFRegion) {
   env_->GetStringUTFRegion(s, 0x7fffffff, 0x7fffffff, nullptr);
   ExpectException(sioobe_);
 
-  char bytes[4] = { 'x', 'x', 'x', 'x' };
+  char bytes[5] = { 'x', 'x', 'x', 'x', 'x' };
   env_->GetStringUTFRegion(s, 1, 2, &bytes[1]);
   EXPECT_EQ('x', bytes[0]);
   EXPECT_EQ('e', bytes[1]);
   EXPECT_EQ('l', bytes[2]);
-  EXPECT_EQ('x', bytes[3]);
+  // NB: The output string is null terminated so this slot is overwritten.
+  EXPECT_EQ('\0', bytes[3]);
+  EXPECT_EQ('x', bytes[4]);
 
   // It's okay for the buffer to be null as long as the length is 0.
   env_->GetStringUTFRegion(s, 2, 0, nullptr);
   // Even if the offset is invalid...
   env_->GetStringUTFRegion(s, 123, 0, nullptr);
   ExpectException(sioobe_);
+  // If not null we still have a 0 length string
+  env_->GetStringUTFRegion(s, 1, 0, &bytes[1]);
+  EXPECT_EQ('x', bytes[0]);
+  EXPECT_EQ('\0', bytes[1]);
+  EXPECT_EQ('l', bytes[2]);
+  EXPECT_EQ('\0', bytes[3]);
+  EXPECT_EQ('x', bytes[4]);
 }
 
 TEST_F(JniInternalTest, GetStringUTFChars_ReleaseStringUTFChars) {
@@ -1987,17 +2119,12 @@ TEST_F(JniInternalTest, DeleteLocalRef) {
   ASSERT_NE(s, nullptr);
   env_->DeleteLocalRef(s);
 
-  // Currently, deleting an already-deleted reference is just a CheckJNI warning.
+  // Currently, deleting an already-deleted reference is just a CheckJNI abort.
   {
-    bool old_check_jni = vm_->SetCheckJniEnabled(false);
-    {
-      CheckJniAbortCatcher check_jni_abort_catcher;
-      env_->DeleteLocalRef(s);
-    }
+    bool old_check_jni = vm_->SetCheckJniEnabled(true);
     CheckJniAbortCatcher check_jni_abort_catcher;
-    EXPECT_FALSE(vm_->SetCheckJniEnabled(true));
     env_->DeleteLocalRef(s);
-    std::string expected(StringPrintf("use of deleted local reference %p", s));
+    std::string expected = StringPrintf("jobject is an invalid local reference: %p", s);
     check_jni_abort_catcher.Check(expected.c_str());
     EXPECT_TRUE(vm_->SetCheckJniEnabled(old_check_jni));
   }
@@ -2052,7 +2179,7 @@ TEST_F(JniInternalTest, PushLocalFrame_PopLocalFrame) {
     {
       CheckJniAbortCatcher check_jni_abort_catcher;
       EXPECT_EQ(JNIInvalidRefType, env_->GetObjectRefType(inner1));
-      check_jni_abort_catcher.Check("use of deleted local reference");
+      check_jni_abort_catcher.Check("jobject is an invalid local reference");
     }
 
     // Our local reference for the survivor is invalid because the survivor
@@ -2060,7 +2187,7 @@ TEST_F(JniInternalTest, PushLocalFrame_PopLocalFrame) {
     {
       CheckJniAbortCatcher check_jni_abort_catcher;
       EXPECT_EQ(JNIInvalidRefType, env_->GetObjectRefType(inner2));
-      check_jni_abort_catcher.Check("use of deleted local reference");
+      check_jni_abort_catcher.Check("jobject is an invalid local reference");
     }
 
     EXPECT_EQ(env_->PopLocalFrame(nullptr), nullptr);
@@ -2068,11 +2195,11 @@ TEST_F(JniInternalTest, PushLocalFrame_PopLocalFrame) {
   EXPECT_EQ(JNILocalRefType, env_->GetObjectRefType(original));
   CheckJniAbortCatcher check_jni_abort_catcher;
   EXPECT_EQ(JNIInvalidRefType, env_->GetObjectRefType(outer));
-  check_jni_abort_catcher.Check("use of deleted local reference");
+  check_jni_abort_catcher.Check("jobject is an invalid local reference");
   EXPECT_EQ(JNIInvalidRefType, env_->GetObjectRefType(inner1));
-  check_jni_abort_catcher.Check("use of deleted local reference");
+  check_jni_abort_catcher.Check("jobject is an invalid local reference");
   EXPECT_EQ(JNIInvalidRefType, env_->GetObjectRefType(inner2));
-  check_jni_abort_catcher.Check("use of deleted local reference");
+  check_jni_abort_catcher.Check("jobject is an invalid local reference");
 }
 
 TEST_F(JniInternalTest, PushLocalFrame_LimitAndOverflow) {
@@ -2126,17 +2253,12 @@ TEST_F(JniInternalTest, DeleteGlobalRef) {
   ASSERT_NE(o, nullptr);
   env_->DeleteGlobalRef(o);
 
-  // Currently, deleting an already-deleted reference is just a CheckJNI warning.
+  // Currently, deleting an already-deleted reference is just a CheckJNI abort.
   {
-    bool old_check_jni = vm_->SetCheckJniEnabled(false);
-    {
-      CheckJniAbortCatcher check_jni_abort_catcher;
-      env_->DeleteGlobalRef(o);
-    }
+    bool old_check_jni = vm_->SetCheckJniEnabled(true);
     CheckJniAbortCatcher check_jni_abort_catcher;
-    EXPECT_FALSE(vm_->SetCheckJniEnabled(true));
     env_->DeleteGlobalRef(o);
-    std::string expected(StringPrintf("use of deleted global reference %p", o));
+    std::string expected = StringPrintf("jobject is an invalid global reference: %p", o);
     check_jni_abort_catcher.Check(expected.c_str());
     EXPECT_TRUE(vm_->SetCheckJniEnabled(old_check_jni));
   }
@@ -2179,17 +2301,12 @@ TEST_F(JniInternalTest, DeleteWeakGlobalRef) {
   ASSERT_NE(o, nullptr);
   env_->DeleteWeakGlobalRef(o);
 
-  // Currently, deleting an already-deleted reference is just a CheckJNI warning.
+  // Currently, deleting an already-deleted reference is just a CheckJNI abort.
   {
-    bool old_check_jni = vm_->SetCheckJniEnabled(false);
-    {
-      CheckJniAbortCatcher check_jni_abort_catcher;
-      env_->DeleteWeakGlobalRef(o);
-    }
+    bool old_check_jni = vm_->SetCheckJniEnabled(true);
     CheckJniAbortCatcher check_jni_abort_catcher;
-    EXPECT_FALSE(vm_->SetCheckJniEnabled(true));
     env_->DeleteWeakGlobalRef(o);
-    std::string expected(StringPrintf("use of deleted weak global reference %p", o));
+    std::string expected(StringPrintf("jobject is an invalid weak global reference: %p", o));
     check_jni_abort_catcher.Check(expected.c_str());
     EXPECT_TRUE(vm_->SetCheckJniEnabled(old_check_jni));
   }
@@ -2459,44 +2576,80 @@ TEST_F(JniInternalTest, DetachThreadUnlockJNIMonitors) {
 
 // Test the offset computation of IndirectReferenceTable offsets. b/26071368.
 TEST_F(JniInternalTest, IndirectReferenceTableOffsets) {
+  ScopedObjectAccess soa(Thread::Current());
   // The segment_state_ field is private, and we want to avoid friend declaration. So we'll check
-  // by modifying memory.
+  // by modifying LRT state and checking the memory contents directly.
   // The parameters don't really matter here.
   std::string error_msg;
-  IndirectReferenceTable irt(5,
-                             IndirectRefKind::kGlobal,
-                             IndirectReferenceTable::ResizableCapacity::kNo,
-                             &error_msg);
-  ASSERT_TRUE(irt.IsValid()) << error_msg;
-  IRTSegmentState old_state = irt.GetSegmentState();
+  jni::LocalReferenceTable lrt(/*check_jni=*/ true);
+  bool success = lrt.Initialize(/*max_count=*/ 5, &error_msg);
+  ASSERT_TRUE(success) << error_msg;
 
-  // Write some new state directly. We invert parts of old_state to ensure a new value.
-  IRTSegmentState new_state;
-  new_state.top_index = old_state.top_index ^ 0x07705005;
-  ASSERT_NE(old_state.top_index, new_state.top_index);
+  // Check initial state.
+  jni::LRTSegmentState* previous_state = reinterpret_cast<jni::LRTSegmentState*>(
+      reinterpret_cast<uint8_t*>(&lrt) +
+      jni::LocalReferenceTable::PreviousStateOffset().SizeValue());
+  jni::LRTSegmentState* segment_state = reinterpret_cast<jni::LRTSegmentState*>(
+      reinterpret_cast<uint8_t*>(&lrt) +
+      jni::LocalReferenceTable::SegmentStateOffset().SizeValue());
+  ASSERT_EQ(jni::kLRTFirstSegment.top_index, previous_state->top_index);
+  ASSERT_EQ(jni::kLRTFirstSegment.top_index, segment_state->top_index);
 
-  uint8_t* base = reinterpret_cast<uint8_t*>(&irt);
-  int32_t segment_state_offset =
-      IndirectReferenceTable::SegmentStateOffset(sizeof(void*)).Int32Value();
-  *reinterpret_cast<IRTSegmentState*>(base + segment_state_offset) = new_state;
+  // Push an empty LRT frame at the bottom.
+  jni::LRTSegmentState cookie0 = lrt.PushFrame();
+  ASSERT_EQ(jni::kLRTFirstSegment.top_index, cookie0.top_index);
+  ASSERT_EQ(jni::kLRTFirstSegment.top_index, previous_state->top_index);
+  ASSERT_EQ(jni::kLRTFirstSegment.top_index, segment_state->top_index);
 
-  // Read and compare.
-  EXPECT_EQ(new_state.top_index, irt.GetSegmentState().top_index);
+  // Add a bogus reference.
+  IndirectRef ref = lrt.Add(reinterpret_cast32<mirror::Object*>(0xdeadbee0u), &error_msg);
+  ASSERT_TRUE(ref != nullptr) << error_msg;
+  ASSERT_EQ(jni::kLRTFirstSegment.top_index, previous_state->top_index);
+  ASSERT_NE(jni::kLRTFirstSegment.top_index, segment_state->top_index);
+  jni::LRTSegmentState expected_cookie2 = *segment_state;
+
+  // Push the non-empty LRT frame.
+  jni::LRTSegmentState cookie1 = lrt.PushFrame();
+  ASSERT_EQ(jni::kLRTFirstSegment.top_index, cookie1.top_index);
+  ASSERT_EQ(expected_cookie2.top_index, previous_state->top_index);
+  ASSERT_EQ(expected_cookie2.top_index, segment_state->top_index);
+
+  // Push another empty LRT frame.
+  jni::LRTSegmentState cookie2 = lrt.PushFrame();
+  ASSERT_EQ(expected_cookie2.top_index, cookie2.top_index);
+  ASSERT_EQ(expected_cookie2.top_index, previous_state->top_index);
+  ASSERT_EQ(expected_cookie2.top_index, segment_state->top_index);
+
+  // Pop the LRT frames and check state transitions.
+  lrt.PopFrame(cookie2);
+  ASSERT_EQ(expected_cookie2.top_index, previous_state->top_index);
+  ASSERT_EQ(expected_cookie2.top_index, segment_state->top_index);
+  lrt.PopFrame(cookie1);
+  ASSERT_EQ(jni::kLRTFirstSegment.top_index, previous_state->top_index);
+  ASSERT_EQ(expected_cookie2.top_index, segment_state->top_index);
+  lrt.PopFrame(cookie0);
+  ASSERT_EQ(jni::kLRTFirstSegment.top_index, previous_state->top_index);
+  ASSERT_EQ(jni::kLRTFirstSegment.top_index, segment_state->top_index);
 }
 
 // Test the offset computation of JNIEnvExt offsets. b/26071368.
 TEST_F(JniInternalTest, JNIEnvExtOffsets) {
-  EXPECT_EQ(OFFSETOF_MEMBER(JNIEnvExt, local_ref_cookie_),
-            JNIEnvExt::LocalRefCookieOffset(sizeof(void*)).Uint32Value());
+  EXPECT_EQ(OFFSETOF_MEMBER(JNIEnvExt, self_),
+            JNIEnvExt::SelfOffset(kRuntimePointerSize).Uint32Value());
 
-  EXPECT_EQ(OFFSETOF_MEMBER(JNIEnvExt, self_), JNIEnvExt::SelfOffset(sizeof(void*)).Uint32Value());
-
-  // segment_state_ is private in the IndirectReferenceTable. So this test isn't as good as we'd
-  // hope it to be.
+  // `previous_state_` amd `segment_state_` are private in the IndirectReferenceTable.
+  // So this test isn't as good as we'd hope it to be.
+  uint32_t previous_state_now =
+      OFFSETOF_MEMBER(JNIEnvExt, locals_) +
+      jni::LocalReferenceTable::PreviousStateOffset().Uint32Value();
+  uint32_t previous_state_computed =
+      JNIEnvExt::LrtPreviousStateOffset(kRuntimePointerSize).Uint32Value();
+  EXPECT_EQ(previous_state_now, previous_state_computed);
   uint32_t segment_state_now =
       OFFSETOF_MEMBER(JNIEnvExt, locals_) +
-      IndirectReferenceTable::SegmentStateOffset(sizeof(void*)).Uint32Value();
-  uint32_t segment_state_computed = JNIEnvExt::SegmentStateOffset(sizeof(void*)).Uint32Value();
+      jni::LocalReferenceTable::SegmentStateOffset().Uint32Value();
+  uint32_t segment_state_computed =
+      JNIEnvExt::LrtSegmentStateOffset(kRuntimePointerSize).Uint32Value();
   EXPECT_EQ(segment_state_now, segment_state_computed);
 }
 

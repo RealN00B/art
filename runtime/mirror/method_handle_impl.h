@@ -19,12 +19,13 @@
 
 #include "art_field.h"
 #include "art_method.h"
+#include "base/macros.h"
 #include "class.h"
 #include "method_type.h"
 #include "obj_ptr.h"
 #include "object.h"
 
-namespace art {
+namespace art HIDDEN {
 
 struct MethodHandleOffsets;
 struct MethodHandleImplOffsets;
@@ -35,6 +36,8 @@ namespace mirror {
 // C++ mirror of java.lang.invoke.MethodHandle
 class MANAGED MethodHandle : public Object {
  public:
+  MIRROR_CLASS("Ljava/lang/invoke/MethodHandle;");
+
   // Defines the behaviour of a given method handle. The behaviour
   // of a handle of a given kind is identical to the dex bytecode behaviour
   // of the equivalent instruction.
@@ -48,7 +51,6 @@ class MANAGED MethodHandle : public Object {
     kInvokeStatic,
     kInvokeInterface,
     kInvokeTransform,
-    kInvokeCallSiteTransform,
     kInvokeVarHandle,
     kInvokeVarHandleExact,
     kInstanceGet,
@@ -61,26 +63,15 @@ class MANAGED MethodHandle : public Object {
     kLastInvokeKind = kInvokeVarHandleExact
   };
 
-  Kind GetHandleKind() REQUIRES_SHARED(Locks::mutator_lock_) {
-    const int32_t handle_kind = GetField32(OFFSET_OF_OBJECT_MEMBER(MethodHandle, handle_kind_));
-    DCHECK(handle_kind >= 0 &&
-           handle_kind <= static_cast<int32_t>(Kind::kLastValidKind));
-    return static_cast<Kind>(handle_kind);
-  }
+  Kind GetHandleKind() REQUIRES_SHARED(Locks::mutator_lock_);
 
-  ALWAYS_INLINE ObjPtr<mirror::MethodType> GetMethodType() REQUIRES_SHARED(Locks::mutator_lock_);
+  ObjPtr<mirror::MethodType> GetMethodType() REQUIRES_SHARED(Locks::mutator_lock_);
 
-  ALWAYS_INLINE ObjPtr<mirror::MethodType> GetNominalType() REQUIRES_SHARED(Locks::mutator_lock_);
+  ObjPtr<mirror::MethodHandle> GetAsTypeCache() REQUIRES_SHARED(Locks::mutator_lock_);
 
-  ArtField* GetTargetField() REQUIRES_SHARED(Locks::mutator_lock_) {
-    return reinterpret_cast<ArtField*>(
-        GetField64(OFFSET_OF_OBJECT_MEMBER(MethodHandle, art_field_or_method_)));
-  }
+  ArtField* GetTargetField() REQUIRES_SHARED(Locks::mutator_lock_);
 
-  ArtMethod* GetTargetMethod() REQUIRES_SHARED(Locks::mutator_lock_) {
-    return reinterpret_cast<ArtMethod*>(
-        GetField64(OFFSET_OF_OBJECT_MEMBER(MethodHandle, art_field_or_method_)));
-  }
+  ArtMethod* GetTargetMethod() REQUIRES_SHARED(Locks::mutator_lock_);
 
   // Gets the return type for a named invoke method, or nullptr if the invoke method is not
   // supported.
@@ -90,13 +81,25 @@ class MANAGED MethodHandle : public Object {
   // method or field.
   void VisitTarget(ReflectiveValueVisitor* v) REQUIRES(Locks::mutator_lock_);
 
+  static MemberOffset ArtFieldOrMethodOffset() {
+    return MemberOffset(OFFSETOF_MEMBER(MethodHandle, art_field_or_method_));
+  }
+
+  static MemberOffset HandleKindOffset() {
+    return MemberOffset(OFFSETOF_MEMBER(MethodHandle, handle_kind_));
+  }
+
+  static MemberOffset MethodTypeOffset() {
+    return MemberOffset(OFFSETOF_MEMBER(MethodHandle, method_type_));
+  }
+
  protected:
   void Initialize(uintptr_t art_field_or_method, Kind kind, Handle<MethodType> method_type)
       REQUIRES_SHARED(Locks::mutator_lock_);
 
  private:
+  HeapReference<mirror::MethodHandle> as_type_cache_;
   HeapReference<mirror::MethodHandle> cached_spread_invoker_;
-  HeapReference<mirror::MethodType> nominal_type_;
   HeapReference<mirror::MethodType> method_type_;
   uint32_t handle_kind_;
   uint64_t art_field_or_method_;
@@ -105,17 +108,8 @@ class MANAGED MethodHandle : public Object {
   static MemberOffset CachedSpreadInvokerOffset() {
     return MemberOffset(OFFSETOF_MEMBER(MethodHandle, cached_spread_invoker_));
   }
-  static MemberOffset NominalTypeOffset() {
-    return MemberOffset(OFFSETOF_MEMBER(MethodHandle, nominal_type_));
-  }
-  static MemberOffset MethodTypeOffset() {
-    return MemberOffset(OFFSETOF_MEMBER(MethodHandle, method_type_));
-  }
-  static MemberOffset ArtFieldOrMethodOffset() {
-    return MemberOffset(OFFSETOF_MEMBER(MethodHandle, art_field_or_method_));
-  }
-  static MemberOffset HandleKindOffset() {
-    return MemberOffset(OFFSETOF_MEMBER(MethodHandle, handle_kind_));
+  static MemberOffset AsTypeCacheOffset() {
+    return MemberOffset(OFFSETOF_MEMBER(MethodHandle, as_type_cache_));
   }
 
   friend struct art::MethodHandleOffsets;  // for verifying offset information
@@ -125,18 +119,16 @@ class MANAGED MethodHandle : public Object {
 // C++ mirror of java.lang.invoke.MethodHandleImpl
 class MANAGED MethodHandleImpl : public MethodHandle {
  public:
-  static ObjPtr<mirror::MethodHandleImpl> Create(Thread* const self,
-                                                 uintptr_t art_field_or_method,
-                                                 MethodHandle::Kind kind,
-                                                 Handle<MethodType> method_type)
+  MIRROR_CLASS("Ljava/lang/invoke/MethodHandleImpl;");
+
+  EXPORT static ObjPtr<mirror::MethodHandleImpl> Create(Thread* const self,
+                                                        uintptr_t art_field_or_method,
+                                                        MethodHandle::Kind kind,
+                                                        Handle<MethodType> method_type)
       REQUIRES_SHARED(Locks::mutator_lock_) REQUIRES(!Roles::uninterruptible_);
 
  private:
-  static MemberOffset InfoOffset() {
-    return MemberOffset(OFFSETOF_MEMBER(MethodHandleImpl, info_));
-  }
-
-  HeapReference<mirror::Object> info_;  // Unused by the runtime.
+  HeapReference<mirror::Object> target_class_or_info_;  // Unused by the runtime.
 
   friend struct art::MethodHandleImplOffsets;  // for verifying offset information
   DISALLOW_IMPLICIT_CONSTRUCTORS(MethodHandleImpl);

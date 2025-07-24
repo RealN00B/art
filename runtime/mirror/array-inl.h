@@ -22,32 +22,36 @@
 #include <android-base/logging.h>
 
 #include "base/bit_utils.h"
+#include "base/casts.h"
 #include "class.h"
+#include "class_linker.h"
 #include "obj_ptr-inl.h"
 #include "runtime.h"
 #include "thread-current-inl.h"
 
-namespace art {
+namespace art HIDDEN {
 namespace mirror {
 
 inline uint32_t Array::ClassSize(PointerSize pointer_size) {
   uint32_t vtable_entries = Object::kVTableLength;
-  return Class::ComputeClassSize(true, vtable_entries, 0, 0, 0, 0, 0, pointer_size);
+  return Class::ComputeClassSize(true, vtable_entries, 0, 0, 0, 0, 0, 0, pointer_size);
 }
 
-template<VerifyObjectFlags kVerifyFlags>
-inline size_t Array::SizeOf() {
-  // No read barrier is needed for reading a constant primitive field through
-  // constant reference field chain. See ReadBarrierOption.
-  size_t component_size_shift =
-      GetClass<kVerifyFlags, kWithoutReadBarrier>()->GetComponentSizeShift();
-  // Don't need to check this since we already check this in GetClass.
-  int32_t component_count =
-      GetLength<static_cast<VerifyObjectFlags>(kVerifyFlags & ~kVerifyThis)>();
-  // This is safe from overflow because the array was already allocated, so we know it's sane.
+template <VerifyObjectFlags kVerifyFlags>
+inline size_t Array::SizeOf(size_t component_size_shift) {
+  int32_t component_count = GetLength<kVerifyFlags>();
+  // This is safe from overflow because the array was already allocated.
   size_t header_size = DataOffset(1U << component_size_shift).SizeValue();
   size_t data_size = component_count << component_size_shift;
   return header_size + data_size;
+}
+
+template <VerifyObjectFlags kVerifyFlags, ReadBarrierOption kReadBarrierOption>
+inline size_t Array::SizeOf() {
+  size_t component_size_shift = GetClass<kVerifyFlags, kReadBarrierOption>()
+                                    ->template GetComponentSizeShift<kReadBarrierOption>();
+  // Don't need to check this since we already check this in GetClass.
+  return SizeOf<static_cast<VerifyObjectFlags>(kVerifyFlags & ~kVerifyThis)>(component_size_shift);
 }
 
 template<VerifyObjectFlags kVerifyFlags>
@@ -95,9 +99,9 @@ inline void PrimitiveArray<T>::SetWithoutChecks(int32_t i, T value) {
     DCHECK_EQ(kTransactionActive, Runtime::Current()->IsActiveTransaction());
   }
   if (kTransactionActive) {
-    Runtime::Current()->RecordWriteArray(this, i, GetWithoutChecks(i));
+    Runtime::Current()->GetClassLinker()->RecordWriteArray(this, i, GetWithoutChecks(i));
   }
-  DCHECK(CheckIsValidIndex<kVerifyFlags>(i));
+  DCHECK(CheckIsValidIndex<kVerifyFlags>(i)) << i << " " << GetLength<kVerifyFlags>();
   GetData()[i] = value;
 }
 // Backward copy where elements are of aligned appropriately for T. Count is in T sized units.
@@ -227,22 +231,33 @@ inline void PrimitiveArray<T>::Memcpy(int32_t dst_pos,
 
 template<typename T, PointerSize kPointerSize, VerifyObjectFlags kVerifyFlags>
 inline T PointerArray::GetElementPtrSize(uint32_t idx) {
-  // C style casts here since we sometimes have T be a pointer, or sometimes an integer
-  // (for stack traces).
   if (kPointerSize == PointerSize::k64) {
-    return (T)static_cast<uintptr_t>(AsLongArray<kVerifyFlags>()->GetWithoutChecks(idx));
+    DCHECK(IsLongArray<kVerifyFlags>());
+  } else {
+    DCHECK(IsIntArray<kVerifyFlags>());
   }
-  return (T)static_cast<uintptr_t>(AsIntArray<kVerifyFlags>()->GetWithoutChecks(idx));
+  return GetElementPtrSizeUnchecked<T, kPointerSize, kVerifyFlags>(idx);
 }
+
 template<typename T, PointerSize kPointerSize, VerifyObjectFlags kVerifyFlags>
 inline T PointerArray::GetElementPtrSizeUnchecked(uint32_t idx) {
   // C style casts here since we sometimes have T be a pointer, or sometimes an integer
   // (for stack traces).
+  using ConversionType = typename std::conditional_t<std::is_pointer_v<T>, uintptr_t, T>;
+  // Note: we cast the array directly when unchecked as this code gets called by
+  // runtime_image, which can pass a 64bit pointer and therefore cannot be held
+  // by an ObjPtr.
   if (kPointerSize == PointerSize::k64) {
-    return (T)static_cast<uintptr_t>(AsLongArrayUnchecked<kVerifyFlags>()->GetWithoutChecks(idx));
+    uint64_t value =
+        static_cast<uint64_t>(reinterpret_cast<LongArray*>(this)->GetWithoutChecks(idx));
+    return (T) dchecked_integral_cast<ConversionType>(value);
+  } else {
+    uint32_t value =
+        static_cast<uint32_t>(reinterpret_cast<IntArray*>(this)->GetWithoutChecks(idx));
+    return (T) dchecked_integral_cast<ConversionType>(value);
   }
-  return (T)static_cast<uintptr_t>(AsIntArrayUnchecked<kVerifyFlags>()->GetWithoutChecks(idx));
 }
+
 template<typename T, VerifyObjectFlags kVerifyFlags>
 inline T PointerArray::GetElementPtrSize(uint32_t idx, PointerSize ptr_size) {
   if (ptr_size == PointerSize::k64) {
@@ -251,34 +266,38 @@ inline T PointerArray::GetElementPtrSize(uint32_t idx, PointerSize ptr_size) {
   return GetElementPtrSize<T, PointerSize::k32, kVerifyFlags>(idx);
 }
 
-template<bool kTransactionActive, bool kUnchecked>
+template<bool kTransactionActive, bool kCheckTransaction, bool kUnchecked>
 inline void PointerArray::SetElementPtrSize(uint32_t idx, uint64_t element, PointerSize ptr_size) {
+  // Note: we cast the array directly when unchecked as this code gets called by
+  // runtime_image, which can pass a 64bit pointer and therefore cannot be held
+  // by an ObjPtr.
   if (ptr_size == PointerSize::k64) {
-    (kUnchecked ? ObjPtr<LongArray>::DownCast(ObjPtr<Object>(this)) : AsLongArray())->
-        SetWithoutChecks<kTransactionActive>(idx, element);
+    (kUnchecked ? reinterpret_cast<LongArray*>(this) : AsLongArray().Ptr())->
+        SetWithoutChecks<kTransactionActive, kCheckTransaction>(idx, element);
   } else {
-    DCHECK_LE(element, static_cast<uint64_t>(0xFFFFFFFFu));
-    (kUnchecked ? ObjPtr<IntArray>::DownCast(ObjPtr<Object>(this)) : AsIntArray())
-        ->SetWithoutChecks<kTransactionActive>(idx, static_cast<uint32_t>(element));
+    uint32_t element32 = dchecked_integral_cast<uint32_t>(element);
+    (kUnchecked ? reinterpret_cast<IntArray*>(this) : AsIntArray().Ptr())
+        ->SetWithoutChecks<kTransactionActive, kCheckTransaction>(idx, element32);
   }
 }
 
-template<bool kTransactionActive, bool kUnchecked, typename T>
+template<bool kTransactionActive, bool kCheckTransaction, bool kUnchecked, typename T>
 inline void PointerArray::SetElementPtrSize(uint32_t idx, T* element, PointerSize ptr_size) {
-  SetElementPtrSize<kTransactionActive, kUnchecked>(idx,
-                                                    reinterpret_cast<uintptr_t>(element),
-                                                    ptr_size);
+  SetElementPtrSize<kTransactionActive, kCheckTransaction, kUnchecked>(
+      idx, reinterpret_cast<uintptr_t>(element), ptr_size);
 }
 
 template <VerifyObjectFlags kVerifyFlags, typename Visitor>
-inline void PointerArray::Fixup(ObjPtr<mirror::PointerArray> dest,
+inline void PointerArray::Fixup(mirror::PointerArray* dest,
                                 PointerSize pointer_size,
                                 const Visitor& visitor) {
   for (size_t i = 0, count = GetLength(); i < count; ++i) {
     void* ptr = GetElementPtrSize<void*, kVerifyFlags>(i, pointer_size);
     void* new_ptr = visitor(ptr);
     if (ptr != new_ptr) {
-      dest->SetElementPtrSize<false, true>(i, new_ptr, pointer_size);
+      dest->SetElementPtrSize</*kActiveTransaction=*/ false,
+                              /*kCheckTransaction=*/ true,
+                              /*kUnchecked=*/ true>(i, new_ptr, pointer_size);
     }
   }
 }

@@ -30,18 +30,15 @@
 #include "base/macros.h"
 #include "base/mutex.h"
 #include "base/scoped_arena_allocator.h"
+#include "base/systrace.h"
 #include "base/timing_logger.h"
 #include "builder.h"
-#include "class_root.h"
 #include "code_generator.h"
-#include "compiled_method.h"
 #include "compiler.h"
 #include "debug/elf_debug_writer.h"
 #include "debug/method_debug_info.h"
 #include "dex/dex_file_types.h"
-#include "dex/verification_results.h"
-#include "dex/verified_method.h"
-#include "driver/compiled_method_storage.h"
+#include "driver/compiled_code_storage.h"
 #include "driver/compiler_options.h"
 #include "driver/dex_compilation_unit.h"
 #include "graph_checker.h"
@@ -54,8 +51,10 @@
 #include "jni/quick/jni_compiler.h"
 #include "linker/linker_patch.h"
 #include "nodes.h"
-#include "oat_quick_method_header.h"
+#include "oat/oat_quick_method_header.h"
+#include "optimizing/write_barrier_elimination.h"
 #include "prepare_for_register_allocation.h"
+#include "profiling_info_builder.h"
 #include "reference_type_propagation.h"
 #include "register_allocator_linear_scan.h"
 #include "select_generator.h"
@@ -64,35 +63,12 @@
 #include "ssa_phi_elimination.h"
 #include "stack_map_stream.h"
 #include "utils/assembler.h"
-#include "verifier/verifier_compiler_binding.h"
 
-namespace art {
+namespace art HIDDEN {
 
 static constexpr size_t kArenaAllocatorMemoryReportThreshold = 8 * MB;
 
 static constexpr const char* kPassNameSeparator = "$";
-
-/**
- * Used by the code generator, to allocate the code in a vector.
- */
-class CodeVectorAllocator final : public CodeAllocator {
- public:
-  explicit CodeVectorAllocator(ArenaAllocator* allocator)
-      : memory_(allocator->Adapter(kArenaAllocCodeBuffer)) {}
-
-  uint8_t* Allocate(size_t size) override {
-    memory_.resize(size);
-    return &memory_[0];
-  }
-
-  ArrayRef<const uint8_t> GetMemory() const override { return ArrayRef<const uint8_t>(memory_); }
-  uint8_t* GetData() { return memory_.data(); }
-
- private:
-  ArenaVector<uint8_t> memory_;
-
-  DISALLOW_COPY_AND_ASSIGN(CodeVectorAllocator);
-};
 
 /**
  * Filter to apply to the visualizer. Methods whose name contain that filter will
@@ -107,8 +83,7 @@ class PassObserver : public ValueObject {
   PassObserver(HGraph* graph,
                CodeGenerator* codegen,
                std::ostream* visualizer_output,
-               const CompilerOptions& compiler_options,
-               Mutex& dump_mutex)
+               const CompilerOptions& compiler_options)
       : graph_(graph),
         last_seen_graph_size_(0),
         cached_method_name_(),
@@ -118,8 +93,8 @@ class PassObserver : public ValueObject {
         visualizer_oss_(),
         visualizer_output_(visualizer_output),
         visualizer_enabled_(!compiler_options.GetDumpCfgFileName().empty()),
-        visualizer_(&visualizer_oss_, graph, *codegen),
-        visualizer_dump_mutex_(dump_mutex),
+        visualizer_(&visualizer_oss_, graph, codegen),
+        codegen_(codegen),
         graph_in_bad_state_(false) {
     if (timing_logger_enabled_ || visualizer_enabled_) {
       if (!IsVerboseMethod(compiler_options, GetMethodName())) {
@@ -146,6 +121,7 @@ class PassObserver : public ValueObject {
   void DumpDisassembly() {
     if (visualizer_enabled_) {
       visualizer_.DumpGraphWithDisassembly();
+      FlushVisualizer();
     }
   }
 
@@ -165,14 +141,14 @@ class PassObserver : public ValueObject {
     // Dump graph first, then start timer.
     if (visualizer_enabled_) {
       visualizer_.DumpGraph(pass_name, /* is_after_pass= */ false, graph_in_bad_state_);
+      FlushVisualizer();
     }
     if (timing_logger_enabled_) {
       timing_logger_.StartTiming(pass_name);
     }
   }
 
-  void FlushVisualizer() REQUIRES(!visualizer_dump_mutex_) {
-    MutexLock mu(Thread::Current(), visualizer_dump_mutex_);
+  void FlushVisualizer() {
     *visualizer_output_ << visualizer_oss_.str();
     visualizer_output_->flush();
     visualizer_oss_.str("");
@@ -186,15 +162,20 @@ class PassObserver : public ValueObject {
     }
     if (visualizer_enabled_) {
       visualizer_.DumpGraph(pass_name, /* is_after_pass= */ true, graph_in_bad_state_);
+      FlushVisualizer();
     }
 
     // Validate the HGraph if running in debug mode.
     if (kIsDebugBuild) {
       if (!graph_in_bad_state_) {
-        GraphChecker checker(graph_);
+        GraphChecker checker(graph_, codegen_);
         last_seen_graph_size_ = checker.Run(pass_change, last_seen_graph_size_);
         if (!checker.IsValid()) {
-          LOG(FATAL) << "Error after " << pass_name << ": " << Dumpable<GraphChecker>(checker);
+          std::ostringstream stream;
+          graph_->Dump(stream, codegen_);
+          LOG(FATAL_WITHOUT_ABORT) << "Error after " << pass_name << "(" << graph_->PrettyMethod()
+                                   << "): " << stream.str();
+          LOG(FATAL) << "(" << pass_name <<  "): " << Dumpable<GraphChecker>(checker);
         }
       }
     }
@@ -231,7 +212,7 @@ class PassObserver : public ValueObject {
   std::ostream* visualizer_output_;
   bool visualizer_enabled_;
   HGraphVisualizer visualizer_;
-  Mutex& visualizer_dump_mutex_;
+  CodeGenerator* codegen_;
 
   // Flag to be set by the compiler if the pass failed and the graph is not
   // expected to validate.
@@ -268,14 +249,13 @@ class PassScope : public ValueObject {
 class OptimizingCompiler final : public Compiler {
  public:
   explicit OptimizingCompiler(const CompilerOptions& compiler_options,
-                              CompiledMethodStorage* storage);
+                              CompiledCodeStorage* storage);
   ~OptimizingCompiler() override;
 
   bool CanCompileMethod(uint32_t method_idx, const DexFile& dex_file) const override;
 
   CompiledMethod* Compile(const dex::CodeItem* code_item,
                           uint32_t access_flags,
-                          InvokeType invoke_type,
                           uint16_t class_def_idx,
                           uint32_t method_idx,
                           Handle<mirror::ClassLoader> class_loader,
@@ -297,8 +277,7 @@ class OptimizingCompiler final : public Compiler {
                   jit::JitCodeCache* code_cache,
                   jit::JitMemoryRegion* region,
                   ArtMethod* method,
-                  bool baseline,
-                  bool osr,
+                  CompilationKind compilation_kind,
                   jit::JitLogger* jit_logger)
       override
       REQUIRES_SHARED(Locks::mutator_lock_);
@@ -308,7 +287,6 @@ class OptimizingCompiler final : public Compiler {
                         CodeGenerator* codegen,
                         const DexCompilationUnit& dex_compilation_unit,
                         PassObserver* pass_observer,
-                        VariableSizedHandleScope* handles,
                         const OptimizationDef definitions[],
                         size_t length) const {
     // Convert definitions to optimization passes.
@@ -319,8 +297,7 @@ class OptimizingCompiler final : public Compiler {
         graph,
         compilation_stats_.get(),
         codegen,
-        dex_compilation_unit,
-        handles);
+        dex_compilation_unit);
     DCHECK_EQ(length, optimizations.size());
     // Run the optimization passes one by one. Any "depends_on" pass refers back to
     // the most recent occurrence of that pass, skipped or executed.
@@ -351,23 +328,20 @@ class OptimizingCompiler final : public Compiler {
       CodeGenerator* codegen,
       const DexCompilationUnit& dex_compilation_unit,
       PassObserver* pass_observer,
-      VariableSizedHandleScope* handles,
       const OptimizationDef (&definitions)[length]) const {
     return RunOptimizations(
-        graph, codegen, dex_compilation_unit, pass_observer, handles, definitions, length);
+        graph, codegen, dex_compilation_unit, pass_observer, definitions, length);
   }
 
   void RunOptimizations(HGraph* graph,
                         CodeGenerator* codegen,
                         const DexCompilationUnit& dex_compilation_unit,
-                        PassObserver* pass_observer,
-                        VariableSizedHandleScope* handles) const;
+                        PassObserver* pass_observer) const;
 
- private:
   // Create a 'CompiledMethod' for an optimized graph.
   CompiledMethod* Emit(ArenaAllocator* allocator,
-                       CodeVectorAllocator* code_allocator,
                        CodeGenerator* codegen,
+                       bool is_intrinsic,
                        const dex::CodeItem* item) const;
 
   // Try compiling a method and return the code generator used for
@@ -376,20 +350,15 @@ class OptimizingCompiler final : public Compiler {
   // 1) Builds the graph. Returns null if it failed to build it.
   // 2) Transforms the graph to SSA. Returns null if it failed.
   // 3) Runs optimizations on the graph, including register allocator.
-  // 4) Generates code with the `code_allocator` provided.
   CodeGenerator* TryCompile(ArenaAllocator* allocator,
                             ArenaStack* arena_stack,
-                            CodeVectorAllocator* code_allocator,
                             const DexCompilationUnit& dex_compilation_unit,
                             ArtMethod* method,
-                            bool baseline,
-                            bool osr,
-                            bool is_shared_jit_code,
+                            CompilationKind compilation_kind,
                             VariableSizedHandleScope* handles) const;
 
   CodeGenerator* TryCompileIntrinsic(ArenaAllocator* allocator,
                                      ArenaStack* arena_stack,
-                                     CodeVectorAllocator* code_allocator,
                                      const DexCompilationUnit& dex_compilation_unit,
                                      ArtMethod* method,
                                      VariableSizedHandleScope* handles) const;
@@ -397,22 +366,21 @@ class OptimizingCompiler final : public Compiler {
   bool RunArchOptimizations(HGraph* graph,
                             CodeGenerator* codegen,
                             const DexCompilationUnit& dex_compilation_unit,
-                            PassObserver* pass_observer,
-                            VariableSizedHandleScope* handles) const;
+                            PassObserver* pass_observer) const;
 
-  bool RunBaselineOptimizations(HGraph* graph,
-                                CodeGenerator* codegen,
-                                const DexCompilationUnit& dex_compilation_unit,
-                                PassObserver* pass_observer,
-                                VariableSizedHandleScope* handles) const;
+  bool RunRequiredPasses(HGraph* graph,
+                         CodeGenerator* codegen,
+                         const DexCompilationUnit& dex_compilation_unit,
+                         PassObserver* pass_observer) const;
 
   std::vector<uint8_t> GenerateJitDebugInfo(const debug::MethodDebugInfo& method_debug_info);
+
+  // This must be called before any other function that dumps data to the cfg
+  void DumpInstructionSetFeaturesToCfg() const;
 
   std::unique_ptr<OptimizingCompilerStats> compilation_stats_;
 
   std::unique_ptr<std::ostream> visualizer_output_;
-
-  mutable Mutex dump_mutex_;  // To synchronize visualizer writing.
 
   DISALLOW_COPY_AND_ASSIGN(OptimizingCompiler);
 };
@@ -420,15 +388,15 @@ class OptimizingCompiler final : public Compiler {
 static const int kMaximumCompilationTimeBeforeWarning = 100; /* ms */
 
 OptimizingCompiler::OptimizingCompiler(const CompilerOptions& compiler_options,
-                                       CompiledMethodStorage* storage)
-    : Compiler(compiler_options, storage, kMaximumCompilationTimeBeforeWarning),
-      dump_mutex_("Visualizer dump lock") {
+                                       CompiledCodeStorage* storage)
+    : Compiler(compiler_options, storage, kMaximumCompilationTimeBeforeWarning) {
   // Enable C1visualizer output.
   const std::string& cfg_file_name = compiler_options.GetDumpCfgFileName();
   if (!cfg_file_name.empty()) {
     std::ios_base::openmode cfg_file_mode =
         compiler_options.GetDumpCfgAppend() ? std::ofstream::app : std::ofstream::out;
     visualizer_output_.reset(new std::ofstream(cfg_file_name, cfg_file_mode));
+    DumpInstructionSetFeaturesToCfg();
   }
   if (compiler_options.GetDumpStats()) {
     compilation_stats_.reset(new OptimizingCompilerStats());
@@ -441,35 +409,80 @@ OptimizingCompiler::~OptimizingCompiler() {
   }
 }
 
-bool OptimizingCompiler::CanCompileMethod(uint32_t method_idx ATTRIBUTE_UNUSED,
-                                          const DexFile& dex_file ATTRIBUTE_UNUSED) const {
+void OptimizingCompiler::DumpInstructionSetFeaturesToCfg() const {
+  const CompilerOptions& compiler_options = GetCompilerOptions();
+  const InstructionSetFeatures* features = compiler_options.GetInstructionSetFeatures();
+  std::string isa_string =
+      std::string("isa:") + GetInstructionSetString(features->GetInstructionSet());
+  std::string features_string = "isa_features:" + features->GetFeatureString();
+  std::string read_barrier_type = "none";
+  if (compiler_options.EmitReadBarrier()) {
+    if (art::kUseBakerReadBarrier)
+      read_barrier_type = "baker";
+    else if (art::kUseTableLookupReadBarrier)
+      read_barrier_type = "tablelookup";
+  }
+  std::string read_barrier_string = ART_FORMAT("read_barrier_type:{}", read_barrier_type);
+  // It is assumed that visualizer_output_ is empty when calling this function, hence the fake
+  // compilation block containing the ISA features will be printed at the beginning of the .cfg
+  // file.
+  *visualizer_output_ << HGraphVisualizer::InsertMetaDataAsCompilationBlock(
+      isa_string + ' ' + features_string + ' ' + read_barrier_string);
+}
+
+bool OptimizingCompiler::CanCompileMethod([[maybe_unused]] uint32_t method_idx,
+                                          [[maybe_unused]] const DexFile& dex_file) const {
   return true;
 }
 
 static bool IsInstructionSetSupported(InstructionSet instruction_set) {
-  return instruction_set == InstructionSet::kArm
-      || instruction_set == InstructionSet::kArm64
-      || instruction_set == InstructionSet::kThumb2
-      || instruction_set == InstructionSet::kX86
-      || instruction_set == InstructionSet::kX86_64;
+  return instruction_set == InstructionSet::kArm ||
+         instruction_set == InstructionSet::kArm64 ||
+         instruction_set == InstructionSet::kThumb2 ||
+         instruction_set == InstructionSet::kRiscv64 ||
+         instruction_set == InstructionSet::kX86 ||
+         instruction_set == InstructionSet::kX86_64;
 }
 
-bool OptimizingCompiler::RunBaselineOptimizations(HGraph* graph,
-                                                  CodeGenerator* codegen,
-                                                  const DexCompilationUnit& dex_compilation_unit,
-                                                  PassObserver* pass_observer,
-                                                  VariableSizedHandleScope* handles) const {
+bool OptimizingCompiler::RunRequiredPasses(HGraph* graph,
+                                           CodeGenerator* codegen,
+                                           const DexCompilationUnit& dex_compilation_unit,
+                                           PassObserver* pass_observer) const {
   switch (codegen->GetCompilerOptions().GetInstructionSet()) {
-#ifdef ART_ENABLE_CODEGEN_x86
-    case InstructionSet::kX86: {
-      OptimizationDef x86_optimizations[] = {
-        OptDef(OptimizationPass::kPcRelativeFixupsX86),
+#if defined(ART_ENABLE_CODEGEN_arm)
+    case InstructionSet::kThumb2:
+    case InstructionSet::kArm: {
+      OptimizationDef arm_optimizations[] = {
+          OptDef(OptimizationPass::kCriticalNativeAbiFixupArm),
       };
       return RunOptimizations(graph,
                               codegen,
                               dex_compilation_unit,
                               pass_observer,
-                              handles,
+                              arm_optimizations);
+    }
+#endif
+#if defined(ART_ENABLE_CODEGEN_riscv64)
+    case InstructionSet::kRiscv64: {
+      OptimizationDef riscv64_optimizations[] = {
+          OptDef(OptimizationPass::kCriticalNativeAbiFixupRiscv64),
+      };
+      return RunOptimizations(graph,
+                              codegen,
+                              dex_compilation_unit,
+                              pass_observer,
+                              riscv64_optimizations);
+    }
+#endif
+#ifdef ART_ENABLE_CODEGEN_x86
+    case InstructionSet::kX86: {
+      OptimizationDef x86_optimizations[] = {
+          OptDef(OptimizationPass::kPcRelativeFixupsX86),
+      };
+      return RunOptimizations(graph,
+                              codegen,
+                              dex_compilation_unit,
+                              pass_observer,
                               x86_optimizations);
     }
 #endif
@@ -478,7 +491,6 @@ bool OptimizingCompiler::RunBaselineOptimizations(HGraph* graph,
       UNUSED(codegen);
       UNUSED(dex_compilation_unit);
       UNUSED(pass_observer);
-      UNUSED(handles);
       return false;
   }
 }
@@ -486,76 +498,90 @@ bool OptimizingCompiler::RunBaselineOptimizations(HGraph* graph,
 bool OptimizingCompiler::RunArchOptimizations(HGraph* graph,
                                               CodeGenerator* codegen,
                                               const DexCompilationUnit& dex_compilation_unit,
-                                              PassObserver* pass_observer,
-                                              VariableSizedHandleScope* handles) const {
+                                              PassObserver* pass_observer) const {
   switch (codegen->GetCompilerOptions().GetInstructionSet()) {
 #if defined(ART_ENABLE_CODEGEN_arm)
     case InstructionSet::kThumb2:
     case InstructionSet::kArm: {
       OptimizationDef arm_optimizations[] = {
-        OptDef(OptimizationPass::kInstructionSimplifierArm),
-        OptDef(OptimizationPass::kSideEffectsAnalysis),
-        OptDef(OptimizationPass::kGlobalValueNumbering, "GVN$after_arch"),
-        OptDef(OptimizationPass::kScheduling)
+          OptDef(OptimizationPass::kInstructionSimplifierArm),
+          OptDef(OptimizationPass::kSideEffectsAnalysis),
+          OptDef(OptimizationPass::kGlobalValueNumbering, "GVN$after_arch"),
+          OptDef(OptimizationPass::kCriticalNativeAbiFixupArm),
+          OptDef(OptimizationPass::kScheduling)
       };
       return RunOptimizations(graph,
                               codegen,
                               dex_compilation_unit,
                               pass_observer,
-                              handles,
                               arm_optimizations);
     }
 #endif
 #ifdef ART_ENABLE_CODEGEN_arm64
     case InstructionSet::kArm64: {
       OptimizationDef arm64_optimizations[] = {
-        OptDef(OptimizationPass::kInstructionSimplifierArm64),
-        OptDef(OptimizationPass::kSideEffectsAnalysis),
-        OptDef(OptimizationPass::kGlobalValueNumbering, "GVN$after_arch"),
-        OptDef(OptimizationPass::kScheduling)
+          OptDef(OptimizationPass::kInstructionSimplifierArm64),
+          OptDef(OptimizationPass::kSideEffectsAnalysis),
+          OptDef(OptimizationPass::kGlobalValueNumbering, "GVN$after_arch"),
+          OptDef(OptimizationPass::kScheduling)
       };
       return RunOptimizations(graph,
                               codegen,
                               dex_compilation_unit,
                               pass_observer,
-                              handles,
                               arm64_optimizations);
+    }
+#endif
+#if defined(ART_ENABLE_CODEGEN_riscv64)
+    case InstructionSet::kRiscv64: {
+      OptimizationDef riscv64_optimizations[] = {
+          OptDef(OptimizationPass::kInstructionSimplifierRiscv64),
+          OptDef(OptimizationPass::kSideEffectsAnalysis),
+          OptDef(OptimizationPass::kGlobalValueNumbering, "GVN$after_arch"),
+          OptDef(OptimizationPass::kCriticalNativeAbiFixupRiscv64)
+      };
+      return RunOptimizations(graph,
+                              codegen,
+                              dex_compilation_unit,
+                              pass_observer,
+                              riscv64_optimizations);
     }
 #endif
 #ifdef ART_ENABLE_CODEGEN_x86
     case InstructionSet::kX86: {
       OptimizationDef x86_optimizations[] = {
-        OptDef(OptimizationPass::kInstructionSimplifierX86),
-        OptDef(OptimizationPass::kSideEffectsAnalysis),
-        OptDef(OptimizationPass::kGlobalValueNumbering, "GVN$after_arch"),
-        OptDef(OptimizationPass::kPcRelativeFixupsX86),
-        OptDef(OptimizationPass::kX86MemoryOperandGeneration)
+          OptDef(OptimizationPass::kInstructionSimplifierX86),
+          OptDef(OptimizationPass::kSideEffectsAnalysis),
+          OptDef(OptimizationPass::kGlobalValueNumbering, "GVN$after_arch"),
+          OptDef(OptimizationPass::kPcRelativeFixupsX86),
+          OptDef(OptimizationPass::kX86MemoryOperandGeneration)
       };
       return RunOptimizations(graph,
                               codegen,
                               dex_compilation_unit,
                               pass_observer,
-                              handles,
                               x86_optimizations);
     }
 #endif
 #ifdef ART_ENABLE_CODEGEN_x86_64
     case InstructionSet::kX86_64: {
       OptimizationDef x86_64_optimizations[] = {
-        OptDef(OptimizationPass::kInstructionSimplifierX86_64),
-        OptDef(OptimizationPass::kSideEffectsAnalysis),
-        OptDef(OptimizationPass::kGlobalValueNumbering, "GVN$after_arch"),
-        OptDef(OptimizationPass::kX86MemoryOperandGeneration)
+          OptDef(OptimizationPass::kInstructionSimplifierX86_64),
+          OptDef(OptimizationPass::kSideEffectsAnalysis),
+          OptDef(OptimizationPass::kGlobalValueNumbering, "GVN$after_arch"),
+          OptDef(OptimizationPass::kX86MemoryOperandGeneration)
       };
       return RunOptimizations(graph,
                               codegen,
                               dex_compilation_unit,
                               pass_observer,
-                              handles,
                               x86_64_optimizations);
     }
 #endif
     default:
+      UNUSED(graph);
+      UNUSED(dex_compilation_unit);
+      UNUSED(pass_observer);
       return false;
   }
 }
@@ -564,7 +590,6 @@ NO_INLINE  // Avoid increasing caller's frame size by large stack-allocated obje
 static void AllocateRegisters(HGraph* graph,
                               CodeGenerator* codegen,
                               PassObserver* pass_observer,
-                              RegisterAllocator::Strategy strategy,
                               OptimizingCompilerStats* stats) {
   {
     PassScope scope(PrepareForRegisterAllocation::kPrepareForRegisterAllocationPassName,
@@ -582,7 +607,7 @@ static void AllocateRegisters(HGraph* graph,
   {
     PassScope scope(RegisterAllocator::kRegisterAllocatorPassName, pass_observer);
     std::unique_ptr<RegisterAllocator> register_allocator =
-        RegisterAllocator::Create(&local_allocator, codegen, liveness, strategy);
+        RegisterAllocator::Create(&local_allocator, codegen, liveness);
     register_allocator->AllocateRegisters();
   }
 }
@@ -596,8 +621,7 @@ static std::string ConvertPassNameToOptimizationName(const std::string& pass_nam
 void OptimizingCompiler::RunOptimizations(HGraph* graph,
                                           CodeGenerator* codegen,
                                           const DexCompilationUnit& dex_compilation_unit,
-                                          PassObserver* pass_observer,
-                                          VariableSizedHandleScope* handles) const {
+                                          PassObserver* pass_observer) const {
   const std::vector<std::string>* pass_names = GetCompilerOptions().GetPassesToRun();
   if (pass_names != nullptr) {
     // If passes were defined on command-line, build the optimization
@@ -613,80 +637,85 @@ void OptimizingCompiler::RunOptimizations(HGraph* graph,
                      codegen,
                      dex_compilation_unit,
                      pass_observer,
-                     handles,
                      optimizations.data(),
                      length);
     return;
   }
 
   OptimizationDef optimizations[] = {
-    // Initial optimizations.
-    OptDef(OptimizationPass::kConstantFolding),
-    OptDef(OptimizationPass::kInstructionSimplifier),
-    OptDef(OptimizationPass::kDeadCodeElimination,
-           "dead_code_elimination$initial"),
-    // Inlining.
-    OptDef(OptimizationPass::kInliner),
-    // Simplification (only if inlining occurred).
-    OptDef(OptimizationPass::kConstantFolding,
-           "constant_folding$after_inlining",
-           OptimizationPass::kInliner),
-    OptDef(OptimizationPass::kInstructionSimplifier,
-           "instruction_simplifier$after_inlining",
-           OptimizationPass::kInliner),
-    OptDef(OptimizationPass::kDeadCodeElimination,
-           "dead_code_elimination$after_inlining",
-           OptimizationPass::kInliner),
-    // GVN.
-    OptDef(OptimizationPass::kSideEffectsAnalysis,
-           "side_effects$before_gvn"),
-    OptDef(OptimizationPass::kGlobalValueNumbering),
-    // Simplification (TODO: only if GVN occurred).
-    OptDef(OptimizationPass::kSelectGenerator),
-    OptDef(OptimizationPass::kConstantFolding,
-           "constant_folding$after_gvn"),
-    OptDef(OptimizationPass::kInstructionSimplifier,
-           "instruction_simplifier$after_gvn"),
-    OptDef(OptimizationPass::kDeadCodeElimination,
-           "dead_code_elimination$after_gvn"),
-    // High-level optimizations.
-    OptDef(OptimizationPass::kSideEffectsAnalysis,
-           "side_effects$before_licm"),
-    OptDef(OptimizationPass::kInvariantCodeMotion),
-    OptDef(OptimizationPass::kInductionVarAnalysis),
-    OptDef(OptimizationPass::kBoundsCheckElimination),
-    OptDef(OptimizationPass::kLoopOptimization),
-    // Simplification.
-    OptDef(OptimizationPass::kConstantFolding,
-           "constant_folding$after_bce"),
-    OptDef(OptimizationPass::kInstructionSimplifier,
-           "instruction_simplifier$after_bce"),
-    // Other high-level optimizations.
-    OptDef(OptimizationPass::kSideEffectsAnalysis,
-           "side_effects$before_lse"),
-    OptDef(OptimizationPass::kLoadStoreAnalysis),
-    OptDef(OptimizationPass::kLoadStoreElimination),
-    OptDef(OptimizationPass::kCHAGuardOptimization),
-    OptDef(OptimizationPass::kDeadCodeElimination,
-           "dead_code_elimination$final"),
-    OptDef(OptimizationPass::kCodeSinking),
-    // The codegen has a few assumptions that only the instruction simplifier
-    // can satisfy. For example, the code generator does not expect to see a
-    // HTypeConversion from a type to the same type.
-    OptDef(OptimizationPass::kInstructionSimplifier,
-           "instruction_simplifier$before_codegen"),
-    // Eliminate constructor fences after code sinking to avoid
-    // complicated sinking logic to split a fence with many inputs.
-    OptDef(OptimizationPass::kConstructorFenceRedundancyElimination)
+      // Initial optimizations.
+      OptDef(OptimizationPass::kConstantFolding),
+      OptDef(OptimizationPass::kInstructionSimplifier),
+      OptDef(OptimizationPass::kDeadCodeElimination,
+             "dead_code_elimination$initial"),
+      // Inlining.
+      OptDef(OptimizationPass::kInliner),
+      // Simplification (if inlining occurred, or if we analyzed the invoke as "always throwing").
+      OptDef(OptimizationPass::kConstantFolding,
+             "constant_folding$after_inlining",
+             OptimizationPass::kInliner),
+      OptDef(OptimizationPass::kInstructionSimplifier,
+             "instruction_simplifier$after_inlining",
+             OptimizationPass::kInliner),
+      OptDef(OptimizationPass::kDeadCodeElimination,
+             "dead_code_elimination$after_inlining",
+             OptimizationPass::kInliner),
+      // GVN.
+      OptDef(OptimizationPass::kSideEffectsAnalysis,
+             "side_effects$before_gvn"),
+      OptDef(OptimizationPass::kGlobalValueNumbering),
+      OptDef(OptimizationPass::kReferenceTypePropagation,
+             "reference_type_propagation$after_gvn",
+             OptimizationPass::kGlobalValueNumbering),
+      // Simplification (TODO: only if GVN occurred).
+      OptDef(OptimizationPass::kSelectGenerator),
+      OptDef(OptimizationPass::kConstantFolding,
+             "constant_folding$after_gvn"),
+      OptDef(OptimizationPass::kInstructionSimplifier,
+             "instruction_simplifier$after_gvn"),
+      OptDef(OptimizationPass::kDeadCodeElimination,
+             "dead_code_elimination$after_gvn"),
+      // High-level optimizations.
+      OptDef(OptimizationPass::kSideEffectsAnalysis,
+             "side_effects$before_licm"),
+      OptDef(OptimizationPass::kInvariantCodeMotion),
+      OptDef(OptimizationPass::kInductionVarAnalysis),
+      OptDef(OptimizationPass::kBoundsCheckElimination),
+      OptDef(OptimizationPass::kLoopOptimization),
+      // Simplification.
+      OptDef(OptimizationPass::kConstantFolding,
+             "constant_folding$after_loop_opt"),
+      OptDef(OptimizationPass::kAggressiveInstructionSimplifier,
+             "instruction_simplifier$after_loop_opt"),
+      OptDef(OptimizationPass::kDeadCodeElimination,
+             "dead_code_elimination$after_loop_opt"),
+      // Other high-level optimizations.
+      OptDef(OptimizationPass::kLoadStoreElimination),
+      OptDef(OptimizationPass::kCHAGuardOptimization),
+      OptDef(OptimizationPass::kCodeSinking),
+      // Simplification.
+      OptDef(OptimizationPass::kConstantFolding,
+             "constant_folding$before_codegen"),
+      // The codegen has a few assumptions that only the instruction simplifier
+      // can satisfy. For example, the code generator does not expect to see a
+      // HTypeConversion from a type to the same type.
+      OptDef(OptimizationPass::kAggressiveInstructionSimplifier,
+             "instruction_simplifier$before_codegen"),
+      // Simplification may result in dead code that should be removed prior to
+      // code generation.
+      OptDef(OptimizationPass::kDeadCodeElimination,
+             "dead_code_elimination$before_codegen"),
+      // Eliminate constructor fences after code sinking to avoid
+      // complicated sinking logic to split a fence with many inputs.
+      OptDef(OptimizationPass::kConstructorFenceRedundancyElimination)
   };
   RunOptimizations(graph,
                    codegen,
                    dex_compilation_unit,
                    pass_observer,
-                   handles,
                    optimizations);
 
-  RunArchOptimizations(graph, codegen, dex_compilation_unit, pass_observer, handles);
+  RunArchOptimizations(graph, codegen, dex_compilation_unit, pass_observer);
 }
 
 static ArenaVector<linker::LinkerPatch> EmitAndSortLinkerPatches(CodeGenerator* codegen) {
@@ -703,20 +732,20 @@ static ArenaVector<linker::LinkerPatch> EmitAndSortLinkerPatches(CodeGenerator* 
 }
 
 CompiledMethod* OptimizingCompiler::Emit(ArenaAllocator* allocator,
-                                         CodeVectorAllocator* code_allocator,
                                          CodeGenerator* codegen,
+                                         bool is_intrinsic,
                                          const dex::CodeItem* code_item_for_osr_check) const {
   ArenaVector<linker::LinkerPatch> linker_patches = EmitAndSortLinkerPatches(codegen);
   ScopedArenaVector<uint8_t> stack_map = codegen->BuildStackMaps(code_item_for_osr_check);
 
-  CompiledMethodStorage* storage = GetCompiledMethodStorage();
-  CompiledMethod* compiled_method = CompiledMethod::SwapAllocCompiledMethod(
-      storage,
+  CompiledCodeStorage* storage = GetCompiledCodeStorage();
+  CompiledMethod* compiled_method = storage->CreateCompiledMethod(
       codegen->GetInstructionSet(),
-      code_allocator->GetMemory(),
+      codegen->GetCode(),
       ArrayRef<const uint8_t>(stack_map),
       ArrayRef<const uint8_t>(*codegen->GetAssembler()->cfi().data()),
-      ArrayRef<const linker::LinkerPatch>(linker_patches));
+      ArrayRef<const linker::LinkerPatch>(linker_patches),
+      is_intrinsic);
 
   for (const linker::LinkerPatch& patch : linker_patches) {
     if (codegen->NeedsThunkCode(patch) && storage->GetThunkCode(patch).empty()) {
@@ -732,12 +761,9 @@ CompiledMethod* OptimizingCompiler::Emit(ArenaAllocator* allocator,
 
 CodeGenerator* OptimizingCompiler::TryCompile(ArenaAllocator* allocator,
                                               ArenaStack* arena_stack,
-                                              CodeVectorAllocator* code_allocator,
                                               const DexCompilationUnit& dex_compilation_unit,
                                               ArtMethod* method,
-                                              bool baseline,
-                                              bool osr,
-                                              bool is_shared_jit_code,
+                                              CompilationKind compilation_kind,
                                               VariableSizedHandleScope* handles) const {
   MaybeRecordStat(compilation_stats_.get(), MethodCompilationStat::kAttemptBytecodeCompilation);
   const CompilerOptions& compiler_options = GetCompilerOptions();
@@ -758,6 +784,7 @@ CodeGenerator* OptimizingCompiler::TryCompile(ArenaAllocator* allocator,
   }
 
   if (Compiler::IsPathologicalCase(*code_item, method_idx, dex_file)) {
+    SCOPED_TRACE << "Not compiling because of pathological case";
     MaybeRecordStat(compilation_stats_.get(), MethodCompilationStat::kNotCompiledPathological);
     return nullptr;
   }
@@ -768,6 +795,7 @@ CodeGenerator* OptimizingCompiler::TryCompile(ArenaAllocator* allocator,
   if ((compiler_options.GetCompilerFilter() == CompilerFilter::kSpace)
       && (CodeItemInstructionAccessor(dex_file, code_item).InsnsSizeInCodeUnits() >
           kSpaceFilterOptimizingThreshold)) {
+    SCOPED_TRACE << "Not compiling because of space filter";
     MaybeRecordStat(compilation_stats_.get(), MethodCompilationStat::kNotCompiledSpaceFilter);
     return nullptr;
   }
@@ -775,7 +803,6 @@ CodeGenerator* OptimizingCompiler::TryCompile(ArenaAllocator* allocator,
   CodeItemDebugInfoAccessor code_item_accessor(dex_file, code_item, method_idx);
 
   bool dead_reference_safe;
-  ArrayRef<const uint8_t> interpreter_metadata;
   // For AOT compilation, we may not get a method, for example if its class is erroneous,
   // possibly due to an unavailable superclass.  JIT should always have a method.
   DCHECK(Runtime::Current()->IsAotCompiler() || method != nullptr);
@@ -784,7 +811,6 @@ CodeGenerator* OptimizingCompiler::TryCompile(ArenaAllocator* allocator,
     {
       ScopedObjectAccess soa(Thread::Current());
       containing_class = &method->GetClassDef();
-      interpreter_metadata = method->GetQuickenedInfo();
     }
     // MethodContainsRSensitiveAccess is currently slow, but HasDeadReferenceSafeAnnotation()
     // is currently rarely true.
@@ -799,18 +825,23 @@ CodeGenerator* OptimizingCompiler::TryCompile(ArenaAllocator* allocator,
   HGraph* graph = new (allocator) HGraph(
       allocator,
       arena_stack,
+      handles,
       dex_file,
       method_idx,
       compiler_options.GetInstructionSet(),
       kInvalidInvokeType,
       dead_reference_safe,
       compiler_options.GetDebuggable(),
-      /* osr= */ osr,
-      /* is_shared_jit_code= */ is_shared_jit_code,
-      /* baseline= */ baseline);
+      compilation_kind);
 
   if (method != nullptr) {
     graph->SetArtMethod(method);
+  }
+
+  jit::Jit* jit = Runtime::Current()->GetJit();
+  if (jit != nullptr) {
+    ProfilingInfo* info = jit->GetCodeCache()->GetProfilingInfo(method, Thread::Current());
+    graph->SetProfilingInfo(info);
   }
 
   std::unique_ptr<CodeGenerator> codegen(
@@ -826,8 +857,7 @@ CodeGenerator* OptimizingCompiler::TryCompile(ArenaAllocator* allocator,
   PassObserver pass_observer(graph,
                              codegen.get(),
                              visualizer_output_.get(),
-                             compiler_options,
-                             dump_mutex_);
+                             compiler_options);
 
   {
     VLOG(compiler) << "Building " << pass_observer.GetMethodName();
@@ -837,11 +867,15 @@ CodeGenerator* OptimizingCompiler::TryCompile(ArenaAllocator* allocator,
                           &dex_compilation_unit,
                           &dex_compilation_unit,
                           codegen.get(),
-                          compilation_stats_.get(),
-                          interpreter_metadata,
-                          handles);
+                          compilation_stats_.get());
     GraphAnalysisResult result = builder.BuildGraph();
     if (result != kAnalysisSuccess) {
+      // Don't try recompiling this method again.
+      if (method != nullptr) {
+        ScopedObjectAccess soa(Thread::Current());
+        method->SetDontCompile();
+      }
+      SCOPED_TRACE << "Not compiling because of " << result;
       switch (result) {
         case kAnalysisSkipped: {
           MaybeRecordStat(compilation_stats_.get(),
@@ -874,6 +908,7 @@ CodeGenerator* OptimizingCompiler::TryCompile(ArenaAllocator* allocator,
           break;
         }
         case kAnalysisSuccess:
+          LOG(FATAL) << "Unreachable";
           UNREACHABLE();
       }
       pass_observer.SetGraphInBadState();
@@ -881,21 +916,49 @@ CodeGenerator* OptimizingCompiler::TryCompile(ArenaAllocator* allocator,
     }
   }
 
-  if (baseline) {
-    RunBaselineOptimizations(graph, codegen.get(), dex_compilation_unit, &pass_observer, handles);
+  if (compilation_kind == CompilationKind::kBaseline && compiler_options.ProfileBranches()) {
+    graph->SetUsefulOptimizing();
+    // Branch profiling currently doesn't support running optimizations.
+    RunRequiredPasses(graph, codegen.get(), dex_compilation_unit, &pass_observer);
   } else {
-    RunOptimizations(graph, codegen.get(), dex_compilation_unit, &pass_observer, handles);
+    RunOptimizations(graph, codegen.get(), dex_compilation_unit, &pass_observer);
+    PassScope scope(WriteBarrierElimination::kWBEPassName, &pass_observer);
+    WriteBarrierElimination(graph, compilation_stats_.get()).Run();
   }
 
-  RegisterAllocator::Strategy regalloc_strategy =
-    compiler_options.GetRegisterAllocationStrategy();
+  // If we are compiling baseline and we haven't created a profiling info for
+  // this method already, do it now.
+  if (jit != nullptr &&
+      compilation_kind == CompilationKind::kBaseline &&
+      graph->IsUsefulOptimizing() &&
+      graph->GetProfilingInfo() == nullptr) {
+    ProfilingInfoBuilder(
+        graph, codegen->GetCompilerOptions(), codegen.get(), compilation_stats_.get()).Run();
+    // We expect a profiling info to be created and attached to the graph.
+    // However, we may have run out of memory trying to create it, so in this
+    // case just abort the compilation.
+    if (graph->GetProfilingInfo() == nullptr) {
+      SCOPED_TRACE << "Not compiling because of out of memory";
+      MaybeRecordStat(compilation_stats_.get(), MethodCompilationStat::kJitOutOfMemoryForCommit);
+      return nullptr;
+    }
+  }
+
   AllocateRegisters(graph,
                     codegen.get(),
                     &pass_observer,
-                    regalloc_strategy,
                     compilation_stats_.get());
 
-  codegen->Compile(code_allocator);
+  if (UNLIKELY(codegen->GetFrameSize() > codegen->GetMaximumFrameSize())) {
+    SCOPED_TRACE << "Not compiling because of stack frame too large";
+    LOG(WARNING) << "Stack frame size is " << codegen->GetFrameSize()
+                 << " which is larger than the maximum of " << codegen->GetMaximumFrameSize()
+                 << " bytes. Method: " << graph->PrettyMethod();
+    MaybeRecordStat(compilation_stats_.get(), MethodCompilationStat::kNotCompiledFrameTooBig);
+    return nullptr;
+  }
+
+  codegen->Compile();
   pass_observer.DumpDisassembly();
 
   MaybeRecordStat(compilation_stats_.get(), MethodCompilationStat::kCompiledBytecode);
@@ -905,7 +968,6 @@ CodeGenerator* OptimizingCompiler::TryCompile(ArenaAllocator* allocator,
 CodeGenerator* OptimizingCompiler::TryCompileIntrinsic(
     ArenaAllocator* allocator,
     ArenaStack* arena_stack,
-    CodeVectorAllocator* code_allocator,
     const DexCompilationUnit& dex_compilation_unit,
     ArtMethod* method,
     VariableSizedHandleScope* handles) const {
@@ -927,13 +989,14 @@ CodeGenerator* OptimizingCompiler::TryCompileIntrinsic(
   HGraph* graph = new (allocator) HGraph(
       allocator,
       arena_stack,
+      handles,
       dex_file,
       method_idx,
       compiler_options.GetInstructionSet(),
       kInvalidInvokeType,
       /* dead_reference_safe= */ true,  // Intrinsics don't affect dead reference safety.
       compiler_options.GetDebuggable(),
-      /* osr= */ false);
+      CompilationKind::kOptimized);
 
   DCHECK(Runtime::Current()->IsAotCompiler());
   DCHECK(method != nullptr);
@@ -951,8 +1014,7 @@ CodeGenerator* OptimizingCompiler::TryCompileIntrinsic(
   PassObserver pass_observer(graph,
                              codegen.get(),
                              visualizer_output_.get(),
-                             compiler_options,
-                             dump_mutex_);
+                             compiler_options);
 
   {
     VLOG(compiler) << "Building intrinsic graph " << pass_observer.GetMethodName();
@@ -962,30 +1024,30 @@ CodeGenerator* OptimizingCompiler::TryCompileIntrinsic(
                           &dex_compilation_unit,
                           &dex_compilation_unit,
                           codegen.get(),
-                          compilation_stats_.get(),
-                          /* interpreter_metadata= */ ArrayRef<const uint8_t>(),
-                          handles);
+                          compilation_stats_.get());
     builder.BuildIntrinsicGraph(method);
   }
 
   OptimizationDef optimizations[] = {
-    // The codegen has a few assumptions that only the instruction simplifier
-    // can satisfy.
-    OptDef(OptimizationPass::kInstructionSimplifier),
+      // The codegen has a few assumptions that only the instruction simplifier
+      // can satisfy.
+      OptDef(OptimizationPass::kInstructionSimplifier),
   };
   RunOptimizations(graph,
                    codegen.get(),
                    dex_compilation_unit,
                    &pass_observer,
-                   handles,
                    optimizations);
 
-  RunArchOptimizations(graph, codegen.get(), dex_compilation_unit, &pass_observer, handles);
+  RunArchOptimizations(graph, codegen.get(), dex_compilation_unit, &pass_observer);
+  {
+    PassScope scope(WriteBarrierElimination::kWBEPassName, &pass_observer);
+    WriteBarrierElimination(graph, compilation_stats_.get()).Run();
+  }
 
   AllocateRegisters(graph,
                     codegen.get(),
                     &pass_observer,
-                    compiler_options.GetRegisterAllocationStrategy(),
                     compilation_stats_.get());
   if (!codegen->IsLeafMethod()) {
     VLOG(compiler) << "Intrinsic method is not leaf: " << method->GetIntrinsic()
@@ -993,7 +1055,8 @@ CodeGenerator* OptimizingCompiler::TryCompileIntrinsic(
     return nullptr;
   }
 
-  codegen->Compile(code_allocator);
+  CHECK_LE(codegen->GetFrameSize(), codegen->GetMaximumFrameSize());
+  codegen->Compile();
   pass_observer.DumpDisassembly();
 
   VLOG(compiler) << "Compiled intrinsic: " << method->GetIntrinsic()
@@ -1004,105 +1067,86 @@ CodeGenerator* OptimizingCompiler::TryCompileIntrinsic(
 
 CompiledMethod* OptimizingCompiler::Compile(const dex::CodeItem* code_item,
                                             uint32_t access_flags,
-                                            InvokeType invoke_type,
                                             uint16_t class_def_idx,
                                             uint32_t method_idx,
                                             Handle<mirror::ClassLoader> jclass_loader,
                                             const DexFile& dex_file,
                                             Handle<mirror::DexCache> dex_cache) const {
   const CompilerOptions& compiler_options = GetCompilerOptions();
+  DCHECK(compiler_options.IsAotCompiler());
   CompiledMethod* compiled_method = nullptr;
   Runtime* runtime = Runtime::Current();
   DCHECK(runtime->IsAotCompiler());
-  const VerifiedMethod* verified_method = compiler_options.GetVerifiedMethod(&dex_file, method_idx);
-  DCHECK(!verified_method->HasRuntimeThrow());
-  if (compiler_options.IsMethodVerifiedWithoutFailures(method_idx, class_def_idx, dex_file) ||
-      verifier::CanCompilerHandleVerificationFailure(
-          verified_method->GetEncounteredVerificationFailures())) {
-    ArenaAllocator allocator(runtime->GetArenaPool());
-    ArenaStack arena_stack(runtime->GetArenaPool());
-    CodeVectorAllocator code_allocator(&allocator);
-    std::unique_ptr<CodeGenerator> codegen;
-    bool compiled_intrinsic = false;
-    {
-      ScopedObjectAccess soa(Thread::Current());
-      ArtMethod* method =
-          runtime->GetClassLinker()->ResolveMethod<ClassLinker::ResolveMode::kCheckICCEAndIAE>(
-              method_idx, dex_cache, jclass_loader, /*referrer=*/ nullptr, invoke_type);
-      DCHECK_EQ(method == nullptr, soa.Self()->IsExceptionPending());
-      soa.Self()->ClearException();  // Suppress exception if any.
-      VariableSizedHandleScope handles(soa.Self());
-      Handle<mirror::Class> compiling_class =
-          handles.NewHandle(method != nullptr ? method->GetDeclaringClass() : nullptr);
-      DexCompilationUnit dex_compilation_unit(
-          jclass_loader,
-          runtime->GetClassLinker(),
-          dex_file,
-          code_item,
-          class_def_idx,
-          method_idx,
-          access_flags,
-          /*verified_method=*/ nullptr,  // Not needed by the Optimizing compiler.
-          dex_cache,
-          compiling_class);
-      // Go to native so that we don't block GC during compilation.
-      ScopedThreadSuspension sts(soa.Self(), kNative);
-      if (method != nullptr && UNLIKELY(method->IsIntrinsic())) {
-        DCHECK(compiler_options.IsBootImage());
-        codegen.reset(
-            TryCompileIntrinsic(&allocator,
-                                &arena_stack,
-                                &code_allocator,
-                                dex_compilation_unit,
-                                method,
-                                &handles));
-        if (codegen != nullptr) {
-          compiled_intrinsic = true;
-        }
-      }
-      if (codegen == nullptr) {
-        codegen.reset(
-            TryCompile(&allocator,
-                       &arena_stack,
-                       &code_allocator,
-                       dex_compilation_unit,
-                       method,
-                       compiler_options.IsBaseline(),
-                       /* osr= */ false,
-                       /* is_shared_jit_code= */ false,
-                       &handles));
+  ArenaAllocator allocator(runtime->GetArenaPool());
+  ArenaStack arena_stack(runtime->GetArenaPool());
+  std::unique_ptr<CodeGenerator> codegen;
+  bool compiled_intrinsic = false;
+  {
+    ScopedObjectAccess soa(Thread::Current());
+    ArtMethod* method =
+        runtime->GetClassLinker()->ResolveMethodId(method_idx, dex_cache, jclass_loader);
+    soa.Self()->ClearException();  // Suppress exception if any.
+    VariableSizedHandleScope handles(soa.Self());
+    Handle<mirror::Class> compiling_class =
+        handles.NewHandle(method != nullptr ? method->GetDeclaringClass() : nullptr);
+    DexCompilationUnit dex_compilation_unit(
+        jclass_loader,
+        runtime->GetClassLinker(),
+        dex_file,
+        code_item,
+        class_def_idx,
+        method_idx,
+        access_flags,
+        /*verified_method=*/ nullptr,  // Not needed by the Optimizing compiler.
+        dex_cache,
+        compiling_class);
+    // All signature polymorphic methods are native.
+    DCHECK(method == nullptr || !method->IsSignaturePolymorphic());
+    // Go to native so that we don't block GC during compilation.
+    ScopedThreadSuspension sts(soa.Self(), ThreadState::kNative);
+    // Try to compile a fully intrinsified implementation.
+    if (method != nullptr && UNLIKELY(method->IsIntrinsic())) {
+      DCHECK(compiler_options.IsBootImage());
+      codegen.reset(
+          TryCompileIntrinsic(&allocator,
+                              &arena_stack,
+                              dex_compilation_unit,
+                              method,
+                              &handles));
+      if (codegen != nullptr) {
+        compiled_intrinsic = true;
       }
     }
-    if (codegen.get() != nullptr) {
-      compiled_method = Emit(&allocator,
-                             &code_allocator,
-                             codegen.get(),
-                             compiled_intrinsic ? nullptr : code_item);
-      if (compiled_intrinsic) {
-        compiled_method->MarkAsIntrinsic();
-      }
+    if (codegen == nullptr) {
+      codegen.reset(
+          TryCompile(&allocator,
+                     &arena_stack,
+                     dex_compilation_unit,
+                     method,
+                     compiler_options.IsBaseline()
+                        ? CompilationKind::kBaseline
+                        : CompilationKind::kOptimized,
+                     &handles));
+    }
+  }
+  if (codegen.get() != nullptr) {
+    compiled_method = Emit(&allocator,
+                           codegen.get(),
+                           compiled_intrinsic,
+                           compiled_intrinsic ? nullptr : code_item);
 
-      if (kArenaAllocatorCountAllocations) {
-        codegen.reset();  // Release codegen's ScopedArenaAllocator for memory accounting.
-        size_t total_allocated = allocator.BytesAllocated() + arena_stack.PeakBytesAllocated();
-        if (total_allocated > kArenaAllocatorMemoryReportThreshold) {
-          MemStats mem_stats(allocator.GetMemStats());
-          MemStats peak_stats(arena_stack.GetPeakStats());
-          LOG(INFO) << "Used " << total_allocated << " bytes of arena memory for compiling "
-                    << dex_file.PrettyMethod(method_idx)
-                    << "\n" << Dumpable<MemStats>(mem_stats)
-                    << "\n" << Dumpable<MemStats>(peak_stats);
-        }
+    if (kArenaAllocatorCountAllocations) {
+      codegen.reset();  // Release codegen's ScopedArenaAllocator for memory accounting.
+      size_t total_allocated = allocator.BytesAllocated() + arena_stack.PeakBytesAllocated();
+      if (total_allocated > kArenaAllocatorMemoryReportThreshold) {
+        MemStats mem_stats(allocator.GetMemStats());
+        MemStats peak_stats(arena_stack.GetPeakStats());
+        LOG(INFO) << "Used " << total_allocated << " bytes of arena memory for compiling "
+                  << dex_file.PrettyMethod(method_idx)
+                  << "\n" << Dumpable<MemStats>(mem_stats)
+                  << "\n" << Dumpable<MemStats>(peak_stats);
       }
     }
-  } else {
-    MethodCompilationStat method_stat;
-    if (compiler_options.VerifyAtRuntime()) {
-      method_stat = MethodCompilationStat::kNotCompiledVerifyAtRuntime;
-    } else {
-      method_stat = MethodCompilationStat::kNotCompiledVerificationError;
-    }
-    MaybeRecordStat(compilation_stats_.get(), method_stat);
   }
 
   if (kIsDebugBuild &&
@@ -1114,25 +1158,27 @@ CompiledMethod* OptimizingCompiler::Compile(const dex::CodeItem* code_item,
     // regressing.
     std::string method_name = dex_file.PrettyMethod(method_idx);
     bool shouldCompile = method_name.find("$opt$") != std::string::npos;
-    DCHECK((compiled_method != nullptr) || !shouldCompile) << "Didn't compile " << method_name;
+    DCHECK_IMPLIES(compiled_method == nullptr, !shouldCompile) << "Didn't compile " << method_name;
   }
 
   return compiled_method;
 }
 
 static ScopedArenaVector<uint8_t> CreateJniStackMap(ScopedArenaAllocator* allocator,
-                                                    const JniCompiledMethod& jni_compiled_method) {
+                                                    const JniCompiledMethod& jni_compiled_method,
+                                                    size_t code_size,
+                                                    bool debuggable) {
   // StackMapStream is quite large, so allocate it using the ScopedArenaAllocator
   // to stay clear of the frame size limit.
   std::unique_ptr<StackMapStream> stack_map_stream(
       new (allocator) StackMapStream(allocator, jni_compiled_method.GetInstructionSet()));
-  stack_map_stream->BeginMethod(
-      jni_compiled_method.GetFrameSize(),
-      jni_compiled_method.GetCoreSpillMask(),
-      jni_compiled_method.GetFpSpillMask(),
-      /* num_dex_registers= */ 0,
-      /* baseline= */ false);
-  stack_map_stream->EndMethod();
+  stack_map_stream->BeginMethod(jni_compiled_method.GetFrameSize(),
+                                jni_compiled_method.GetCoreSpillMask(),
+                                jni_compiled_method.GetFpSpillMask(),
+                                /* num_dex_registers= */ 0,
+                                /* baseline= */ false,
+                                debuggable);
+  stack_map_stream->EndMethod(code_size);
   return stack_map_stream->Encode();
 }
 
@@ -1149,7 +1195,10 @@ CompiledMethod* OptimizingCompiler::JniCompile(uint32_t access_flags,
     ScopedObjectAccess soa(Thread::Current());
     ArtMethod* method = runtime->GetClassLinker()->LookupResolvedMethod(
         method_idx, dex_cache.Get(), /*class_loader=*/ nullptr);
-    if (method != nullptr && UNLIKELY(method->IsIntrinsic())) {
+    // Try to compile a fully intrinsified implementation. Do not try to do this for
+    // signature polymorphic methods as the InstructionBuilder cannot handle them;
+    // and it would be useless as they always have a slow path for type conversions.
+    if (method != nullptr && UNLIKELY(method->IsIntrinsic()) && !method->IsSignaturePolymorphic()) {
       VariableSizedHandleScope handles(soa.Self());
       ScopedNullHandle<mirror::ClassLoader> class_loader;  // null means boot class path loader.
       Handle<mirror::Class> compiling_class = handles.NewHandle(method->GetDeclaringClass());
@@ -1164,49 +1213,48 @@ CompiledMethod* OptimizingCompiler::JniCompile(uint32_t access_flags,
           /*verified_method=*/ nullptr,
           dex_cache,
           compiling_class);
-      CodeVectorAllocator code_allocator(&allocator);
       // Go to native so that we don't block GC during compilation.
-      ScopedThreadSuspension sts(soa.Self(), kNative);
+      ScopedThreadSuspension sts(soa.Self(), ThreadState::kNative);
       std::unique_ptr<CodeGenerator> codegen(
           TryCompileIntrinsic(&allocator,
                               &arena_stack,
-                              &code_allocator,
                               dex_compilation_unit,
                               method,
                               &handles));
       if (codegen != nullptr) {
-        CompiledMethod* compiled_method = Emit(&allocator,
-                                               &code_allocator,
-                                               codegen.get(),
-                                               /* item= */ nullptr);
-        compiled_method->MarkAsIntrinsic();
-        return compiled_method;
+        return Emit(&allocator,
+                    codegen.get(),
+                    /*is_intrinsic=*/ true,
+                    /*item=*/ nullptr);
       }
     }
   }
 
   JniCompiledMethod jni_compiled_method = ArtQuickJniCompileMethod(
-      compiler_options, access_flags, method_idx, dex_file);
+      compiler_options, dex_file.GetMethodShortyView(method_idx), access_flags, &allocator);
   MaybeRecordStat(compilation_stats_.get(), MethodCompilationStat::kCompiledNativeStub);
 
   ScopedArenaAllocator stack_map_allocator(&arena_stack);  // Will hold the stack map.
-  ScopedArenaVector<uint8_t> stack_map = CreateJniStackMap(&stack_map_allocator,
-                                                           jni_compiled_method);
-  return CompiledMethod::SwapAllocCompiledMethod(
-      GetCompiledMethodStorage(),
+  ScopedArenaVector<uint8_t> stack_map =
+      CreateJniStackMap(&stack_map_allocator,
+                        jni_compiled_method,
+                        jni_compiled_method.GetCode().size(),
+                        compiler_options.GetDebuggable() && compiler_options.IsJitCompiler());
+  return GetCompiledCodeStorage()->CreateCompiledMethod(
       jni_compiled_method.GetInstructionSet(),
       jni_compiled_method.GetCode(),
       ArrayRef<const uint8_t>(stack_map),
       jni_compiled_method.GetCfi(),
-      /* patches= */ ArrayRef<const linker::LinkerPatch>());
+      /*patches=*/ ArrayRef<const linker::LinkerPatch>(),
+      /*is_intrinsic=*/ false);
 }
 
 Compiler* CreateOptimizingCompiler(const CompilerOptions& compiler_options,
-                                   CompiledMethodStorage* storage) {
+                                   CompiledCodeStorage* storage) {
   return new OptimizingCompiler(compiler_options, storage);
 }
 
-bool EncodeArtMethodInInlineInfo(ArtMethod* method ATTRIBUTE_UNUSED) {
+bool EncodeArtMethodInInlineInfo([[maybe_unused]] ArtMethod* method) {
   // Note: the runtime is null only for unit testing.
   return Runtime::Current() == nullptr || !Runtime::Current()->IsAotCompiler();
 }
@@ -1215,9 +1263,11 @@ bool OptimizingCompiler::JitCompile(Thread* self,
                                     jit::JitCodeCache* code_cache,
                                     jit::JitMemoryRegion* region,
                                     ArtMethod* method,
-                                    bool baseline,
-                                    bool osr,
+                                    CompilationKind compilation_kind,
                                     jit::JitLogger* jit_logger) {
+  const CompilerOptions& compiler_options = GetCompilerOptions();
+  DCHECK(compiler_options.IsJitCompiler());
+  DCHECK_EQ(compiler_options.IsJitCompilerForSharedCode(), code_cache->IsSharedRegion(*region));
   StackHandleScope<3> hs(self);
   Handle<mirror::ClassLoader> class_loader(hs.NewHandle(
       method->GetDeclaringClass()->GetClassLoader()));
@@ -1226,7 +1276,7 @@ bool OptimizingCompiler::JitCompile(Thread* self,
 
   const DexFile* dex_file = method->GetDexFile();
   const uint16_t class_def_idx = method->GetClassDefIndex();
-  const dex::CodeItem* code_item = dex_file->GetCodeItem(method->GetCodeItemOffset());
+  const dex::CodeItem* code_item = method->GetCodeItem();
   const uint32_t method_idx = method->GetDexMethodIndex();
   const uint32_t access_flags = method->GetAccessFlags();
 
@@ -1234,17 +1284,32 @@ bool OptimizingCompiler::JitCompile(Thread* self,
   ArenaAllocator allocator(runtime->GetJitArenaPool());
 
   if (UNLIKELY(method->IsNative())) {
-    const CompilerOptions& compiler_options = GetCompilerOptions();
+    // Use GenericJniTrampoline for critical native methods in debuggable runtimes. We don't
+    // support calling method entry / exit hooks for critical native methods yet.
+    // TODO(mythria): Add support for calling method entry / exit hooks in JITed stubs for critical
+    // native methods too.
+    if (compiler_options.GetDebuggable() && method->IsCriticalNative()) {
+      DCHECK(compiler_options.IsJitCompiler());
+      return false;
+    }
+    // Java debuggable runtimes should set compiler options to debuggable, so that we either
+    // generate method entry / exit hooks or skip JITing. For critical native methods we don't
+    // generate method entry / exit hooks so we shouldn't JIT them in debuggable runtimes.
+    DCHECK_IMPLIES(method->IsCriticalNative(), !runtime->IsJavaDebuggable());
+
     JniCompiledMethod jni_compiled_method = ArtQuickJniCompileMethod(
-        compiler_options, access_flags, method_idx, *dex_file);
+        compiler_options, dex_file->GetMethodShortyView(method_idx), access_flags, &allocator);
     std::vector<Handle<mirror::Object>> roots;
     ArenaSet<ArtMethod*, std::less<ArtMethod*>> cha_single_implementation_list(
         allocator.Adapter(kArenaAllocCHA));
     ArenaStack arena_stack(runtime->GetJitArenaPool());
     // StackMapStream is large and it does not fit into this frame, so we need helper method.
     ScopedArenaAllocator stack_map_allocator(&arena_stack);  // Will hold the stack map.
-    ScopedArenaVector<uint8_t> stack_map = CreateJniStackMap(&stack_map_allocator,
-                                                             jni_compiled_method);
+    ScopedArenaVector<uint8_t> stack_map =
+        CreateJniStackMap(&stack_map_allocator,
+                          jni_compiled_method,
+                          jni_compiled_method.GetCode().size(),
+                          compiler_options.GetDebuggable() && compiler_options.IsJitCompiler());
 
     ArrayRef<const uint8_t> reserved_code;
     ArrayRef<const uint8_t> reserved_data;
@@ -1265,6 +1330,7 @@ bool OptimizingCompiler::JitCompile(Thread* self,
     std::vector<uint8_t> debug_info;
     if (compiler_options.GenerateAnyDebugInfo()) {
       debug::MethodDebugInfo info = {};
+      // Simpleperf relies on art_jni_trampoline to detect jni methods.
       info.custom_name = "art_jni_trampoline";
       info.dex_file = dex_file;
       info.class_def_index = class_def_idx;
@@ -1294,8 +1360,7 @@ bool OptimizingCompiler::JitCompile(Thread* self,
                             ArrayRef<const uint8_t>(stack_map),
                             debug_info,
                             /* is_full_debug_info= */ compiler_options.GetGenerateDebugInfo(),
-                            osr,
-                            /* has_should_deoptimize_flag= */ false,
+                            compilation_kind,
                             cha_single_implementation_list)) {
       code_cache->Free(self, region, reserved_code.data(), reserved_data.data());
       return false;
@@ -1309,7 +1374,6 @@ bool OptimizingCompiler::JitCompile(Thread* self,
   }
 
   ArenaStack arena_stack(runtime->GetJitArenaPool());
-  CodeVectorAllocator code_allocator(&allocator);
   VariableSizedHandleScope handles(self);
 
   std::unique_ptr<CodeGenerator> codegen;
@@ -1328,16 +1392,13 @@ bool OptimizingCompiler::JitCompile(Thread* self,
         compiling_class);
 
     // Go to native so that we don't block GC during compilation.
-    ScopedThreadSuspension sts(self, kNative);
+    ScopedThreadSuspension sts(self, ThreadState::kNative);
     codegen.reset(
         TryCompile(&allocator,
                    &arena_stack,
-                   &code_allocator,
                    dex_compilation_unit,
                    method,
-                   baseline || GetCompilerOptions().IsBaseline(),
-                   osr,
-                   /* is_shared_jit_code= */ code_cache->IsSharedRegion(*region),
+                   compilation_kind,
                    &handles));
     if (codegen.get() == nullptr) {
       return false;
@@ -1350,7 +1411,7 @@ bool OptimizingCompiler::JitCompile(Thread* self,
   ArrayRef<const uint8_t> reserved_data;
   if (!code_cache->Reserve(self,
                            region,
-                           code_allocator.GetMemory().size(),
+                           codegen->GetAssembler()->CodeSize(),
                            stack_map.size(),
                            /*number_of_roots=*/codegen->GetNumberOfJitRoots(),
                            method,
@@ -1363,7 +1424,9 @@ bool OptimizingCompiler::JitCompile(Thread* self,
   const uint8_t* roots_data = reserved_data.data();
 
   std::vector<Handle<mirror::Object>> roots;
-  codegen->EmitJitRoots(code_allocator.GetData(), roots_data, &roots);
+  codegen->EmitJitRoots(const_cast<uint8_t*>(codegen->GetAssembler()->CodeBufferBaseAddress()),
+                        roots_data,
+                        &roots);
   // The root Handle<>s filled by the codegen reference entries in the VariableSizedHandleScope.
   DCHECK(std::all_of(roots.begin(),
                      roots.end(),
@@ -1372,7 +1435,6 @@ bool OptimizingCompiler::JitCompile(Thread* self,
                      }));
 
   // Add debug info after we know the code location but before we update entry-point.
-  const CompilerOptions& compiler_options = GetCompilerOptions();
   std::vector<uint8_t> debug_info;
   if (compiler_options.GenerateAnyDebugInfo()) {
     debug::MethodDebugInfo info = {};
@@ -1388,33 +1450,39 @@ bool OptimizingCompiler::JitCompile(Thread* self,
     info.is_optimized = true;
     info.is_code_address_text_relative = false;
     info.code_address = reinterpret_cast<uintptr_t>(code);
-    info.code_size = code_allocator.GetMemory().size();
+    info.code_size = codegen->GetAssembler()->CodeSize(),
     info.frame_size_in_bytes = codegen->GetFrameSize();
     info.code_info = stack_map.size() == 0 ? nullptr : stack_map.data();
     info.cfi = ArrayRef<const uint8_t>(*codegen->GetAssembler()->cfi().data());
     debug_info = GenerateJitDebugInfo(info);
   }
 
+  if (compilation_kind == CompilationKind::kBaseline &&
+      !codegen->GetGraph()->IsUsefulOptimizing()) {
+    compilation_kind = CompilationKind::kOptimized;
+  }
+
   if (!code_cache->Commit(self,
                           region,
                           method,
                           reserved_code,
-                          code_allocator.GetMemory(),
+                          codegen->GetCode(),
                           reserved_data,
                           roots,
                           ArrayRef<const uint8_t>(stack_map),
                           debug_info,
                           /* is_full_debug_info= */ compiler_options.GetGenerateDebugInfo(),
-                          osr,
-                          codegen->GetGraph()->HasShouldDeoptimizeFlag(),
+                          compilation_kind,
                           codegen->GetGraph()->GetCHASingleImplementationList())) {
+    CHECK_EQ(CodeInfo::HasShouldDeoptimizeFlag(stack_map.data()),
+             codegen->GetGraph()->HasShouldDeoptimizeFlag());
     code_cache->Free(self, region, reserved_code.data(), reserved_data.data());
     return false;
   }
 
   Runtime::Current()->GetJit()->AddMemoryUsage(method, allocator.BytesUsed());
   if (jit_logger != nullptr) {
-    jit_logger->WriteLog(code, code_allocator.GetMemory().size(), method);
+    jit_logger->WriteLog(code, codegen->GetAssembler()->CodeSize(), method);
   }
 
   if (kArenaAllocatorCountAllocations) {

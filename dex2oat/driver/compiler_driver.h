@@ -35,12 +35,10 @@
 #include "compiler.h"
 #include "dex/class_reference.h"
 #include "dex/dex_file_types.h"
-#include "dex/dex_to_dex_compiler.h"
 #include "dex/method_reference.h"
 #include "driver/compiled_method_storage.h"
 #include "thread_pool.h"
 #include "utils/atomic_dex_ref_map.h"
-#include "utils/dex_cache_arrays_layout.h"
 
 namespace art {
 
@@ -87,7 +85,7 @@ class CompilerDriver {
   // can assume will be in the image, with null implying all available
   // classes.
   CompilerDriver(const CompilerOptions* compiler_options,
-                 Compiler::Kind compiler_kind,
+                 const VerificationResults* verification_results,
                  size_t thread_count,
                  int swap_fd);
 
@@ -106,8 +104,7 @@ class CompilerDriver {
   void PreCompile(jobject class_loader,
                   const std::vector<const DexFile*>& dex_files,
                   TimingLogger* timings,
-                  /*inout*/ HashSet<std::string>* image_classes,
-                  /*out*/ VerificationResults* verification_results)
+                  /*inout*/ HashSet<std::string>* image_classes)
       REQUIRES(!Locks::mutator_lock_);
   void CompileAll(jobject class_loader,
                   const std::vector<const DexFile*>& dex_files,
@@ -116,6 +113,10 @@ class CompilerDriver {
 
   const CompilerOptions& GetCompilerOptions() const {
     return *compiler_options_;
+  }
+
+  const VerificationResults* GetVerificationResults() const {
+    return verification_results_;
   }
 
   Compiler* GetCompiler() const {
@@ -129,6 +130,7 @@ class CompilerDriver {
   std::unique_ptr<const std::vector<uint8_t>> CreateQuickImtConflictTrampoline() const;
   std::unique_ptr<const std::vector<uint8_t>> CreateQuickResolutionTrampoline() const;
   std::unique_ptr<const std::vector<uint8_t>> CreateQuickToInterpreterBridge() const;
+  std::unique_ptr<const std::vector<uint8_t>> CreateNterpTrampoline() const;
 
   ClassStatus GetClassStatus(const ClassReference& ref) const;
   bool GetCompiledClass(const ClassReference& ref, ClassStatus* status) const;
@@ -183,8 +185,6 @@ class CompilerDriver {
       REQUIRES_SHARED(Locks::mutator_lock_);
 
 
-  bool IsSafeCast(const DexCompilationUnit* mUnit, uint32_t dex_pc);
-
   size_t GetThreadCount() const {
     return parallel_thread_count_;
   }
@@ -196,10 +196,6 @@ class CompilerDriver {
   bool DedupeEnabled() const {
     return compiled_method_storage_.DedupeEnabled();
   }
-
-  // Checks whether profile guided compilation is enabled and if the method should be compiled
-  // according to the profile file.
-  bool ShouldCompileBasedOnProfile(const MethodReference& method_ref) const;
 
   // Checks whether profile guided verification is enabled and if the method should be verified
   // according to the profile file.
@@ -217,20 +213,18 @@ class CompilerDriver {
     number_of_soft_verifier_failures_++;
   }
 
-  Compiler::Kind GetCompilerKind() {
-    return compiler_kind_;
-  }
-
   CompiledMethodStorage* GetCompiledMethodStorage() {
     return &compiled_method_storage_;
   }
 
-  optimizer::DexToDexCompiler& GetDexToDexCompiler() {
-    return dex_to_dex_compiler_;
+  const CompiledMethodStorage* GetCompiledMethodStorage() const {
+    return &compiled_method_storage_;
   }
 
  private:
-  void LoadImageClasses(TimingLogger* timings, /*inout*/ HashSet<std::string>* image_classes)
+  void LoadImageClasses(TimingLogger* timings,
+                        jobject class_loader,
+                        /*inout*/ HashSet<std::string>* image_classes)
       REQUIRES(!Locks::mutator_lock_);
 
   // Attempt to resolve all type, methods, fields, and strings
@@ -242,7 +236,6 @@ class CompilerDriver {
       REQUIRES(!Locks::mutator_lock_);
   void ResolveDexFile(jobject class_loader,
                       const DexFile& dex_file,
-                      const std::vector<const DexFile*>& dex_files,
                       ThreadPool* thread_pool,
                       size_t thread_count,
                       TimingLogger* timings)
@@ -252,17 +245,14 @@ class CompilerDriver {
   // verification was successful.
   bool FastVerify(jobject class_loader,
                   const std::vector<const DexFile*>& dex_files,
-                  TimingLogger* timings,
-                  /*out*/ VerificationResults* verification_results);
+                  TimingLogger* timings);
 
   void Verify(jobject class_loader,
               const std::vector<const DexFile*>& dex_files,
-              TimingLogger* timings,
-              /*out*/ VerificationResults* verification_results);
+              TimingLogger* timings);
 
   void VerifyDexFile(jobject class_loader,
                      const DexFile& dex_file,
-                     const std::vector<const DexFile*>& dex_files,
                      ThreadPool* thread_pool,
                      size_t thread_count,
                      TimingLogger* timings)
@@ -273,7 +263,6 @@ class CompilerDriver {
                    TimingLogger* timings);
   void SetVerifiedDexFile(jobject class_loader,
                           const DexFile& dex_file,
-                          const std::vector<const DexFile*>& dex_files,
                           ThreadPool* thread_pool,
                           size_t thread_count,
                           TimingLogger* timings)
@@ -285,7 +274,6 @@ class CompilerDriver {
       REQUIRES(!Locks::mutator_lock_);
   void InitializeClasses(jobject class_loader,
                          const DexFile& dex_file,
-                         const std::vector<const DexFile*>& dex_files,
                          TimingLogger* timings)
       REQUIRES(!Locks::mutator_lock_);
 
@@ -305,9 +293,9 @@ class CompilerDriver {
                            /*inout*/ TimingLogger* timings);
 
   const CompilerOptions* const compiler_options_;
+  const VerificationResults* const verification_results_;
 
   std::unique_ptr<Compiler> compiler_;
-  Compiler::Kind compiler_kind_;
 
   // All class references that this compiler has compiled. Indexed by class defs.
   using ClassStateTable = AtomicDexRefMap<ClassReference, ClassStatus>;
@@ -315,7 +303,7 @@ class CompilerDriver {
   // All class references that are in the classpath. Indexed by class defs.
   ClassStateTable classpath_classes_;
 
-  typedef AtomicDexRefMap<MethodReference, CompiledMethod*> MethodTable;
+  using MethodTable = AtomicDexRefMap<MethodReference, CompiledMethod*>;
 
   // All method references that this compiler has compiled.
   MethodTable compiled_methods_;
@@ -338,12 +326,8 @@ class CompilerDriver {
 
   size_t max_arena_alloc_;
 
-  // Compiler for dex to dex (quickening).
-  optimizer::DexToDexCompiler dex_to_dex_compiler_;
-
   friend class CommonCompilerDriverTest;
   friend class CompileClassVisitor;
-  friend class DexToDexDecompilerTest;
   friend class InitializeClassVisitor;
   friend class verifier::VerifierDepsTest;
   DISALLOW_COPY_AND_ASSIGN(CompilerDriver);

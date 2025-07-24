@@ -27,7 +27,7 @@
 #include "base/mem_map.h"
 #include "runtime_globals.h"
 
-namespace art {
+namespace art HIDDEN {
 
 namespace mirror {
 class Class;
@@ -40,12 +40,14 @@ namespace accounting {
 template<size_t kAlignment>
 class SpaceBitmap {
  public:
-  typedef void ScanCallback(mirror::Object* obj, void* finger, void* arg);
-  typedef void SweepCallback(size_t ptr_count, mirror::Object** ptrs, void* arg);
+  using ScanCallback = void(mirror::Object* obj, void* finger, void* arg);
+  using SweepCallback = void(size_t ptr_count, mirror::Object** ptrs, void* arg);
 
   // Initialize a space bitmap so that it points to a bitmap large enough to cover a heap at
   // heap_begin of heap_capacity bytes, where objects are guaranteed to be kAlignment-aligned.
-  static SpaceBitmap Create(const std::string& name, uint8_t* heap_begin, size_t heap_capacity);
+  EXPORT static SpaceBitmap Create(const std::string& name,
+                                   uint8_t* heap_begin,
+                                   size_t heap_capacity);
 
   // Initialize a space bitmap using the provided mem_map as the live bits. Takes ownership of the
   // mem map. The address range covered starts at heap_begin and is of size equal to heap_capacity.
@@ -55,7 +57,7 @@ class SpaceBitmap {
                                       uint8_t* heap_begin,
                                       size_t heap_capacity);
 
-  ~SpaceBitmap();
+  EXPORT ~SpaceBitmap();
 
   // Return the bitmap word index corresponding to memory offset (relative to
   // `HeapBegin()`) `offset`.
@@ -102,7 +104,9 @@ class SpaceBitmap {
   bool AtomicTestAndSet(const mirror::Object* obj);
 
   // Fill the bitmap with zeroes.  Returns the bitmap's memory to the system as a side-effect.
-  void Clear();
+  // If `release_eagerly` is true, this method will also try to give back the
+  // memory to the OS eagerly.
+  void Clear(bool release_eagerly = true);
 
   // Clear a range covered by the bitmap using madvise if possible.
   void ClearRange(const mirror::Object* begin, const mirror::Object* end);
@@ -131,10 +135,15 @@ class SpaceBitmap {
     }
   }
 
-  // Visit the live objects in the range [visit_begin, visit_end).
+  // Find first object while scanning bitmap backwards from visit_begin -> visit_end.
+  // Covers [visit_end, visit_begin] range.
+  mirror::Object* FindPrecedingObject(uintptr_t visit_begin, uintptr_t visit_end = 0) const;
+
+  // Visit the live objects in the range [visit_begin, visit_end). If kVisitOnce
+  // is true, then only the first live object will be visited.
   // TODO: Use lock annotations when clang is fixed.
   // REQUIRES(Locks::heap_bitmap_lock_) REQUIRES_SHARED(Locks::mutator_lock_);
-  template <typename Visitor>
+  template <bool kVisitOnce = false, typename Visitor>
   void VisitMarkedRange(uintptr_t visit_begin, uintptr_t visit_end, Visitor&& visitor) const
       NO_THREAD_SAFETY_ANALYSIS;
 
@@ -159,7 +168,7 @@ class SpaceBitmap {
   void CopyFrom(SpaceBitmap* source_bitmap);
 
   // Starting address of our internal storage.
-  Atomic<uintptr_t>* Begin() {
+  Atomic<uintptr_t>* Begin() const {
     return bitmap_begin_;
   }
 
@@ -174,10 +183,12 @@ class SpaceBitmap {
   }
 
   void SetHeapSize(size_t bytes) {
-    // TODO: Un-map the end of the mem map.
     heap_limit_ = heap_begin_ + bytes;
-    bitmap_size_ = OffsetToIndex(bytes) * sizeof(intptr_t);
+    bitmap_size_ = ComputeBitmapSize(bytes);
     CHECK_EQ(HeapSize(), bytes);
+    if (mem_map_.IsValid()) {
+      mem_map_.SetSize(bitmap_size_);
+    }
   }
 
   uintptr_t HeapBegin() const {
@@ -202,6 +213,9 @@ class SpaceBitmap {
 
   std::string Dump() const;
 
+  // Dump three bitmap words around obj.
+  std::string DumpMemAround(mirror::Object* obj) const;
+
   // Helper function for computing bitmap size based on a 64 bit capacity.
   static size_t ComputeBitmapSize(uint64_t capacity);
   static size_t ComputeHeapSize(uint64_t bitmap_bytes);
@@ -210,8 +224,8 @@ class SpaceBitmap {
   // however, we document that this is expected on heap_end_
 
   SpaceBitmap() = default;
-  SpaceBitmap(SpaceBitmap&&) = default;
-  SpaceBitmap& operator=(SpaceBitmap&&) = default;
+  SpaceBitmap(SpaceBitmap&&) noexcept = default;
+  SpaceBitmap& operator=(SpaceBitmap&&) noexcept = default;
 
   bool IsValid() const {
     return bitmap_begin_ != nullptr;
@@ -261,8 +275,21 @@ class SpaceBitmap {
   std::string name_;
 };
 
-typedef SpaceBitmap<kObjectAlignment> ContinuousSpaceBitmap;
-typedef SpaceBitmap<kLargeObjectAlignment> LargeObjectBitmap;
+using ContinuousSpaceBitmap = SpaceBitmap<kObjectAlignment>;
+
+// We pick the lowest supported page size to ensure that it's a constexpr, so
+// that we can keep bitmap accesses optimized. However, this means that when the
+// large-object alignment is higher than kMinPageSize, then not all bits in the
+// bitmap are actually in use.
+// In practice, this happens when running with a kernel that uses 16kB as the
+// page size, where 1 out of every 4 bits of the bitmap is used.
+
+// TODO: In the future, we should consider alternative fixed alignments for
+// large objects, disassociated from the page size. This would allow us to keep
+// accesses optimized, while also packing the bitmap efficiently, and reducing
+// its size enough that it would no longer make sense to allocate it with
+// mmap().
+using LargeObjectBitmap = SpaceBitmap<kMinPageSize>;
 
 template<size_t kAlignment>
 std::ostream& operator << (std::ostream& stream, const SpaceBitmap<kAlignment>& bitmap);

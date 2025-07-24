@@ -26,24 +26,64 @@
 #include "mirror/class-inl.h"
 #include "mirror/object_reference.h"
 
-namespace art {
+namespace art HIDDEN {
+
+// Fast path field resolution that can't initialize classes or throw exceptions.
+inline ArtField* FindFieldFast(uint32_t field_idx,
+                               ArtMethod* referrer,
+                               FindFieldType type,
+                               bool should_resolve_type = false)
+    REQUIRES(!Roles::uninterruptible_)
+    REQUIRES_SHARED(Locks::mutator_lock_) {
+  ScopedAssertNoThreadSuspension ants(__FUNCTION__);
+  ArtField* resolved_field = referrer->GetDexCache()->GetResolvedField(field_idx);
+  if (UNLIKELY(resolved_field == nullptr)) {
+    return nullptr;
+  }
+  // Check for incompatible class change.
+  const bool is_set = (type & FindFieldFlags::WriteBit) != 0;
+  const bool is_static = (type & FindFieldFlags::StaticBit) != 0;
+  if (UNLIKELY(resolved_field->IsStatic() != is_static)) {
+    // Incompatible class change.
+    return nullptr;
+  }
+  ObjPtr<mirror::Class> fields_class = resolved_field->GetDeclaringClass();
+  if (is_static) {
+    // Check class is initialized else fail so that we can contend to initialize the class with
+    // other threads that may be racing to do this.
+    if (UNLIKELY(!fields_class->IsVisiblyInitialized())) {
+      return nullptr;
+    }
+  }
+  ObjPtr<mirror::Class> referring_class = referrer->GetDeclaringClass();
+  if (UNLIKELY(!referring_class->CanAccess(fields_class) ||
+               !referring_class->CanAccessMember(fields_class, resolved_field->GetAccessFlags()) ||
+               (is_set && !resolved_field->CanBeChangedBy(referrer)))) {
+    // Illegal access.
+    return nullptr;
+  }
+  if (should_resolve_type && resolved_field->LookupResolvedType() == nullptr) {
+    return nullptr;
+  }
+  return resolved_field;
+}
 
 // Helper function to do a null check after trying to resolve the field. Not for statics since obj
 // does not exist there. There is a suspend check, object is a double pointer to update the value
 // in the caller in case it moves.
-template<FindFieldType type, bool kAccessCheck>
+template<FindFieldType type>
 ALWAYS_INLINE static inline ArtField* FindInstanceField(uint32_t field_idx,
                                                         ArtMethod* referrer,
                                                         Thread* self,
-                                                        size_t size,
-                                                        mirror::Object** obj)
+                                                        mirror::Object** obj,
+                                                        bool should_resolve_type = false)
     REQUIRES(!Roles::uninterruptible_)
     REQUIRES_SHARED(Locks::mutator_lock_) {
   StackHandleScope<1> hs(self);
   HandleWrapper<mirror::Object> h(hs.NewHandleWrapper(obj));
-  ArtField* field = FindFieldFromCode<type, kAccessCheck>(field_idx, referrer, self, size);
+  ArtField* field = FindFieldFromCode<type>(field_idx, referrer, self, should_resolve_type);
   if (LIKELY(field != nullptr) && UNLIKELY(h == nullptr)) {
-    ThrowNullPointerExceptionForFieldAccess(field, (type & FindFieldFlags::ReadBit) != 0);
+    ThrowNullPointerExceptionForFieldAccess(field, referrer, (type & FindFieldFlags::ReadBit) != 0);
     return nullptr;
   }
   return field;
@@ -66,21 +106,20 @@ static ArtMethod* GetReferrer(Thread* self) REQUIRES_SHARED(Locks::mutator_lock_
 //   art{Get,Set}<Kind>{Static,Instance}FromCode
 //   art{Get,Set}<Kind>{Static,Instance}FromCompiledCode
 //
-#define ART_GET_FIELD_FROM_CODE(Kind, PrimitiveType, RetType, SetType,         \
-                                PrimitiveOrObject, IsObject, Ptr)              \
+#define ART_GET_FIELD_FROM_CODE(Kind, RetType, SetType, PrimitiveOrObject,     \
+                                IsObject, Ptr)                                 \
   extern "C" RetType artGet ## Kind ## StaticFromCode(uint32_t field_idx,      \
                                                       ArtMethod* referrer,     \
                                                       Thread* self)            \
       REQUIRES_SHARED(Locks::mutator_lock_) {                                  \
     ScopedQuickEntrypointChecks sqec(self);                                    \
     ArtField* field = FindFieldFast(                                           \
-        field_idx, referrer, Static ## PrimitiveOrObject ## Read,              \
-        sizeof(PrimitiveType));                                                \
+        field_idx, referrer, Static ## PrimitiveOrObject ## Read);             \
     if (LIKELY(field != nullptr)) {                                            \
       return field->Get ## Kind (field->GetDeclaringClass())Ptr;  /* NOLINT */ \
     }                                                                          \
-    field = FindFieldFromCode<Static ## PrimitiveOrObject ## Read, true>(      \
-        field_idx, referrer, self, sizeof(PrimitiveType));                     \
+    field = FindFieldFromCode<Static ## PrimitiveOrObject ## Read>(            \
+        field_idx, referrer, self);                                            \
     if (LIKELY(field != nullptr)) {                                            \
       return field->Get ## Kind (field->GetDeclaringClass())Ptr;  /* NOLINT */ \
     }                                                                          \
@@ -95,13 +134,12 @@ static ArtMethod* GetReferrer(Thread* self) REQUIRES_SHARED(Locks::mutator_lock_
       REQUIRES_SHARED(Locks::mutator_lock_) {                                  \
     ScopedQuickEntrypointChecks sqec(self);                                    \
     ArtField* field = FindFieldFast(                                           \
-        field_idx, referrer, Instance ## PrimitiveOrObject ## Read,            \
-        sizeof(PrimitiveType));                                                \
+        field_idx, referrer, Instance ## PrimitiveOrObject ## Read);           \
     if (LIKELY(field != nullptr) && obj != nullptr) {                          \
       return field->Get ## Kind (obj)Ptr;  /* NOLINT */                        \
     }                                                                          \
-    field = FindInstanceField<Instance ## PrimitiveOrObject ## Read, true>(    \
-        field_idx, referrer, self, sizeof(PrimitiveType), &obj);               \
+    field = FindInstanceField<Instance ## PrimitiveOrObject ## Read>(          \
+        field_idx, referrer, self, &obj);                                      \
     if (LIKELY(field != nullptr)) {                                            \
       return field->Get ## Kind (obj)Ptr;  /* NOLINT */                        \
     }                                                                          \
@@ -115,28 +153,32 @@ static ArtMethod* GetReferrer(Thread* self) REQUIRES_SHARED(Locks::mutator_lock_
                                                   Thread* self)                \
       REQUIRES_SHARED(Locks::mutator_lock_) {                                  \
     ScopedQuickEntrypointChecks sqec(self);                                    \
+    bool should_resolve_type = (IsObject) && new_value != 0;                   \
     ArtField* field = FindFieldFast(                                           \
-        field_idx, referrer, Static ## PrimitiveOrObject ## Write,             \
-        sizeof(PrimitiveType));                                                \
-    if (LIKELY(field != nullptr)) {                                            \
-      field->Set ## Kind <false>(field->GetDeclaringClass(), new_value);       \
-      return 0;                                                                \
+        field_idx,                                                             \
+        referrer,                                                              \
+        Static ## PrimitiveOrObject ## Write,                                  \
+        should_resolve_type);                                                  \
+    if (UNLIKELY(field == nullptr)) {                                          \
+      if (IsObject) {                                                          \
+        StackHandleScope<1> hs(self);                                          \
+        HandleWrapper<mirror::Object> h_obj(hs.NewHandleWrapper(               \
+            reinterpret_cast<mirror::Object**>(&new_value)));                  \
+        field = FindFieldFromCode<Static ## PrimitiveOrObject ## Write>(       \
+            field_idx,                                                         \
+            referrer,                                                          \
+            self,                                                              \
+            should_resolve_type);                                              \
+      } else {                                                                 \
+        field = FindFieldFromCode<Static ## PrimitiveOrObject ## Write>(       \
+            field_idx, referrer, self);                                        \
+      }                                                                        \
+      if (UNLIKELY(field == nullptr)) {                                        \
+        return -1;                                                             \
+      }                                                                        \
     }                                                                          \
-    if (IsObject) {                                                            \
-      StackHandleScope<1> hs(self);                                            \
-      HandleWrapper<mirror::Object> h_obj(hs.NewHandleWrapper(                 \
-          reinterpret_cast<mirror::Object**>(&new_value)));                    \
-      field = FindFieldFromCode<Static ## PrimitiveOrObject ## Write, true>(   \
-          field_idx, referrer, self, sizeof(PrimitiveType));                   \
-    } else {                                                                   \
-      field = FindFieldFromCode<Static ## PrimitiveOrObject ## Write, true>(   \
-          field_idx, referrer, self, sizeof(PrimitiveType));                   \
-    }                                                                          \
-    if (LIKELY(field != nullptr)) {                                            \
-      field->Set ## Kind <false>(field->GetDeclaringClass(), new_value);       \
-      return 0;                                                                \
-    }                                                                          \
-    return -1;                                                                 \
+    field->Set ## Kind <false>(field->GetDeclaringClass(), new_value);         \
+    return 0;                                                                  \
   }                                                                            \
                                                                                \
   extern "C" int artSet ## Kind ## InstanceFromCode(uint32_t field_idx,        \
@@ -146,36 +188,33 @@ static ArtMethod* GetReferrer(Thread* self) REQUIRES_SHARED(Locks::mutator_lock_
                                                     Thread* self)              \
     REQUIRES_SHARED(Locks::mutator_lock_) {                                    \
     ScopedQuickEntrypointChecks sqec(self);                                    \
+    bool should_resolve_type = (IsObject) && new_value != 0;                   \
     ArtField* field = FindFieldFast(                                           \
-        field_idx, referrer, Instance ## PrimitiveOrObject ## Write,           \
-        sizeof(PrimitiveType));                                                \
-    if (LIKELY(field != nullptr && obj != nullptr)) {                          \
-      field->Set ## Kind <false>(obj, new_value);                              \
-      return 0;                                                                \
+        field_idx,                                                             \
+        referrer,                                                              \
+        Instance ## PrimitiveOrObject ## Write,                                \
+        should_resolve_type);                                                  \
+    if (UNLIKELY(field == nullptr || obj == nullptr)) {                        \
+      if (IsObject) {                                                          \
+        StackHandleScope<1> hs(self);                                          \
+        HandleWrapper<mirror::Object> h_obj(hs.NewHandleWrapper(               \
+            reinterpret_cast<mirror::Object**>(&new_value)));                  \
+        field = FindInstanceField<Instance ## PrimitiveOrObject ## Write>(     \
+            field_idx,                                                         \
+            referrer,                                                          \
+            self,                                                              \
+            &obj,                                                              \
+            should_resolve_type);                                              \
+      } else {                                                                 \
+        field = FindInstanceField<Instance ## PrimitiveOrObject ## Write>(     \
+            field_idx, referrer, self, &obj);                                  \
+      }                                                                        \
+      if (UNLIKELY(field == nullptr)) {                                        \
+        return -1;                                                             \
+      }                                                                        \
     }                                                                          \
-    if (IsObject) {                                                            \
-      StackHandleScope<1> hs(self);                                            \
-      HandleWrapper<mirror::Object> h_obj(hs.NewHandleWrapper(                 \
-          reinterpret_cast<mirror::Object**>(&new_value)));                    \
-      field = FindInstanceField<Instance ## PrimitiveOrObject ## Write, true>( \
-          field_idx,                                                           \
-          referrer,                                                            \
-          self,                                                                \
-          sizeof(PrimitiveType),                                               \
-          &obj);                                                               \
-    } else {                                                                   \
-      field = FindInstanceField<Instance ## PrimitiveOrObject ## Write, true>( \
-          field_idx,                                                           \
-          referrer,                                                            \
-          self,                                                                \
-          sizeof(PrimitiveType),                                               \
-          &obj);                                                               \
-    }                                                                          \
-    if (LIKELY(field != nullptr)) {                                            \
-      field->Set ## Kind<false>(obj, new_value);                               \
-      return 0;                                                                \
-    }                                                                          \
-    return -1;                                                                 \
+    field->Set ## Kind<false>(obj, new_value);                                 \
+    return 0;                                                                  \
   }                                                                            \
                                                                                \
   extern "C" RetType artGet ## Kind ## StaticFromCompiledCode(                 \
@@ -225,7 +264,7 @@ static ArtMethod* GetReferrer(Thread* self) REQUIRES_SHARED(Locks::mutator_lock_
 //   artSetByteStaticFromCompiledCode
 //   artSetByteInstanceFromCompiledCode
 //
-ART_GET_FIELD_FROM_CODE(Byte, int8_t, ssize_t, uint32_t, Primitive, false, )
+ART_GET_FIELD_FROM_CODE(Byte, ssize_t, uint32_t, Primitive, false, )
 
 // Define these functions:
 //
@@ -238,7 +277,7 @@ ART_GET_FIELD_FROM_CODE(Byte, int8_t, ssize_t, uint32_t, Primitive, false, )
 //   artSetBooleanStaticFromCompiledCode
 //   artSetBooleanInstanceFromCompiledCode
 //
-ART_GET_FIELD_FROM_CODE(Boolean, int8_t, size_t, uint32_t, Primitive, false, )
+ART_GET_FIELD_FROM_CODE(Boolean, size_t, uint32_t, Primitive, false, )
 
 // Define these functions:
 //
@@ -251,7 +290,7 @@ ART_GET_FIELD_FROM_CODE(Boolean, int8_t, size_t, uint32_t, Primitive, false, )
 //   artSetShortStaticFromCompiledCode
 //   artSetShortInstanceFromCompiledCode
 //
-ART_GET_FIELD_FROM_CODE(Short, int16_t, ssize_t, uint16_t, Primitive, false, )
+ART_GET_FIELD_FROM_CODE(Short, ssize_t, uint16_t, Primitive, false, )
 
 // Define these functions:
 //
@@ -264,7 +303,7 @@ ART_GET_FIELD_FROM_CODE(Short, int16_t, ssize_t, uint16_t, Primitive, false, )
 //   artSetCharStaticFromCompiledCode
 //   artSetCharInstanceFromCompiledCode
 //
-ART_GET_FIELD_FROM_CODE(Char, int16_t, size_t, uint16_t, Primitive, false, )
+ART_GET_FIELD_FROM_CODE(Char, size_t, uint16_t, Primitive, false, )
 
 // Define these functions:
 //
@@ -277,7 +316,18 @@ ART_GET_FIELD_FROM_CODE(Char, int16_t, size_t, uint16_t, Primitive, false, )
 //   artSet32StaticFromCompiledCode
 //   artSet32InstanceFromCompiledCode
 //
-ART_GET_FIELD_FROM_CODE(32, int32_t, size_t, uint32_t, Primitive, false, )
+#if defined(__riscv)
+// On riscv64 we need to sign-extend `int` values to the full 64-bit register.
+// `ArtField::Get32()` returns a `uint32_t`, so let the getters return the same,
+// allowing the sign-extension specified by the RISC-V native calling convention:
+//     "[I]nteger scalars narrower than XLEN bits are widened according to the
+//     sign of their type up to 32 bits, then sign-extended to XLEN bits."
+// This is OK for `float` as the compiled code shall transfer it using FMV.W.X,
+// ignoring the upper 32 bits.
+ART_GET_FIELD_FROM_CODE(32, uint32_t, uint32_t, Primitive, false, )
+#else
+ART_GET_FIELD_FROM_CODE(32, size_t, uint32_t, Primitive, false, )
+#endif
 
 // Define these functions:
 //
@@ -290,7 +340,7 @@ ART_GET_FIELD_FROM_CODE(32, int32_t, size_t, uint32_t, Primitive, false, )
 //   artSet64StaticFromCompiledCode
 //   artSet64InstanceFromCompiledCode
 //
-ART_GET_FIELD_FROM_CODE(64, int64_t, uint64_t, uint64_t, Primitive, false, )
+ART_GET_FIELD_FROM_CODE(64, uint64_t, uint64_t, Primitive, false, )
 
 // Define these functions:
 //
@@ -303,8 +353,7 @@ ART_GET_FIELD_FROM_CODE(64, int64_t, uint64_t, uint64_t, Primitive, false, )
 //   artSetObjStaticFromCompiledCode
 //   artSetObjInstanceFromCompiledCode
 //
-ART_GET_FIELD_FROM_CODE(Obj, mirror::HeapReference<mirror::Object>, mirror::Object*,
-                        mirror::Object*, Object, true, .Ptr())
+ART_GET_FIELD_FROM_CODE(Obj, mirror::Object*, mirror::Object*, Object, true, .Ptr())
 
 #undef ART_GET_FIELD_FROM_CODE
 
@@ -376,31 +425,45 @@ extern "C" int artSet16InstanceFromCode(uint32_t field_idx,
   return artSetCharInstanceFromCode(field_idx, obj, new_value, referrer, self);
 }
 
-extern "C" mirror::Object* artReadBarrierMark(mirror::Object* obj) {
-  DCHECK(kEmitCompilerReadBarrier);
+// Read barrier entrypoints.
+//
+// Compilers for ARM, ARM64 can insert a call to these
+// functions directly.  For x86 and x86-64, compilers need a wrapper
+// assembly function, to handle mismatch in ABI.
+
+// Mark the heap reference `obj`. This entry point is used by read
+// barrier fast path implementations generated by the compiler to mark
+// an object that is referenced by a field of a gray object.
+extern "C" mirror::Object* artReadBarrierMark(mirror::Object* obj)
+    REQUIRES_SHARED(Locks::mutator_lock_) {
+  DCHECK(gUseReadBarrier);
   return ReadBarrier::Mark(obj);
 }
 
-extern "C" mirror::Object* artReadBarrierSlow(mirror::Object* ref ATTRIBUTE_UNUSED,
+// Read barrier entrypoint for heap references.
+// This is the read barrier slow path for instance and static fields
+// and reference type arrays.
+extern "C" mirror::Object* artReadBarrierSlow([[maybe_unused]] mirror::Object* ref,
                                               mirror::Object* obj,
-                                              uint32_t offset) {
+                                              uint32_t offset)
+    REQUIRES_SHARED(Locks::mutator_lock_) {
   // Used only in connection with non-volatile loads.
-  DCHECK(kEmitCompilerReadBarrier);
+  DCHECK(gUseReadBarrier);
   uint8_t* raw_addr = reinterpret_cast<uint8_t*>(obj) + offset;
   mirror::HeapReference<mirror::Object>* ref_addr =
      reinterpret_cast<mirror::HeapReference<mirror::Object>*>(raw_addr);
-  constexpr ReadBarrierOption kReadBarrierOption =
-      kUseReadBarrier ? kWithReadBarrier : kWithoutReadBarrier;
   mirror::Object* result =
-      ReadBarrier::Barrier<mirror::Object, /* kIsVolatile= */ false, kReadBarrierOption>(
+      ReadBarrier::Barrier<mirror::Object, /* kIsVolatile= */ false, kWithReadBarrier>(
         obj,
         MemberOffset(offset),
         ref_addr);
   return result;
 }
 
-extern "C" mirror::Object* artReadBarrierForRootSlow(GcRoot<mirror::Object>* root) {
-  DCHECK(kEmitCompilerReadBarrier);
+// Read barrier entrypoint for GC roots.
+extern "C" mirror::Object* artReadBarrierForRootSlow(GcRoot<mirror::Object>* root)
+    REQUIRES_SHARED(Locks::mutator_lock_) {
+  DCHECK(gUseReadBarrier);
   return root->Read();
 }
 

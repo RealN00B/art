@@ -25,7 +25,7 @@
 #include "dex/utf.h"
 #include "runtime_globals.h"
 
-namespace art {
+namespace art HIDDEN {
 namespace mirror {
 
 inline uint32_t String::ClassSize(PointerSize pointer_size) {
@@ -35,11 +35,11 @@ inline uint32_t String::ClassSize(PointerSize pointer_size) {
   //   lambda$codePoints$1$CharSequence
   // which were virtual functions in standalone desugar, becomes
   // direct functions with D8 desugaring.
-  uint32_t vtable_entries = Object::kVTableLength + 54;
+  uint32_t vtable_entries = Object::kVTableLength + 70;
 #else
-  uint32_t vtable_entries = Object::kVTableLength + 56;
+  uint32_t vtable_entries = Object::kVTableLength + 72;
 #endif
-  return Class::ComputeClassSize(true, vtable_entries, 0, 0, 0, 1, 2, pointer_size);
+  return Class::ComputeClassSize(true, vtable_entries, 3, 0, 0, 1, 3, 0, pointer_size);
 }
 
 inline uint16_t String::CharAt(int32_t index) {
@@ -67,21 +67,42 @@ int32_t String::FastIndexOf(MemoryType* chars, int32_t ch, int32_t start) {
   return -1;
 }
 
-inline int32_t String::GetHashCode() {
-  int32_t result = GetField32(OFFSET_OF_OBJECT_MEMBER(String, hash_code_));
-  if (UNLIKELY(result == 0)) {
-    result = ComputeHashCode();
-  }
-  if (kIsDebugBuild) {
-    if (IsCompressed()) {
-      DCHECK(result != 0 || ComputeUtf16Hash(GetValueCompressed(), GetLength()) == 0)
-          << ToModifiedUtf8() << " " << result;
-    } else {
-      DCHECK(result != 0 || ComputeUtf16Hash(GetValue(), GetLength()) == 0)
-          << ToModifiedUtf8() << " " << result;
+template <typename MemoryType>
+int32_t String::LastIndexOf(MemoryType* chars, int32_t ch, int32_t from_index) {
+  DCHECK_LT(from_index, GetLength());
+  const MemoryType* start = chars;
+  const MemoryType* p = chars + from_index;
+  while (p >= start) {
+    if (*p == ch) {
+      return p - chars;
     }
+    p--;
   }
+  return -1;
+}
+
+inline int32_t String::ComputeHashCode() {
+  uint32_t hash = IsCompressed()
+      ? ComputeUtf16Hash(GetValueCompressed(), GetLength())
+      : ComputeUtf16Hash(GetValue(), GetLength());
+  return static_cast<int32_t>(hash);
+}
+
+inline int32_t String::GetHashCode() {
+  int32_t result = GetStoredHashCode();
+  if (UNLIKELY(result == 0)) {
+    result = ComputeAndSetHashCode();
+  }
+  DCHECK_IMPLIES(result == 0, ComputeHashCode() == 0) << ToModifiedUtf8();
   return result;
+}
+
+inline int32_t String::GetModifiedUtf8Length() {
+  if (IsCompressed()) {
+    return GetLength();
+  } else {
+    return CountModifiedUtf8BytesInUtf16(GetValue(), GetLength());
+  }
 }
 
 template<typename MemoryType>

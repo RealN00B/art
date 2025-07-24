@@ -19,10 +19,11 @@
 
 #include <iosfwd>
 
-#include "base/enums.h"
+#include "base/macros.h"
+#include "base/pointer_size.h"
 #include "runtime_globals.h"
 
-namespace art {
+namespace art HIDDEN {
 
 // Allow the meaning of offsets to be strongly typed.
 class Offset {
@@ -37,8 +38,27 @@ class Offset {
   constexpr size_t SizeValue() const {
     return val_;
   }
+  Offset& operator+=(const size_t rhs) {
+    val_ += rhs;
+    return *this;
+  }
   constexpr bool operator==(Offset o) const {
     return SizeValue() == o.SizeValue();
+  }
+  constexpr bool operator!=(Offset o) const {
+    return !(*this == o);
+  }
+  constexpr bool operator<(Offset o) const {
+    return SizeValue() < o.SizeValue();
+  }
+  constexpr bool operator<=(Offset o) const {
+    return !(*this > o);
+  }
+  constexpr bool operator>(Offset o) const {
+    return o < *this;
+  }
+  constexpr bool operator>=(Offset o) const {
+    return !(*this < o);
   }
 
  protected:

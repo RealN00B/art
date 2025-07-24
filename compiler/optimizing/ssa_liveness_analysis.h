@@ -21,11 +21,12 @@
 
 #include "base/intrusive_forward_list.h"
 #include "base/iteration_range.h"
+#include "base/macros.h"
 #include "base/scoped_arena_allocator.h"
 #include "base/scoped_arena_containers.h"
 #include "nodes.h"
 
-namespace art {
+namespace art HIDDEN {
 
 class CodeGenerator;
 class SsaLivenessAnalysis;
@@ -40,9 +41,6 @@ class BlockInfo : public ArenaObject<kArenaAllocSsaLiveness> {
         live_out_(allocator, number_of_ssa_values, false, kArenaAllocSsaLiveness),
         kill_(allocator, number_of_ssa_values, false, kArenaAllocSsaLiveness) {
     UNUSED(block_);
-    live_in_.ClearAllBits();
-    live_out_.ClearAllBits();
-    kill_.ClearAllBits();
   }
 
  private:
@@ -873,9 +871,9 @@ class LiveInterval : public ArenaObject<kArenaAllocSsaLiveness> {
   }
 
   // Returns whether an interval, when it is non-split, is using
-  // the same register of one of its input.
+  // the same register of one of its input. This function should
+  // be used only for DCHECKs.
   bool IsUsingInputRegister() const {
-    CHECK(kIsDebugBuild) << "Function should be used only for DCHECKs";
     if (defined_by_ != nullptr && !IsSplit()) {
       for (const HInstruction* input : defined_by_->GetInputs()) {
         LiveInterval* interval = input->GetLiveInterval();
@@ -899,9 +897,9 @@ class LiveInterval : public ArenaObject<kArenaAllocSsaLiveness> {
 
   // Returns whether an interval, when it is non-split, can safely use
   // the same register of one of its input. Note that this method requires
-  // IsUsingInputRegister() to be true.
+  // IsUsingInputRegister() to be true. This function should be used only
+  // for DCHECKs.
   bool CanUseInputRegister() const {
-    CHECK(kIsDebugBuild) << "Function should be used only for DCHECKs";
     DCHECK(IsUsingInputRegister());
     if (defined_by_ != nullptr && !IsSplit()) {
       LocationSummary* locations = defined_by_->GetLocations();

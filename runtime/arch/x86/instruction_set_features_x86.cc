@@ -24,8 +24,17 @@
 #include <android-base/strings.h>
 
 #include "arch/x86_64/instruction_set_features_x86_64.h"
+#include "base/array_ref.h"
 
-namespace art {
+#include <cpu_features_macros.h>
+
+#ifdef CPU_FEATURES_ARCH_X86
+// This header can only be included on x86 targets,
+// as determined by cpu_features own define.
+#include <cpuinfo_x86.h>
+#endif
+
+namespace art HIDDEN {
 
 using android::base::StringPrintf;
 
@@ -35,39 +44,67 @@ static constexpr const char* x86_known_variants[] = {
     "atom",
     "sandybridge",
     "silvermont",
+    "goldmont",
+    "goldmont-plus",
+    "goldmont-without-sha-xsaves",
+    "tremont",
     "kabylake",
+    "alderlake",
+    "default",
 };
 
 static constexpr const char* x86_variants_with_ssse3[] = {
     "atom",
     "sandybridge",
     "silvermont",
+    "goldmont",
+    "goldmont-plus",
+    "goldmont-without-sha-xsaves",
+    "tremont",
+    "alderlake",
     "kabylake",
 };
 
 static constexpr const char* x86_variants_with_sse4_1[] = {
     "sandybridge",
     "silvermont",
+    "goldmont",
+    "goldmont-plus",
+    "goldmont-without-sha-xsaves",
+    "tremont",
+    "alderlake",
     "kabylake",
 };
 
 static constexpr const char* x86_variants_with_sse4_2[] = {
     "sandybridge",
     "silvermont",
+    "goldmont",
+    "goldmont-plus",
+    "goldmont-without-sha-xsaves",
+    "tremont",
+    "alderlake",
     "kabylake",
 };
 
 static constexpr const char* x86_variants_with_popcnt[] = {
     "sandybridge",
     "silvermont",
+    "goldmont",
+    "goldmont-plus",
+    "goldmont-without-sha-xsaves",
+    "tremont",
+    "alderlake",
     "kabylake",
 };
 static constexpr const char* x86_variants_with_avx[] = {
     "kabylake",
+    "alderlake",
 };
 
 static constexpr const char* x86_variants_with_avx2[] = {
     "kabylake",
+    "alderlake",
 };
 
 X86FeaturesUniquePtr X86InstructionSetFeatures::Create(bool x86_64,
@@ -94,9 +131,15 @@ X86FeaturesUniquePtr X86InstructionSetFeatures::Create(bool x86_64,
   }
 }
 
-X86FeaturesUniquePtr X86InstructionSetFeatures::FromVariant(
-    const std::string& variant, std::string* error_msg ATTRIBUTE_UNUSED,
-    bool x86_64) {
+X86FeaturesUniquePtr X86InstructionSetFeatures::FromVariant(const std::string& variant,
+                                                            [[maybe_unused]] std::string* error_msg,
+                                                            bool x86_64) {
+  const bool is_runtime_isa =
+      kRuntimeISA == (x86_64 ? InstructionSet::kX86_64 : InstructionSet::kX86);
+  if (is_runtime_isa && variant == "default") {
+    return FromCppDefines(x86_64);
+  }
+
   bool has_SSSE3 = FindVariantInArray(x86_variants_with_ssse3, arraysize(x86_variants_with_ssse3),
                                       variant);
   bool has_SSE4_1 = FindVariantInArray(x86_variants_with_sse4_1,
@@ -118,8 +161,12 @@ X86FeaturesUniquePtr X86InstructionSetFeatures::FromVariant(
   // Verify that variant is known.
   bool known_variant = FindVariantInArray(x86_known_variants, arraysize(x86_known_variants),
                                           variant);
-  if (!known_variant && variant != "default") {
-    LOG(WARNING) << "Unexpected CPU variant for X86 using defaults: " << variant;
+  if (!known_variant) {
+    std::ostringstream os;
+    os << "Unexpected CPU variant for x86: " << variant << ".\n"
+       << "Known variants: "
+       << android::base::Join(ArrayRef<const char* const>(x86_known_variants), ", ");
+    LOG(WARNING) << os.str();
   }
 
   return Create(x86_64, has_SSSE3, has_SSE4_1, has_SSE4_2, has_AVX, has_AVX2, has_POPCNT);
@@ -231,6 +278,24 @@ X86FeaturesUniquePtr X86InstructionSetFeatures::FromAssembly(bool x86_64) {
   UNIMPLEMENTED(WARNING);
   return FromCppDefines(x86_64);
 }
+
+
+X86FeaturesUniquePtr X86InstructionSetFeatures::FromCpuFeatures(bool x86_64) {
+#ifdef CPU_FEATURES_ARCH_X86
+  cpu_features::X86Features features = cpu_features::GetX86Info().features;
+  return Create(x86_64,
+    features.ssse3,
+    features.sse4_1,
+    features.sse4_2,
+    features.avx,
+    features.avx2,
+    features.popcnt);
+#else
+  UNIMPLEMENTED(WARNING);
+  return FromCppDefines(x86_64);
+#endif
+}
+
 
 bool X86InstructionSetFeatures::Equals(const InstructionSetFeatures* other) const {
   if (GetInstructionSet() != other->GetInstructionSet()) {

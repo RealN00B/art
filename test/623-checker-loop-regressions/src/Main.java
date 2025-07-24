@@ -155,7 +155,7 @@ public class Main {
   /// CHECK-START: int Main.polynomialInt() loop_optimization (after)
   /// CHECK-NOT: Phi
   //
-  /// CHECK-START: int Main.polynomialInt() instruction_simplifier$after_bce (after)
+  /// CHECK-START: int Main.polynomialInt() instruction_simplifier$before_codegen (after)
   /// CHECK-DAG: <<Int:i\d+>>  IntConstant -45  loop:none
   /// CHECK-DAG:               Return [<<Int>>] loop:none
   static int polynomialInt() {
@@ -176,7 +176,7 @@ public class Main {
   /// CHECK-START: int Main.geoIntDivLastValue(int) loop_optimization (after)
   /// CHECK-NOT: Phi
   //
-  /// CHECK-START: int Main.geoIntDivLastValue(int) instruction_simplifier$after_bce (after)
+  /// CHECK-START: int Main.geoIntDivLastValue(int) instruction_simplifier$before_codegen (after)
   /// CHECK-DAG: <<Int:i\d+>> IntConstant 0    loop:none
   /// CHECK-DAG:              Return [<<Int>>] loop:none
   static int geoIntDivLastValue(int x) {
@@ -193,7 +193,7 @@ public class Main {
   /// CHECK-START: int Main.geoIntMulLastValue(int) loop_optimization (after)
   /// CHECK-NOT: Phi
   //
-  /// CHECK-START: int Main.geoIntMulLastValue(int) instruction_simplifier$after_bce (after)
+  /// CHECK-START: int Main.geoIntMulLastValue(int) instruction_simplifier$before_codegen (after)
   /// CHECK-DAG: <<Par:i\d+>> ParameterValue         loop:none
   /// CHECK-DAG: <<Int:i\d+>> IntConstant -194211840 loop:none
   /// CHECK-DAG: <<Mul:i\d+>> Mul [<<Par>>,<<Int>>]  loop:none
@@ -212,7 +212,7 @@ public class Main {
   /// CHECK-START: long Main.geoLongDivLastValue(long) loop_optimization (after)
   /// CHECK-NOT: Phi
   //
-  /// CHECK-START: long Main.geoLongDivLastValue(long) instruction_simplifier$after_bce (after)
+  /// CHECK-START: long Main.geoLongDivLastValue(long) instruction_simplifier$before_codegen (after)
   /// CHECK-DAG: <<Long:j\d+>> LongConstant 0    loop:none
   /// CHECK-DAG:               Return [<<Long>>] loop:none
   //
@@ -231,7 +231,7 @@ public class Main {
   /// CHECK-START: long Main.geoLongDivLastValue() loop_optimization (after)
   /// CHECK-NOT: Phi
   //
-  /// CHECK-START: long Main.geoLongDivLastValue() instruction_simplifier$after_bce (after)
+  /// CHECK-START: long Main.geoLongDivLastValue() instruction_simplifier$before_codegen (after)
   /// CHECK-DAG: <<Long:j\d+>> LongConstant 0    loop:none
   /// CHECK-DAG:               Return [<<Long>>] loop:none
   //
@@ -251,7 +251,7 @@ public class Main {
   /// CHECK-START: long Main.geoLongMulLastValue(long) loop_optimization (after)
   /// CHECK-NOT: Phi
   //
-  /// CHECK-START: long Main.geoLongMulLastValue(long) instruction_simplifier$after_bce (after)
+  /// CHECK-START: long Main.geoLongMulLastValue(long) instruction_simplifier$before_codegen (after)
   /// CHECK-DAG: <<Par:j\d+>>  ParameterValue                    loop:none
   /// CHECK-DAG: <<Long:j\d+>> LongConstant -8070450532247928832 loop:none
   /// CHECK-DAG: <<Mul:j\d+>>  Mul [<<Par>>,<<Long>>]            loop:none
@@ -290,8 +290,17 @@ public class Main {
   /// CHECK-NOT: VecLoad
   //
   /// CHECK-START-ARM64: void Main.string2Bytes(char[], java.lang.String) loop_optimization (after)
-  /// CHECK-DAG: VecLoad  loop:<<Loop:B\d+>> outer_loop:none
-  /// CHECK-DAG: VecStore loop:<<Loop>>      outer_loop:none
+  /// CHECK-IF:     hasIsaFeature("sve") and os.environ.get('ART_FORCE_TRY_PREDICATED_SIMD') == 'true'
+  //
+  //      TODO: Support CharAt for SVE.
+  ///     CHECK-NOT: VecLoad
+  //
+  /// CHECK-ELSE:
+  //
+  ///     CHECK-DAG: VecLoad  loop:<<Loop:B\d+>> outer_loop:none
+  ///     CHECK-DAG: VecStore loop:<<Loop>>      outer_loop:none
+  //
+  /// CHECK-FI:
   //
   // NOTE: should correctly deal with compressed and uncompressed cases.
   private static void string2Bytes(char[] a, String b) {
@@ -305,8 +314,17 @@ public class Main {
   /// CHECK-NOT: VecLoad
 
   /// CHECK-START-ARM64: void Main.$noinline$stringToShorts(short[], java.lang.String) loop_optimization (after)
-  /// CHECK-DAG: VecLoad  loop:<<Loop:B\d+>> outer_loop:none
-  /// CHECK-DAG: VecStore loop:<<Loop>>      outer_loop:none
+  /// CHECK-IF:     hasIsaFeature("sve") and os.environ.get('ART_FORCE_TRY_PREDICATED_SIMD') == 'true'
+  //
+  //      TODO: Support CharAt for SVE.
+  ///     CHECK-NOT: VecLoad
+  //
+  /// CHECK-ELSE:
+  //
+  ///     CHECK-DAG: VecLoad  loop:<<Loop:B\d+>> outer_loop:none
+  ///     CHECK-DAG: VecStore loop:<<Loop>>      outer_loop:none
+  //
+  /// CHECK-FI:
   private static void $noinline$stringToShorts(short[] dest, String src) {
     int min = Math.min(dest.length, src.length());
     for (int i = 0; i < min; ++i) {
@@ -350,9 +368,20 @@ public class Main {
   //
   /// CHECK-START-ARM64: void Main.oneBoth(short[], char[]) loop_optimization (after)
   /// CHECK-DAG: <<One:i\d+>>  IntConstant 1                             loop:none
-  /// CHECK-DAG: <<Repl:d\d+>> VecReplicateScalar [<<One>>]              loop:none
-  /// CHECK-DAG:               VecStore [{{l\d+}},<<Phi:i\d+>>,<<Repl>>] loop:<<Loop:B\d+>> outer_loop:none
-  /// CHECK-DAG:               VecStore [{{l\d+}},<<Phi>>,<<Repl>>]      loop:<<Loop>>      outer_loop:none
+  /// CHECK-IF:     hasIsaFeature("sve") and os.environ.get('ART_FORCE_TRY_PREDICATED_SIMD') == 'true'
+  //
+  ///     CHECK-DAG: <<Repl:d\d+>>  VecReplicateScalar [<<One>>,{{j\d+}}]               loop:none
+  ///     CHECK-DAG: <<LoopP:j\d+>> VecPredWhile                                        loop:<<Loop:B\d+>> outer_loop:none
+  ///     CHECK-DAG:                VecStore [{{l\d+}},<<Phi:i\d+>>,<<Repl>>,<<LoopP>>] loop:<<Loop>>      outer_loop:none
+  ///     CHECK-DAG:                VecStore [{{l\d+}},<<Phi>>,<<Repl>>,<<LoopP>>]      loop:<<Loop>>      outer_loop:none
+  //
+  /// CHECK-ELSE:
+  //
+  ///     CHECK-DAG: <<Repl:d\d+>>  VecReplicateScalar [<<One>>]              loop:none
+  ///     CHECK-DAG:                VecStore [{{l\d+}},<<Phi:i\d+>>,<<Repl>>] loop:<<Loop:B\d+>> outer_loop:none
+  ///     CHECK-DAG:                VecStore [{{l\d+}},<<Phi>>,<<Repl>>]      loop:<<Loop>>      outer_loop:none
+  //
+  /// CHECK-FI:
   //
   // Bug b/37764324: integral same-length packed types can be mixed freely.
   private static void oneBoth(short[] a, char[] b) {
@@ -382,6 +411,7 @@ public class Main {
   //
   /// CHECK-START-ARM: void Main.typeConv(byte[], byte[]) loop_optimization (after)
   /// CHECK-DAG: <<One:i\d+>>  IntConstant 1                         loop:none
+
   /// CHECK-DAG: <<Repl:d\d+>> VecReplicateScalar [<<One>>]          loop:none
   /// CHECK-DAG: <<Load:d\d+>> VecLoad [{{l\d+}},<<Phi1:i\d+>>]      loop:<<Loop1:B\d+>> outer_loop:none
   /// CHECK-DAG: <<Vadd:d\d+>> VecAdd [<<Load>>,<<Repl>>]            loop:<<Loop1>>      outer_loop:none
@@ -393,14 +423,26 @@ public class Main {
   //
   /// CHECK-START-ARM64: void Main.typeConv(byte[], byte[]) loop_optimization (after)
   /// CHECK-DAG: <<One:i\d+>>  IntConstant 1                         loop:none
-  /// CHECK-DAG: <<Repl:d\d+>> VecReplicateScalar [<<One>>]          loop:none
-  /// CHECK-DAG: <<Load:d\d+>> VecLoad [{{l\d+}},<<Phi1:i\d+>>]      loop:<<Loop1:B\d+>> outer_loop:none
-  /// CHECK-DAG: <<Vadd:d\d+>> VecAdd [<<Load>>,<<Repl>>]            loop:<<Loop1>>      outer_loop:none
-  /// CHECK-DAG:               VecStore [{{l\d+}},<<Phi1>>,<<Vadd>>] loop:<<Loop1>>      outer_loop:none
-  /// CHECK-DAG: <<Get:b\d+>>  ArrayGet [{{l\d+}},<<Phi2:i\d+>>]     loop:<<Loop2:B\d+>> outer_loop:none
-  /// CHECK-DAG: <<Add:i\d+>>  Add [<<Get>>,<<One>>]                 loop:<<Loop2>>      outer_loop:none
-  /// CHECK-DAG: <<Cnv:b\d+>>  TypeConversion [<<Add>>]              loop:<<Loop2>>      outer_loop:none
-  /// CHECK-DAG:               ArraySet [{{l\d+}},<<Phi2>>,<<Cnv>>]  loop:<<Loop2>>      outer_loop:none
+  /// CHECK-IF:     hasIsaFeature("sve") and os.environ.get('ART_FORCE_TRY_PREDICATED_SIMD') == 'true'
+  //
+  ///     CHECK-DAG: <<Repl:d\d+>>  VecReplicateScalar [<<One>>,{{j\d+}}]           loop:none
+  ///     CHECK-DAG: <<LoopP:j\d+>> VecPredWhile                                    loop:<<Loop1:B\d+>> outer_loop:none
+  ///     CHECK-DAG: <<Load:d\d+>>  VecLoad [{{l\d+}},<<Phi1:i\d+>>,<<LoopP>>]      loop:<<Loop1>>      outer_loop:none
+  ///     CHECK-DAG: <<Vadd:d\d+>>  VecAdd [<<Load>>,<<Repl>>,<<LoopP>>]            loop:<<Loop1>>      outer_loop:none
+  ///     CHECK-DAG:                VecStore [{{l\d+}},<<Phi1>>,<<Vadd>>,<<LoopP>>] loop:<<Loop1>>      outer_loop:none
+  //
+  /// CHECK-ELSE:
+  //
+  ///     CHECK-DAG: <<Repl:d\d+>>  VecReplicateScalar [<<One>>]          loop:none
+  ///     CHECK-DAG: <<Load:d\d+>>  VecLoad [{{l\d+}},<<Phi1:i\d+>>]      loop:<<Loop1:B\d+>> outer_loop:none
+  ///     CHECK-DAG: <<Vadd:d\d+>>  VecAdd [<<Load>>,<<Repl>>]            loop:<<Loop1>>      outer_loop:none
+  ///     CHECK-DAG:                VecStore [{{l\d+}},<<Phi1>>,<<Vadd>>] loop:<<Loop1>>      outer_loop:none
+  ///     CHECK-DAG: <<Get:b\d+>>   ArrayGet [{{l\d+}},<<Phi2:i\d+>>]     loop:<<Loop2:B\d+>> outer_loop:none
+  ///     CHECK-DAG: <<Add:i\d+>>   Add [<<Get>>,<<One>>]                 loop:<<Loop2>>      outer_loop:none
+  ///     CHECK-DAG: <<Cnv:b\d+>>   TypeConversion [<<Add>>]              loop:<<Loop2>>      outer_loop:none
+  ///     CHECK-DAG:                ArraySet [{{l\d+}},<<Phi2>>,<<Cnv>>]  loop:<<Loop2>>      outer_loop:none
+  //
+  /// CHECK-FI:
   //
   // Scalar code in cleanup loop uses correct byte type on array get and type conversion.
   private static void typeConv(byte[] a, byte[] b) {
@@ -577,6 +619,97 @@ public class Main {
            s24 + s25 + s26 + s27 + s28 + s29 + s30 + s31;
   }
 
+  // Ensure spilling saves regular FP values correctly when the graph HasSIMD()
+  // is true.
+  /// CHECK-START-ARM64: float Main.$noinline$ensureSlowPathFPSpillFill(float[], float[], float[], float[], int[]) loop_optimization (after)
+  //
+  //  Both regular and SIMD accesses are present.
+  /// CHECK-DAG: VecLoad
+  /// CHECK-DAG: ArrayGet
+  private static final float $noinline$ensureSlowPathFPSpillFill(float[] a,
+                                                                 float[] b,
+                                                                 float[] c,
+                                                                 float[] d,
+                                                                 int[] e) {
+    // This loop should be vectorized so the graph->HasSIMD() will be true.
+    // A power-of-2 number of iterations is chosen to avoid peeling/unrolling interference.
+    for (int i = 0; i < 64; i++) {
+      // The actual values of the array elements don't matter, just the
+      // presence of a SIMD loop.
+      e[i]++;
+    }
+
+    float f0 = 0;
+    float f1 = 0;
+    float f2 = 0;
+    float f3 = 0;
+    float f4 = 0;
+    float f5 = 0;
+    float f6 = 0;
+    float f7 = 0;
+    float f8 = 0;
+    float f9 = 0;
+    float f10 = 0;
+    float f11 = 0;
+    float f12 = 0;
+    float f13 = 0;
+    float f14 = 0;
+    float f15 = 0;
+    float f16 = 0;
+    float f17 = 0;
+    float f18 = 0;
+    float f19 = 0;
+    float f20 = 0;
+    float f21 = 0;
+    float f22 = 0;
+    float f23 = 0;
+    float f24 = 0;
+    float f25 = 0;
+    float f26 = 0;
+    float f27 = 0;
+    float f28 = 0;
+    float f29 = 0;
+    float f30 = 0;
+    float f31 = 0;
+    for (int i = 0; i < 100; i++) {
+      f0 += a[i];
+      f1 += b[i];
+      f2 += c[i];
+      f3 += d[i];
+      f4 += a[i];
+      f5 += b[i];
+      f6 += c[i];
+      f7 += d[i];
+      f8 += a[i];
+      f9 += b[i];
+      f10 += c[i];
+      f11 += d[i];
+      f12 += a[i];
+      f13 += b[i];
+      f14 += c[i];
+      f15 += d[i];
+      f16 += a[i];
+      f17 += b[i];
+      f18 += c[i];
+      f19 += d[i];
+      f20 += a[i];
+      f21 += b[i];
+      f22 += c[i];
+      f23 += d[i];
+      f24 += a[i];
+      f25 += b[i];
+      f26 += c[i];
+      f27 += d[i];
+      f28 += a[i];
+      f29 += b[i];
+      f30 += c[i];
+      f31 += d[i];
+    }
+    return f0 + f1 + f2 + f3 + f4 + f5 + f6 + f7 + f8 + f9 + f10 + f11 + f12 + f13 + f14 + f15 +
+           f16 + f17 + f18 + f19 + f20 + f21 + f22 + f23 +
+           f24 + f25 + f26 + f27 + f28 + f29 + f30 + f31;
+  }
+
   public static int reductionIntoReplication() {
     int[] a = { 1, 2, 3, 4 };
     int x = 0;
@@ -627,9 +760,22 @@ public class Main {
 
   // Idioms common sub-expression bug: SAD and ArraySet.
   //
-  /// CHECK-START-{ARM,ARM64}: int Main.testSADAndSet(int[], int[], int[]) loop_optimization (after)
+  /// CHECK-START-ARM: int Main.testSADAndSet(int[], int[], int[]) loop_optimization (after)
   /// CHECK-DAG:       VecSADAccumulate
   /// CHECK-DAG:       VecStore
+  //
+  /// CHECK-START-ARM64: int Main.testSADAndSet(int[], int[], int[]) loop_optimization (after)
+  /// CHECK-IF:     hasIsaFeature("sve") and os.environ.get('ART_FORCE_TRY_PREDICATED_SIMD') == 'true'
+  //
+  //      VecSADAccumulate is not supported for SVE.
+  ///     CHECK-NOT:       VecSADAccumulate
+  //
+  /// CHECK-ELSE:
+  //
+  ///     CHECK-DAG:       VecSADAccumulate
+  ///     CHECK-DAG:       VecStore
+  //
+  /// CHECK-FI:
   public static int testSADAndSet(int[] x, int[] y, int[] z) {
     int min_length = Math.min(x.length, y.length);
     int sad = 0;
@@ -642,9 +788,22 @@ public class Main {
   }
 
   // Idioms common sub-expression bug: SAD and SAD.
-  /// CHECK-START-{ARM,ARM64}: int Main.testSADAndSAD(int[], int[]) loop_optimization (after)
+  /// CHECK-START-ARM: int Main.testSADAndSAD(int[], int[]) loop_optimization (after)
   /// CHECK-DAG:       VecSADAccumulate
   /// CHECK-DAG:       VecSADAccumulate
+  //
+  /// CHECK-START-ARM64: int Main.testSADAndSAD(int[], int[]) loop_optimization (after)
+  /// CHECK-IF:     hasIsaFeature("sve") and os.environ.get('ART_FORCE_TRY_PREDICATED_SIMD') == 'true'
+  //
+  //      VecSADAccumulate is not supported for SVE.
+  ///     CHECK-NOT:       VecSADAccumulate
+  //
+  /// CHECK-ELSE:
+  //
+  ///     CHECK-DAG:       VecSADAccumulate
+  ///     CHECK-DAG:       VecSADAccumulate
+  //
+  /// CHECK-FI:
   public static final int testSADAndSAD(int[] x, int[] y) {
     int s0 = 1;
     int s1 = 1;
@@ -694,11 +853,26 @@ public class Main {
 
   // Idioms common sub-expression bug: SAD and SAD with extra abs.
   //
-  /// CHECK-START-{ARM,ARM64}: int Main.testSADAndSADExtraAbs0(int[], int[]) loop_optimization (after)
+  /// CHECK-START-ARM: int Main.testSADAndSADExtraAbs0(int[], int[]) loop_optimization (after)
   /// CHECK-DAG:       VecSub
   /// CHECK-DAG:       VecAbs
   /// CHECK-DAG:       VecSADAccumulate
   /// CHECK-DAG:       VecSADAccumulate
+  //
+  /// CHECK-START-ARM64: int Main.testSADAndSADExtraAbs0(int[], int[]) loop_optimization (after)
+  /// CHECK-IF:     hasIsaFeature("sve") and os.environ.get('ART_FORCE_TRY_PREDICATED_SIMD') == 'true'
+  //
+  //      VecSADAccumulate is not supported for SVE.
+  ///     CHECK-NOT:       VecSADAccumulate
+  //
+  /// CHECK-ELSE:
+  //
+  ///     CHECK-DAG:       VecSub
+  ///     CHECK-DAG:       VecAbs
+  ///     CHECK-DAG:       VecSADAccumulate
+  ///     CHECK-DAG:       VecSADAccumulate
+  //
+  /// CHECK-FI:
   public static final int testSADAndSADExtraAbs0(int[] x, int[] y) {
     int s0 = 1;
     int s1 = 1;
@@ -713,11 +887,26 @@ public class Main {
 
   // Idioms common sub-expression bug: SAD and SAD with extra abs (reversed order).
   //
-  /// CHECK-START-{ARM,ARM64}: int Main.testSADAndSADExtraAbs1(int[], int[]) loop_optimization (after)
+  /// CHECK-START-ARM: int Main.testSADAndSADExtraAbs1(int[], int[]) loop_optimization (after)
   /// CHECK-DAG:       VecSub
   /// CHECK-DAG:       VecAbs
   /// CHECK-DAG:       VecSADAccumulate
   /// CHECK-DAG:       VecSADAccumulate
+  //
+  /// CHECK-START-ARM64: int Main.testSADAndSADExtraAbs1(int[], int[]) loop_optimization (after)
+  /// CHECK-IF:     hasIsaFeature("sve") and os.environ.get('ART_FORCE_TRY_PREDICATED_SIMD') == 'true'
+  //
+  //      VecSADAccumulate is not supported for SVE.
+  ///     CHECK-NOT:       VecSADAccumulate
+  //
+  /// CHECK-ELSE:
+  //
+  ///     CHECK-DAG:       VecSub
+  ///     CHECK-DAG:       VecAbs
+  ///     CHECK-DAG:       VecSADAccumulate
+  ///     CHECK-DAG:       VecSADAccumulate
+  //
+  /// CHECK-FI:
   public static final int testSADAndSADExtraAbs1(int[] x, int[] y) {
     int s0 = 1;
     int s1 = 1;
@@ -734,9 +923,18 @@ public class Main {
   // Idioms common sub-expression bug: SAD and DotProd combined.
   //
   /// CHECK-START-ARM64: int Main.testSADAndDotProdCombined0(byte[], byte[]) loop_optimization (after)
-  /// CHECK-DAG:       VecSub
-  /// CHECK-DAG:       VecSADAccumulate
-  /// CHECK-DAG:       VecDotProd
+  /// CHECK-IF:     hasIsaFeature("sve") and os.environ.get('ART_FORCE_TRY_PREDICATED_SIMD') == 'true'
+  //
+  //      VecSADAccumulate is not supported for SVE.
+  ///     CHECK-NOT:       VecSADAccumulate
+  //
+  /// CHECK-ELSE:
+  //
+  ///     CHECK-DAG:       VecSub
+  ///     CHECK-DAG:       VecSADAccumulate
+  ///     CHECK-DAG:       VecDotProd
+  //
+  /// CHECK-FI:
   public static final int testSADAndDotProdCombined0(byte[] x, byte[] y) {
     int s0 = 1;
     int s1 = 1;
@@ -753,9 +951,18 @@ public class Main {
 
   // Idioms common sub-expression bug: SAD and DotProd combined (reversed order).
   /// CHECK-START-ARM64: int Main.testSADAndDotProdCombined1(byte[], byte[]) loop_optimization (after)
-  /// CHECK-DAG:       VecSub
-  /// CHECK-DAG:       VecSADAccumulate
-  /// CHECK-DAG:       VecDotProd
+  /// CHECK-IF:     hasIsaFeature("sve") and os.environ.get('ART_FORCE_TRY_PREDICATED_SIMD') == 'true'
+  //
+  //      VecSADAccumulate is not supported for SVE.
+  ///     CHECK-NOT:       VecSADAccumulate
+  //
+  /// CHECK-ELSE:
+  //
+  ///     CHECK-DAG:       VecSub
+  ///     CHECK-DAG:       VecSADAccumulate
+  ///     CHECK-DAG:       VecDotProd
+  //
+  /// CHECK-FI:
   public static final int testSADAndDotProdCombined1(byte[] x, byte[] y) {
     int s0 = 1;
     int s1 = 1;
@@ -768,6 +975,39 @@ public class Main {
       s1 += temp1;
     }
     return s0 + s1;
+  }
+
+  // Regression test for the case, where a loop is vectorized in predicated mode, and there is
+  // a disambiguation scalar loop added. Make sure that the set, which records instructions
+  // inserted outside of new loops, is not reset until the full vectorization process has
+  // happened.
+  //
+  // Based on void android.util.Spline$MonotoneCubicSpline.<init>(float[], float[]).
+  //
+  /// CHECK-START-ARM64: void Main.$noinline$testExternalSetForLoopWithDisambiguation(int[], int[]) loop_optimization (after)
+  /// CHECK-IF:     hasIsaFeature("sve") and os.environ.get('ART_FORCE_TRY_PREDICATED_SIMD') == 'true'
+  //
+  ///     CHECK-DAG: <<Pred:j\d+>>    VecPredSetAll                          loop:none
+  ///     CHECK-DAG:                  VecReplicateScalar [{{i\d+}},<<Pred>>] loop:none
+  //
+  /// CHECK-ELSE:
+  //
+  ///     CHECK-DAG:                  VecReplicateScalar                     loop:none
+  //
+  /// CHECK-FI:
+  //
+  // Vector loop.
+  /// CHECK-DAG:       Phi                    loop:<<VectorLoop:B\d+>> outer_loop:none
+  /// CHECK-DAG:       VecLoad                loop:<<VectorLoop>>      outer_loop:none
+  //
+  // Backup scalar loop.
+  /// CHECK-DAG:       Phi                    loop:<<ScalarLoop:B\d+>> outer_loop:none
+  /// CHECK-DAG:       ArrayGet               loop:<<ScalarLoop>>      outer_loop:none
+  public static void $noinline$testExternalSetForLoopWithDisambiguation(int[] d, int[] m) {
+    m[0] = d[0];
+    for (int i = 1; i < m.length; i++) {
+      m[i] = (d[i - 1] + d[i]) * 53;
+    }
   }
 
   public static final int ARRAY_SIZE = 512;
@@ -976,6 +1216,21 @@ public class Main {
       }
       expectEquals(85800, reduction32Values(a1, a2, a3, a4));
     }
+    {
+      float[] a1 = new float[100];
+      float[] a2 = new float[100];
+      float[] a3 = new float[100];
+      float[] a4 = new float[100];
+      int[] a5 = new int[100];
+
+      for (int i = 0; i < 100; i++) {
+        a1[i] = (float)i;
+        a2[i] = (float)1;
+        a3[i] = (float)(100 - i);
+        a4[i] = (i % 16);
+      }
+      expectEquals(86608.0f, $noinline$ensureSlowPathFPSpillFill(a1, a2, a3, a4, a5));
+    }
 
     expectEquals(10, reductionIntoReplication());
 
@@ -1030,6 +1285,17 @@ public class Main {
         byte[] b_a = createAndInitByteArray(1);
         byte[] b_b = createAndInitByteArray(2);
         expectEquals(1278, testSADAndDotProdCombined1(b_a, b_b));
+    }
+    {
+        int[] i_a = createAndInitIntArray(1);
+        int[] i_b = createAndInitIntArray(2);
+        $noinline$testExternalSetForLoopWithDisambiguation(i_a, i_b);
+
+        int sum = 0;
+        for (int i = 0; i < i_b.length; i++) {
+          sum += i_b[i];
+        }
+        expectEquals(-13839413, sum);
     }
 
     System.out.println("passed");

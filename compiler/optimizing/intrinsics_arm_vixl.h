@@ -17,10 +17,12 @@
 #ifndef ART_COMPILER_OPTIMIZING_INTRINSICS_ARM_VIXL_H_
 #define ART_COMPILER_OPTIMIZING_INTRINSICS_ARM_VIXL_H_
 
+#include "base/macros.h"
 #include "intrinsics.h"
+#include "intrinsics_list.h"
 #include "utils/arm/assembler_arm_vixl.h"
 
-namespace art {
+namespace art HIDDEN {
 
 namespace arm {
 
@@ -35,9 +37,7 @@ class IntrinsicLocationsBuilderARMVIXL final : public IntrinsicVisitor {
 
 #define OPTIMIZING_INTRINSICS(Name, IsStatic, NeedsEnvironmentOrCache, SideEffects, Exceptions, ...) \
   void Visit ## Name(HInvoke* invoke) override;
-#include "intrinsics_list.h"
-  INTRINSICS_LIST(OPTIMIZING_INTRINSICS)
-#undef INTRINSICS_LIST
+  ART_INTRINSICS_WITH_HINVOKE_LIST(OPTIMIZING_INTRINSICS)
 #undef OPTIMIZING_INTRINSICS
 
   // Check whether an invoke is an intrinsic, and if so, create a location summary. Returns whether
@@ -47,7 +47,7 @@ class IntrinsicLocationsBuilderARMVIXL final : public IntrinsicVisitor {
 
  private:
   ArenaAllocator* const allocator_;
-  CodeGenerator* const codegen_;
+  CodeGeneratorARMVIXL* const codegen_;
   ArmVIXLAssembler* const assembler_;
   const ArmInstructionSetFeatures& features_;
 
@@ -62,14 +62,16 @@ class IntrinsicCodeGeneratorARMVIXL final : public IntrinsicVisitor {
 
 #define OPTIMIZING_INTRINSICS(Name, IsStatic, NeedsEnvironmentOrCache, SideEffects, Exceptions, ...) \
   void Visit ## Name(HInvoke* invoke) override;
-#include "intrinsics_list.h"
-  INTRINSICS_LIST(OPTIMIZING_INTRINSICS)
-#undef INTRINSICS_LIST
+  ART_INTRINSICS_WITH_HINVOKE_LIST(OPTIMIZING_INTRINSICS)
 #undef OPTIMIZING_INTRINSICS
 
  private:
   ArenaAllocator* GetAllocator();
   ArmVIXLAssembler* GetAssembler();
+
+  void HandleValueOf(HInvoke* invoke,
+                     const IntrinsicVisitor::ValueOfInfo& info,
+                     DataType::Type type);
 
   CodeGeneratorARMVIXL* const codegen_;
 

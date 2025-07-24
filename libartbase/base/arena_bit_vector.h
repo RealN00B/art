@@ -18,6 +18,7 @@
 #define ART_LIBARTBASE_BASE_ARENA_BIT_VECTOR_H_
 
 #include "arena_object.h"
+#include "base/arena_allocator.h"
 #include "bit_vector.h"
 
 namespace art {
@@ -26,7 +27,8 @@ class ArenaAllocator;
 class ScopedArenaAllocator;
 
 /*
- * A BitVector implementation that uses Arena allocation.
+ * A BitVector implementation that uses Arena allocation. All constructors of ArenaBitVector start
+ * with an empty ArenaBitVector.
  */
 class ArenaBitVector : public BitVector, public ArenaObject<kArenaAllocGrowableBitMap> {
  public:
@@ -49,8 +51,8 @@ class ArenaBitVector : public BitVector, public ArenaObject<kArenaAllocGrowableB
                  ArenaAllocKind kind = kArenaAllocGrowableBitMap);
   ~ArenaBitVector() {}
 
- private:
-  DISALLOW_COPY_AND_ASSIGN(ArenaBitVector);
+  ArenaBitVector(ArenaBitVector&&) = default;
+  ArenaBitVector(const ArenaBitVector&) = delete;
 };
 
 }  // namespace art

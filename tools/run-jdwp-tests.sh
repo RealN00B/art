@@ -20,7 +20,7 @@ if [ ! -d libcore ]; then
 fi
 
 source build/envsetup.sh >&/dev/null # for get_build_var, setpaths
-setpaths # include platform prebuilt java, javac, etc in $PATH.
+set_lunch_paths # include platform prebuilt java, javac, etc in $PATH.
 
 if [ -z "$ANDROID_HOST_OUT" ] ; then
   ANDROID_HOST_OUT=${OUT_DIR-$ANDROID_BUILD_TOP/out}/host/linux-x86
@@ -42,6 +42,8 @@ function boot_classpath_arg {
   do
     if [ "$var" = "conscrypt" ] && [ "$mode" = "target" ]; then
       printf -- "${separator}/apex/com.android.conscrypt/javalib/conscrypt.jar";
+    elif [ "$var" = "core-icu4j" ] && [ "$mode" = "target" ]; then
+      printf -- "${separator}/apex/com.android.i18n/javalib/core-icu4j.jar";
     else
       printf -- "${separator}${dir}/${var}${suffix}.jar";
     fi
@@ -50,9 +52,9 @@ function boot_classpath_arg {
 }
 
 # Note: This must start with the CORE_IMG_JARS in Android.common_path.mk
-# because that's what we use for compiling the core.art image.
+# because that's what we use for compiling the boot.art image.
 # It may contain additional modules from TEST_CORE_JARS.
-BOOT_CLASSPATH_JARS="core-oj core-libart core-icu4j okhttp bouncycastle apache-xml conscrypt"
+BOOT_CLASSPATH_JARS="core-oj core-libart okhttp bouncycastle apache-xml core-icu4j conscrypt"
 
 vm_args=""
 art="$android_root/bin/art"
@@ -70,7 +72,7 @@ plugin=""
 debug="no"
 explicit_debug="no"
 verbose="no"
-image="-Ximage:/data/art-test/core.art"
+image="-Ximage:/system/framework/art_boot_images/boot.art"
 boot_classpath="$(boot_classpath_arg /apex/com.android.art/javalib "" $BOOT_CLASSPATH_JARS)"
 boot_classpath_locations=""
 with_jdwp_path=""
@@ -384,9 +386,9 @@ fi
 
 if [[ $mode != "ri" ]]; then
   # Because we're running debuggable, we discard any AOT code.
-  # Therefore we run de2oat with 'quicken' to avoid spending time compiling.
-  vm_args="$vm_args --vm-arg -Xcompiler-option --vm-arg --compiler-filter=quicken"
-  debuggee_args="$debuggee_args -Xcompiler-option --compiler-filter=quicken"
+  # Therefore we run dex2oat with 'verify' to avoid spending time compiling.
+  vm_args="$vm_args --vm-arg -Xcompiler-option --vm-arg --compiler-filter=verify"
+  debuggee_args="$debuggee_args -Xcompiler-option --compiler-filter=verify"
 
   if $instant_jit; then
     debuggee_args="$debuggee_args -Xjitthreshold:0"

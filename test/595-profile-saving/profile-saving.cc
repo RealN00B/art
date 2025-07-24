@@ -14,65 +14,17 @@
  * limitations under the License.
  */
 
-#include "dex/dex_file.h"
-
 #include "art_method-inl.h"
-#include "dex/method_reference.h"
-#include "jit/profile_saver.h"
+#include "art_method.h"
+#include "jit/profiling_info.h"
 #include "jni.h"
-#include "mirror/class-inl.h"
 #include "mirror/executable.h"
-#include "nativehelper/ScopedUtfChars.h"
-#include "oat_file_assistant.h"
-#include "oat_file_manager.h"
-#include "profile/profile_compilation_info.h"
 #include "scoped_thread_state_change-inl.h"
 #include "thread.h"
 
 namespace art {
 namespace {
 
-extern "C" JNIEXPORT void JNICALL Java_Main_ensureProfilingInfo(JNIEnv* env,
-                                                                jclass,
-                                                                jobject method) {
-  CHECK(method != nullptr);
-  ScopedObjectAccess soa(env);
-  ObjPtr<mirror::Executable> exec = soa.Decode<mirror::Executable>(method);
-  ArtMethod* art_method = exec->GetArtMethod();
-  if (!ProfilingInfo::Create(soa.Self(), art_method, /* retry_allocation */ true)) {
-    LOG(ERROR) << "Failed to create profiling info for method " << art_method->PrettyMethod();
-  }
-}
-
-extern "C" JNIEXPORT void JNICALL Java_Main_ensureProfileProcessing(JNIEnv*, jclass) {
-  ProfileSaver::ForceProcessProfiles();
-}
-
-extern "C" JNIEXPORT jboolean JNICALL Java_Main_presentInProfile(JNIEnv* env,
-                                                                 jclass,
-                                                                 jstring filename,
-                                                                 jobject method) {
-  ScopedUtfChars filename_chars(env, filename);
-  CHECK(filename_chars.c_str() != nullptr);
-  ScopedObjectAccess soa(env);
-  ObjPtr<mirror::Executable> exec = soa.Decode<mirror::Executable>(method);
-  ArtMethod* art_method = exec->GetArtMethod();
-  return ProfileSaver::HasSeenMethod(std::string(filename_chars.c_str()),
-                                     /*hot*/ true,
-                                     MethodReference(art_method->GetDexFile(),
-                                                     art_method->GetDexMethodIndex()));
-}
-
-extern "C" JNIEXPORT jboolean JNICALL Java_Main_isForBootImage(JNIEnv* env,
-                                                               jclass,
-                                                               jstring filename) {
-  ScopedUtfChars filename_chars(env, filename);
-  CHECK(filename_chars.c_str() != nullptr);
-
-  ProfileCompilationInfo info;
-  info.Load(std::string(filename_chars.c_str()), /*clear_if_invalid=*/ false);
-  return info.IsForBootImage();
-}
 
 }  // namespace
 }  // namespace art

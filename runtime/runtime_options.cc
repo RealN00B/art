@@ -18,6 +18,7 @@
 
 #include <memory>
 
+#include "base/fast_exit.h"
 #include "base/sdk_version.h"
 #include "base/utils.h"
 #include "debugger.h"
@@ -27,7 +28,7 @@
 #include "thread_list.h"
 #include "trace.h"
 
-namespace art {
+namespace art HIDDEN {
 
 // Specify storage for the RuntimeOptions keys.
 

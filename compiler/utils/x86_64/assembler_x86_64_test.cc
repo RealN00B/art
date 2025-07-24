@@ -21,13 +21,14 @@
 #include <random>
 
 #include "base/bit_utils.h"
+#include "base/macros.h"
 #include "base/malloc_arena_pool.h"
 #include "base/stl_util.h"
 #include "jni_macro_assembler_x86_64.h"
 #include "utils/assembler_test.h"
 #include "utils/jni_macro_assembler_test.h"
 
-namespace art {
+namespace art HIDDEN {
 
 TEST(AssemblerX86_64, CreateBuffer) {
   MallocArenaPool pool;
@@ -144,13 +145,12 @@ class AssemblerX86_64Test : public AssemblerTest<x86_64::X86_64Assembler,
                              x86_64::Immediate>;
 
  protected:
-  // Get the typically used name for this architecture, e.g., aarch64, x86-64, ...
-  std::string GetArchitectureString() override {
-    return "x86_64";
+  AssemblerX86_64Test() : Base() {
+    require_same_encoding_ = false;  // Allow different encoding with the same size and disassembly.
   }
 
-  std::string GetDisassembleParameters() override {
-    return " -D -bbinary -mi386:x86-64 -Mx86-64,addr64,data32 --no-show-raw-insn";
+  InstructionSet GetIsa() override {
+    return InstructionSet::kX86_64;
   }
 
   void SetUpHelpers() override {
@@ -158,23 +158,23 @@ class AssemblerX86_64Test : public AssemblerTest<x86_64::X86_64Assembler,
       // One addressing mode to test the repeat drivers.
       addresses_singleton_.push_back(
           x86_64::Address(x86_64::CpuRegister(x86_64::RAX),
-                          x86_64::CpuRegister(x86_64::RBX), x86_64::TIMES_1, -1));
+                          x86_64::CpuRegister(x86_64::RBX), TIMES_1, -1));
     }
 
     if (addresses_.size() == 0) {
       // Several addressing modes.
       addresses_.push_back(
           x86_64::Address(x86_64::CpuRegister(x86_64::RDI),
-                          x86_64::CpuRegister(x86_64::RAX), x86_64::TIMES_1, 15));
+                          x86_64::CpuRegister(x86_64::RAX), TIMES_1, 15));
       addresses_.push_back(
           x86_64::Address(x86_64::CpuRegister(x86_64::RDI),
-                          x86_64::CpuRegister(x86_64::RBX), x86_64::TIMES_2, 16));
+                          x86_64::CpuRegister(x86_64::RBX), TIMES_2, 16));
       addresses_.push_back(
           x86_64::Address(x86_64::CpuRegister(x86_64::RDI),
-                          x86_64::CpuRegister(x86_64::RCX), x86_64::TIMES_4, 17));
+                          x86_64::CpuRegister(x86_64::RCX), TIMES_4, 17));
       addresses_.push_back(
           x86_64::Address(x86_64::CpuRegister(x86_64::RDI),
-                          x86_64::CpuRegister(x86_64::RDX), x86_64::TIMES_8, 18));
+                          x86_64::CpuRegister(x86_64::RDX), TIMES_8, 18));
       addresses_.push_back(x86_64::Address(x86_64::CpuRegister(x86_64::RAX), -1));
       addresses_.push_back(x86_64::Address(x86_64::CpuRegister(x86_64::RBX), 0));
       addresses_.push_back(x86_64::Address(x86_64::CpuRegister(x86_64::RSI), 1));
@@ -182,16 +182,16 @@ class AssemblerX86_64Test : public AssemblerTest<x86_64::X86_64Assembler,
       // Several addressing modes with the special ESP.
       addresses_.push_back(
           x86_64::Address(x86_64::CpuRegister(x86_64::RSP),
-                          x86_64::CpuRegister(x86_64::RAX), x86_64::TIMES_1, 15));
+                          x86_64::CpuRegister(x86_64::RAX), TIMES_1, 15));
       addresses_.push_back(
           x86_64::Address(x86_64::CpuRegister(x86_64::RSP),
-                          x86_64::CpuRegister(x86_64::RBX), x86_64::TIMES_2, 16));
+                          x86_64::CpuRegister(x86_64::RBX), TIMES_2, 16));
       addresses_.push_back(
           x86_64::Address(x86_64::CpuRegister(x86_64::RSP),
-                          x86_64::CpuRegister(x86_64::RCX), x86_64::TIMES_4, 17));
+                          x86_64::CpuRegister(x86_64::RCX), TIMES_4, 17));
       addresses_.push_back(
           x86_64::Address(x86_64::CpuRegister(x86_64::RSP),
-                          x86_64::CpuRegister(x86_64::RDX), x86_64::TIMES_8, 18));
+                          x86_64::CpuRegister(x86_64::RDX), TIMES_8, 18));
       addresses_.push_back(x86_64::Address(x86_64::CpuRegister(x86_64::RSP), -1));
       addresses_.push_back(x86_64::Address(x86_64::CpuRegister(x86_64::RSP), 0));
       addresses_.push_back(x86_64::Address(x86_64::CpuRegister(x86_64::RSP), 1));
@@ -199,28 +199,11 @@ class AssemblerX86_64Test : public AssemblerTest<x86_64::X86_64Assembler,
       // Several addressing modes with the higher registers.
       addresses_.push_back(
           x86_64::Address(x86_64::CpuRegister(x86_64::R8),
-                          x86_64::CpuRegister(x86_64::R15), x86_64::TIMES_2, -1));
+                          x86_64::CpuRegister(x86_64::R15), TIMES_2, -1));
       addresses_.push_back(x86_64::Address(x86_64::CpuRegister(x86_64::R15), 123456789));
     }
 
-    if (registers_.size() == 0) {
-      registers_.push_back(new x86_64::CpuRegister(x86_64::RAX));
-      registers_.push_back(new x86_64::CpuRegister(x86_64::RBX));
-      registers_.push_back(new x86_64::CpuRegister(x86_64::RCX));
-      registers_.push_back(new x86_64::CpuRegister(x86_64::RDX));
-      registers_.push_back(new x86_64::CpuRegister(x86_64::RBP));
-      registers_.push_back(new x86_64::CpuRegister(x86_64::RSP));
-      registers_.push_back(new x86_64::CpuRegister(x86_64::RSI));
-      registers_.push_back(new x86_64::CpuRegister(x86_64::RDI));
-      registers_.push_back(new x86_64::CpuRegister(x86_64::R8));
-      registers_.push_back(new x86_64::CpuRegister(x86_64::R9));
-      registers_.push_back(new x86_64::CpuRegister(x86_64::R10));
-      registers_.push_back(new x86_64::CpuRegister(x86_64::R11));
-      registers_.push_back(new x86_64::CpuRegister(x86_64::R12));
-      registers_.push_back(new x86_64::CpuRegister(x86_64::R13));
-      registers_.push_back(new x86_64::CpuRegister(x86_64::R14));
-      registers_.push_back(new x86_64::CpuRegister(x86_64::R15));
-
+    if (secondary_register_names_.empty()) {
       secondary_register_names_.emplace(x86_64::CpuRegister(x86_64::RAX), "eax");
       secondary_register_names_.emplace(x86_64::CpuRegister(x86_64::RBX), "ebx");
       secondary_register_names_.emplace(x86_64::CpuRegister(x86_64::RCX), "ecx");
@@ -271,42 +254,59 @@ class AssemblerX86_64Test : public AssemblerTest<x86_64::X86_64Assembler,
       quaternary_register_names_.emplace(x86_64::CpuRegister(x86_64::R13), "r13b");
       quaternary_register_names_.emplace(x86_64::CpuRegister(x86_64::R14), "r14b");
       quaternary_register_names_.emplace(x86_64::CpuRegister(x86_64::R15), "r15b");
-
-      fp_registers_.push_back(new x86_64::XmmRegister(x86_64::XMM0));
-      fp_registers_.push_back(new x86_64::XmmRegister(x86_64::XMM1));
-      fp_registers_.push_back(new x86_64::XmmRegister(x86_64::XMM2));
-      fp_registers_.push_back(new x86_64::XmmRegister(x86_64::XMM3));
-      fp_registers_.push_back(new x86_64::XmmRegister(x86_64::XMM4));
-      fp_registers_.push_back(new x86_64::XmmRegister(x86_64::XMM5));
-      fp_registers_.push_back(new x86_64::XmmRegister(x86_64::XMM6));
-      fp_registers_.push_back(new x86_64::XmmRegister(x86_64::XMM7));
-      fp_registers_.push_back(new x86_64::XmmRegister(x86_64::XMM8));
-      fp_registers_.push_back(new x86_64::XmmRegister(x86_64::XMM9));
-      fp_registers_.push_back(new x86_64::XmmRegister(x86_64::XMM10));
-      fp_registers_.push_back(new x86_64::XmmRegister(x86_64::XMM11));
-      fp_registers_.push_back(new x86_64::XmmRegister(x86_64::XMM12));
-      fp_registers_.push_back(new x86_64::XmmRegister(x86_64::XMM13));
-      fp_registers_.push_back(new x86_64::XmmRegister(x86_64::XMM14));
-      fp_registers_.push_back(new x86_64::XmmRegister(x86_64::XMM15));
     }
   }
 
   void TearDown() override {
     AssemblerTest::TearDown();
-    STLDeleteElements(&registers_);
-    STLDeleteElements(&fp_registers_);
   }
 
   std::vector<x86_64::Address> GetAddresses() override {
     return addresses_;
   }
 
-  std::vector<x86_64::CpuRegister*> GetRegisters() override {
-    return registers_;
+  ArrayRef<const x86_64::CpuRegister> GetRegisters() override {
+    static constexpr x86_64::CpuRegister kRegisters[] = {
+        x86_64::CpuRegister(x86_64::RAX),
+        x86_64::CpuRegister(x86_64::RBX),
+        x86_64::CpuRegister(x86_64::RCX),
+        x86_64::CpuRegister(x86_64::RDX),
+        x86_64::CpuRegister(x86_64::RBP),
+        x86_64::CpuRegister(x86_64::RSP),
+        x86_64::CpuRegister(x86_64::RSI),
+        x86_64::CpuRegister(x86_64::RDI),
+        x86_64::CpuRegister(x86_64::R8),
+        x86_64::CpuRegister(x86_64::R9),
+        x86_64::CpuRegister(x86_64::R10),
+        x86_64::CpuRegister(x86_64::R11),
+        x86_64::CpuRegister(x86_64::R12),
+        x86_64::CpuRegister(x86_64::R13),
+        x86_64::CpuRegister(x86_64::R14),
+        x86_64::CpuRegister(x86_64::R15),
+    };
+    return ArrayRef<const x86_64::CpuRegister>(kRegisters);
   }
 
-  std::vector<x86_64::XmmRegister*> GetFPRegisters() override {
-    return fp_registers_;
+  ArrayRef<const x86_64::XmmRegister> GetFPRegisters() override {
+    static constexpr x86_64::XmmRegister kFPRegisters[] = {
+        x86_64::XmmRegister(x86_64::XMM0),
+        x86_64::XmmRegister(x86_64::XMM1),
+        x86_64::XmmRegister(x86_64::XMM2),
+        x86_64::XmmRegister(x86_64::XMM3),
+        x86_64::XmmRegister(x86_64::XMM4),
+        x86_64::XmmRegister(x86_64::XMM5),
+        x86_64::XmmRegister(x86_64::XMM6),
+        x86_64::XmmRegister(x86_64::XMM7),
+        x86_64::XmmRegister(x86_64::XMM8),
+        x86_64::XmmRegister(x86_64::XMM9),
+        x86_64::XmmRegister(x86_64::XMM10),
+        x86_64::XmmRegister(x86_64::XMM11),
+        x86_64::XmmRegister(x86_64::XMM12),
+        x86_64::XmmRegister(x86_64::XMM13),
+        x86_64::XmmRegister(x86_64::XMM14),
+        x86_64::XmmRegister(x86_64::XMM15),
+    };
+    return ArrayRef<const x86_64::XmmRegister>(kFPRegisters);
   }
 
   x86_64::Immediate CreateImmediate(int64_t imm_value) override {
@@ -332,11 +332,9 @@ class AssemblerX86_64Test : public AssemblerTest<x86_64::X86_64Assembler,
 
  private:
   std::vector<x86_64::Address> addresses_;
-  std::vector<x86_64::CpuRegister*> registers_;
   std::map<x86_64::CpuRegister, std::string, X86_64CpuRegisterCompare> secondary_register_names_;
   std::map<x86_64::CpuRegister, std::string, X86_64CpuRegisterCompare> tertiary_register_names_;
   std::map<x86_64::CpuRegister, std::string, X86_64CpuRegisterCompare> quaternary_register_names_;
-  std::vector<x86_64::XmmRegister*> fp_registers_;
 };
 
 class AssemblerX86_64AVXTest : public AssemblerX86_64Test {
@@ -519,28 +517,28 @@ TEST_F(AssemblerX86_64Test, Toolchain) {
 TEST_F(AssemblerX86_64Test, PopqAllAddresses) {
   // Make sure all addressing modes combinations are tested at least once.
   std::vector<x86_64::Address> all_addresses;
-  for (x86_64::CpuRegister* base : GetRegisters()) {
+  for (const x86_64::CpuRegister& base : GetRegisters()) {
     // Base only.
-    all_addresses.push_back(x86_64::Address(*base, -1));
-    all_addresses.push_back(x86_64::Address(*base, 0));
-    all_addresses.push_back(x86_64::Address(*base, 1));
-    all_addresses.push_back(x86_64::Address(*base, 123456789));
-    for (x86_64::CpuRegister* index : GetRegisters()) {
-      if (index->AsRegister() == x86_64::RSP) {
+    all_addresses.push_back(x86_64::Address(base, -1));
+    all_addresses.push_back(x86_64::Address(base, 0));
+    all_addresses.push_back(x86_64::Address(base, 1));
+    all_addresses.push_back(x86_64::Address(base, 123456789));
+    for (const x86_64::CpuRegister& index : GetRegisters()) {
+      if (index.AsRegister() == x86_64::RSP) {
         // Index cannot be RSP.
         continue;
-      } else if (base->AsRegister() == index->AsRegister()) {
+      } else if (base.AsRegister() == index.AsRegister()) {
        // Index only.
-       all_addresses.push_back(x86_64::Address(*index, x86_64::TIMES_1, -1));
-       all_addresses.push_back(x86_64::Address(*index, x86_64::TIMES_2, 0));
-       all_addresses.push_back(x86_64::Address(*index, x86_64::TIMES_4, 1));
-       all_addresses.push_back(x86_64::Address(*index, x86_64::TIMES_8, 123456789));
+       all_addresses.push_back(x86_64::Address(index, TIMES_1, -1));
+       all_addresses.push_back(x86_64::Address(index, TIMES_2, 0));
+       all_addresses.push_back(x86_64::Address(index, TIMES_4, 1));
+       all_addresses.push_back(x86_64::Address(index, TIMES_8, 123456789));
       }
       // Base and index.
-      all_addresses.push_back(x86_64::Address(*base, *index, x86_64::TIMES_1, -1));
-      all_addresses.push_back(x86_64::Address(*base, *index, x86_64::TIMES_2, 0));
-      all_addresses.push_back(x86_64::Address(*base, *index, x86_64::TIMES_4, 1));
-      all_addresses.push_back(x86_64::Address(*base, *index, x86_64::TIMES_8, 123456789));
+      all_addresses.push_back(x86_64::Address(base, index, TIMES_1, -1));
+      all_addresses.push_back(x86_64::Address(base, index, TIMES_2, 0));
+      all_addresses.push_back(x86_64::Address(base, index, TIMES_4, 1));
+      all_addresses.push_back(x86_64::Address(base, index, TIMES_8, 123456789));
     }
   }
   DriverStr(RepeatA(&x86_64::X86_64Assembler::popq, all_addresses, "popq {mem}"), "popq");
@@ -591,9 +589,19 @@ TEST_F(AssemblerX86_64Test, AddlImm) {
                      "add ${imm}, %{reg}"), "addli");
 }
 
-TEST_F(AssemblerX86_64Test, Addw) {
+TEST_F(AssemblerX86_64Test, AddwMem) {
   DriverStr(
       RepeatAI(&x86_64::X86_64Assembler::addw, /*imm_bytes*/2U, "addw ${imm}, {mem}"), "addw");
+}
+
+TEST_F(AssemblerX86_64Test, AddwImm) {
+  DriverStr(
+      RepeatwI(&x86_64::X86_64Assembler::addw, /*imm_bytes*/2U, "addw ${imm}, %{reg}"), "addw");
+}
+
+TEST_F(AssemblerX86_64Test, AddwMemReg) {
+  DriverStr(
+      RepeatAw(&x86_64::X86_64Assembler::addw, "addw %{reg}, {mem}"), "addw");
 }
 
 TEST_F(AssemblerX86_64Test, ImulqReg1) {
@@ -645,11 +653,11 @@ TEST_F(AssemblerX86_64Test, SublImm) {
 // Shll only allows CL as the shift count.
 std::string shll_fn(AssemblerX86_64Test::Base* assembler_test, x86_64::X86_64Assembler* assembler) {
   std::ostringstream str;
-  std::vector<x86_64::CpuRegister*> registers = assembler_test->GetRegisters();
+  ArrayRef<const x86_64::CpuRegister> registers = assembler_test->GetRegisters();
   x86_64::CpuRegister shifter(x86_64::RCX);
-  for (auto reg : registers) {
-    assembler->shll(*reg, shifter);
-    str << "shll %cl, %" << assembler_test->GetSecondaryRegisterName(*reg) << "\n";
+  for (auto&& reg : registers) {
+    assembler->shll(reg, shifter);
+    str << "shll %cl, %" << assembler_test->GetSecondaryRegisterName(reg) << "\n";
   }
   return str.str();
 }
@@ -666,11 +674,11 @@ TEST_F(AssemblerX86_64Test, ShllImm) {
 // Shlq only allows CL as the shift count.
 std::string shlq_fn(AssemblerX86_64Test::Base* assembler_test, x86_64::X86_64Assembler* assembler) {
   std::ostringstream str;
-  std::vector<x86_64::CpuRegister*> registers = assembler_test->GetRegisters();
+  ArrayRef<const x86_64::CpuRegister> registers = assembler_test->GetRegisters();
   x86_64::CpuRegister shifter(x86_64::RCX);
-  for (auto reg : registers) {
-    assembler->shlq(*reg, shifter);
-    str << "shlq %cl, %" << assembler_test->GetRegisterName(*reg) << "\n";
+  for (auto&& reg : registers) {
+    assembler->shlq(reg, shifter);
+    str << "shlq %cl, %" << assembler_test->GetRegisterName(reg) << "\n";
   }
   return str.str();
 }
@@ -687,11 +695,11 @@ TEST_F(AssemblerX86_64Test, ShlqImm) {
 // Shrl only allows CL as the shift count.
 std::string shrl_fn(AssemblerX86_64Test::Base* assembler_test, x86_64::X86_64Assembler* assembler) {
   std::ostringstream str;
-  std::vector<x86_64::CpuRegister*> registers = assembler_test->GetRegisters();
+  ArrayRef<const x86_64::CpuRegister> registers = assembler_test->GetRegisters();
   x86_64::CpuRegister shifter(x86_64::RCX);
-  for (auto reg : registers) {
-    assembler->shrl(*reg, shifter);
-    str << "shrl %cl, %" << assembler_test->GetSecondaryRegisterName(*reg) << "\n";
+  for (auto&& reg : registers) {
+    assembler->shrl(reg, shifter);
+    str << "shrl %cl, %" << assembler_test->GetSecondaryRegisterName(reg) << "\n";
   }
   return str.str();
 }
@@ -707,11 +715,11 @@ TEST_F(AssemblerX86_64Test, ShrlImm) {
 // Shrq only allows CL as the shift count.
 std::string shrq_fn(AssemblerX86_64Test::Base* assembler_test, x86_64::X86_64Assembler* assembler) {
   std::ostringstream str;
-  std::vector<x86_64::CpuRegister*> registers = assembler_test->GetRegisters();
+  ArrayRef<const x86_64::CpuRegister> registers = assembler_test->GetRegisters();
   x86_64::CpuRegister shifter(x86_64::RCX);
-  for (auto reg : registers) {
-    assembler->shrq(*reg, shifter);
-    str << "shrq %cl, %" << assembler_test->GetRegisterName(*reg) << "\n";
+  for (auto&& reg : registers) {
+    assembler->shrq(reg, shifter);
+    str << "shrq %cl, %" << assembler_test->GetRegisterName(reg) << "\n";
   }
   return str.str();
 }
@@ -727,11 +735,11 @@ TEST_F(AssemblerX86_64Test, ShrqImm) {
 // Sarl only allows CL as the shift count.
 std::string sarl_fn(AssemblerX86_64Test::Base* assembler_test, x86_64::X86_64Assembler* assembler) {
   std::ostringstream str;
-  std::vector<x86_64::CpuRegister*> registers = assembler_test->GetRegisters();
+  ArrayRef<const x86_64::CpuRegister> registers = assembler_test->GetRegisters();
   x86_64::CpuRegister shifter(x86_64::RCX);
-  for (auto reg : registers) {
-    assembler->sarl(*reg, shifter);
-    str << "sarl %cl, %" << assembler_test->GetSecondaryRegisterName(*reg) << "\n";
+  for (auto&& reg : registers) {
+    assembler->sarl(reg, shifter);
+    str << "sarl %cl, %" << assembler_test->GetSecondaryRegisterName(reg) << "\n";
   }
   return str.str();
 }
@@ -747,11 +755,11 @@ TEST_F(AssemblerX86_64Test, SarlImm) {
 // Sarq only allows CL as the shift count.
 std::string sarq_fn(AssemblerX86_64Test::Base* assembler_test, x86_64::X86_64Assembler* assembler) {
   std::ostringstream str;
-  std::vector<x86_64::CpuRegister*> registers = assembler_test->GetRegisters();
+  ArrayRef<const x86_64::CpuRegister> registers = assembler_test->GetRegisters();
   x86_64::CpuRegister shifter(x86_64::RCX);
-  for (auto reg : registers) {
-    assembler->sarq(*reg, shifter);
-    str << "sarq %cl, %" << assembler_test->GetRegisterName(*reg) << "\n";
+  for (auto&& reg : registers) {
+    assembler->sarq(reg, shifter);
+    str << "sarq %cl, %" << assembler_test->GetRegisterName(reg) << "\n";
   }
   return str.str();
 }
@@ -767,11 +775,11 @@ TEST_F(AssemblerX86_64Test, SarqImm) {
 // Rorl only allows CL as the shift count.
 std::string rorl_fn(AssemblerX86_64Test::Base* assembler_test, x86_64::X86_64Assembler* assembler) {
   std::ostringstream str;
-  std::vector<x86_64::CpuRegister*> registers = assembler_test->GetRegisters();
+  ArrayRef<const x86_64::CpuRegister> registers = assembler_test->GetRegisters();
   x86_64::CpuRegister shifter(x86_64::RCX);
-  for (auto reg : registers) {
-    assembler->rorl(*reg, shifter);
-    str << "rorl %cl, %" << assembler_test->GetSecondaryRegisterName(*reg) << "\n";
+  for (auto&& reg : registers) {
+    assembler->rorl(reg, shifter);
+    str << "rorl %cl, %" << assembler_test->GetSecondaryRegisterName(reg) << "\n";
   }
   return str.str();
 }
@@ -787,11 +795,11 @@ TEST_F(AssemblerX86_64Test, RorlImm) {
 // Roll only allows CL as the shift count.
 std::string roll_fn(AssemblerX86_64Test::Base* assembler_test, x86_64::X86_64Assembler* assembler) {
   std::ostringstream str;
-  std::vector<x86_64::CpuRegister*> registers = assembler_test->GetRegisters();
+  ArrayRef<const x86_64::CpuRegister> registers = assembler_test->GetRegisters();
   x86_64::CpuRegister shifter(x86_64::RCX);
-  for (auto reg : registers) {
-    assembler->roll(*reg, shifter);
-    str << "roll %cl, %" << assembler_test->GetSecondaryRegisterName(*reg) << "\n";
+  for (auto&& reg : registers) {
+    assembler->roll(reg, shifter);
+    str << "roll %cl, %" << assembler_test->GetSecondaryRegisterName(reg) << "\n";
   }
   return str.str();
 }
@@ -807,11 +815,11 @@ TEST_F(AssemblerX86_64Test, RollImm) {
 // Rorq only allows CL as the shift count.
 std::string rorq_fn(AssemblerX86_64Test::Base* assembler_test, x86_64::X86_64Assembler* assembler) {
   std::ostringstream str;
-  std::vector<x86_64::CpuRegister*> registers = assembler_test->GetRegisters();
+  ArrayRef<const x86_64::CpuRegister> registers = assembler_test->GetRegisters();
   x86_64::CpuRegister shifter(x86_64::RCX);
-  for (auto reg : registers) {
-    assembler->rorq(*reg, shifter);
-    str << "rorq %cl, %" << assembler_test->GetRegisterName(*reg) << "\n";
+  for (auto&& reg : registers) {
+    assembler->rorq(reg, shifter);
+    str << "rorq %cl, %" << assembler_test->GetRegisterName(reg) << "\n";
   }
   return str.str();
 }
@@ -827,11 +835,11 @@ TEST_F(AssemblerX86_64Test, RorqImm) {
 // Rolq only allows CL as the shift count.
 std::string rolq_fn(AssemblerX86_64Test::Base* assembler_test, x86_64::X86_64Assembler* assembler) {
   std::ostringstream str;
-  std::vector<x86_64::CpuRegister*> registers = assembler_test->GetRegisters();
+  ArrayRef<const x86_64::CpuRegister> registers = assembler_test->GetRegisters();
   x86_64::CpuRegister shifter(x86_64::RCX);
-  for (auto reg : registers) {
-    assembler->rolq(*reg, shifter);
-    str << "rolq %cl, %" << assembler_test->GetRegisterName(*reg) << "\n";
+  for (auto&& reg : registers) {
+    assembler->rolq(reg, shifter);
+    str << "rolq %cl, %" << assembler_test->GetRegisterName(reg) << "\n";
   }
   return str.str();
 }
@@ -866,6 +874,22 @@ TEST_F(AssemblerX86_64Test, Testl) {
   // Note: uses different order for GCC than usual. This makes GCC happy, and doesn't have an
   // impact on functional correctness.
   DriverStr(Repeatrr(&x86_64::X86_64Assembler::testl, "testl %{reg1}, %{reg2}"), "testl");
+}
+
+TEST_F(AssemblerX86_64Test, Idivq) {
+  DriverStr(RepeatR(&x86_64::X86_64Assembler::idivq, "idivq %{reg}"), "idivq");
+}
+
+TEST_F(AssemblerX86_64Test, Idivl) {
+  DriverStr(Repeatr(&x86_64::X86_64Assembler::idivl, "idivl %{reg}"), "idivl");
+}
+
+TEST_F(AssemblerX86_64Test, Divq) {
+  DriverStr(RepeatR(&x86_64::X86_64Assembler::divq, "divq %{reg}"), "divq");
+}
+
+TEST_F(AssemblerX86_64Test, Divl) {
+  DriverStr(Repeatr(&x86_64::X86_64Assembler::divl, "divl %{reg}"), "divl");
 }
 
 TEST_F(AssemblerX86_64Test, Negq) {
@@ -904,6 +928,11 @@ TEST_F(AssemblerX86_64Test, AndlImm) {
                      "andl ${imm}, %{reg}"), "andli");
 }
 
+TEST_F(AssemblerX86_64Test, Andw) {
+  DriverStr(
+      RepeatAI(&x86_64::X86_64Assembler::andw, /*imm_bytes*/2U, "andw ${imm}, {mem}"), "andw");
+}
+
 TEST_F(AssemblerX86_64Test, OrqRegs) {
   DriverStr(RepeatRR(&x86_64::X86_64Assembler::orq, "orq %{reg2}, %{reg1}"), "orq");
 }
@@ -935,14 +964,119 @@ TEST_F(AssemblerX86_64Test, XorlImm) {
                      /*imm_bytes*/ 4U, "xor ${imm}, %{reg}"), "xorli");
 }
 
-TEST_F(AssemblerX86_64Test, Xchgq) {
+TEST_F(AssemblerX86_64Test, XchgqReg) {
   DriverStr(RepeatRR(&x86_64::X86_64Assembler::xchgq, "xchgq %{reg2}, %{reg1}"), "xchgq");
 }
 
-TEST_F(AssemblerX86_64Test, Xchgl) {
-  // TODO: Test is disabled because GCC generates 0x87 0xC0 for xchgl eax, eax. All other cases
-  // are the same. Anyone know why it doesn't emit a simple 0x90? It does so for xchgq rax, rax...
-  // DriverStr(Repeatrr(&x86_64::X86_64Assembler::xchgl, "xchgl %{reg2}, %{reg1}"), "xchgl");
+TEST_F(AssemblerX86_64Test, XchgqMem) {
+  DriverStr(RepeatRA(&x86_64::X86_64Assembler::xchgq, "xchgq %{reg}, {mem}"), "xchgq");
+}
+
+TEST_F(AssemblerX86_64Test, XchglReg) {
+  // Exclude `xcghl eax, eax` because the reference implementation generates 0x87 0xC0 (contrary to
+  // the intel manual saying that this should be a `nop` 0x90). All other cases are the same.
+  static const std::vector<std::pair<x86_64::CpuRegister, x86_64::CpuRegister>> except = {
+    std::make_pair(x86_64::CpuRegister(x86_64::RAX), x86_64::CpuRegister(x86_64::RAX))
+  };
+  DriverStr(Repeatrr(&x86_64::X86_64Assembler::xchgl, "xchgl %{reg2}, %{reg1}", &except), "xchgl");
+}
+
+TEST_F(AssemblerX86_64Test, XchglMem) {
+  DriverStr(RepeatrA(&x86_64::X86_64Assembler::xchgl, "xchgl %{reg}, {mem}"), "xchgl");
+}
+
+TEST_F(AssemblerX86_64Test, XchgwReg) {
+  DriverStr(Repeatww(&x86_64::X86_64Assembler::xchgw, "xchgw %{reg2}, %{reg1}"), "xchgw");
+}
+
+TEST_F(AssemblerX86_64Test, XchgwMem) {
+  DriverStr(RepeatwA(&x86_64::X86_64Assembler::xchgw, "xchgw %{reg}, {mem}"), "xchgw");
+}
+
+TEST_F(AssemblerX86_64Test, XchgbReg) {
+  DriverStr(Repeatbb(&x86_64::X86_64Assembler::xchgb, "xchgb %{reg2}, %{reg1}"), "xchgb");
+}
+
+TEST_F(AssemblerX86_64Test, XchgbMem) {
+  DriverStr(RepeatbA(&x86_64::X86_64Assembler::xchgb, "xchgb %{reg}, {mem}"), "xchgb");
+}
+
+TEST_F(AssemblerX86_64Test, XaddqReg) {
+  DriverStr(RepeatRR(&x86_64::X86_64Assembler::xaddq, "xaddq %{reg2}, %{reg1}"), "xaddq");
+}
+
+TEST_F(AssemblerX86_64Test, XaddqMem) {
+  DriverStr(RepeatAR(&x86_64::X86_64Assembler::xaddq, "xaddq %{reg}, {mem}"), "xaddq");
+}
+
+TEST_F(AssemblerX86_64Test, XaddlReg) {
+  DriverStr(Repeatrr(&x86_64::X86_64Assembler::xaddl, "xaddl %{reg2}, %{reg1}"), "xaddl");
+}
+
+TEST_F(AssemblerX86_64Test, XaddlMem) {
+  DriverStr(RepeatAr(&x86_64::X86_64Assembler::xaddl, "xaddl %{reg}, {mem}"), "xaddl");
+}
+
+TEST_F(AssemblerX86_64Test, XaddwReg) {
+  DriverStr(Repeatww(&x86_64::X86_64Assembler::xaddw, "xaddw %{reg2}, %{reg1}"), "xaddw");
+}
+
+TEST_F(AssemblerX86_64Test, XaddwMem) {
+  DriverStr(RepeatAw(&x86_64::X86_64Assembler::xaddw, "xaddw %{reg}, {mem}"), "xaddw");
+}
+
+TEST_F(AssemblerX86_64Test, XaddbReg) {
+  DriverStr(Repeatbb(&x86_64::X86_64Assembler::xaddb, "xaddb %{reg2}, %{reg1}"), "xaddb");
+}
+
+TEST_F(AssemblerX86_64Test, XaddbMem) {
+  DriverStr(RepeatAb(&x86_64::X86_64Assembler::xaddb, "xaddb %{reg}, {mem}"), "xaddb");
+}
+
+TEST_F(AssemblerX86_64Test, LockXaddq) {
+  DriverStr(
+      RepeatAR(&x86_64::X86_64Assembler::LockXaddq, "lock xaddq %{reg}, {mem}"), "lock_xaddq");
+}
+
+TEST_F(AssemblerX86_64Test, LockXaddl) {
+  DriverStr(
+      RepeatAr(&x86_64::X86_64Assembler::LockXaddl, "lock xaddl %{reg}, {mem}"), "lock_xaddl");
+}
+
+TEST_F(AssemblerX86_64Test, LockXaddw) {
+  DriverStr(
+      RepeatAw(&x86_64::X86_64Assembler::LockXaddw, "lock xaddw %{reg}, {mem}"), "lock_xaddw");
+}
+
+TEST_F(AssemblerX86_64Test, LockXaddb) {
+  DriverStr(
+      RepeatAb(&x86_64::X86_64Assembler::LockXaddb, "lock xaddb %{reg}, {mem}"), "lock_xaddb");
+}
+
+TEST_F(AssemblerX86_64Test, Cmpxchgb) {
+  DriverStr(RepeatAb(&x86_64::X86_64Assembler::cmpxchgb, "cmpxchgb %{reg}, {mem}"), "cmpxchgb");
+}
+
+TEST_F(AssemblerX86_64Test, Cmpxchgw) {
+  DriverStr(RepeatAw(&x86_64::X86_64Assembler::cmpxchgw, "cmpxchgw %{reg}, {mem}"), "cmpxchgw");
+}
+
+TEST_F(AssemblerX86_64Test, Cmpxchgl) {
+  DriverStr(RepeatAr(&x86_64::X86_64Assembler::cmpxchgl, "cmpxchgl %{reg}, {mem}"), "cmpxchgl");
+}
+
+TEST_F(AssemblerX86_64Test, Cmpxchgq) {
+  DriverStr(RepeatAR(&x86_64::X86_64Assembler::cmpxchgq, "cmpxchg %{reg}, {mem}"), "cmpxchg");
+}
+
+TEST_F(AssemblerX86_64Test, LockCmpxchgb) {
+  DriverStr(RepeatAb(&x86_64::X86_64Assembler::LockCmpxchgb,
+                     "lock cmpxchgb %{reg}, {mem}"), "lock_cmpxchgb");
+}
+
+TEST_F(AssemblerX86_64Test, LockCmpxchgw) {
+  DriverStr(RepeatAw(&x86_64::X86_64Assembler::LockCmpxchgw,
+                     "lock cmpxchgw %{reg}, {mem}"), "lock_cmpxchgw");
 }
 
 TEST_F(AssemblerX86_64Test, LockCmpxchgl) {
@@ -1105,14 +1239,26 @@ TEST_F(AssemblerX86_64Test, RepneScasw) {
   DriverStr(expected, "repne_scasw");
 }
 
+TEST_F(AssemblerX86_64Test, RepMovsb) {
+  GetAssembler()->rep_movsb();
+  const char* expected = "rep movsb\n";
+  DriverStr(expected, "rep_movsb");
+}
+
 TEST_F(AssemblerX86_64Test, RepMovsw) {
   GetAssembler()->rep_movsw();
   const char* expected = "rep movsw\n";
   DriverStr(expected, "rep_movsw");
 }
 
+TEST_F(AssemblerX86_64Test, RepMovsl) {
+  GetAssembler()->rep_movsl();
+  const char* expected = "rep movsl\n";
+  DriverStr(expected, "rep_movsl");
+}
+
 TEST_F(AssemblerX86_64Test, Movsxd) {
-  DriverStr(RepeatRr(&x86_64::X86_64Assembler::movsxd, "movsxd %{reg2}, %{reg1}"), "movsxd");
+  DriverStr(RepeatRr(&x86_64::X86_64Assembler::movsxd, "movslq %{reg2}, %{reg1}"), "movsxd");
 }
 
 TEST_F(AssemblerX86_64Test, Movaps) {
@@ -1745,6 +1891,16 @@ TEST_F(AssemblerX86_64AVXTest, VPmaddwd) {
                       "vpmaddwd %{reg3}, %{reg2}, %{reg1}"), "vpmaddwd");
 }
 
+TEST_F(AssemblerX86_64AVXTest, VFmadd213ss) {
+  DriverStr(RepeatFFF(&x86_64::X86_64Assembler::vfmadd213ss,
+                      "vfmadd213ss %{reg3}, %{reg2}, %{reg1}"), "vfmadd213ss");
+}
+
+TEST_F(AssemblerX86_64AVXTest, VFmadd213sd) {
+  DriverStr(RepeatFFF(&x86_64::X86_64Assembler::vfmadd213sd,
+                      "vfmadd213sd %{reg3}, %{reg2}, %{reg1}"), "vfmadd213sd");
+}
+
 TEST_F(AssemblerX86_64Test, Phaddw) {
   DriverStr(RepeatFF(&x86_64::X86_64Assembler::phaddw, "phaddw %{reg2}, %{reg1}"), "phaddw");
 }
@@ -1991,7 +2147,7 @@ TEST_F(AssemblerX86_64Test, Psrldq) {
             "psrldq $2, %xmm15\n", "psrldqi");
 }
 
-std::string x87_fn(AssemblerX86_64Test::Base* assembler_test ATTRIBUTE_UNUSED,
+std::string x87_fn([[maybe_unused]] AssemblerX86_64Test::Base* assembler_test,
                    x86_64::X86_64Assembler* assembler) {
   std::ostringstream str;
 
@@ -2058,7 +2214,7 @@ TEST_F(AssemblerX86_64Test, RetImm) {
                     "ret ${imm}", /*non-negative*/ true), "ret");
 }
 
-std::string ret_and_leave_fn(AssemblerX86_64Test::Base* assembler_test ATTRIBUTE_UNUSED,
+std::string ret_and_leave_fn([[maybe_unused]] AssemblerX86_64Test::Base* assembler_test,
                              x86_64::X86_64Assembler* assembler) {
   std::ostringstream str;
 
@@ -2145,11 +2301,11 @@ TEST_F(AssemblerX86_64Test, PopcntqAddress) {
 
 TEST_F(AssemblerX86_64Test, CmovlAddress) {
   GetAssembler()->cmov(x86_64::kEqual, x86_64::CpuRegister(x86_64::R10), x86_64::Address(
-      x86_64::CpuRegister(x86_64::RDI), x86_64::CpuRegister(x86_64::RBX), x86_64::TIMES_4, 12), false);
+      x86_64::CpuRegister(x86_64::RDI), x86_64::CpuRegister(x86_64::RBX), TIMES_4, 12), false);
   GetAssembler()->cmov(x86_64::kNotEqual, x86_64::CpuRegister(x86_64::RDI), x86_64::Address(
-      x86_64::CpuRegister(x86_64::R10), x86_64::CpuRegister(x86_64::RBX), x86_64::TIMES_4, 12), false);
+      x86_64::CpuRegister(x86_64::R10), x86_64::CpuRegister(x86_64::RBX), TIMES_4, 12), false);
   GetAssembler()->cmov(x86_64::kEqual, x86_64::CpuRegister(x86_64::RDI), x86_64::Address(
-      x86_64::CpuRegister(x86_64::RDI), x86_64::CpuRegister(x86_64::R9), x86_64::TIMES_4, 12), false);
+      x86_64::CpuRegister(x86_64::RDI), x86_64::CpuRegister(x86_64::R9), TIMES_4, 12), false);
   const char* expected =
     "cmovzl 0xc(%RDI,%RBX,4), %R10d\n"
     "cmovnzl 0xc(%R10,%RBX,4), %edi\n"
@@ -2159,11 +2315,11 @@ TEST_F(AssemblerX86_64Test, CmovlAddress) {
 
 TEST_F(AssemblerX86_64Test, CmovqAddress) {
   GetAssembler()->cmov(x86_64::kEqual, x86_64::CpuRegister(x86_64::R10), x86_64::Address(
-      x86_64::CpuRegister(x86_64::RDI), x86_64::CpuRegister(x86_64::RBX), x86_64::TIMES_4, 12), true);
+      x86_64::CpuRegister(x86_64::RDI), x86_64::CpuRegister(x86_64::RBX), TIMES_4, 12), true);
   GetAssembler()->cmov(x86_64::kNotEqual, x86_64::CpuRegister(x86_64::RDI), x86_64::Address(
-      x86_64::CpuRegister(x86_64::R10), x86_64::CpuRegister(x86_64::RBX), x86_64::TIMES_4, 12), true);
+      x86_64::CpuRegister(x86_64::R10), x86_64::CpuRegister(x86_64::RBX), TIMES_4, 12), true);
   GetAssembler()->cmov(x86_64::kEqual, x86_64::CpuRegister(x86_64::RDI), x86_64::Address(
-      x86_64::CpuRegister(x86_64::RDI), x86_64::CpuRegister(x86_64::R9), x86_64::TIMES_4, 12), true);
+      x86_64::CpuRegister(x86_64::RDI), x86_64::CpuRegister(x86_64::R9), TIMES_4, 12), true);
   const char* expected =
     "cmovzq 0xc(%RDI,%RBX,4), %R10\n"
     "cmovnzq 0xc(%R10,%RBX,4), %rdi\n"
@@ -2231,13 +2387,13 @@ std::string setcc_test_fn(AssemblerX86_64Test::Base* assembler_test,
   std::string suffixes[15] = { "o", "no", "b", "ae", "e", "ne", "be", "a", "s", "ns", "pe", "po",
                                "l", "ge", "le" };
 
-  std::vector<x86_64::CpuRegister*> registers = assembler_test->GetRegisters();
+  ArrayRef<const x86_64::CpuRegister> registers = assembler_test->GetRegisters();
   std::ostringstream str;
 
-  for (auto reg : registers) {
+  for (auto&& reg : registers) {
     for (size_t i = 0; i < 15; ++i) {
-      assembler->setcc(static_cast<x86_64::Condition>(i), *reg);
-      str << "set" << suffixes[i] << " %" << assembler_test->GetQuaternaryRegisterName(*reg) << "\n";
+      assembler->setcc(static_cast<x86_64::Condition>(i), reg);
+      str << "set" << suffixes[i] << " %" << assembler_test->GetQuaternaryRegisterName(reg) << "\n";
     }
   }
 
@@ -2280,6 +2436,12 @@ TEST_F(AssemblerX86_64Test, Repecmpsq) {
   DriverStr(expected, "Repecmpsq");
 }
 
+TEST_F(AssemblerX86_64Test, Ud2) {
+  GetAssembler()->ud2();
+  const char* expected = "ud2\n";
+  DriverStr(expected, "Ud2");
+}
+
 TEST_F(AssemblerX86_64Test, Cmpb) {
   DriverStr(RepeatAI(&x86_64::X86_64Assembler::cmpb,
                      /*imm_bytes*/ 1U,
@@ -2298,18 +2460,58 @@ TEST_F(AssemblerX86_64Test, TestlAddressImmediate) {
                      "testl ${imm}, {mem}"), "testli");
 }
 
+// Test that displacing an existing address is the same as constructing a new one with the same
+// initial displacement.
+TEST_F(AssemblerX86_64Test, AddressDisplaceBy) {
+  // Test different displacements, including some 8-bit and 32-bit ones, so that changing
+  // displacement may require a different addressing mode.
+  static const std::vector<int32_t> displacements = {0, 42, -42, 140, -140};
+  // Test with all scale factors.
+  static const std::vector<ScaleFactor> scales = {TIMES_1, TIMES_2, TIMES_4, TIMES_8};
+
+  for (int32_t disp0 : displacements) {  // initial displacement
+    for (int32_t disp : displacements) {  // extra displacement
+      for (const x86_64::CpuRegister reg : GetRegisters()) {
+        // Test non-SIB addressing.
+        EXPECT_EQ(x86_64::Address::displace(x86_64::Address(reg, disp0), disp),
+                  x86_64::Address(reg, disp0 + disp));
+
+        // Test SIB addressing with RBP base.
+        if (reg.AsRegister() != x86_64::RSP) {
+          for (ScaleFactor scale : scales) {
+            EXPECT_EQ(x86_64::Address::displace(x86_64::Address(reg, scale, disp0), disp),
+                      x86_64::Address(reg, scale, disp0 + disp));
+          }
+        }
+
+        // Test SIB addressing with different base.
+        for (const x86_64::CpuRegister& index : GetRegisters()) {
+          if (index.AsRegister() == x86_64::RSP) {
+            continue;  // Skip RSP as it cannot be used with this address constructor.
+          }
+          for (ScaleFactor scale : scales) {
+            EXPECT_EQ(x86_64::Address::displace(x86_64::Address(reg, index, scale, disp0), disp),
+                      x86_64::Address(reg, index, scale, disp0 + disp));
+          }
+        }
+
+        // Test absolute and RIP-relative addressing.
+        EXPECT_EQ(x86_64::Address::displace(x86_64::Address::Absolute(disp0, false), disp),
+                  x86_64::Address::Absolute(disp0 + disp, false));
+        EXPECT_EQ(x86_64::Address::displace(x86_64::Address::Absolute(disp0, true), disp),
+                  x86_64::Address::Absolute(disp0 + disp, true));
+      }
+    }
+  }
+}
+
 class JNIMacroAssemblerX86_64Test : public JNIMacroAssemblerTest<x86_64::X86_64JNIMacroAssembler> {
  public:
   using Base = JNIMacroAssemblerTest<x86_64::X86_64JNIMacroAssembler>;
 
  protected:
-  // Get the typically used name for this architecture, e.g., aarch64, x86-64, ...
-  std::string GetArchitectureString() override {
-    return "x86_64";
-  }
-
-  std::string GetDisassembleParameters() override {
-    return " -D -bbinary -mi386:x86-64 -Mx86-64,addr64,data32 --no-show-raw-insn";
+  InstructionSet GetIsa() override {
+    return InstructionSet::kX86_64;
   }
 
  private:
@@ -2323,7 +2525,7 @@ static x86_64::X86_64ManagedRegister ManagedFromFpu(x86_64::FloatRegister r) {
   return x86_64::X86_64ManagedRegister::FromXmmRegister(r);
 }
 
-std::string buildframe_test_fn(JNIMacroAssemblerX86_64Test::Base* assembler_test ATTRIBUTE_UNUSED,
+std::string buildframe_test_fn([[maybe_unused]] JNIMacroAssemblerX86_64Test::Base* assembler_test,
                                x86_64::X86_64JNIMacroAssembler* assembler) {
   // TODO: more interesting spill registers / entry spills.
 
@@ -2366,7 +2568,7 @@ TEST_F(JNIMacroAssemblerX86_64Test, BuildFrame) {
   DriverFn(&buildframe_test_fn, "BuildFrame");
 }
 
-std::string removeframe_test_fn(JNIMacroAssemblerX86_64Test::Base* assembler_test ATTRIBUTE_UNUSED,
+std::string removeframe_test_fn([[maybe_unused]] JNIMacroAssemblerX86_64Test::Base* assembler_test,
                                 x86_64::X86_64JNIMacroAssembler* assembler) {
   // TODO: more interesting spill registers / entry spills.
 
@@ -2398,7 +2600,7 @@ TEST_F(JNIMacroAssemblerX86_64Test, RemoveFrame) {
 }
 
 std::string increaseframe_test_fn(
-    JNIMacroAssemblerX86_64Test::Base* assembler_test ATTRIBUTE_UNUSED,
+    [[maybe_unused]] JNIMacroAssemblerX86_64Test::Base* assembler_test,
     x86_64::X86_64JNIMacroAssembler* assembler) {
   assembler->IncreaseFrameSize(0U);
   assembler->IncreaseFrameSize(kStackAlignment);
@@ -2418,7 +2620,7 @@ TEST_F(JNIMacroAssemblerX86_64Test, IncreaseFrame) {
 }
 
 std::string decreaseframe_test_fn(
-    JNIMacroAssemblerX86_64Test::Base* assembler_test ATTRIBUTE_UNUSED,
+    [[maybe_unused]] JNIMacroAssemblerX86_64Test::Base* assembler_test,
     x86_64::X86_64JNIMacroAssembler* assembler) {
   assembler->DecreaseFrameSize(0U);
   assembler->DecreaseFrameSize(kStackAlignment);

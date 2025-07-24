@@ -19,13 +19,15 @@
 #include <cmath>
 
 #include "base/casts.h"
-#include "base/enums.h"
-#include "class_root.h"
+#include "base/pointer_size.h"
+#include "class_linker.h"
+#include "class_root-inl.h"
 #include "debugger.h"
 #include "dex/dex_file_types.h"
 #include "entrypoints/runtime_asm_entrypoints.h"
 #include "handle.h"
 #include "intrinsics_enum.h"
+#include "intrinsics_list.h"
 #include "jit/jit.h"
 #include "jvalue-inl.h"
 #include "method_handles-inl.h"
@@ -45,11 +47,10 @@
 #include "shadow_frame-inl.h"
 #include "stack.h"
 #include "thread-inl.h"
-#include "transaction.h"
 #include "var_handles.h"
-#include "well_known_classes.h"
+#include "well_known_classes-inl.h"
 
-namespace art {
+namespace art HIDDEN {
 namespace interpreter {
 
 void ThrowNullPointerExceptionFromInterpreter() {
@@ -58,59 +59,57 @@ void ThrowNullPointerExceptionFromInterpreter() {
 
 bool CheckStackOverflow(Thread* self, size_t frame_size)
     REQUIRES_SHARED(Locks::mutator_lock_) {
-  bool implicit_check = !Runtime::Current()->ExplicitStackOverflowChecks();
+  bool implicit_check = Runtime::Current()->GetImplicitStackOverflowChecks();
   uint8_t* stack_end = self->GetStackEndForInterpreter(implicit_check);
   if (UNLIKELY(__builtin_frame_address(0) < stack_end + frame_size)) {
-    ThrowStackOverflowError(self);
+    ThrowStackOverflowError<kNativeStackType>(self);
     return false;
   }
   return true;
 }
 
-bool UseFastInterpreterToInterpreterInvoke(ArtMethod* method) {
-  Runtime* runtime = Runtime::Current();
-  const void* quick_code = method->GetEntryPointFromQuickCompiledCode();
-  if (!runtime->GetClassLinker()->IsQuickToInterpreterBridge(quick_code)) {
+bool ShouldStayInSwitchInterpreter(ArtMethod* method)
+    REQUIRES_SHARED(Locks::mutator_lock_) {
+  if (!Runtime::Current()->IsStarted()) {
+    // For unstarted runtimes, always use the interpreter entrypoint. This fixes the case where
+    // we are doing cross compilation. Note that GetEntryPointFromQuickCompiledCode doesn't use
+    // the image pointer size here and this may case an overflow if it is called from the
+    // compiler. b/62402160
+    return true;
+  }
+
+  if (UNLIKELY(method->IsNative() || method->IsProxyMethod())) {
     return false;
   }
-  if (!method->SkipAccessChecks() || method->IsNative() || method->IsProxyMethod()) {
-    return false;
+
+  if (Thread::Current()->IsForceInterpreter()) {
+    // Force the use of interpreter when it is required by the debugger.
+    return true;
   }
-  if (method->IsIntrinsic()) {
-    return false;
+
+  if (Thread::Current()->IsAsyncExceptionPending()) {
+    // Force use of interpreter to handle async-exceptions
+    return true;
   }
-  if (method->GetDeclaringClass()->IsStringClass() && method->IsConstructor()) {
-    return false;
-  }
-  if (method->IsStatic() && !method->GetDeclaringClass()->IsVisiblyInitialized()) {
-    return false;
-  }
-  ProfilingInfo* profiling_info = method->GetProfilingInfo(kRuntimePointerSize);
-  if ((profiling_info != nullptr) && (profiling_info->GetSavedEntryPoint() != nullptr)) {
-    return false;
-  }
-  return true;
+
+  const void* code = method->GetEntryPointFromQuickCompiledCode();
+  return Runtime::Current()->GetClassLinker()->IsQuickToInterpreterBridge(code);
 }
 
 template <typename T>
 bool SendMethodExitEvents(Thread* self,
                           const instrumentation::Instrumentation* instrumentation,
                           ShadowFrame& frame,
-                          ObjPtr<mirror::Object> thiz,
                           ArtMethod* method,
-                          uint32_t dex_pc,
                           T& result) {
   bool had_event = false;
   // We can get additional ForcePopFrame requests during handling of these events. We should
   // respect these and send additional instrumentation events.
-  StackHandleScope<1> hs(self);
-  Handle<mirror::Object> h_thiz(hs.NewHandle(thiz));
   do {
     frame.SetForcePopFrame(false);
     if (UNLIKELY(instrumentation->HasMethodExitListeners() && !frame.GetSkipMethodExitEvents())) {
       had_event = true;
-      instrumentation->MethodExitEvent(
-          self, h_thiz.Get(), method, dex_pc, instrumentation::OptionalFrame{ frame }, result);
+      instrumentation->MethodExitEvent(self, method, instrumentation::OptionalFrame{frame}, result);
     }
     // We don't send method-exit if it's a pop-frame. We still send frame_popped though.
     if (UNLIKELY(frame.NeedsNotifyPop() && instrumentation->HasWatchedFramePopListeners())) {
@@ -129,18 +128,14 @@ template
 bool SendMethodExitEvents(Thread* self,
                           const instrumentation::Instrumentation* instrumentation,
                           ShadowFrame& frame,
-                          ObjPtr<mirror::Object> thiz,
                           ArtMethod* method,
-                          uint32_t dex_pc,
                           MutableHandle<mirror::Object>& result);
 
 template
 bool SendMethodExitEvents(Thread* self,
                           const instrumentation::Instrumentation* instrumentation,
                           ShadowFrame& frame,
-                          ObjPtr<mirror::Object> thiz,
                           ArtMethod* method,
-                          uint32_t dex_pc,
                           JValue& result);
 
 // We execute any instrumentation events that are triggered by this exception and change the
@@ -152,11 +147,14 @@ bool SendMethodExitEvents(Thread* self,
 // behavior.
 bool MoveToExceptionHandler(Thread* self,
                             ShadowFrame& shadow_frame,
-                            const instrumentation::Instrumentation* instrumentation) {
+                            bool skip_listeners,
+                            bool skip_throw_listener) {
   self->VerifyStack();
   StackHandleScope<2> hs(self);
   Handle<mirror::Throwable> exception(hs.NewHandle(self->GetException()));
-  if (instrumentation != nullptr &&
+  const instrumentation::Instrumentation* instrumentation =
+      Runtime::Current()->GetInstrumentation();
+  if (!skip_throw_listener &&
       instrumentation->HasExceptionThrownListeners() &&
       self->IsExceptionThrownByCurrentMethod(exception.Get())) {
     // See b/65049545 for why we don't need to check to see if the exception has changed.
@@ -171,7 +169,7 @@ bool MoveToExceptionHandler(Thread* self,
   uint32_t found_dex_pc = shadow_frame.GetMethod()->FindCatchBlock(
       hs.NewHandle(exception->GetClass()), shadow_frame.GetDexPC(), &clear_exception);
   if (found_dex_pc == dex::kDexNoIndex) {
-    if (instrumentation != nullptr) {
+    if (!skip_listeners) {
       if (shadow_frame.NeedsNotifyPop()) {
         instrumentation->WatchedFramePopped(self, shadow_frame);
         if (shadow_frame.GetForcePopFrame()) {
@@ -184,22 +182,14 @@ bool MoveToExceptionHandler(Thread* self,
       // Exception is not caught by the current method. We will unwind to the
       // caller. Notify any instrumentation listener.
       instrumentation->MethodUnwindEvent(self,
-                                         shadow_frame.GetThisObject(),
                                          shadow_frame.GetMethod(),
                                          shadow_frame.GetDexPC());
     }
     return shadow_frame.GetForcePopFrame();
   } else {
     shadow_frame.SetDexPC(found_dex_pc);
-    if (instrumentation != nullptr && instrumentation->HasExceptionHandledListeners()) {
-      self->ClearException();
-      instrumentation->ExceptionHandledEvent(self, exception.Get());
-      if (UNLIKELY(self->IsExceptionPending())) {
-        // Exception handled event threw an exception. Try to find the handler for this one.
-        return MoveToExceptionHandler(self, shadow_frame, instrumentation);
-      } else if (!clear_exception) {
-        self->SetException(exception.Get());
-      }
+    if (!skip_listeners && instrumentation->HasExceptionHandledListeners()) {
+      shadow_frame.SetNotifyExceptionHandledEvent(/*enable=*/ true);
     } else if (clear_exception) {
       self->ClearException();
     }
@@ -213,36 +203,22 @@ void UnexpectedOpcode(const Instruction* inst, const ShadowFrame& shadow_frame) 
   UNREACHABLE();
 }
 
-void AbortTransactionF(Thread* self, const char* fmt, ...) {
-  va_list args;
-  va_start(args, fmt);
-  AbortTransactionV(self, fmt, args);
-  va_end(args);
-}
-
-void AbortTransactionV(Thread* self, const char* fmt, va_list args) {
-  CHECK(Runtime::Current()->IsActiveTransaction());
-  // Constructs abort message.
-  std::string abort_msg;
-  android::base::StringAppendV(&abort_msg, fmt, args);
-  // Throws an exception so we can abort the transaction and rollback every change.
-  Runtime::Current()->AbortTransactionAndThrowAbortError(self, abort_msg);
-}
-
 // START DECLARATIONS :
 //
 // These additional declarations are required because clang complains
 // about ALWAYS_INLINE (-Werror, -Wgcc-compat) in definitions.
 //
 
-template <bool is_range, bool do_assignability_check>
+template <bool is_range>
+NO_STACK_PROTECTOR
 static ALWAYS_INLINE bool DoCallCommon(ArtMethod* called_method,
                                        Thread* self,
                                        ShadowFrame& shadow_frame,
                                        JValue* result,
                                        uint16_t number_of_inputs,
                                        uint32_t (&arg)[Instruction::kMaxVarArgRegs],
-                                       uint32_t vregC) REQUIRES_SHARED(Locks::mutator_lock_);
+                                       uint32_t vregC,
+                                       bool string_init) REQUIRES_SHARED(Locks::mutator_lock_);
 
 template <bool is_range>
 ALWAYS_INLINE void CopyRegisters(ShadowFrame& caller_frame,
@@ -254,6 +230,7 @@ ALWAYS_INLINE void CopyRegisters(ShadowFrame& caller_frame,
 
 // END DECLARATIONS.
 
+NO_STACK_PROTECTOR
 void ArtInterpreterToCompiledCodeBridge(Thread* self,
                                         ArtMethod* caller,
                                         ShadowFrame* shadow_frame,
@@ -261,25 +238,6 @@ void ArtInterpreterToCompiledCodeBridge(Thread* self,
                                         JValue* result)
     REQUIRES_SHARED(Locks::mutator_lock_) {
   ArtMethod* method = shadow_frame->GetMethod();
-  // Ensure static methods are initialized.
-  if (method->IsStatic()) {
-    ObjPtr<mirror::Class> declaringClass = method->GetDeclaringClass();
-    if (UNLIKELY(!declaringClass->IsVisiblyInitialized())) {
-      self->PushShadowFrame(shadow_frame);
-      StackHandleScope<1> hs(self);
-      Handle<mirror::Class> h_class(hs.NewHandle(declaringClass));
-      if (UNLIKELY(!Runtime::Current()->GetClassLinker()->EnsureInitialized(
-                        self, h_class, /*can_init_fields=*/ true, /*can_init_parents=*/ true))) {
-        self->PopShadowFrame();
-        DCHECK(self->IsExceptionPending());
-        return;
-      }
-      self->PopShadowFrame();
-      DCHECK(h_class->IsInitializing());
-      // Reload from shadow frame in case the method moved, this is faster than adding a handle.
-      method = shadow_frame->GetMethod();
-    }
-  }
   // Basic checks for the arg_offset. If there's no code item, the arg_offset must be 0. Otherwise,
   // check that the arg_offset isn't greater than the number of registers. A stronger check is
   // difficult since the frame may contain space for all the registers in the method, or only enough
@@ -342,7 +300,7 @@ static bool DoMethodHandleInvokeCommon(Thread* self,
 
   // Initialize |result| to 0 as this is the default return value for
   // polymorphic invocations of method handle types with void return
-  // and provides sane return result in error cases.
+  // and provides a sensible return result in error cases.
   result->SetJ(0);
 
   // The invoke_method_idx here is the name of the signature polymorphic method that
@@ -471,44 +429,35 @@ static bool DoVarHandleInvokeCommon(Thread* self,
     return false;
   }
 
-  StackHandleScope<2> hs(self);
   bool is_var_args = inst->HasVarArgs();
-  const uint16_t vRegH = is_var_args ? inst->VRegH_45cc() : inst->VRegH_4rcc();
-  ClassLinker* const class_linker = Runtime::Current()->GetClassLinker();
-  Handle<mirror::MethodType> callsite_type(hs.NewHandle(
-      class_linker->ResolveMethodType(self, dex::ProtoIndex(vRegH), shadow_frame.GetMethod())));
-  // This implies we couldn't resolve one or more types in this VarHandle.
-  if (UNLIKELY(callsite_type == nullptr)) {
-    CHECK(self->IsExceptionPending());
-    return false;
-  }
-
   const uint32_t vRegC = is_var_args ? inst->VRegC_45cc() : inst->VRegC_4rcc();
-  ObjPtr<mirror::Object> receiver(shadow_frame.GetVRegReference(vRegC));
-  Handle<mirror::VarHandle> var_handle(hs.NewHandle(ObjPtr<mirror::VarHandle>::DownCast(receiver)));
+  const uint16_t vRegH = is_var_args ? inst->VRegH_45cc() : inst->VRegH_4rcc();
+  StackHandleScope<1> hs(self);
+  Handle<mirror::VarHandle> var_handle = hs.NewHandle(
+      ObjPtr<mirror::VarHandle>::DownCast(shadow_frame.GetVRegReference(vRegC)));
+  ArtMethod* method = shadow_frame.GetMethod();
+  uint32_t var_args[Instruction::kMaxVarArgRegs];
+  std::optional<VarArgsInstructionOperands> var_args_operands(std::nullopt);
+  std::optional<RangeInstructionOperands> range_operands(std::nullopt);
+  InstructionOperands* all_operands;
   if (is_var_args) {
-    uint32_t args[Instruction::kMaxVarArgRegs];
-    inst->GetVarArgs(args, inst_data);
-    VarArgsInstructionOperands all_operands(args, inst->VRegA_45cc());
-    NoReceiverInstructionOperands operands(&all_operands);
-    return VarHandleInvokeAccessor(self,
-                                   shadow_frame,
-                                   var_handle,
-                                   callsite_type,
-                                   access_mode,
-                                   &operands,
-                                   result);
+    inst->GetVarArgs(var_args, inst_data);
+    var_args_operands.emplace(var_args, inst->VRegA_45cc());
+    all_operands = &var_args_operands.value();
   } else {
-    RangeInstructionOperands all_operands(inst->VRegC_4rcc(), inst->VRegA_4rcc());
-    NoReceiverInstructionOperands operands(&all_operands);
-    return VarHandleInvokeAccessor(self,
-                                   shadow_frame,
-                                   var_handle,
-                                   callsite_type,
-                                   access_mode,
-                                   &operands,
-                                   result);
+    range_operands.emplace(inst->VRegC_4rcc(), inst->VRegA_4rcc());
+    all_operands = &range_operands.value();
   }
+  NoReceiverInstructionOperands operands(all_operands);
+
+  return VarHandleInvokeAccessor(self,
+                                 shadow_frame,
+                                 var_handle,
+                                 method,
+                                 dex::ProtoIndex(vRegH),
+                                 access_mode,
+                                 &operands,
+                                 result);
 }
 
 #define DO_VAR_HANDLE_ACCESSOR(_access_mode)                                                \
@@ -564,21 +513,18 @@ bool DoInvokePolymorphic(Thread* self,
   const int invoke_method_idx = inst->VRegB();
   ClassLinker* class_linker = Runtime::Current()->GetClassLinker();
   ArtMethod* invoke_method =
-      class_linker->ResolveMethod<ClassLinker::ResolveMode::kCheckICCEAndIAE>(
-          self, invoke_method_idx, shadow_frame.GetMethod(), kVirtual);
+      class_linker->ResolveMethodWithChecks(
+          invoke_method_idx, shadow_frame.GetMethod(), kPolymorphic);
 
   // Ensure intrinsic identifiers are initialized.
   DCHECK(invoke_method->IsIntrinsic());
 
   // Dispatch based on intrinsic identifier associated with method.
-  switch (static_cast<art::Intrinsics>(invoke_method->GetIntrinsic())) {
+  switch (invoke_method->GetIntrinsic()) {
 #define CASE_SIGNATURE_POLYMORPHIC_INTRINSIC(Name, ...) \
     case Intrinsics::k##Name:                           \
       return Do ## Name(self, shadow_frame, inst, inst_data, result);
-#include "intrinsics_list.h"
-    SIGNATURE_POLYMORPHIC_INTRINSICS_LIST(CASE_SIGNATURE_POLYMORPHIC_INTRINSIC)
-#undef INTRINSICS_LIST
-#undef SIGNATURE_POLYMORPHIC_INTRINSICS_LIST
+    ART_SIGNATURE_POLYMORPHIC_INTRINSICS_LIST(CASE_SIGNATURE_POLYMORPHIC_INTRINSIC)
 #undef CASE_SIGNATURE_POLYMORPHIC_INTRINSIC
     default:
       LOG(FATAL) << "Unreachable: " << invoke_method->GetIntrinsic();
@@ -629,6 +575,9 @@ static ObjPtr<mirror::Class> GetClassForBootstrapArgument(EncodedArrayValueItera
     case EncodedArrayValueIterator::ValueType::kAnnotation:
     case EncodedArrayValueIterator::ValueType::kNull:
       return nullptr;
+    case EncodedArrayValueIterator::ValueType::kEndOfInput:
+      LOG(FATAL) << "Unreachable";
+      UNREACHABLE();
   }
 }
 
@@ -710,6 +659,8 @@ static bool GetArgumentForBootstrapMethod(Thread* self,
       // Unreachable - unsupported types that have been checked when
       // determining the effect call site type based on the bootstrap
       // argument types.
+    case EncodedArrayValueIterator::ValueType::kEndOfInput:
+      LOG(FATAL) << "Unreachable";
       UNREACHABLE();
   }
 }
@@ -753,6 +704,8 @@ static bool PackArgumentForBootstrapMethod(Thread* self,
       // Unreachable - unsupported types that have been checked when
       // determining the effect call site type based on the bootstrap
       // argument types.
+    case EncodedArrayValueIterator::ValueType::kEndOfInput:
+      LOG(FATAL) << "Unreachable";
       UNREACHABLE();
   }
 }
@@ -838,6 +791,8 @@ static bool PackCollectorArrayForBootstrapMethod(Thread* self,
   } else if (component_type == GetClassRoot<mirror::Class>()) {
     COLLECT_REFERENCE_ARRAY(mirror::Class, Type);
   } else {
+    component_type->DumpClass(LOG_STREAM(FATAL_WITHOUT_ABORT), mirror::Class::kDumpClassFullDetail);
+    LOG(FATAL) << "unexpected class: " << component_type->PrettyTypeOf();
     UNREACHABLE();
   }
   #undef COLLECT_PRIMITIVE_ARRAY
@@ -1017,11 +972,9 @@ static ObjPtr<mirror::CallSite> InvokeBootstrapMethod(Thread* self,
   // Set-up a shadow frame for invoking the bootstrap method handle.
   ShadowFrameAllocaUniquePtr bootstrap_frame =
       CREATE_SHADOW_FRAME(call_site_type->NumberOfVRegs(),
-                          nullptr,
                           referrer,
                           shadow_frame.GetDexPC());
-  ScopedStackedShadowFramePusher pusher(
-      self, bootstrap_frame.get(), StackedShadowFrameType::kShadowFrameUnderConstruction);
+  ScopedStackedShadowFramePusher pusher(self, bootstrap_frame.get());
   ShadowFrameSetter setter(bootstrap_frame.get(), 0u);
 
   // The first parameter is a MethodHandles lookup instance.
@@ -1204,23 +1157,15 @@ inline void CopyRegisters(ShadowFrame& caller_frame,
   }
 }
 
-template <bool is_range,
-          bool do_assignability_check>
+template <bool is_range>
 static inline bool DoCallCommon(ArtMethod* called_method,
                                 Thread* self,
                                 ShadowFrame& shadow_frame,
                                 JValue* result,
                                 uint16_t number_of_inputs,
                                 uint32_t (&arg)[Instruction::kMaxVarArgRegs],
-                                uint32_t vregC) {
-  bool string_init = false;
-  // Replace calls to String.<init> with equivalent StringFactory call.
-  if (UNLIKELY(called_method->GetDeclaringClass()->IsStringClass()
-               && called_method->IsConstructor())) {
-    called_method = WellKnownClasses::StringInitToStringFactory(called_method);
-    string_init = true;
-  }
-
+                                uint32_t vregC,
+                                bool string_init) {
   // Compute method information.
   CodeItemDataAccessor accessor(called_method->DexInstructionData());
   // Number of registers for the callee's call frame.
@@ -1229,13 +1174,7 @@ static inline bool DoCallCommon(ArtMethod* called_method,
   // PerformCall. A deoptimization could occur at any time, and we shouldn't change which
   // entrypoint to use once we start building the shadow frame.
 
-  // For unstarted runtimes, always use the interpreter entrypoint. This fixes the case where we are
-  // doing cross compilation. Note that GetEntryPointFromQuickCompiledCode doesn't use the image
-  // pointer size here and this may case an overflow if it is called from the compiler. b/62402160
-  const bool use_interpreter_entrypoint = !Runtime::Current()->IsStarted() ||
-      ClassLinker::ShouldUseInterpreterEntrypoint(
-          called_method,
-          called_method->GetEntryPointFromQuickCompiledCode());
+  const bool use_interpreter_entrypoint = ShouldStayInSwitchInterpreter(called_method);
   if (LIKELY(accessor.HasCodeItem())) {
     // When transitioning to compiled code, space only needs to be reserved for the input registers.
     // The rest of the frame gets discarded. This also prevents accessing the called method's code
@@ -1293,16 +1232,15 @@ static inline bool DoCallCommon(ArtMethod* called_method,
   // Allocate shadow frame on the stack.
   const char* old_cause = self->StartAssertNoThreadSuspension("DoCallCommon");
   ShadowFrameAllocaUniquePtr shadow_frame_unique_ptr =
-      CREATE_SHADOW_FRAME(num_regs, &shadow_frame, called_method, /* dex pc */ 0);
+      CREATE_SHADOW_FRAME(num_regs, called_method, /* dex pc */ 0);
   ShadowFrame* new_shadow_frame = shadow_frame_unique_ptr.get();
 
   // Initialize new shadow frame by copying the registers from the callee shadow frame.
-  if (do_assignability_check) {
+  if (!shadow_frame.GetMethod()->SkipAccessChecks()) {
     // Slow path.
     // We might need to do class loading, which incurs a thread state change to kNative. So
     // register the shadow frame as under construction and allow suspension again.
-    ScopedStackedShadowFramePusher pusher(
-        self, new_shadow_frame, StackedShadowFrameType::kShadowFrameUnderConstruction);
+    ScopedStackedShadowFramePusher pusher(self, new_shadow_frame);
     self->EndAssertNoThreadSuspension(old_cause);
 
     // ArtMethod here is needed to check type information of the call site against the callee.
@@ -1341,7 +1279,7 @@ static inline bool DoCallCommon(ArtMethod* called_method,
         // Handle Object references. 1 virtual register slot.
         case 'L': {
           ObjPtr<mirror::Object> o = shadow_frame.GetVRegReference(src_reg);
-          if (do_assignability_check && o != nullptr) {
+          if (o != nullptr) {
             const dex::TypeIndex type_idx = params->GetTypeItem(shorty_pos).type_idx_;
             ObjPtr<mirror::Class> arg_type = method->GetDexCache()->GetResolvedType(type_idx);
             if (arg_type == nullptr) {
@@ -1415,9 +1353,15 @@ static inline bool DoCallCommon(ArtMethod* called_method,
   return !self->IsExceptionPending();
 }
 
-template<bool is_range, bool do_assignability_check>
-bool DoCall(ArtMethod* called_method, Thread* self, ShadowFrame& shadow_frame,
-            const Instruction* inst, uint16_t inst_data, JValue* result) {
+template<bool is_range>
+NO_STACK_PROTECTOR
+bool DoCall(ArtMethod* called_method,
+            Thread* self,
+            ShadowFrame& shadow_frame,
+            const Instruction* inst,
+            uint16_t inst_data,
+            bool is_string_init,
+            JValue* result) {
   // Argument word count.
   const uint16_t number_of_inputs =
       (is_range) ? inst->VRegA_3rc(inst_data) : inst->VRegA_35c(inst_data);
@@ -1433,12 +1377,18 @@ bool DoCall(ArtMethod* called_method, Thread* self, ShadowFrame& shadow_frame,
     inst->GetVarArgs(arg, inst_data);
   }
 
-  return DoCallCommon<is_range, do_assignability_check>(
-      called_method, self, shadow_frame,
-      result, number_of_inputs, arg, vregC);
+  return DoCallCommon<is_range>(
+      called_method,
+      self,
+      shadow_frame,
+      result,
+      number_of_inputs,
+      arg,
+      vregC,
+      is_string_init);
 }
 
-template <bool is_range, bool do_access_check, bool transaction_active>
+template <bool is_range>
 bool DoFilledNewArray(const Instruction* inst,
                       const ShadowFrame& shadow_frame,
                       Thread* self,
@@ -1455,6 +1405,7 @@ bool DoFilledNewArray(const Instruction* inst,
     return false;
   }
   uint16_t type_idx = is_range ? inst->VRegB_3rc() : inst->VRegB_35c();
+  bool do_access_check = !shadow_frame.GetMethod()->SkipAccessChecks();
   ObjPtr<mirror::Class> array_class = ResolveVerifyAndClinit(dex::TypeIndex(type_idx),
                                                              shadow_frame.GetMethod(),
                                                              self,
@@ -1495,13 +1446,21 @@ bool DoFilledNewArray(const Instruction* inst,
   } else {
     inst->GetVarArgs(arg);
   }
-  for (int32_t i = 0; i < length; ++i) {
-    size_t src_reg = is_range ? vregC + i : arg[i];
-    if (is_primitive_int_component) {
-      new_array->AsIntArray()->SetWithoutChecks<transaction_active>(
+  // We're initializing a newly allocated array, so we do not need to record that under
+  // a transaction. If the transaction is aborted, the whole array shall be unreachable.
+  if (LIKELY(is_primitive_int_component)) {
+    ObjPtr<mirror::IntArray> int_array = new_array->AsIntArray();
+    for (int32_t i = 0; i < length; ++i) {
+      size_t src_reg = is_range ? vregC + i : arg[i];
+      int_array->SetWithoutChecks</*kTransactionActive=*/ false, /*kCheckTransaction=*/ false>(
           i, shadow_frame.GetVReg(src_reg));
-    } else {
-      new_array->AsObjectArray<mirror::Object>()->SetWithoutChecks<transaction_active>(
+    }
+  } else {
+    ObjPtr<mirror::ObjectArray<mirror::Object>> object_array =
+        new_array->AsObjectArray<mirror::Object>();
+    for (int32_t i = 0; i < length; ++i) {
+      size_t src_reg = is_range ? vregC + i : arg[i];
+      object_array->SetWithoutChecks</*kTransactionActive=*/ false, /*kCheckTransaction=*/ false>(
           i, shadow_frame.GetVRegReference(src_reg));
     }
   }
@@ -1510,66 +1469,72 @@ bool DoFilledNewArray(const Instruction* inst,
   return true;
 }
 
-// TODO: Use ObjPtr here.
-template<typename T>
-static void RecordArrayElementsInTransactionImpl(ObjPtr<mirror::PrimitiveArray<T>> array,
-                                                 int32_t count)
+void UnlockHeldMonitors(Thread* self, ShadowFrame* shadow_frame)
     REQUIRES_SHARED(Locks::mutator_lock_) {
-  Runtime* runtime = Runtime::Current();
-  for (int32_t i = 0; i < count; ++i) {
-    runtime->RecordWriteArray(array.Ptr(), i, array->GetWithoutChecks(i));
+  DCHECK(shadow_frame->GetForcePopFrame() ||
+         (Runtime::Current()->IsActiveTransaction() &&
+             Runtime::Current()->GetClassLinker()->IsTransactionAborted()));
+  // Unlock all monitors.
+  if (shadow_frame->GetMethod()->MustCountLocks()) {
+    DCHECK(!shadow_frame->GetMethod()->SkipAccessChecks());
+    // Get the monitors from the shadow-frame monitor-count data.
+    shadow_frame->GetLockCountData().VisitMonitors(
+      [&](mirror::Object** obj) REQUIRES_SHARED(Locks::mutator_lock_) {
+        // Since we don't use the 'obj' pointer after the DoMonitorExit everything should be fine
+        // WRT suspension.
+        DoMonitorExit(self, shadow_frame, *obj);
+      });
+  } else {
+    std::vector<verifier::MethodVerifier::DexLockInfo> locks;
+    verifier::MethodVerifier::FindLocksAtDexPc(shadow_frame->GetMethod(),
+                                               shadow_frame->GetDexPC(),
+                                               &locks,
+                                               Runtime::Current()->GetTargetSdkVersion());
+    for (const auto& reg : locks) {
+      if (UNLIKELY(reg.dex_registers.empty())) {
+        LOG(ERROR) << "Unable to determine reference locked by "
+                   << shadow_frame->GetMethod()->PrettyMethod() << " at pc "
+                   << shadow_frame->GetDexPC();
+      } else {
+        DoMonitorExit(
+            self, shadow_frame, shadow_frame->GetVRegReference(*reg.dex_registers.begin()));
+      }
+    }
   }
 }
 
-void RecordArrayElementsInTransaction(ObjPtr<mirror::Array> array, int32_t count)
-    REQUIRES_SHARED(Locks::mutator_lock_) {
-  DCHECK(Runtime::Current()->IsActiveTransaction());
-  DCHECK(array != nullptr);
-  DCHECK_LE(count, array->GetLength());
-  Primitive::Type primitive_component_type = array->GetClass()->GetComponentType()->GetPrimitiveType();
-  switch (primitive_component_type) {
-    case Primitive::kPrimBoolean:
-      RecordArrayElementsInTransactionImpl(array->AsBooleanArray(), count);
-      break;
-    case Primitive::kPrimByte:
-      RecordArrayElementsInTransactionImpl(array->AsByteArray(), count);
-      break;
-    case Primitive::kPrimChar:
-      RecordArrayElementsInTransactionImpl(array->AsCharArray(), count);
-      break;
-    case Primitive::kPrimShort:
-      RecordArrayElementsInTransactionImpl(array->AsShortArray(), count);
-      break;
-    case Primitive::kPrimInt:
-      RecordArrayElementsInTransactionImpl(array->AsIntArray(), count);
-      break;
-    case Primitive::kPrimFloat:
-      RecordArrayElementsInTransactionImpl(array->AsFloatArray(), count);
-      break;
-    case Primitive::kPrimLong:
-      RecordArrayElementsInTransactionImpl(array->AsLongArray(), count);
-      break;
-    case Primitive::kPrimDouble:
-      RecordArrayElementsInTransactionImpl(array->AsDoubleArray(), count);
-      break;
-    default:
-      LOG(FATAL) << "Unsupported primitive type " << primitive_component_type
-                 << " in fill-array-data";
-      UNREACHABLE();
+void PerformNonStandardReturn(Thread* self,
+                              ShadowFrame& frame,
+                              JValue& result,
+                              const instrumentation::Instrumentation* instrumentation,
+                              bool unlock_monitors) {
+  if (UNLIKELY(self->IsExceptionPending())) {
+    LOG(WARNING) << "Suppressing exception for non-standard method exit: "
+                 << self->GetException()->Dump();
+    self->ClearException();
+  }
+  if (unlock_monitors) {
+    UnlockHeldMonitors(self, &frame);
+    DoMonitorCheckOnExit(self, &frame);
+  }
+  result = JValue();
+  if (UNLIKELY(NeedsMethodExitEvent(instrumentation))) {
+    SendMethodExitEvents(self, instrumentation, frame, frame.GetMethod(), result);
   }
 }
 
 // Explicit DoCall template function declarations.
-#define EXPLICIT_DO_CALL_TEMPLATE_DECL(_is_range, _do_assignability_check)                      \
-  template REQUIRES_SHARED(Locks::mutator_lock_)                                                \
-  bool DoCall<_is_range, _do_assignability_check>(ArtMethod* method, Thread* self,              \
-                                                  ShadowFrame& shadow_frame,                    \
-                                                  const Instruction* inst, uint16_t inst_data,  \
-                                                  JValue* result)
-EXPLICIT_DO_CALL_TEMPLATE_DECL(false, false);
-EXPLICIT_DO_CALL_TEMPLATE_DECL(false, true);
-EXPLICIT_DO_CALL_TEMPLATE_DECL(true, false);
-EXPLICIT_DO_CALL_TEMPLATE_DECL(true, true);
+#define EXPLICIT_DO_CALL_TEMPLATE_DECL(_is_range)                      \
+  template REQUIRES_SHARED(Locks::mutator_lock_)                       \
+  bool DoCall<_is_range>(ArtMethod* method,                            \
+                         Thread* self,                                 \
+                         ShadowFrame& shadow_frame,                    \
+                         const Instruction* inst,                      \
+                         uint16_t inst_data,                           \
+                         bool string_init,                             \
+                         JValue* result)
+EXPLICIT_DO_CALL_TEMPLATE_DECL(false);
+EXPLICIT_DO_CALL_TEMPLATE_DECL(true);
 #undef EXPLICIT_DO_CALL_TEMPLATE_DECL
 
 // Explicit DoInvokePolymorphic template function declarations.
@@ -1583,19 +1548,14 @@ EXPLICIT_DO_INVOKE_POLYMORPHIC_TEMPLATE_DECL(true);
 #undef EXPLICIT_DO_INVOKE_POLYMORPHIC_TEMPLATE_DECL
 
 // Explicit DoFilledNewArray template function declarations.
-#define EXPLICIT_DO_FILLED_NEW_ARRAY_TEMPLATE_DECL(_is_range_, _check, _transaction_active)       \
-  template REQUIRES_SHARED(Locks::mutator_lock_)                                                  \
-  bool DoFilledNewArray<_is_range_, _check, _transaction_active>(const Instruction* inst,         \
-                                                                 const ShadowFrame& shadow_frame, \
-                                                                 Thread* self, JValue* result)
-#define EXPLICIT_DO_FILLED_NEW_ARRAY_ALL_TEMPLATE_DECL(_transaction_active)       \
-  EXPLICIT_DO_FILLED_NEW_ARRAY_TEMPLATE_DECL(false, false, _transaction_active);  \
-  EXPLICIT_DO_FILLED_NEW_ARRAY_TEMPLATE_DECL(false, true, _transaction_active);   \
-  EXPLICIT_DO_FILLED_NEW_ARRAY_TEMPLATE_DECL(true, false, _transaction_active);   \
-  EXPLICIT_DO_FILLED_NEW_ARRAY_TEMPLATE_DECL(true, true, _transaction_active)
-EXPLICIT_DO_FILLED_NEW_ARRAY_ALL_TEMPLATE_DECL(false);
-EXPLICIT_DO_FILLED_NEW_ARRAY_ALL_TEMPLATE_DECL(true);
-#undef EXPLICIT_DO_FILLED_NEW_ARRAY_ALL_TEMPLATE_DECL
+#define EXPLICIT_DO_FILLED_NEW_ARRAY_TEMPLATE_DECL(_is_range_)               \
+  template REQUIRES_SHARED(Locks::mutator_lock_)                             \
+  bool DoFilledNewArray<_is_range_>(const Instruction* inst,                 \
+                                    const ShadowFrame& shadow_frame,         \
+                                    Thread* self,                            \
+                                    JValue* result)
+EXPLICIT_DO_FILLED_NEW_ARRAY_TEMPLATE_DECL(false);
+EXPLICIT_DO_FILLED_NEW_ARRAY_TEMPLATE_DECL(true);
 #undef EXPLICIT_DO_FILLED_NEW_ARRAY_TEMPLATE_DECL
 
 }  // namespace interpreter

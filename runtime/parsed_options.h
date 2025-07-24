@@ -18,25 +18,26 @@
 #define ART_RUNTIME_PARSED_OPTIONS_H_
 
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include <jni.h>
 
 #include "arch/instruction_set.h"
+#include "base/macros.h"
 #include "gc/collector_type.h"
-#include "gc/space/image_space_loading_order.h"
 #include "gc/space/large_object_space.h"
 // #include "jit/profile_saver_options.h"
 #include "runtime_globals.h"
 #include "runtime_options.h"
 
-namespace art {
+namespace art HIDDEN {
 
 class CompilerCallbacks;
 class DexFile;
 struct RuntimeArgumentMap;
 
-typedef std::vector<std::pair<std::string, const void*>> RuntimeOptions;
+using RuntimeOptions = std::vector<std::pair<std::string, const void*>>;
 
 template <typename TVariantMap,
           template <typename TKeyValue> class TVariantMapKey>

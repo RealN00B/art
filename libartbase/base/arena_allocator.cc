@@ -28,8 +28,6 @@
 
 namespace art {
 
-constexpr size_t kMemoryToolRedZoneBytes = 8;
-
 template <bool kCount>
 const char* const ArenaAllocatorStatsImpl<kCount>::kAllocNames[] = {
   // Every name should have the same width and end with a space. Abbreviate if necessary:
@@ -44,6 +42,7 @@ const char* const ArenaAllocatorStatsImpl<kCount>::kAllocNames[] = {
   "BlockList    ",
   "RevPostOrder ",
   "LinearOrder  ",
+  "Reachability ",
   "ConstantsMap ",
   "Predecessors ",
   "Successors   ",
@@ -58,7 +57,6 @@ const char* const ArenaAllocatorStatsImpl<kCount>::kAllocNames[] = {
   "TryCatchInf  ",
   "UseListNode  ",
   "Environment  ",
-  "EnvVRegs     ",
   "EnvLocations ",
   "LocSummary   ",
   "SsaBuilder   ",
@@ -74,6 +72,7 @@ const char* const ArenaAllocatorStatsImpl<kCount>::kAllocNames[] = {
   "LSE          ",
   "CFRE         ",
   "LICM         ",
+  "WBE          ",
   "LoopOpt      ",
   "SsaLiveness  ",
   "SsaPhiElim   ",
@@ -95,6 +94,7 @@ const char* const ArenaAllocatorStatsImpl<kCount>::kAllocNames[] = {
   "Scheduler    ",
   "Profile      ",
   "SBCloner     ",
+  "Transaction  ",
 };
 
 template <bool kCount>
@@ -159,9 +159,7 @@ void ArenaAllocatorStatsImpl<kCount>::Dump(std::ostream& os, const Arena* first,
 }
 
 #pragma GCC diagnostic push
-#if __clang_major__ >= 4
 #pragma GCC diagnostic ignored "-Winstantiation-after-specialization"
-#endif
 // We're going to use ArenaAllocatorStatsImpl<kArenaAllocatorCountAllocations> which needs
 // to be explicitly instantiated if kArenaAllocatorCountAllocations is true. Explicit
 // instantiation of the specialization ArenaAllocatorStatsImpl<false> does not do anything
@@ -183,9 +181,6 @@ void ArenaAllocatorMemoryTool::DoMakeUndefined(void* ptr, size_t size) {
 
 void ArenaAllocatorMemoryTool::DoMakeInaccessible(void* ptr, size_t size) {
   MEMORY_TOOL_MAKE_NOACCESS(ptr, size);
-}
-
-Arena::Arena() : bytes_allocated_(0), memory_(nullptr), size_(0), next_(nullptr) {
 }
 
 size_t ArenaAllocator::BytesAllocated() const {
@@ -245,7 +240,7 @@ void* ArenaAllocator::AllocWithMemoryToolAlign16(size_t bytes, ArenaAllocKind ki
   size_t rounded_bytes = bytes + kMemoryToolRedZoneBytes;
   DCHECK_ALIGNED(rounded_bytes, 8);  // `bytes` is 16-byte aligned, red zone is 8-byte aligned.
   uintptr_t padding =
-      ((reinterpret_cast<uintptr_t>(ptr_) + 15u) & 15u) - reinterpret_cast<uintptr_t>(ptr_);
+      RoundUp(reinterpret_cast<uintptr_t>(ptr_), 16) - reinterpret_cast<uintptr_t>(ptr_);
   ArenaAllocatorStats::RecordAlloc(rounded_bytes, kind);
   uint8_t* ret;
   if (UNLIKELY(padding + rounded_bytes > static_cast<size_t>(end_ - ptr_))) {
@@ -266,6 +261,13 @@ ArenaAllocator::~ArenaAllocator() {
   // Reclaim all the arenas by giving them back to the thread pool.
   UpdateBytesAllocated();
   pool_->FreeArenaChain(arena_head_);
+}
+
+void ArenaAllocator::ResetCurrentArena() {
+  UpdateBytesAllocated();
+  begin_ = nullptr;
+  ptr_ = nullptr;
+  end_ = nullptr;
 }
 
 uint8_t* ArenaAllocator::AllocFromNewArena(size_t bytes) {

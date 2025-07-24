@@ -14,21 +14,54 @@
  * limitations under the License.
  */
 
+import java.lang.reflect.InvocationTargetException;
+import java.lang.reflect.Method;
 
 public class Main {
     public static void main(String[] args) throws Throwable {
+        // Class BadField is defined in BadField.smali.
+        Class<?> c = Class.forName("BadField");
+
+        // Storing null is OK.
+        c.getMethod("storeStaticNull").invoke(null);
+        c.getMethod("storeInstanceNull").invoke(null);
+        c.getMethod("storeStatic", Object.class).invoke(null, new Object[]{ null });
+        c.getMethod("storeInstance", c, Object.class).invoke(
+            null, new Object[]{ c.newInstance(), null });
+
+        // Storing anything else should throw an exception.
+        testStoreObject(c.getMethod("storeStaticObject"));
+        testStoreObject(c.getMethod("storeInstanceObject"));
+        testStoreObject(c.getMethod("storeStatic", Object.class), new Object());
+        testStoreObject(
+            c.getMethod("storeInstance", c, Object.class), c.newInstance(), new Object());
+
+        // Loading is OK.
+        c = Class.forName("BadFieldGet");
+        testLoadObject(c, "loadStatic");
+    }
+
+    public static void testLoadObject(Class<?> c, String methodName) throws Throwable {
+      c.getMethod(methodName).invoke(null);
+    }
+
+    public static void testStoreObject(Method method, Object... arguments) throws Throwable {
         try {
-            // Class BadField is defined in BadField.smali.
-            Class<?> c = Class.forName("BadField");
-            System.out.println("Not reached");
-            c.newInstance();
-        } catch (NoClassDefFoundError expected) {
+          method.invoke(null, arguments);
+          throw new Error("Expected NoClassDefFoundError");
+        } catch (InvocationTargetException expected) {
+          Throwable e = expected.getCause();
+          if (e instanceof NoClassDefFoundError) {
             // The NoClassDefFoundError is for the field widget in class BadField.
-            if (expected.getMessage().equals("Failed resolution of: LWidget;")) {
-                System.out.println("passed");
-            } else {
-                System.out.println("failed: " + expected.getMessage());
+            if (!e.getMessage().equals("Failed resolution of: LWidget;")) {
+                throw new Error("Unexpected " + e);
             }
+          } else {
+            throw new Error("Unexpected " + e);
+          }
         }
+    }
+
+    private static void privateMethod() {
     }
 }

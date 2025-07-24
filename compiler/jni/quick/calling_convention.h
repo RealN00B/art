@@ -19,13 +19,13 @@
 
 #include "base/arena_object.h"
 #include "base/array_ref.h"
-#include "base/enums.h"
+#include "base/macros.h"
+#include "base/pointer_size.h"
 #include "dex/primitive.h"
-#include "handle_scope.h"
 #include "thread.h"
 #include "utils/managed_register.h"
 
-namespace art {
+namespace art HIDDEN {
 
 enum class InstructionSet;
 
@@ -47,7 +47,7 @@ class CallingConvention : public DeletableArenaObject<kArenaAllocCallingConventi
   }
 
   // Register that holds result of this method invocation.
-  virtual ManagedRegister ReturnRegister() = 0;
+  virtual ManagedRegister ReturnRegister() const = 0;
 
   // Iterator interface
 
@@ -76,20 +76,19 @@ class CallingConvention : public DeletableArenaObject<kArenaAllocCallingConventi
  protected:
   CallingConvention(bool is_static,
                     bool is_synchronized,
-                    const char* shorty,
+                    std::string_view shorty,
                     PointerSize frame_pointer_size)
       : itr_slots_(0), itr_refs_(0), itr_args_(0), itr_longs_and_doubles_(0),
         itr_float_and_doubles_(0), displacement_(0),
         frame_pointer_size_(frame_pointer_size),
-        handle_scope_pointer_size_(sizeof(StackReference<mirror::Object>)),
         is_static_(is_static), is_synchronized_(is_synchronized),
         shorty_(shorty) {
-    num_args_ = (is_static ? 0 : 1) + strlen(shorty) - 1;
+    num_args_ = (is_static ? 0 : 1) + shorty.length() - 1;
     num_ref_args_ = is_static ? 0 : 1;  // The implicit this pointer.
     num_float_or_double_args_ = 0;
     num_long_or_double_args_ = 0;
-    for (size_t i = 1; i < strlen(shorty); i++) {
-      char ch = shorty_[i];
+    for (size_t i = 1; i < shorty.length(); i++) {
+      char ch = shorty[i];
       switch (ch) {
       case 'L':
         num_ref_args_++;
@@ -179,21 +178,25 @@ class CallingConvention : public DeletableArenaObject<kArenaAllocCallingConventi
   size_t NumReferenceArgs() const {
     return num_ref_args_;
   }
-  size_t ParamSize(unsigned int param) const {
+  size_t ParamSize(size_t param, size_t reference_size) const {
     DCHECK_LT(param, NumArgs());
     if (IsStatic()) {
       param++;  // 0th argument must skip return value at start of the shorty
     } else if (param == 0) {
-      return sizeof(mirror::HeapReference<mirror::Object>);  // this argument
+      return reference_size;  // this argument
     }
-    size_t result = Primitive::ComponentSize(Primitive::GetType(shorty_[param]));
+    Primitive::Type type = Primitive::GetType(shorty_[param]);
+    if (type == Primitive::kPrimNot) {
+      return reference_size;
+    }
+    size_t result = Primitive::ComponentSize(type);
     if (result >= 1 && result < 4) {
       result = 4;
     }
     return result;
   }
-  const char* GetShorty() const {
-    return shorty_.c_str();
+  std::string_view GetShorty() const {
+    return shorty_;
   }
   // The slot number for current calling_convention argument.
   // Note that each slot is 32-bit. When the current argument is bigger
@@ -211,8 +214,6 @@ class CallingConvention : public DeletableArenaObject<kArenaAllocCallingConventi
   FrameOffset displacement_;
   // The size of a pointer.
   const PointerSize frame_pointer_size_;
-  // The size of a reference entry within the handle scope.
-  const size_t handle_scope_pointer_size_;
 
  private:
   const bool is_static_;
@@ -237,7 +238,7 @@ class ManagedRuntimeCallingConvention : public CallingConvention {
   static std::unique_ptr<ManagedRuntimeCallingConvention> Create(ArenaAllocator* allocator,
                                                                  bool is_static,
                                                                  bool is_synchronized,
-                                                                 const char* shorty,
+                                                                 std::string_view shorty,
                                                                  InstructionSet instruction_set);
 
   // Offset of Method within the managed frame.
@@ -247,6 +248,11 @@ class ManagedRuntimeCallingConvention : public CallingConvention {
 
   // Register that holds the incoming method argument
   virtual ManagedRegister MethodRegister() = 0;
+
+  // Register that is used to pass frame size for method exit hook call. This
+  // shouldn't be the same as the return register since method exit hook also expects
+  // return values in the return register.
+  virtual ManagedRegister ArgumentRegisterForMethodExitHook() = 0;
 
   // Iterator interface
   bool HasNext();
@@ -271,7 +277,7 @@ class ManagedRuntimeCallingConvention : public CallingConvention {
  protected:
   ManagedRuntimeCallingConvention(bool is_static,
                                   bool is_synchronized,
-                                  const char* shorty,
+                                  std::string_view shorty,
                                   PointerSize frame_pointer_size)
       : CallingConvention(is_static, is_synchronized, shorty, frame_pointer_size) {}
 };
@@ -295,38 +301,43 @@ class JniCallingConvention : public CallingConvention {
   static std::unique_ptr<JniCallingConvention> Create(ArenaAllocator* allocator,
                                                       bool is_static,
                                                       bool is_synchronized,
+                                                      bool is_fast_native,
                                                       bool is_critical_native,
-                                                      const char* shorty,
+                                                      std::string_view shorty,
                                                       InstructionSet instruction_set);
 
   // Size of frame excluding space for outgoing args (its assumed Method* is
   // always at the bottom of a frame, but this doesn't work for outgoing
   // native args). Includes alignment.
   virtual size_t FrameSize() const = 0;
-  // Size of outgoing arguments (stack portion), including alignment.
+  // Size of outgoing frame, i.e. stack arguments, @CriticalNative return PC if needed, alignment.
   // -- Arguments that are passed via registers are excluded from this size.
-  virtual size_t OutArgSize() const = 0;
+  virtual size_t OutFrameSize() const = 0;
   // Number of references in stack indirect reference table
   size_t ReferenceCount() const;
-  // Location where the segment state of the local indirect reference table is saved
-  FrameOffset SavedLocalReferenceCookieOffset() const;
-  // Location where the return value of a call can be squirreled if another
-  // call is made following the native call
-  FrameOffset ReturnValueSaveLocation() const;
   // Register that holds result if it is integer.
-  virtual ManagedRegister IntReturnRegister() = 0;
+  virtual ManagedRegister IntReturnRegister() const = 0;
   // Whether the compiler needs to ensure zero-/sign-extension of a small result type
   virtual bool RequiresSmallResultTypeExtension() const = 0;
 
   // Callee save registers to spill prior to native code (which may clobber)
   virtual ArrayRef<const ManagedRegister> CalleeSaveRegisters() const = 0;
 
+  // Subset of core callee save registers that can be used for arbitrary purposes after
+  // constructing the JNI transition frame. These should be both managed and native callee-saves.
+  // These should not include special purpose registers such as thread register.
+  // JNI compiler currently requires at least 4 callee save scratch registers, except for x86
+  // where we have only 3 such registers but all args are passed on stack, so the method register
+  // is never clobbered by argument moves and does not need to be preserved elsewhere.
+  virtual ArrayRef<const ManagedRegister> CalleeSaveScratchRegisters() const = 0;
+
+  // Subset of core argument registers that can be used for arbitrary purposes after
+  // calling the native function. These should exclude the return register(s).
+  virtual ArrayRef<const ManagedRegister> ArgumentScratchRegisters() const = 0;
+
   // Spill mask values
   virtual uint32_t CoreSpillMask() const = 0;
   virtual uint32_t FpSpillMask() const = 0;
-
-  // An extra scratch register live after the call
-  virtual ManagedRegister ReturnScratchRegister() const = 0;
 
   // Iterator interface
   bool HasNext();
@@ -339,37 +350,17 @@ class JniCallingConvention : public CallingConvention {
     return IsCurrentParamALong() || IsCurrentParamADouble();
   }
   bool IsCurrentParamJniEnv();
-  size_t CurrentParamSize() const;
+  virtual size_t CurrentParamSize() const;
   virtual bool IsCurrentParamInRegister() = 0;
   virtual bool IsCurrentParamOnStack() = 0;
   virtual ManagedRegister CurrentParamRegister() = 0;
   virtual FrameOffset CurrentParamStackOffset() = 0;
 
-  // Iterator interface extension for JNI
-  FrameOffset CurrentParamHandleScopeEntryOffset();
-
-  // Position of handle scope and interior fields
-  FrameOffset HandleScopeOffset() const {
-    return FrameOffset(this->displacement_.Int32Value() + static_cast<size_t>(frame_pointer_size_));
-    // above Method reference
-  }
-
-  FrameOffset HandleScopeLinkOffset() const {
-    return FrameOffset(HandleScopeOffset().Int32Value() +
-                       HandleScope::LinkOffset(frame_pointer_size_));
-  }
-
-  FrameOffset HandleScopeNumRefsOffset() const {
-    return FrameOffset(HandleScopeOffset().Int32Value() +
-                       HandleScope::NumberOfReferencesOffset(frame_pointer_size_));
-  }
-
-  FrameOffset HandleReferencesOffset() const {
-    return FrameOffset(HandleScopeOffset().Int32Value() +
-                       HandleScope::ReferencesOffset(frame_pointer_size_));
-  }
-
   virtual ~JniCallingConvention() {}
+
+  bool IsFastNative() const {
+    return is_fast_native_;
+  }
 
   bool IsCriticalNative() const {
     return is_critical_native_;
@@ -380,6 +371,10 @@ class JniCallingConvention : public CallingConvention {
     // Exclude method pointer for @CriticalNative methods for optimization speed.
     return !IsCriticalNative();
   }
+
+  // Locking argument register, used to pass the synchronization object for calls
+  // to `JniLockObject()` and `JniUnlockObject()`.
+  virtual ManagedRegister LockingArgumentRegister() const = 0;
 
   // Hidden argument register, used to pass the method pointer for @CriticalNative call.
   virtual ManagedRegister HiddenArgumentRegister() const = 0;
@@ -406,30 +401,20 @@ class JniCallingConvention : public CallingConvention {
 
   JniCallingConvention(bool is_static,
                        bool is_synchronized,
+                       bool is_fast_native,
                        bool is_critical_native,
-                       const char* shorty,
+                       std::string_view shorty,
                        PointerSize frame_pointer_size)
       : CallingConvention(is_static, is_synchronized, shorty, frame_pointer_size),
+        is_fast_native_(is_fast_native),
         is_critical_native_(is_critical_native) {}
 
  protected:
   size_t NumberOfExtraArgumentsForJni() const;
 
-  // Does the transition have a StackHandleScope?
-  bool HasHandleScope() const {
-    // Exclude HandleScope for @CriticalNative methods for optimization speed.
-    return !IsCriticalNative();
-  }
-
   // Does the transition have a local reference segment state?
   bool HasLocalReferenceSegmentState() const {
     // Exclude local reference segment states for @CriticalNative methods for optimization speed.
-    return !IsCriticalNative();
-  }
-
-  // Does the transition back spill the return value in the stack frame?
-  bool SpillsReturnValue() const {
-    // Exclude return value for @CriticalNative methods for optimization speed.
     return !IsCriticalNative();
   }
 
@@ -449,11 +434,12 @@ class JniCallingConvention : public CallingConvention {
   bool HasSelfClass() const;
 
   // Returns the position of itr_args_, fixed up by removing the offset of extra JNI arguments.
-  unsigned int GetIteratorPositionWithinShorty() const;
+  size_t GetIteratorPositionWithinShorty() const;
 
   // Is the current argument (at the iterator) an extra argument for JNI?
   bool IsCurrentArgExtraForJni() const;
 
+  const bool is_fast_native_;
   const bool is_critical_native_;
 
  private:

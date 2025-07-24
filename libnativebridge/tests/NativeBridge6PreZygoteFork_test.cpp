@@ -19,13 +19,11 @@
 
 namespace android {
 
-constexpr const char* kNativeBridgeLibrary6 = "libnativebridge6-dummy.so";
-
 TEST_F(NativeBridgeTest, V6_PreZygoteFork) {
     // Init
     ASSERT_TRUE(LoadNativeBridge(kNativeBridgeLibrary6, nullptr));
     ASSERT_TRUE(NativeBridgeAvailable());
-    ASSERT_TRUE(PreInitializeNativeBridge(".", "isa"));
+    ASSERT_TRUE(PreInitializeNativeBridge(AppDataDir(), "isa"));
     ASSERT_TRUE(NativeBridgeAvailable());
     ASSERT_TRUE(InitializeNativeBridge(nullptr, nullptr));
     ASSERT_TRUE(NativeBridgeAvailable());

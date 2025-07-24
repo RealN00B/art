@@ -21,8 +21,10 @@ import static java.util.concurrent.TimeUnit.MINUTES;
 /**
  * Test a class with a bad finalizer.
  *
- * This test is inherently flaky. It assumes that the system will schedule the finalizer daemon
- * and finalizer watchdog daemon enough to reach the timeout and throwing the fatal exception.
+ * This test is inherently very slightly flaky. It assumes that the system will schedule the
+ * finalizer daemon and finalizer watchdog daemon soon and often enough to reach the timeout and
+ * throw the fatal exception before we time out. Since we build in a 100 second buffer, failures
+ * should be very rare.
  */
 public class Main {
     public static void main(String[] args) throws Exception {
@@ -54,6 +56,7 @@ public class Main {
                 try {
                     args.wait(remainingWait);
                 } catch (Exception e) {
+                    System.out.println("UNEXPECTED EXCEPTION");
                 }
             }
             remainingWait = timeout - (System.currentTimeMillis() - waitStart);
@@ -75,6 +78,7 @@ public class Main {
         try {
             Thread.sleep(ms);
         } catch (InterruptedException ie) {
+            System.out.println("Unexpected interrupt");
         }
     }
 
@@ -92,14 +96,13 @@ public class Main {
         protected void finalize() {
             finalizerWait.countDown();
 
-            System.out.println("Finalizer started and spinning...");
+            System.out.println("Finalizer started and sleeping briefly...");
 
-            /* spin for a bit */
             long start, end;
             start = System.nanoTime();
             snooze(2000);
             end = System.nanoTime();
-            System.out.println("Finalizer done spinning.");
+            System.out.println("Finalizer done snoozing.");
 
             System.out.println("Finalizer sleeping forever now.");
             while (true) {

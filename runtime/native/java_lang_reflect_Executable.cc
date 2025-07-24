@@ -19,8 +19,8 @@
 #include "android-base/stringprintf.h"
 #include "nativehelper/jni_macros.h"
 
-#include "art_method-inl.h"
-#include "class_root.h"
+#include "art_method-alloc-inl.h"
+#include "class_root-inl.h"
 #include "dex/dex_file_annotations.h"
 #include "handle.h"
 #include "jni/jni_internal.h"
@@ -35,7 +35,7 @@
 #include "scoped_fast_native_object_access-inl.h"
 #include "well_known_classes.h"
 
-namespace art {
+namespace art HIDDEN {
 
 using android::base::StringPrintf;
 
@@ -45,7 +45,7 @@ static jobjectArray Executable_getDeclaredAnnotationsNative(JNIEnv* env, jobject
   if (method->GetDeclaringClass()->IsProxyClass()) {
     // Return an empty array instead of a null pointer.
     ObjPtr<mirror::Class> annotation_array_class =
-        soa.Decode<mirror::Class>(WellKnownClasses::java_lang_annotation_Annotation__array);
+        WellKnownClasses::ToClass(WellKnownClasses::java_lang_annotation_Annotation__array);
     ObjPtr<mirror::ObjectArray<mirror::Object>> empty_array =
         mirror::ObjectArray<mirror::Object>::Alloc(soa.Self(), annotation_array_class, 0);
     return soa.AddLocalReference<jobjectArray>(empty_array);
@@ -128,7 +128,7 @@ static jobjectArray Executable_getParameterAnnotationsNative(JNIEnv* env, jobjec
     // Workaround for dexers (d8/dx) that do not insert annotations
     // for implicit parameters (b/68033708).
     ObjPtr<mirror::Class> annotation_array_class =
-        soa.Decode<mirror::Class>(WellKnownClasses::java_lang_annotation_Annotation__array);
+        WellKnownClasses::ToClass(WellKnownClasses::java_lang_annotation_Annotation__array);
     Handle<mirror::ObjectArray<mirror::Object>> empty_annotations = hs.NewHandle(
         mirror::ObjectArray<mirror::Object>::Alloc(soa.Self(), annotation_array_class, 0));
     if (empty_annotations.IsNull()) {
@@ -157,7 +157,7 @@ static jobjectArray Executable_getParameterAnnotationsNative(JNIEnv* env, jobjec
 static jobjectArray Executable_getParameters0(JNIEnv* env, jobject javaMethod) {
   ScopedFastNativeObjectAccess soa(env);
   Thread* self = soa.Self();
-  StackHandleScope<8> hs(self);
+  StackHandleScope<6> hs(self);
 
   Handle<mirror::Method> executable = hs.NewHandle(soa.Decode<mirror::Method>(javaMethod));
   ArtMethod* art_method = executable.Get()->GetArtMethod();
@@ -197,57 +197,37 @@ static jobjectArray Executable_getParameters0(JNIEnv* env, jobject javaMethod) {
   // Instantiate a Parameter[] to hold the result.
   Handle<mirror::Class> parameter_array_class =
       hs.NewHandle(
-          soa.Decode<mirror::Class>(WellKnownClasses::java_lang_reflect_Parameter__array));
-  Handle<mirror::ObjectArray<mirror::Object>> parameter_array =
-      hs.NewHandle(
-          mirror::ObjectArray<mirror::Object>::Alloc(self,
-                                                     parameter_array_class.Get(),
-                                                     names_count));
+          WellKnownClasses::ToClass(WellKnownClasses::java_lang_reflect_Parameter__array));
+  Handle<mirror::ObjectArray<mirror::Object>> parameter_array = hs.NewHandle(
+      mirror::ObjectArray<mirror::Object>::Alloc(self, parameter_array_class.Get(), names_count));
   if (UNLIKELY(parameter_array == nullptr)) {
     self->AssertPendingException();
     return nullptr;
   }
 
-  Handle<mirror::Class> parameter_class =
-      hs.NewHandle(soa.Decode<mirror::Class>(WellKnownClasses::java_lang_reflect_Parameter));
-  ArtMethod* parameter_init =
-      jni::DecodeArtMethod(WellKnownClasses::java_lang_reflect_Parameter_init);
+  ArtMethod* parameter_init = WellKnownClasses::java_lang_reflect_Parameter_init;
 
   // Mutable handles used in the loop below to ensure cleanup without scaling the number of
   // handles by the number of parameters.
   MutableHandle<mirror::String> name = hs.NewHandle<mirror::String>(nullptr);
-  MutableHandle<mirror::Object> parameter = hs.NewHandle<mirror::Object>(nullptr);
 
   // Populate the Parameter[] to return.
   for (int32_t parameter_index = 0; parameter_index < names_count; parameter_index++) {
     name.Assign(names.Get()->Get(parameter_index));
     int32_t modifiers = access_flags.Get()->Get(parameter_index);
 
-    // Allocate / initialize the Parameter to add to parameter_array.
-    parameter.Assign(parameter_class->AllocObject(self));
+    // Create the Parameter to add to parameter_array.
+    ObjPtr<mirror::Object> parameter = parameter_init->NewObject<'L', 'I', 'L', 'I'>(
+        self, name, modifiers, executable, parameter_index);
     if (UNLIKELY(parameter == nullptr)) {
-      self->AssertPendingOOMException();
+      DCHECK(self->IsExceptionPending());
       return nullptr;
     }
 
-    uint32_t args[5] = { PointerToLowMemUInt32(parameter.Get()),
-                         PointerToLowMemUInt32(name.Get()),
-                         static_cast<uint32_t>(modifiers),
-                         PointerToLowMemUInt32(executable.Get()),
-                         static_cast<uint32_t>(parameter_index)
-    };
-    JValue result;
-    static const char* method_signature = "VLILI";  // return + parameter types
-    parameter_init->Invoke(self, args, sizeof(args), &result, method_signature);
-    if (UNLIKELY(self->IsExceptionPending())) {
-      return nullptr;
-    }
-
-    // Store the Parameter in the Parameter[].
-    parameter_array.Get()->Set(parameter_index, parameter.Get());
-    if (UNLIKELY(self->IsExceptionPending())) {
-      return nullptr;
-    }
+    // We're initializing a newly allocated array object, so we do not need to record that under
+    // a transaction. If the transaction is aborted, the whole object shall be unreachable.
+    parameter_array->SetWithoutChecks</*kTransactionActive=*/ false, /*kCheckTransaction=*/ false>(
+        parameter_index, parameter);
   }
   return soa.AddLocalReference<jobjectArray>(parameter_array.Get());
 }
@@ -275,6 +255,11 @@ static jint Executable_compareMethodParametersInternal(JNIEnv* env,
   this_method = this_method->GetInterfaceMethodIfProxy(kRuntimePointerSize);
   other_method = other_method->GetInterfaceMethodIfProxy(kRuntimePointerSize);
 
+  // Get dex files early. (`ArtMethod::GetParameterTypeList()` includes `GetDexFile()`,
+  // so the compiler should deduplicate these subexpressions after inlining.)
+  const DexFile* this_dex_file = this_method->GetDexFile();
+  const DexFile* other_dex_file = other_method->GetDexFile();
+
   const dex::TypeList* this_list = this_method->GetParameterTypeList();
   const dex::TypeList* other_list = other_method->GetParameterTypeList();
 
@@ -298,18 +283,9 @@ static jint Executable_compareMethodParametersInternal(JNIEnv* env,
   }
 
   for (int32_t i = 0; i < this_size; ++i) {
-    const dex::TypeId& lhs = this_method->GetDexFile()->GetTypeId(
-        this_list->GetTypeItem(i).type_idx_);
-    const dex::TypeId& rhs = other_method->GetDexFile()->GetTypeId(
-        other_list->GetTypeItem(i).type_idx_);
-
-    uint32_t lhs_len, rhs_len;
-    const char* lhs_data = this_method->GetDexFile()->StringDataAndUtf16LengthByIdx(
-        lhs.descriptor_idx_, &lhs_len);
-    const char* rhs_data = other_method->GetDexFile()->StringDataAndUtf16LengthByIdx(
-        rhs.descriptor_idx_, &rhs_len);
-
-    int cmp = strcmp(lhs_data, rhs_data);
+    int cmp = DexFile::CompareDescriptors(
+        this_dex_file->GetTypeDescriptorView(this_list->GetTypeItem(i).type_idx_),
+        other_dex_file->GetTypeDescriptorView(other_list->GetTypeItem(i).type_idx_));
     if (cmp != 0) {
       return (cmp < 0) ? -1 : 1;
     }

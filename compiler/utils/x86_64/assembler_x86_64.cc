@@ -21,7 +21,7 @@
 #include "entrypoints/quick/quick_entrypoints.h"
 #include "thread.h"
 
-namespace art {
+namespace art HIDDEN {
 namespace x86_64 {
 
 std::ostream& operator<<(std::ostream& os, const CpuRegister& reg) {
@@ -857,12 +857,14 @@ void X86_64Assembler::subps(XmmRegister dst, XmmRegister src) {
 
 void X86_64Assembler::vaddps(XmmRegister dst, XmmRegister add_left, XmmRegister add_right) {
   DCHECK(CpuHasAVXorAVX2FeatureFlag());
-  AssemblerBuffer::EnsureCapacity ensured(&buffer_);
   bool is_twobyte_form = false;
   uint8_t ByteZero = 0x00, ByteOne = 0x00, ByteTwo = 0x00;
   if (!add_right.NeedsRex()) {
     is_twobyte_form = true;
+  } else if (!add_left.NeedsRex()) {
+    return vaddps(dst, add_right, add_left);
   }
+  AssemblerBuffer::EnsureCapacity ensured(&buffer_);
   X86_64ManagedRegister vvvv_reg =
       X86_64ManagedRegister::FromXmmRegister(add_left.AsFloatRegister());
   ByteZero = EmitVexPrefixByteZero(is_twobyte_form);
@@ -920,12 +922,14 @@ void X86_64Assembler::mulps(XmmRegister dst, XmmRegister src) {
 
 void X86_64Assembler::vmulps(XmmRegister dst, XmmRegister src1, XmmRegister src2) {
   DCHECK(CpuHasAVXorAVX2FeatureFlag());
-  AssemblerBuffer::EnsureCapacity ensured(&buffer_);
   bool is_twobyte_form = false;
   uint8_t ByteZero = 0x00, ByteOne = 0x00, ByteTwo = 0x00;
   if (!src2.NeedsRex()) {
     is_twobyte_form = true;
+  } else if (!src1.NeedsRex()) {
+    return vmulps(dst, src2, src1);
   }
+  AssemblerBuffer::EnsureCapacity ensured(&buffer_);
   ByteZero = EmitVexPrefixByteZero(is_twobyte_form);
   X86_64ManagedRegister vvvv_reg =
       X86_64ManagedRegister::FromXmmRegister(src1.AsFloatRegister());
@@ -984,6 +988,43 @@ void X86_64Assembler::vdivps(XmmRegister dst, XmmRegister src1, XmmRegister src2
   EmitXmmRegisterOperand(dst.LowBits(), src2);
 }
 
+void X86_64Assembler::vfmadd213ss(XmmRegister acc, XmmRegister left, XmmRegister right) {
+  DCHECK(CpuHasAVXorAVX2FeatureFlag());
+  AssemblerBuffer::EnsureCapacity ensured(&buffer_);
+  uint8_t ByteZero = 0x00, ByteOne = 0x00, ByteTwo = 0x00;
+  ByteZero = EmitVexPrefixByteZero(/*is_twobyte_form=*/ false);
+  X86_64ManagedRegister vvvv_reg =
+      X86_64ManagedRegister::FromXmmRegister(left.AsFloatRegister());
+  ByteOne = EmitVexPrefixByteOne(acc.NeedsRex(),
+                                 /*X=*/ false,
+                                 right.NeedsRex(),
+                                 SET_VEX_M_0F_38);
+  ByteTwo = EmitVexPrefixByteTwo(/*W=*/ false, vvvv_reg, SET_VEX_L_128, SET_VEX_PP_66);
+  EmitUint8(ByteZero);
+  EmitUint8(ByteOne);
+  EmitUint8(ByteTwo);
+  EmitUint8(0xA9);
+  EmitXmmRegisterOperand(acc.LowBits(), right);
+}
+
+void X86_64Assembler::vfmadd213sd(XmmRegister acc, XmmRegister left, XmmRegister right) {
+  DCHECK(CpuHasAVXorAVX2FeatureFlag());
+  AssemblerBuffer::EnsureCapacity ensured(&buffer_);
+  uint8_t ByteZero = 0x00, ByteOne = 0x00, ByteTwo = 0x00;
+  ByteZero = EmitVexPrefixByteZero(/*is_twobyte_form=*/ false);
+  X86_64ManagedRegister vvvv_reg =
+      X86_64ManagedRegister::FromXmmRegister(left.AsFloatRegister());
+  ByteOne = EmitVexPrefixByteOne(acc.NeedsRex(),
+                                 /*X=*/ false,
+                                 right.NeedsRex(),
+                                 SET_VEX_M_0F_38);
+  ByteTwo = EmitVexPrefixByteTwo(/*W=*/ true, vvvv_reg, SET_VEX_L_128, SET_VEX_PP_66);
+  EmitUint8(ByteZero);
+  EmitUint8(ByteOne);
+  EmitUint8(ByteTwo);
+  EmitUint8(0xA9);
+  EmitXmmRegisterOperand(acc.LowBits(), right);
+}
 void X86_64Assembler::flds(const Address& src) {
   AssemblerBuffer::EnsureCapacity ensured(&buffer_);
   EmitUint8(0xD9);
@@ -1402,12 +1443,14 @@ void X86_64Assembler::addpd(XmmRegister dst, XmmRegister src) {
 
 
 void X86_64Assembler::vaddpd(XmmRegister dst, XmmRegister add_left, XmmRegister add_right) {
-  AssemblerBuffer::EnsureCapacity ensured(&buffer_);
   bool is_twobyte_form = false;
   uint8_t ByteZero = 0x00, ByteOne = 0x00, ByteTwo = 0x00;
   if (!add_right.NeedsRex()) {
     is_twobyte_form = true;
+  } else if (!add_left.NeedsRex()) {
+    return vaddpd(dst, add_right, add_left);
   }
+  AssemblerBuffer::EnsureCapacity ensured(&buffer_);
   ByteZero = EmitVexPrefixByteZero(is_twobyte_form);
   X86_64ManagedRegister vvvv_reg =
       X86_64ManagedRegister::FromXmmRegister(add_left.AsFloatRegister());
@@ -1480,12 +1523,14 @@ void X86_64Assembler::mulpd(XmmRegister dst, XmmRegister src) {
 
 void X86_64Assembler::vmulpd(XmmRegister dst, XmmRegister src1, XmmRegister src2) {
   DCHECK(CpuHasAVXorAVX2FeatureFlag());
-  AssemblerBuffer::EnsureCapacity ensured(&buffer_);
   bool is_twobyte_form = false;
   uint8_t ByteZero = 0x00, ByteOne = 0x00, ByteTwo = 0x00;
   if (!src2.NeedsRex()) {
     is_twobyte_form = true;
+  } else if (!src1.NeedsRex()) {
+    return vmulpd(dst, src2, src1);
   }
+  AssemblerBuffer::EnsureCapacity ensured(&buffer_);
   ByteZero = EmitVexPrefixByteZero(is_twobyte_form);
   X86_64ManagedRegister vvvv_reg =
       X86_64ManagedRegister::FromXmmRegister(src1.AsFloatRegister());
@@ -1836,12 +1881,14 @@ void X86_64Assembler::paddb(XmmRegister dst, XmmRegister src) {
 
 void X86_64Assembler::vpaddb(XmmRegister dst, XmmRegister add_left, XmmRegister add_right) {
   DCHECK(CpuHasAVXorAVX2FeatureFlag());
-  AssemblerBuffer::EnsureCapacity ensured(&buffer_);
   uint8_t ByteOne = 0x00, ByteZero = 0x00, ByteTwo = 0x00;
-  bool is_twobyte_form = true;
-  if (add_right.NeedsRex()) {
-    is_twobyte_form = false;
+  bool is_twobyte_form = false;
+  if (!add_right.NeedsRex()) {
+    is_twobyte_form = true;
+  } else if (!add_left.NeedsRex()) {
+    return vpaddb(dst, add_right, add_left);
   }
+  AssemblerBuffer::EnsureCapacity ensured(&buffer_);
   ByteZero = EmitVexPrefixByteZero(is_twobyte_form);
   X86_64ManagedRegister vvvv_reg =
       X86_64ManagedRegister::FromXmmRegister(add_left.AsFloatRegister());
@@ -1915,12 +1962,14 @@ void X86_64Assembler::paddw(XmmRegister dst, XmmRegister src) {
 
 void X86_64Assembler::vpaddw(XmmRegister dst, XmmRegister add_left, XmmRegister add_right) {
   DCHECK(CpuHasAVXorAVX2FeatureFlag());
-  AssemblerBuffer::EnsureCapacity ensured(&buffer_);
   bool is_twobyte_form = false;
   uint8_t ByteZero = 0x00, ByteOne = 0x00, ByteTwo = 0x00;
   if (!add_right.NeedsRex()) {
     is_twobyte_form = true;
+  } else if (!add_left.NeedsRex()) {
+    return vpaddw(dst, add_right, add_left);
   }
+  AssemblerBuffer::EnsureCapacity ensured(&buffer_);
   ByteZero = EmitVexPrefixByteZero(is_twobyte_form);
   X86_64ManagedRegister vvvv_reg =
       X86_64ManagedRegister::FromXmmRegister(add_left.AsFloatRegister());
@@ -1993,12 +2042,14 @@ void X86_64Assembler::pmullw(XmmRegister dst, XmmRegister src) {
 
 void X86_64Assembler::vpmullw(XmmRegister dst, XmmRegister src1, XmmRegister src2) {
   DCHECK(CpuHasAVXorAVX2FeatureFlag());
-  AssemblerBuffer::EnsureCapacity ensured(&buffer_);
   bool is_twobyte_form = false;
   uint8_t ByteZero = 0x00, ByteOne = 0x00, ByteTwo = 0x00;
   if (!src2.NeedsRex()) {
     is_twobyte_form = true;
+  } else if (!src1.NeedsRex()) {
+    return vpmullw(dst, src2, src1);
   }
+  AssemblerBuffer::EnsureCapacity ensured(&buffer_);
   ByteZero = EmitVexPrefixByteZero(is_twobyte_form);
   X86_64ManagedRegister vvvv_reg =
       X86_64ManagedRegister::FromXmmRegister(src1.AsFloatRegister());
@@ -2031,12 +2082,14 @@ void X86_64Assembler::paddd(XmmRegister dst, XmmRegister src) {
 
 void X86_64Assembler::vpaddd(XmmRegister dst, XmmRegister add_left, XmmRegister add_right) {
   DCHECK(CpuHasAVXorAVX2FeatureFlag());
-  AssemblerBuffer::EnsureCapacity ensured(&buffer_);
   bool is_twobyte_form = false;
   uint8_t ByteZero = 0x00, ByteOne = 0x00, ByteTwo = 0x00;
   if (!add_right.NeedsRex()) {
     is_twobyte_form = true;
+  } else if (!add_left.NeedsRex()) {
+    return vpaddd(dst, add_right, add_left);
   }
+  AssemblerBuffer::EnsureCapacity ensured(&buffer_);
   ByteZero = EmitVexPrefixByteZero(is_twobyte_form);
   X86_64ManagedRegister vvvv_reg =
       X86_64ManagedRegister::FromXmmRegister(add_left.AsFloatRegister());
@@ -2109,12 +2162,14 @@ void X86_64Assembler::paddq(XmmRegister dst, XmmRegister src) {
 
 void X86_64Assembler::vpaddq(XmmRegister dst, XmmRegister add_left, XmmRegister add_right) {
   DCHECK(CpuHasAVXorAVX2FeatureFlag());
-  AssemblerBuffer::EnsureCapacity ensured(&buffer_);
   bool is_twobyte_form = false;
   uint8_t ByteZero = 0x00, ByteOne = 0x00, ByteTwo = 0x00;
   if (!add_right.NeedsRex()) {
     is_twobyte_form = true;
+  } else if (!add_left.NeedsRex()) {
+    return vpaddq(dst, add_right, add_left);
   }
+  AssemblerBuffer::EnsureCapacity ensured(&buffer_);
   ByteZero = EmitVexPrefixByteZero(is_twobyte_form);
   X86_64ManagedRegister vvvv_reg =
       X86_64ManagedRegister::FromXmmRegister(add_left.AsFloatRegister());
@@ -2644,12 +2699,14 @@ void X86_64Assembler::pxor(XmmRegister dst, XmmRegister src) {
 /* VEX.128.66.0F.WIG EF /r VPXOR xmm1, xmm2, xmm3/m128 */
 void X86_64Assembler::vpxor(XmmRegister dst, XmmRegister src1, XmmRegister src2) {
   DCHECK(CpuHasAVXorAVX2FeatureFlag());
-  AssemblerBuffer::EnsureCapacity ensured(&buffer_);
   bool is_twobyte_form = false;
   uint8_t ByteZero = 0x00, ByteOne = 0x00, ByteTwo = 0x00;
   if (!src2.NeedsRex()) {
     is_twobyte_form = true;
+  } else if (!src1.NeedsRex()) {
+    return vpxor(dst, src2, src1);
   }
+  AssemblerBuffer::EnsureCapacity ensured(&buffer_);
   X86_64ManagedRegister vvvv_reg =
       X86_64ManagedRegister::FromXmmRegister(src1.AsFloatRegister());
   ByteZero = EmitVexPrefixByteZero(is_twobyte_form);
@@ -2674,12 +2731,14 @@ void X86_64Assembler::vpxor(XmmRegister dst, XmmRegister src1, XmmRegister src2)
 /* VEX.128.0F.WIG 57 /r VXORPS xmm1,xmm2, xmm3/m128 */
 void X86_64Assembler::vxorps(XmmRegister dst, XmmRegister src1, XmmRegister src2) {
   DCHECK(CpuHasAVXorAVX2FeatureFlag());
-  AssemblerBuffer::EnsureCapacity ensured(&buffer_);
   bool is_twobyte_form = false;
   uint8_t ByteZero = 0x00, ByteOne = 0x00, ByteTwo = 0x00;
   if (!src2.NeedsRex()) {
     is_twobyte_form = true;
+  } else if (!src1.NeedsRex()) {
+    return vxorps(dst, src2, src1);
   }
+  AssemblerBuffer::EnsureCapacity ensured(&buffer_);
   X86_64ManagedRegister vvvv_reg =
       X86_64ManagedRegister::FromXmmRegister(src1.AsFloatRegister());
   ByteZero = EmitVexPrefixByteZero(is_twobyte_form);
@@ -2704,12 +2763,14 @@ void X86_64Assembler::vxorps(XmmRegister dst, XmmRegister src1, XmmRegister src2
 /* VEX.128.66.0F.WIG 57 /r VXORPD xmm1,xmm2, xmm3/m128 */
 void X86_64Assembler::vxorpd(XmmRegister dst, XmmRegister src1, XmmRegister src2) {
   DCHECK(CpuHasAVXorAVX2FeatureFlag());
-  AssemblerBuffer::EnsureCapacity ensured(&buffer_);
   bool is_twobyte_form = false;
   uint8_t ByteZero = 0x00, ByteOne = 0x00, ByteTwo = 0x00;
   if (!src2.NeedsRex()) {
     is_twobyte_form = true;
+  } else if (!src1.NeedsRex()) {
+    return vxorpd(dst, src2, src1);
   }
+  AssemblerBuffer::EnsureCapacity ensured(&buffer_);
   X86_64ManagedRegister vvvv_reg =
       X86_64ManagedRegister::FromXmmRegister(src1.AsFloatRegister());
   ByteZero = EmitVexPrefixByteZero(is_twobyte_form);
@@ -2769,12 +2830,14 @@ void X86_64Assembler::pand(XmmRegister dst, XmmRegister src) {
 /* VEX.128.66.0F.WIG DB /r VPAND xmm1, xmm2, xmm3/m128 */
 void X86_64Assembler::vpand(XmmRegister dst, XmmRegister src1, XmmRegister src2) {
   DCHECK(CpuHasAVXorAVX2FeatureFlag());
-  AssemblerBuffer::EnsureCapacity ensured(&buffer_);
   bool is_twobyte_form = false;
   uint8_t ByteZero = 0x00, ByteOne = 0x00, ByteTwo = 0x00;
   if (!src2.NeedsRex()) {
     is_twobyte_form = true;
+  } else if (!src1.NeedsRex()) {
+    return vpand(dst, src2, src1);
   }
+  AssemblerBuffer::EnsureCapacity ensured(&buffer_);
   X86_64ManagedRegister vvvv_reg =
       X86_64ManagedRegister::FromXmmRegister(src1.AsFloatRegister());
   ByteZero = EmitVexPrefixByteZero(is_twobyte_form);
@@ -2799,12 +2862,14 @@ void X86_64Assembler::vpand(XmmRegister dst, XmmRegister src1, XmmRegister src2)
 /* VEX.128.0F 54 /r VANDPS xmm1,xmm2, xmm3/m128 */
 void X86_64Assembler::vandps(XmmRegister dst, XmmRegister src1, XmmRegister src2) {
   DCHECK(CpuHasAVXorAVX2FeatureFlag());
-  AssemblerBuffer::EnsureCapacity ensured(&buffer_);
   bool is_twobyte_form = false;
   uint8_t ByteZero = 0x00, ByteOne = 0x00, ByteTwo = 0x00;
   if (!src2.NeedsRex()) {
     is_twobyte_form = true;
+  } else if (!src1.NeedsRex()) {
+    return vandps(dst, src2, src1);
   }
+  AssemblerBuffer::EnsureCapacity ensured(&buffer_);
   X86_64ManagedRegister vvvv_reg =
       X86_64ManagedRegister::FromXmmRegister(src1.AsFloatRegister());
   ByteZero = EmitVexPrefixByteZero(is_twobyte_form);
@@ -2829,12 +2894,14 @@ void X86_64Assembler::vandps(XmmRegister dst, XmmRegister src1, XmmRegister src2
 /* VEX.128.66.0F 54 /r VANDPD xmm1, xmm2, xmm3/m128 */
 void X86_64Assembler::vandpd(XmmRegister dst, XmmRegister src1, XmmRegister src2) {
   DCHECK(CpuHasAVXorAVX2FeatureFlag());
-  AssemblerBuffer::EnsureCapacity ensured(&buffer_);
   bool is_twobyte_form = false;
   uint8_t ByteZero = 0x00, ByteOne = 0x00, ByteTwo = 0x00;
   if (!src2.NeedsRex()) {
     is_twobyte_form = true;
+  } else if (!src1.NeedsRex()) {
+    return vandpd(dst, src2, src1);
   }
+  AssemblerBuffer::EnsureCapacity ensured(&buffer_);
   X86_64ManagedRegister vvvv_reg =
       X86_64ManagedRegister::FromXmmRegister(src1.AsFloatRegister());
   ByteZero = EmitVexPrefixByteZero(is_twobyte_form);
@@ -3020,12 +3087,14 @@ void X86_64Assembler::por(XmmRegister dst, XmmRegister src) {
 /* VEX.128.66.0F.WIG EB /r VPOR xmm1, xmm2, xmm3/m128 */
 void X86_64Assembler::vpor(XmmRegister dst, XmmRegister src1, XmmRegister src2) {
   DCHECK(CpuHasAVXorAVX2FeatureFlag());
-  AssemblerBuffer::EnsureCapacity ensured(&buffer_);
   bool is_twobyte_form = false;
   uint8_t ByteZero = 0x00, ByteOne = 0x00, ByteTwo = 0x00;
   if (!src2.NeedsRex()) {
     is_twobyte_form = true;
+  } else if (!src1.NeedsRex()) {
+    return vpor(dst, src2, src1);
   }
+  AssemblerBuffer::EnsureCapacity ensured(&buffer_);
   X86_64ManagedRegister vvvv_reg =
       X86_64ManagedRegister::FromXmmRegister(src1.AsFloatRegister());
   ByteZero = EmitVexPrefixByteZero(is_twobyte_form);
@@ -3050,12 +3119,14 @@ void X86_64Assembler::vpor(XmmRegister dst, XmmRegister src1, XmmRegister src2) 
 /* VEX.128.0F 56 /r VORPS xmm1,xmm2, xmm3/m128 */
 void X86_64Assembler::vorps(XmmRegister dst, XmmRegister src1, XmmRegister src2) {
   DCHECK(CpuHasAVXorAVX2FeatureFlag());
-  AssemblerBuffer::EnsureCapacity ensured(&buffer_);
   bool is_twobyte_form = false;
   uint8_t ByteZero = 0x00, ByteOne = 0x00, ByteTwo = 0x00;
   if (!src2.NeedsRex()) {
     is_twobyte_form = true;
+  } else if (!src1.NeedsRex()) {
+    return vorps(dst, src2, src1);
   }
+  AssemblerBuffer::EnsureCapacity ensured(&buffer_);
   X86_64ManagedRegister vvvv_reg =
       X86_64ManagedRegister::FromXmmRegister(src1.AsFloatRegister());
   ByteZero = EmitVexPrefixByteZero(is_twobyte_form);
@@ -3080,12 +3151,14 @@ void X86_64Assembler::vorps(XmmRegister dst, XmmRegister src1, XmmRegister src2)
 /* VEX.128.66.0F 56 /r VORPD xmm1,xmm2, xmm3/m128 */
 void X86_64Assembler::vorpd(XmmRegister dst, XmmRegister src1, XmmRegister src2) {
   DCHECK(CpuHasAVXorAVX2FeatureFlag());
-  AssemblerBuffer::EnsureCapacity ensured(&buffer_);
   bool is_twobyte_form = false;
   uint8_t ByteZero = 0x00, ByteOne = 0x00, ByteTwo = 0x00;
   if (!src2.NeedsRex()) {
     is_twobyte_form = true;
+  } else if (!src1.NeedsRex()) {
+    return vorpd(dst, src2, src1);
   }
+  AssemblerBuffer::EnsureCapacity ensured(&buffer_);
   X86_64ManagedRegister vvvv_reg =
       X86_64ManagedRegister::FromXmmRegister(src1.AsFloatRegister());
   ByteZero = EmitVexPrefixByteZero(is_twobyte_form);
@@ -3145,12 +3218,14 @@ void X86_64Assembler::pmaddwd(XmmRegister dst, XmmRegister src) {
 
 void X86_64Assembler::vpmaddwd(XmmRegister dst, XmmRegister src1, XmmRegister src2) {
   DCHECK(CpuHasAVXorAVX2FeatureFlag());
-  AssemblerBuffer::EnsureCapacity ensured(&buffer_);
   bool is_twobyte_form = false;
   uint8_t ByteZero = 0x00, ByteOne = 0x00, ByteTwo = 0x00;
   if (!src2.NeedsRex()) {
     is_twobyte_form = true;
+  } else if (!src1.NeedsRex()) {
+    return vpmaddwd(dst, src2, src1);
   }
+  AssemblerBuffer::EnsureCapacity ensured(&buffer_);
   ByteZero = EmitVexPrefixByteZero(is_twobyte_form);
   X86_64ManagedRegister vvvv_reg =
       X86_64ManagedRegister::FromXmmRegister(src1.AsFloatRegister());
@@ -3812,48 +3887,76 @@ void X86_64Assembler::fprem() {
 }
 
 
-void X86_64Assembler::xchgl(CpuRegister dst, CpuRegister src) {
-  AssemblerBuffer::EnsureCapacity ensured(&buffer_);
-  // There is a short version for rax.
-  // It's a bit awkward, as CpuRegister has a const field, so assignment and thus swapping doesn't
-  // work.
-  const bool src_rax = src.AsRegister() == RAX;
-  const bool dst_rax = dst.AsRegister() == RAX;
-  if (src_rax || dst_rax) {
-    EmitOptionalRex32(src_rax ? dst : src);
-    EmitUint8(0x90 + (src_rax ? dst.LowBits() : src.LowBits()));
-    return;
+bool X86_64Assembler::try_xchg_rax(CpuRegister dst,
+                                   CpuRegister src,
+                                   void (X86_64Assembler::*prefix_fn)(CpuRegister)) {
+  Register src_reg = src.AsRegister();
+  Register dst_reg = dst.AsRegister();
+  if (src_reg != RAX && dst_reg != RAX) {
+    return false;
   }
-
-  // General case.
-  EmitOptionalRex32(src, dst);
-  EmitUint8(0x87);
-  EmitRegisterOperand(src.LowBits(), dst.LowBits());
+  if (dst_reg == RAX) {
+    std::swap(src_reg, dst_reg);
+  }
+  if (dst_reg != RAX) {
+    // Prefix is needed only if one of the registers is not RAX, otherwise it's a pure NOP.
+    (this->*prefix_fn)(CpuRegister(dst_reg));
+  }
+  EmitUint8(0x90 + CpuRegister(dst_reg).LowBits());
+  return true;
 }
 
 
-void X86_64Assembler::xchgq(CpuRegister dst, CpuRegister src) {
+void X86_64Assembler::xchgb(CpuRegister dst, CpuRegister src) {
   AssemblerBuffer::EnsureCapacity ensured(&buffer_);
-  // There is a short version for rax.
-  // It's a bit awkward, as CpuRegister has a const field, so assignment and thus swapping doesn't
-  // work.
-  const bool src_rax = src.AsRegister() == RAX;
-  const bool dst_rax = dst.AsRegister() == RAX;
-  if (src_rax || dst_rax) {
-    // If src == target, emit a nop instead.
-    if (src_rax && dst_rax) {
-      EmitUint8(0x90);
-    } else {
-      EmitRex64(src_rax ? dst : src);
-      EmitUint8(0x90 + (src_rax ? dst.LowBits() : src.LowBits()));
-    }
+  // There is no short version for AL.
+  EmitOptionalByteRegNormalizingRex32(dst, src, /*normalize_both=*/ true);
+  EmitUint8(0x86);
+  EmitRegisterOperand(dst.LowBits(), src.LowBits());
+}
+
+
+void X86_64Assembler::xchgb(CpuRegister reg, const Address& address) {
+  AssemblerBuffer::EnsureCapacity ensured(&buffer_);
+  EmitOptionalByteRegNormalizingRex32(reg, address);
+  EmitUint8(0x86);
+  EmitOperand(reg.LowBits(), address);
+}
+
+
+void X86_64Assembler::xchgw(CpuRegister dst, CpuRegister src) {
+  AssemblerBuffer::EnsureCapacity ensured(&buffer_);
+  EmitOperandSizeOverride();
+  if (try_xchg_rax(dst, src, &X86_64Assembler::EmitOptionalRex32)) {
+    // A short version for AX.
     return;
   }
-
   // General case.
-  EmitRex64(src, dst);
+  EmitOptionalRex32(dst, src);
   EmitUint8(0x87);
-  EmitRegisterOperand(src.LowBits(), dst.LowBits());
+  EmitRegisterOperand(dst.LowBits(), src.LowBits());
+}
+
+
+void X86_64Assembler::xchgw(CpuRegister reg, const Address& address) {
+  AssemblerBuffer::EnsureCapacity ensured(&buffer_);
+  EmitOperandSizeOverride();
+  EmitOptionalRex32(reg, address);
+  EmitUint8(0x87);
+  EmitOperand(reg.LowBits(), address);
+}
+
+
+void X86_64Assembler::xchgl(CpuRegister dst, CpuRegister src) {
+  AssemblerBuffer::EnsureCapacity ensured(&buffer_);
+  if (try_xchg_rax(dst, src, &X86_64Assembler::EmitOptionalRex32)) {
+    // A short version for EAX.
+    return;
+  }
+  // General case.
+  EmitOptionalRex32(dst, src);
+  EmitUint8(0x87);
+  EmitRegisterOperand(dst.LowBits(), src.LowBits());
 }
 
 
@@ -3861,6 +3964,101 @@ void X86_64Assembler::xchgl(CpuRegister reg, const Address& address) {
   AssemblerBuffer::EnsureCapacity ensured(&buffer_);
   EmitOptionalRex32(reg, address);
   EmitUint8(0x87);
+  EmitOperand(reg.LowBits(), address);
+}
+
+
+void X86_64Assembler::xchgq(CpuRegister dst, CpuRegister src) {
+  AssemblerBuffer::EnsureCapacity ensured(&buffer_);
+  if (try_xchg_rax(dst, src, &X86_64Assembler::EmitRex64)) {
+    // A short version for RAX.
+    return;
+  }
+  // General case.
+  EmitRex64(dst, src);
+  EmitUint8(0x87);
+  EmitRegisterOperand(dst.LowBits(), src.LowBits());
+}
+
+
+void X86_64Assembler::xchgq(CpuRegister reg, const Address& address) {
+  AssemblerBuffer::EnsureCapacity ensured(&buffer_);
+  EmitRex64(reg, address);
+  EmitUint8(0x87);
+  EmitOperand(reg.LowBits(), address);
+}
+
+
+void X86_64Assembler::xaddb(CpuRegister dst, CpuRegister src) {
+  AssemblerBuffer::EnsureCapacity ensured(&buffer_);
+  EmitOptionalByteRegNormalizingRex32(src, dst, /*normalize_both=*/ true);
+  EmitUint8(0x0F);
+  EmitUint8(0xC0);
+  EmitRegisterOperand(src.LowBits(), dst.LowBits());
+}
+
+
+void X86_64Assembler::xaddb(const Address& address, CpuRegister reg) {
+  AssemblerBuffer::EnsureCapacity ensured(&buffer_);
+  EmitOptionalByteRegNormalizingRex32(reg, address);
+  EmitUint8(0x0F);
+  EmitUint8(0xC0);
+  EmitOperand(reg.LowBits(), address);
+}
+
+
+void X86_64Assembler::xaddw(CpuRegister dst, CpuRegister src) {
+  AssemblerBuffer::EnsureCapacity ensured(&buffer_);
+  EmitOperandSizeOverride();
+  EmitOptionalRex32(src, dst);
+  EmitUint8(0x0F);
+  EmitUint8(0xC1);
+  EmitRegisterOperand(src.LowBits(), dst.LowBits());
+}
+
+
+void X86_64Assembler::xaddw(const Address& address, CpuRegister reg) {
+  AssemblerBuffer::EnsureCapacity ensured(&buffer_);
+  EmitOperandSizeOverride();
+  EmitOptionalRex32(reg, address);
+  EmitUint8(0x0F);
+  EmitUint8(0xC1);
+  EmitOperand(reg.LowBits(), address);
+}
+
+
+void X86_64Assembler::xaddl(CpuRegister dst, CpuRegister src) {
+  AssemblerBuffer::EnsureCapacity ensured(&buffer_);
+  EmitOptionalRex32(src, dst);
+  EmitUint8(0x0F);
+  EmitUint8(0xC1);
+  EmitRegisterOperand(src.LowBits(), dst.LowBits());
+}
+
+
+void X86_64Assembler::xaddl(const Address& address, CpuRegister reg) {
+  AssemblerBuffer::EnsureCapacity ensured(&buffer_);
+  EmitOptionalRex32(reg, address);
+  EmitUint8(0x0F);
+  EmitUint8(0xC1);
+  EmitOperand(reg.LowBits(), address);
+}
+
+
+void X86_64Assembler::xaddq(CpuRegister dst, CpuRegister src) {
+  AssemblerBuffer::EnsureCapacity ensured(&buffer_);
+  EmitRex64(src, dst);
+  EmitUint8(0x0F);
+  EmitUint8(0xC1);
+  EmitRegisterOperand(src.LowBits(), dst.LowBits());
+}
+
+
+void X86_64Assembler::xaddq(const Address& address, CpuRegister reg) {
+  AssemblerBuffer::EnsureCapacity ensured(&buffer_);
+  EmitRex64(reg, address);
+  EmitUint8(0x0F);
+  EmitUint8(0xC1);
   EmitOperand(reg.LowBits(), address);
 }
 
@@ -4067,6 +4265,7 @@ void X86_64Assembler::andl(CpuRegister reg, const Address& address) {
 
 void X86_64Assembler::andl(CpuRegister dst, const Immediate& imm) {
   AssemblerBuffer::EnsureCapacity ensured(&buffer_);
+  CHECK(imm.is_int32());  // andl only supports 32b immediate.
   EmitOptionalRex32(dst);
   EmitComplex(4, Operand(dst), imm);
 }
@@ -4093,6 +4292,15 @@ void X86_64Assembler::andq(CpuRegister dst, const Address& src) {
   EmitRex64(dst, src);
   EmitUint8(0x23);
   EmitOperand(dst.LowBits(), src);
+}
+
+
+void X86_64Assembler::andw(const Address& address, const Immediate& imm) {
+  AssemblerBuffer::EnsureCapacity ensured(&buffer_);
+  CHECK(imm.is_uint16() || imm.is_int16()) << imm.value();
+  EmitUint8(0x66);
+  EmitOptionalRex32(address);
+  EmitComplex(4, address, imm, /* is_16_op= */ true);
 }
 
 
@@ -4249,6 +4457,15 @@ void X86_64Assembler::addl(CpuRegister reg, const Immediate& imm) {
 }
 
 
+void X86_64Assembler::addw(CpuRegister reg, const Immediate& imm) {
+  AssemblerBuffer::EnsureCapacity ensured(&buffer_);
+  CHECK(imm.is_uint16() || imm.is_int16()) << imm.value();
+  EmitUint8(0x66);
+  EmitOptionalRex32(reg);
+  EmitComplex(0, Operand(reg), imm, /* is_16_op= */ true);
+}
+
+
 void X86_64Assembler::addq(CpuRegister reg, const Immediate& imm) {
   AssemblerBuffer::EnsureCapacity ensured(&buffer_);
   CHECK(imm.is_int32());  // addq only supports 32b immediate.
@@ -4295,6 +4512,15 @@ void X86_64Assembler::addw(const Address& address, const Immediate& imm) {
   EmitUint8(0x66);
   EmitOptionalRex32(address);
   EmitComplex(0, address, imm, /* is_16_op= */ true);
+}
+
+
+void X86_64Assembler::addw(const Address& address, CpuRegister reg) {
+  AssemblerBuffer::EnsureCapacity ensured(&buffer_);
+  EmitOperandSizeOverride();
+  EmitOptionalRex32(reg, address);
+  EmitUint8(0x01);
+  EmitOperand(reg.LowBits(), address);
 }
 
 
@@ -4371,6 +4597,22 @@ void X86_64Assembler::idivq(CpuRegister reg) {
   EmitRex64(reg);
   EmitUint8(0xF7);
   EmitUint8(0xF8 | reg.LowBits());
+}
+
+
+void X86_64Assembler::divl(CpuRegister reg) {
+  AssemblerBuffer::EnsureCapacity ensured(&buffer_);
+  EmitOptionalRex32(reg);
+  EmitUint8(0xF7);
+  EmitUint8(0xF0 | reg.LowBits());
+}
+
+
+void X86_64Assembler::divq(CpuRegister reg) {
+  AssemblerBuffer::EnsureCapacity ensured(&buffer_);
+  EmitRex64(reg);
+  EmitUint8(0xF7);
+  EmitUint8(0xF0 | reg.LowBits());
 }
 
 
@@ -4796,11 +5038,41 @@ void X86_64Assembler::rep_movsw() {
   EmitUint8(0xA5);
 }
 
+void X86_64Assembler::rep_movsb() {
+  AssemblerBuffer::EnsureCapacity ensured(&buffer_);
+  EmitUint8(0xF3);
+  EmitUint8(0xA4);
+}
+
+void X86_64Assembler::rep_movsl() {
+  AssemblerBuffer::EnsureCapacity ensured(&buffer_);
+  EmitUint8(0xF3);
+  EmitUint8(0xA5);
+}
 
 X86_64Assembler* X86_64Assembler::lock() {
   AssemblerBuffer::EnsureCapacity ensured(&buffer_);
   EmitUint8(0xF0);
   return this;
+}
+
+
+void X86_64Assembler::cmpxchgb(const Address& address, CpuRegister reg) {
+  AssemblerBuffer::EnsureCapacity ensured(&buffer_);
+  EmitOptionalByteRegNormalizingRex32(reg, address);
+  EmitUint8(0x0F);
+  EmitUint8(0xB0);
+  EmitOperand(reg.LowBits(), address);
+}
+
+
+void X86_64Assembler::cmpxchgw(const Address& address, CpuRegister reg) {
+  AssemblerBuffer::EnsureCapacity ensured(&buffer_);
+  EmitOperandSizeOverride();
+  EmitOptionalRex32(reg, address);
+  EmitUint8(0x0F);
+  EmitUint8(0xB1);
+  EmitOperand(reg.LowBits(), address);
 }
 
 
@@ -5029,6 +5301,12 @@ void X86_64Assembler::popcntq(CpuRegister dst, const Address& src) {
   EmitOperand(dst.LowBits(), src);
 }
 
+void X86_64Assembler::rdtsc() {
+  AssemblerBuffer::EnsureCapacity ensured(&buffer_);
+  EmitUint8(0x0F);
+  EmitUint8(0x31);
+}
+
 void X86_64Assembler::repne_scasb() {
   AssemblerBuffer::EnsureCapacity ensured(&buffer_);
   EmitUint8(0xF2);
@@ -5064,6 +5342,11 @@ void X86_64Assembler::repe_cmpsq() {
   EmitUint8(0xA7);
 }
 
+void X86_64Assembler::ud2() {
+  AssemblerBuffer::EnsureCapacity ensured(&buffer_);
+  EmitUint8(0x0F);
+  EmitUint8(0x0B);
+}
 
 void X86_64Assembler::LoadDoubleConstant(XmmRegister dst, double value) {
   // TODO: Need to have a code constants table.
@@ -5350,9 +5633,19 @@ void X86_64Assembler::EmitRex64(XmmRegister dst, const Operand& operand) {
   EmitUint8(rex);
 }
 
-void X86_64Assembler::EmitOptionalByteRegNormalizingRex32(CpuRegister dst, CpuRegister src) {
-  // For src, SPL, BPL, SIL, DIL need the rex prefix.
+void X86_64Assembler::EmitOptionalByteRegNormalizingRex32(CpuRegister dst,
+                                                          CpuRegister src,
+                                                          bool normalize_both) {
+  // SPL, BPL, SIL, DIL need the REX prefix.
   bool force = src.AsRegister() > 3;
+  if (normalize_both) {
+    // Some instructions take two byte registers, such as `xchg bpl, al`, so they need the REX
+    // prefix if either `src` or `dst` needs it.
+    force |= dst.AsRegister() > 3;
+  } else {
+    // Other instructions take one byte register and one full register, such as `movzxb rax, bpl`.
+    // They need REX prefix only if `src` needs it, but not `dst`.
+  }
   EmitOptionalRex(force, false, dst.NeedsRex(), false, src.NeedsRex());
 }
 

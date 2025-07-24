@@ -67,7 +67,7 @@ TEST(TestDexFileBuilderTest, SimpleTest) {
   }
 
   ASSERT_EQ(1u, dex_file->NumFieldIds());
-  EXPECT_STREQ("[I TestClass.intField", dex_file->PrettyField(0u).c_str());
+  EXPECT_STREQ("int[] TestClass.intField", dex_file->PrettyField(0u).c_str());
 
   ASSERT_EQ(2u, dex_file->NumProtoIds());
   ASSERT_EQ(2u, dex_file->NumMethodIds());
@@ -80,7 +80,9 @@ TEST(TestDexFileBuilderTest, SimpleTest) {
   EXPECT_EQ(2u, builder.GetTypeIdx("Ljava/lang/Class;"));
   EXPECT_EQ(0u, builder.GetFieldIdx("LTestClass;", "[I", "intField"));
   EXPECT_EQ(1u, builder.GetMethodIdx("LTestClass;", "()I", "foo"));
-  EXPECT_EQ(0u, builder.GetMethodIdx("LTestClass;", "(Ljava/lang/Object;[Ljava/lang/Object;)LTestClass;", "bar"));
+  EXPECT_EQ(0u, builder.GetMethodIdx("LTestClass;",
+                                     "(Ljava/lang/Object;[Ljava/lang/Object;)LTestClass;",
+                                     "bar"));
 }
 
 }  // namespace art

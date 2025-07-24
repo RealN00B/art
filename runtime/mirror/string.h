@@ -18,17 +18,19 @@
 #define ART_RUNTIME_MIRROR_STRING_H_
 
 #include "base/bit_utils.h"
+#include "base/macros.h"
 #include "class.h"
 #include "object.h"
 #include "runtime_globals.h"
 
-namespace art {
+namespace art HIDDEN {
 
 namespace gc {
 enum AllocatorType : char;
 }  // namespace gc
 
 template<class T> class Handle;
+class InternTable;
 template<class MirrorType> class ObjPtr;
 class StringBuilderAppend;
 struct StringOffsets;
@@ -46,6 +48,8 @@ enum class StringCompressionFlag : uint32_t {
 // C++ mirror of java.lang.String
 class MANAGED String final : public Object {
  public:
+  MIRROR_CLASS("Ljava/lang/String;");
+
   // Size of java.lang.String.class.
   static uint32_t ClassSize(PointerSize pointer_size);
 
@@ -102,12 +106,16 @@ class MANAGED String final : public Object {
     SetField32<false, false>(OFFSET_OF_OBJECT_MEMBER(String, count_), new_count);
   }
 
+  int32_t GetStoredHashCode() REQUIRES_SHARED(Locks::mutator_lock_) {
+    return GetField32(OFFSET_OF_OBJECT_MEMBER(String, hash_code_));
+  }
+
   int32_t GetHashCode() REQUIRES_SHARED(Locks::mutator_lock_);
 
-  // Computes, stores, and returns the hash code.
+  // Computes and returns the hash code.
   int32_t ComputeHashCode() REQUIRES_SHARED(Locks::mutator_lock_);
 
-  int32_t GetUtfLength() REQUIRES_SHARED(Locks::mutator_lock_);
+  int32_t GetModifiedUtf8Length() REQUIRES_SHARED(Locks::mutator_lock_);
 
   uint16_t CharAt(int32_t index) REQUIRES_SHARED(Locks::mutator_lock_);
 
@@ -116,7 +124,14 @@ class MANAGED String final : public Object {
   static ObjPtr<String> DoReplace(Thread* self, Handle<String> src, uint16_t old_c, uint16_t new_c)
       REQUIRES_SHARED(Locks::mutator_lock_);
 
-  ObjPtr<String> Intern() REQUIRES_SHARED(Locks::mutator_lock_);
+  EXPORT ObjPtr<String> Intern() REQUIRES_SHARED(Locks::mutator_lock_);
+
+  template <bool kIsInstrumented = true, typename PreFenceVisitor>
+  ALWAYS_INLINE static ObjPtr<String> Alloc(Thread* self,
+                                            int32_t utf16_length_with_flag,
+                                            gc::AllocatorType allocator_type,
+                                            const PreFenceVisitor& pre_fence_visitor)
+      REQUIRES_SHARED(Locks::mutator_lock_) REQUIRES(!Roles::uninterruptible_);
 
   template <bool kIsInstrumented = true>
   ALWAYS_INLINE static ObjPtr<String> AllocFromByteArray(Thread* self,
@@ -124,6 +139,14 @@ class MANAGED String final : public Object {
                                                          Handle<ByteArray> array,
                                                          int32_t offset,
                                                          int32_t high_byte,
+                                                         gc::AllocatorType allocator_type)
+      REQUIRES_SHARED(Locks::mutator_lock_) REQUIRES(!Roles::uninterruptible_);
+
+  template <bool kIsInstrumented = true>
+  ALWAYS_INLINE static ObjPtr<String> AllocFromUtf16ByteArray(Thread* self,
+                                                         int32_t char_count,
+                                                         Handle<ByteArray> array,
+                                                         int32_t offset,
                                                          gc::AllocatorType allocator_type)
       REQUIRES_SHARED(Locks::mutator_lock_) REQUIRES(!Roles::uninterruptible_);
 
@@ -148,9 +171,10 @@ class MANAGED String final : public Object {
                                                        gc::AllocatorType allocator_type)
       REQUIRES_SHARED(Locks::mutator_lock_) REQUIRES(!Roles::uninterruptible_);
 
-  static ObjPtr<String> AllocFromStrings(Thread* self,
-                                         Handle<String> string,
-                                         Handle<String> string2)
+  static ObjPtr<String> DoConcat(Thread* self, Handle<String> h_this, Handle<String> h_arg)
+      REQUIRES_SHARED(Locks::mutator_lock_) REQUIRES(!Roles::uninterruptible_);
+
+  static ObjPtr<String> DoRepeat(Thread* self, Handle<String> h_this, int32_t count)
       REQUIRES_SHARED(Locks::mutator_lock_) REQUIRES(!Roles::uninterruptible_);
 
   static ObjPtr<String> AllocFromUtf16(Thread* self,
@@ -158,7 +182,7 @@ class MANAGED String final : public Object {
                                        const uint16_t* utf16_data_in)
       REQUIRES_SHARED(Locks::mutator_lock_) REQUIRES(!Roles::uninterruptible_);
 
-  static ObjPtr<String> AllocFromModifiedUtf8(Thread* self, const char* utf)
+  EXPORT static ObjPtr<String> AllocFromModifiedUtf8(Thread* self, const char* utf)
       REQUIRES_SHARED(Locks::mutator_lock_) REQUIRES(!Roles::uninterruptible_);
 
   static ObjPtr<String> AllocFromModifiedUtf8(Thread* self,
@@ -174,15 +198,28 @@ class MANAGED String final : public Object {
 
   bool Equals(const char* modified_utf8) REQUIRES_SHARED(Locks::mutator_lock_);
 
-  bool Equals(ObjPtr<String> that) REQUIRES_SHARED(Locks::mutator_lock_);
+  bool Equals(ObjPtr<mirror::String> that) REQUIRES_SHARED(Locks::mutator_lock_) {
+    return Equals(that.Ptr());
+  }
+
+  // A version that takes a mirror::String pointer instead of ObjPtr as it's being
+  // called by the runtime app image code which can encode mirror::String at 64bit
+  // addresses (ObjPtr only works with 32bit pointers).
+  EXPORT bool Equals(mirror::String* that) REQUIRES_SHARED(Locks::mutator_lock_);
 
   // Create a modified UTF-8 encoded std::string from a java/lang/String object.
-  std::string ToModifiedUtf8() REQUIRES_SHARED(Locks::mutator_lock_);
+  EXPORT std::string ToModifiedUtf8() REQUIRES_SHARED(Locks::mutator_lock_);
 
   int32_t FastIndexOf(int32_t ch, int32_t start) REQUIRES_SHARED(Locks::mutator_lock_);
 
   template <typename MemoryType>
   int32_t FastIndexOf(MemoryType* chars, int32_t ch, int32_t start)
+      REQUIRES_SHARED(Locks::mutator_lock_);
+
+  int32_t LastIndexOf(int32_t ch) REQUIRES_SHARED(Locks::mutator_lock_);
+
+  template <typename MemoryType>
+  int32_t LastIndexOf(MemoryType* chars, int32_t ch, int32_t from_index)
       REQUIRES_SHARED(Locks::mutator_lock_);
 
   int32_t CompareTo(ObjPtr<String> other) REQUIRES_SHARED(Locks::mutator_lock_);
@@ -192,6 +229,12 @@ class MANAGED String final : public Object {
       REQUIRES(!Roles::uninterruptible_);
 
   void GetChars(int32_t start, int32_t end, Handle<CharArray> array, int32_t index)
+      REQUIRES_SHARED(Locks::mutator_lock_);
+
+  void FillBytesLatin1(Handle<ByteArray> array, int32_t index)
+      REQUIRES_SHARED(Locks::mutator_lock_);
+
+  void FillBytesUTF16(Handle<ByteArray> array, int32_t index)
       REQUIRES_SHARED(Locks::mutator_lock_);
 
   template<VerifyObjectFlags kVerifyFlags = kDefaultVerifyFlags>
@@ -237,28 +280,31 @@ class MANAGED String final : public Object {
   std::string PrettyStringDescriptor()
       REQUIRES_SHARED(Locks::mutator_lock_);
 
- private:
   static constexpr bool IsASCII(uint16_t c) {
     // Valid ASCII characters are in range 1..0x7f. Zero is not considered ASCII
     // because it would complicate the detection of ASCII strings in Modified-UTF8.
     return (c - 1u) < 0x7fu;
   }
 
+ private:
   static bool AllASCIIExcept(const uint16_t* chars, int32_t length, uint16_t non_ascii);
 
-  void SetHashCode(int32_t new_hash_code) REQUIRES_SHARED(Locks::mutator_lock_) {
-    // Hash code is invariant so use non-transactional mode. Also disable check as we may run inside
-    // a transaction.
-    DCHECK_EQ(0, GetField32(OFFSET_OF_OBJECT_MEMBER(String, hash_code_)));
-    SetField32<false, false>(OFFSET_OF_OBJECT_MEMBER(String, hash_code_), new_hash_code);
-  }
+  // Computes, stores, and returns the hash code.
+  EXPORT int32_t ComputeAndSetHashCode() REQUIRES_SHARED(Locks::mutator_lock_);
 
-  template <bool kIsInstrumented = true, typename PreFenceVisitor>
-  ALWAYS_INLINE static ObjPtr<String> Alloc(Thread* self,
-                                            int32_t utf16_length_with_flag,
-                                            gc::AllocatorType allocator_type,
-                                            const PreFenceVisitor& pre_fence_visitor)
-      REQUIRES_SHARED(Locks::mutator_lock_) REQUIRES(!Roles::uninterruptible_);
+  void SetHashCode(int32_t new_hash_code) REQUIRES_SHARED(Locks::mutator_lock_) {
+    if (kIsDebugBuild) {
+      CHECK_EQ(new_hash_code, ComputeHashCode());
+      int32_t old_hash_code = GetStoredHashCode();
+      // Another thread could have raced this one and set the hash code.
+      CHECK(old_hash_code == 0 || old_hash_code == new_hash_code)
+          << "old: " << old_hash_code << " new: " << new_hash_code;
+    }
+    // Hash code is invariant so use non-transactional mode, allowing a failed transaction
+    // to set the hash code anyway. Also disable check as we may run inside a transaction.
+    SetField32</*kTransactionActive=*/ false, /*kCheckTransaction=*/ false>(
+        OFFSET_OF_OBJECT_MEMBER(String, hash_code_), new_hash_code);
+  }
 
   // Field order required by test "ValidateFieldOrderOfJavaCppUnionClasses".
 
@@ -274,6 +320,7 @@ class MANAGED String final : public Object {
     uint8_t value_compressed_[0];
   };
 
+  friend class art::InternTable;  // Let `InternTable` call `SetHashCode()`.
   friend class art::StringBuilderAppend;
   friend struct art::StringOffsets;  // for verifying offset information
 

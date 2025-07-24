@@ -16,13 +16,20 @@
 
 #include <dlfcn.h>
 #include <errno.h>
+#include <inttypes.h>
 #include <pthread.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
+#if defined(__BIONIC__)
+#include <bionic/macros.h>
+#include <unwindstack/AndroidUnwinder.h>
+#endif
+
 #include <algorithm>
+#include <atomic>
 #include <initializer_list>
 #include <mutex>
 #include <type_traits>
@@ -38,6 +45,9 @@
 // Darwin has an #error when ucontext.h is included without _XOPEN_SOURCE defined.
 #define _XOPEN_SOURCE
 #endif
+
+#define SA_UNSUPPORTED 0x00000400
+#define SA_EXPOSE_TAGBITS 0x00000800
 
 #include <ucontext.h>
 
@@ -88,6 +98,28 @@ static int sigorset(SigsetType* dest, SigsetType* left, SigsetType* right) {
   return 0;
 }
 
+void LogStack() {
+#if defined(__BIONIC__)
+  unwindstack::AndroidLocalUnwinder unwinder;
+  unwindstack::AndroidUnwinderData data;
+  if (!unwinder.Unwind(data)) {
+    LogError("Failed to get callstack.");
+    return;
+  }
+  data.DemangleFunctionNames();
+  for (const unwindstack::FrameData& frame : data.frames) {
+    auto& map = frame.map_info;
+    LogError("  #%02zu pc %08" PRIx64 "  %s (%s+%" PRIu64 ") (BuildId: %s)",
+             frame.num,
+             frame.rel_pc,
+             map != nullptr ? map->name().c_str() : "???",
+             frame.function_name.c_str(),
+             frame.function_offset,
+             map != nullptr ? map->GetPrintableBuildID().c_str() : "???");
+  }
+#endif
+}
+
 namespace art {
 
 static decltype(&sigaction) linked_sigaction;
@@ -107,6 +139,8 @@ static void lookup_libc_symbol(T* output, T wrapper, const char* name) {
 #error unsupported glibc version
 #endif
   constexpr const char* libc_name = "libc.so.6";
+#elif defined(ANDROID_HOST_MUSL)
+  constexpr const char* libc_name = "libc_musl.so";
 #else
 #error unsupported libc: not bionic or glibc?
 #endif
@@ -142,38 +176,92 @@ __attribute__((constructor)) static void InitializeSignalChain() {
   });
 }
 
-static pthread_key_t GetHandlingSignalKey() {
-  static pthread_key_t key;
+template <typename T>
+static constexpr bool IsPowerOfTwo(T x) {
+  static_assert(std::is_integral_v<T>, "T must be integral");
+  static_assert(std::is_unsigned_v<T>, "T must be unsigned");
+  return (x & (x - 1)) == 0;
+}
+
+template <typename T>
+static constexpr T RoundUp(T x, T n) {
+  return (x + n - 1) & -n;
+}
+// Use a bitmap to indicate which signal is being handled so that other
+// non-blocked signals are allowed to be handled, if raised.
+static constexpr size_t kSignalSetLength = _NSIG - 1;
+static constexpr size_t kNumSignalsPerKey = std::numeric_limits<uintptr_t>::digits;
+static_assert(IsPowerOfTwo(kNumSignalsPerKey));
+static constexpr size_t kHandlingSignalKeyCount =
+    RoundUp(kSignalSetLength, kNumSignalsPerKey) / kNumSignalsPerKey;
+
+// We rely on bionic's implementation of pthread_(get/set)specific being
+// async-signal safe.
+static pthread_key_t GetHandlingSignalKey(size_t idx) {
+  static pthread_key_t key[kHandlingSignalKeyCount];
   static std::once_flag once;
   std::call_once(once, []() {
-    int rc = pthread_key_create(&key, nullptr);
-    if (rc != 0) {
-      fatal("failed to create sigchain pthread key: %s", strerror(rc));
+    for (size_t i = 0; i < kHandlingSignalKeyCount; i++) {
+      int rc = pthread_key_create(&key[i], nullptr);
+      if (rc != 0) {
+        fatal("failed to create sigchain pthread key: %s", strerror(rc));
+      }
     }
   });
-  return key;
+  return key[idx];
 }
 
 static bool GetHandlingSignal() {
-  void* result = pthread_getspecific(GetHandlingSignalKey());
-  return reinterpret_cast<uintptr_t>(result);
+  for (size_t i = 0; i < kHandlingSignalKeyCount; i++) {
+    void* result = pthread_getspecific(GetHandlingSignalKey(i));
+    if (reinterpret_cast<uintptr_t>(result) != 0) {
+      return true;
+    }
+  }
+  return false;
 }
 
-static void SetHandlingSignal(bool value) {
-  pthread_setspecific(GetHandlingSignalKey(),
-                      reinterpret_cast<void*>(static_cast<uintptr_t>(value)));
+static bool GetHandlingSignal(int signo) {
+  size_t bit_idx = signo - 1;
+  size_t key_idx = bit_idx / kNumSignalsPerKey;
+  uintptr_t bit_mask = static_cast<uintptr_t>(1) << (bit_idx % kNumSignalsPerKey);
+  uintptr_t result =
+      reinterpret_cast<uintptr_t>(pthread_getspecific(GetHandlingSignalKey(key_idx)));
+  return result & bit_mask;
+}
+
+static bool SetHandlingSignal(int signo, bool value) {
+  // Use signal-fence to ensure that compiler doesn't reorder generated code
+  // across signal handlers.
+  size_t bit_idx = signo - 1;
+  size_t key_idx = bit_idx / kNumSignalsPerKey;
+  uintptr_t bit_mask = static_cast<uintptr_t>(1) << (bit_idx % kNumSignalsPerKey);
+  pthread_key_t key = GetHandlingSignalKey(key_idx);
+  std::atomic_signal_fence(std::memory_order_seq_cst);
+  uintptr_t bitmap = reinterpret_cast<uintptr_t>(pthread_getspecific(key));
+  bool ret = bitmap & bit_mask;
+  if (value) {
+    bitmap |= bit_mask;
+  } else {
+    bitmap &= ~bit_mask;
+  }
+  pthread_setspecific(key, reinterpret_cast<void*>(bitmap));
+  std::atomic_signal_fence(std::memory_order_seq_cst);
+  return ret;
 }
 
 class ScopedHandlingSignal {
  public:
-  ScopedHandlingSignal() : original_value_(GetHandlingSignal()) {
-  }
+  ScopedHandlingSignal(int signo, bool set)
+      : signo_(signo),
+        original_value_(set ? SetHandlingSignal(signo, true) : GetHandlingSignal(signo)) {}
 
   ~ScopedHandlingSignal() {
-    SetHandlingSignal(original_value_);
+    SetHandlingSignal(signo_, original_value_);
   }
 
  private:
+  int signo_;
   bool original_value_;
 };
 
@@ -204,13 +292,52 @@ class SignalChain {
 #endif
 
     handler_action.sa_sigaction = SignalChain::Handler;
-    handler_action.sa_flags = SA_RESTART | SA_SIGINFO | SA_ONSTACK;
+    handler_action.sa_flags = SA_RESTART | SA_SIGINFO | SA_ONSTACK |
+                              SA_UNSUPPORTED | SA_EXPOSE_TAGBITS;
 
 #if defined(__BIONIC__)
     linked_sigaction64(signo, &handler_action, &action_);
+    linked_sigaction64(signo, nullptr, &handler_action);
 #else
     linked_sigaction(signo, &handler_action, &action_);
+    linked_sigaction(signo, nullptr, &handler_action);
 #endif
+
+    // Newer kernels clear unknown flags from sigaction.sa_flags in order to
+    // allow userspace to determine which flag bits are supported. We use this
+    // behavior in turn to implement the same flag bit support detection
+    // protocol regardless of kernel version. Due to the lack of a flag bit
+    // support detection protocol in older kernels we assume support for a base
+    // set of flags that have been supported since at least 2003 [1]. No flags
+    // were introduced since then until the introduction of SA_EXPOSE_TAGBITS
+    // handled below. glibc headers do not define SA_RESTORER so we define it
+    // ourselves.
+    //
+    // TODO(pcc): The new kernel behavior has been implemented in a kernel
+    // patch [2] that has not yet landed. Update the code if necessary once it
+    // lands.
+    //
+    // [1] https://github.com/mpe/linux-fullhistory/commit/c0f806c86fc8b07ad426df023f1a4bb0e53c64f6
+    // [2] https://lore.kernel.org/linux-arm-kernel/cover.1605235762.git.pcc@google.com/
+#if !defined(__BIONIC__)
+#define SA_RESTORER 0x04000000
+#endif
+    kernel_supported_flags_ = SA_NOCLDSTOP | SA_NOCLDWAIT | SA_SIGINFO | SA_ONSTACK | SA_RESTART |
+                              SA_NODEFER | SA_RESETHAND;
+#if defined(SA_RESTORER)
+    kernel_supported_flags_ |= SA_RESTORER;
+#endif
+
+    // Determine whether the kernel supports SA_EXPOSE_TAGBITS. For newer
+    // kernels we use the flag support detection protocol described above. In
+    // order to allow userspace to distinguish old and new kernels,
+    // SA_UNSUPPORTED has been reserved as an unsupported flag. If the kernel
+    // did not clear it then we know that we have an old kernel that would not
+    // support SA_EXPOSE_TAGBITS anyway.
+    if (!(handler_action.sa_flags & SA_UNSUPPORTED) &&
+        (handler_action.sa_flags & SA_EXPOSE_TAGBITS)) {
+      kernel_supported_flags_ |= SA_EXPOSE_TAGBITS;
+    }
   }
 
   template <typename SigactionType>
@@ -244,6 +371,7 @@ class SignalChain {
       memcpy(&action_.sa_mask, &new_action->sa_mask,
              std::min(sizeof(action_.sa_mask), sizeof(new_action->sa_mask)));
     }
+    action_.sa_flags &= kernel_supported_flags_;
   }
 
   void AddSpecialHandler(SigchainAction* sa) {
@@ -278,6 +406,7 @@ class SignalChain {
 
  private:
   bool claimed_;
+  int kernel_supported_flags_;
 #if defined(__BIONIC__)
   struct sigaction64 action_;
 #else
@@ -288,14 +417,20 @@ class SignalChain {
 
 // _NSIG is 1 greater than the highest valued signal, but signals start from 1.
 // Leave an empty element at index 0 for convenience.
-static SignalChain chains[_NSIG + 1];
+static SignalChain chains[_NSIG];
 
 static bool is_signal_hook_debuggable = false;
+
+// Weak linkage, as the ART APEX might be deployed on devices where this symbol doesn't exist (i.e.
+// all OS's before Android U). This symbol comes from libdl.
+__attribute__((weak)) extern "C" bool android_handle_signal(int signal_number,
+                                                            siginfo_t* info,
+                                                            void* context);
 
 void SignalChain::Handler(int signo, siginfo_t* siginfo, void* ucontext_raw) {
   // Try the special handlers first.
   // If one of them crashes, we'll reenter this handler and pass that crash onto the user handler.
-  if (!GetHandlingSignal()) {
+  if (!GetHandlingSignal(signo)) {
     for (const auto& handler : chains[signo].special_handlers_) {
       if (handler.sc_sigaction == nullptr) {
         break;
@@ -308,10 +443,7 @@ void SignalChain::Handler(int signo, siginfo_t* siginfo, void* ucontext_raw) {
       sigset_t previous_mask;
       linked_sigprocmask(SIG_SETMASK, &handler.sc_mask, &previous_mask);
 
-      ScopedHandlingSignal restorer;
-      if (!handler_noreturn) {
-        SetHandlingSignal(true);
-      }
+      ScopedHandlingSignal restorer(signo, !handler_noreturn);
 
       if (handler.sc_sigaction(signo, siginfo, ucontext_raw)) {
         return;
@@ -319,6 +451,43 @@ void SignalChain::Handler(int signo, siginfo_t* siginfo, void* ucontext_raw) {
 
       linked_sigprocmask(SIG_SETMASK, &previous_mask, nullptr);
     }
+  } else {
+#if defined(__aarch64__)
+    // Log the specific value if we're handling more than one signal (or if the bit is
+    // concurrently cleared) to help diagnose rare crashes. Multiple bits set may
+    // indicate memory corruption of the specific value in TLS. Bugs: 304237198, 294339122.
+    size_t bit_idx = signo - 1;
+    size_t key_idx = bit_idx / kNumSignalsPerKey;
+    uintptr_t expected = static_cast<uintptr_t>(1) << (bit_idx % kNumSignalsPerKey);
+    uintptr_t value =
+        reinterpret_cast<uintptr_t>(pthread_getspecific(GetHandlingSignalKey(key_idx)));
+    if (value != expected) {
+      LogError(
+          "Already handling signal %d, value=0x%" PRIxPTR " differs from expected=0x%" PRIxPTR,
+          signo,
+          value,
+          expected);
+    }
+#endif
+  }
+
+  // In Android 14, there's a special feature called "recoverable" GWP-ASan. GWP-ASan is a tool that
+  // finds heap-buffer-overflow and heap-use-after-free on native heap allocations (e.g. malloc()
+  // inside of JNI, not the ART heap). The way it catches buffer overflow (roughly) is by rounding
+  // up the malloc() so that it's page-sized, and mapping an inaccessible page on the left- and
+  // right-hand side. It catches use-after-free by mprotecting the allocation page to be PROT_NONE
+  // on free(). The new "recoverable" mode is designed to allow debuggerd to print a crash report,
+  // but for the app or process in question to not crash (i.e. recover) and continue even after the
+  // bug is detected. Sigchain thus must allow debuggerd to handle the signal first, and if
+  // debuggerd has promised that it can recover, and it's done the steps to allow recovery (as
+  // identified by android_handle_signal returning true), then we should return from this handler
+  // and let the app continue.
+  //
+  // For all non-GWP-ASan-recoverable crashes, or crashes where recovery is not possible,
+  // android_handle_signal returns false, and we will continue to the rest of the sigchain handler
+  // logic.
+  if (android_handle_signal != nullptr && android_handle_signal(signo, siginfo, ucontext_raw)) {
+    return;
   }
 
   // Forward to the user's signal handler.
@@ -342,13 +511,33 @@ void SignalChain::Handler(int signo, siginfo_t* siginfo, void* ucontext_raw) {
 #endif
 
   if ((handler_flags & SA_SIGINFO)) {
+    // If the chained handler is not expecting tag bits in the fault address,
+    // mask them out now.
+#if defined(__BIONIC__)
+    if (!(handler_flags & SA_EXPOSE_TAGBITS) &&
+        (signo == SIGILL || signo == SIGFPE || signo == SIGSEGV ||
+         signo == SIGBUS || signo == SIGTRAP) &&
+        siginfo->si_code > SI_USER && siginfo->si_code < SI_KERNEL &&
+        !(signo == SIGTRAP && siginfo->si_code == TRAP_HWBKPT)) {
+      siginfo->si_addr = untag_address(siginfo->si_addr);
+    }
+#endif
     chains[signo].action_.sa_sigaction(signo, siginfo, ucontext_raw);
   } else {
     auto handler = chains[signo].action_.sa_handler;
     if (handler == SIG_IGN) {
       return;
     } else if (handler == SIG_DFL) {
-      fatal("exiting due to SIG_DFL handler for signal %d", signo);
+      // We'll only get here if debuggerd is disabled. In that case, whatever next tries to handle
+      // the crash will have no way to know our ucontext, and thus no way to dump the original crash
+      // stack (since we're on an alternate stack.) Let's remove our handler and return. Then the
+      // pre-crash state is restored, the crash happens again, and the next handler gets a chance.
+      LogError("reverting to SIG_DFL handler for signal %d, ucontext %p", signo, ucontext);
+      LogStack();
+      struct sigaction dfl = {};
+      dfl.sa_handler = SIG_DFL;
+      linked_sigaction(signo, &dfl, nullptr);
+      return;
     } else {
       handler(signo);
     }
@@ -371,6 +560,11 @@ static int __sigaction(int signal, const SigactionType* new_action,
   if (signal <= 0 || signal >= _NSIG) {
     errno = EINVAL;
     return -1;
+  }
+
+  if (signal == SIGSEGV && new_action != nullptr && new_action->sa_handler == SIG_DFL) {
+    LogError("Setting SIGSEGV to SIG_DFL");
+    LogStack();
   }
 
   if (chains[signal].IsClaimed()) {
@@ -526,7 +720,7 @@ extern "C" void EnsureFrontOfChain(int signal) {
   // If the sigactions don't match then we put the current action on the chain and make ourself as
   // the main action.
   if (current_action.sa_sigaction != SignalChain::Handler) {
-    log("Warning: Unexpected sigaction action found %p\n", current_action.sa_sigaction);
+    LogError("Warning: Unexpected sigaction action found %p\n", current_action.sa_sigaction);
     chains[signal].Register(signal);
   }
 }

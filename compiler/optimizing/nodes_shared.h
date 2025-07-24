@@ -22,7 +22,7 @@
 // (defining `HInstruction` and co).
 #include "nodes.h"
 
-namespace art {
+namespace art HIDDEN {
 
 class HMultiplyAccumulate final : public HExpression<3> {
  public:
@@ -62,72 +62,6 @@ class HMultiplyAccumulate final : public HExpression<3> {
   const InstructionKind op_kind_;
 };
 
-class HBitwiseNegatedRight final : public HBinaryOperation {
- public:
-  HBitwiseNegatedRight(DataType::Type result_type,
-                       InstructionKind op,
-                       HInstruction* left,
-                       HInstruction* right,
-                       uint32_t dex_pc = kNoDexPc)
-    : HBinaryOperation(kBitwiseNegatedRight,
-                       result_type,
-                       left,
-                       right,
-                       SideEffects::None(),
-                       dex_pc),
-      op_kind_(op) {
-    DCHECK(op == HInstruction::kAnd || op == HInstruction::kOr || op == HInstruction::kXor) << op;
-  }
-
-  template <typename T, typename U>
-  auto Compute(T x, U y) const -> decltype(x & ~y) {
-    static_assert(std::is_same<decltype(x & ~y), decltype(x | ~y)>::value &&
-                  std::is_same<decltype(x & ~y), decltype(x ^ ~y)>::value,
-                  "Inconsistent negated bitwise types");
-    switch (op_kind_) {
-      case HInstruction::kAnd:
-        return x & ~y;
-      case HInstruction::kOr:
-        return x | ~y;
-      case HInstruction::kXor:
-        return x ^ ~y;
-      default:
-        LOG(FATAL) << "Unreachable";
-        UNREACHABLE();
-    }
-  }
-
-  HConstant* Evaluate(HIntConstant* x, HIntConstant* y) const override {
-    return GetBlock()->GetGraph()->GetIntConstant(
-        Compute(x->GetValue(), y->GetValue()), GetDexPc());
-  }
-  HConstant* Evaluate(HLongConstant* x, HLongConstant* y) const override {
-    return GetBlock()->GetGraph()->GetLongConstant(
-        Compute(x->GetValue(), y->GetValue()), GetDexPc());
-  }
-  HConstant* Evaluate(HFloatConstant* x ATTRIBUTE_UNUSED,
-                      HFloatConstant* y ATTRIBUTE_UNUSED) const override {
-    LOG(FATAL) << DebugName() << " is not defined for float values";
-    UNREACHABLE();
-  }
-  HConstant* Evaluate(HDoubleConstant* x ATTRIBUTE_UNUSED,
-                      HDoubleConstant* y ATTRIBUTE_UNUSED) const override {
-    LOG(FATAL) << DebugName() << " is not defined for double values";
-    UNREACHABLE();
-  }
-
-  InstructionKind GetOpKind() const { return op_kind_; }
-
-  DECLARE_INSTRUCTION(BitwiseNegatedRight);
-
- protected:
-  DEFAULT_COPY_CONSTRUCTOR(BitwiseNegatedRight);
-
- private:
-  // Specifies the bitwise operation, which will be then negated.
-  const InstructionKind op_kind_;
-};
-
 // This instruction computes part of the array access offset (data and index offset).
 //
 // For array accesses the element address has the following structure:
@@ -160,7 +94,7 @@ class HIntermediateAddressIndex final : public HExpression<3> {
 
   bool IsClonable() const override { return true; }
   bool CanBeMoved() const override { return true; }
-  bool InstructionDataEquals(const HInstruction* other ATTRIBUTE_UNUSED) const override {
+  bool InstructionDataEquals([[maybe_unused]] const HInstruction* other) const override {
     return true;
   }
   bool IsActualObject() const override { return false; }

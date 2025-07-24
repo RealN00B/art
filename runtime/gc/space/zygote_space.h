@@ -21,7 +21,7 @@
 #include "gc/accounting/space_bitmap.h"
 #include "malloc_space.h"
 
-namespace art {
+namespace art HIDDEN {
 namespace gc {
 
 namespace space {
@@ -79,7 +79,7 @@ class ZygoteSpace final : public ContinuousMemMapAllocSpace {
     return false;
   }
 
-  void LogFragmentationAllocFailure(std::ostream& os, size_t failed_alloc_bytes) override
+  bool LogFragmentationAllocFailure(std::ostream& os, size_t failed_alloc_bytes) override
       REQUIRES_SHARED(Locks::mutator_lock_);
 
  protected:

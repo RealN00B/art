@@ -18,10 +18,6 @@ import java.lang.reflect.Method;
 import java.lang.reflect.Field;
 
 public class Main {
-
-  // Workaround for b/18051191.
-  class InnerClass {}
-
   public static void main(String[] args) throws Exception {
     Class<?> c = Class.forName("StoreLoad");
     Method m = c.getMethod("test", int.class);
@@ -43,6 +39,24 @@ public class Main {
     b = f.getByte(null);
     if (b != (byte)0x78) {
       throw new Error("Expected 0xef, got " + b);
+    }
+
+    m = c.getMethod("test3", int.class);
+    result = (Integer)m.invoke(null, 300);
+    assertIntEquals(result, 300);
+    result = (Integer)m.invoke(null, 301);
+    assertIntEquals(result, 90);
+
+    m = c.getMethod("test4", int.class);
+    result = (Integer)m.invoke(null, 5);
+    assertIntEquals(result, 5);
+    result = (Integer)m.invoke(null, 10);
+    assertIntEquals(result, 10);
+  }
+
+  private static void assertIntEquals(int result, int expected) {
+    if (result != expected) {
+      throw new Error("Expected " + expected + ", got " + result);
     }
   }
 }

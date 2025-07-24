@@ -28,7 +28,7 @@ static constexpr bool kEnableTrackingAllocator = false;
 
 class Allocator {
  public:
-  static Allocator* GetMallocAllocator();
+  static Allocator* GetCallocAllocator();
   static Allocator* GetNoopAllocator();
 
   Allocator() {}
@@ -67,7 +67,7 @@ enum AllocatorTag {
   kAllocatorTagRosAlloc,
   kAllocatorTagCount,  // Must always be last element.
 };
-std::ostream& operator<<(std::ostream& os, const AllocatorTag& tag);
+std::ostream& operator<<(std::ostream& os, AllocatorTag tag);
 
 namespace TrackedAllocators {
 
@@ -102,42 +102,34 @@ inline void RegisterFree(AllocatorTag tag, size_t bytes) {
 }  // namespace TrackedAllocators
 
 // Tracking allocator for use with STL types, tracks how much memory is used.
-template<class T, AllocatorTag kTag>
-class TrackingAllocatorImpl : public std::allocator<T> {
+template <class T, AllocatorTag kTag>
+class TrackingAllocatorImpl {
+  static_assert(kTag < kAllocatorTagCount, "kTag must be less than kAllocatorTagCount");
+
  public:
-  typedef typename std::allocator<T>::value_type value_type;
-  typedef typename std::allocator<T>::size_type size_type;
-  typedef typename std::allocator<T>::difference_type difference_type;
-  typedef typename std::allocator<T>::pointer pointer;
-  typedef typename std::allocator<T>::const_pointer const_pointer;
-  typedef typename std::allocator<T>::reference reference;
-  typedef typename std::allocator<T>::const_reference const_reference;
+  using value_type = T;
 
-  // Used internally by STL data structures.
+  // Used internally by STL data structures. This copy constructor needs to be implicit. Don't wrap
+  // the line because that would break cpplint's detection of the implicit constructor.
   template <class U>
-  TrackingAllocatorImpl(
-      const TrackingAllocatorImpl<U, kTag>& alloc ATTRIBUTE_UNUSED) noexcept {}
-
+  TrackingAllocatorImpl([[maybe_unused]] const TrackingAllocatorImpl<U, kTag>& alloc) noexcept {}  // NOLINT [runtime/explicit]
   // Used internally by STL data structures.
-  TrackingAllocatorImpl() noexcept {
-    static_assert(kTag < kAllocatorTagCount, "kTag must be less than kAllocatorTagCount");
-  }
+  TrackingAllocatorImpl() noexcept {}
 
   // Enables an allocator for objects of one type to allocate storage for objects of another type.
   // Used internally by STL data structures.
   template <class U>
   struct rebind {
-    typedef TrackingAllocatorImpl<U, kTag> other;
+    using other = TrackingAllocatorImpl<U, kTag>;
   };
 
-  pointer allocate(size_type n, const_pointer hint ATTRIBUTE_UNUSED = 0) {
+  T* allocate(size_t n) {
     const size_t size = n * sizeof(T);
     TrackedAllocators::RegisterAllocation(GetTag(), size);
-    return reinterpret_cast<pointer>(malloc(size));
+    return reinterpret_cast<T*>(malloc(size));
   }
 
-  template <typename PT>
-  void deallocate(PT p, size_type n) {
+  void deallocate(T* p, size_t n) {
     const size_t size = n * sizeof(T);
     TrackedAllocators::RegisterFree(GetTag(), size);
     free(p);
@@ -149,11 +141,9 @@ class TrackingAllocatorImpl : public std::allocator<T> {
 };
 
 template<class T, AllocatorTag kTag>
-// C++ doesn't allow template typedefs. This is a workaround template typedef which is
-// TrackingAllocatorImpl<T> if kEnableTrackingAllocator is true, std::allocator<T> otherwise.
-using TrackingAllocator = typename std::conditional<kEnableTrackingAllocator,
-                                                    TrackingAllocatorImpl<T, kTag>,
-                                                    std::allocator<T>>::type;
+using TrackingAllocator = std::conditional_t<kEnableTrackingAllocator,
+                                             TrackingAllocatorImpl<T, kTag>,
+                                             std::allocator<T>>;
 
 }  // namespace art
 

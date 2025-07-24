@@ -26,10 +26,6 @@
 
 namespace art {
 
-static inline bool ModifiedUtf8StringEquals(const char* lhs, const char* rhs) {
-  return CompareModifiedUtf8ToModifiedUtf8AsUtf16CodePointValues(lhs, rhs) == 0;
-}
-
 TypeLookupTable TypeLookupTable::Create(const DexFile& dex_file) {
   uint32_t num_class_defs = dex_file.NumClassDefs();
   if (UNLIKELY(!SupportedSize(num_class_defs))) {
@@ -50,7 +46,7 @@ TypeLookupTable TypeLookupTable::Create(const DexFile& dex_file) {
     const dex::ClassDef& class_def = dex_file.GetClassDef(class_def_idx);
     const dex::TypeId& type_id = dex_file.GetTypeId(class_def.class_idx_);
     const dex::StringId& str_id = dex_file.GetStringId(type_id.descriptor_idx_);
-    const uint32_t hash = ComputeModifiedUtf8Hash(dex_file.GetStringData(str_id));
+    const uint32_t hash = ComputeModifiedUtf8Hash(dex_file.GetStringView(str_id));
     const uint32_t pos = hash & mask;
     if (entries[pos].IsEmpty()) {
       entries[pos] = Entry(str_id.string_data_off_, hash, class_def_idx, mask_bits);
@@ -65,7 +61,7 @@ TypeLookupTable TypeLookupTable::Create(const DexFile& dex_file) {
     const dex::ClassDef& class_def = dex_file.GetClassDef(class_def_idx);
     const dex::TypeId& type_id = dex_file.GetTypeId(class_def.class_idx_);
     const dex::StringId& str_id = dex_file.GetStringId(type_id.descriptor_idx_);
-    const uint32_t hash = ComputeModifiedUtf8Hash(dex_file.GetStringData(str_id));
+    const uint32_t hash = ComputeModifiedUtf8Hash(dex_file.GetStringView(str_id));
     // Find the last entry in the chain.
     uint32_t tail_pos = hash & mask;
     DCHECK(!entries[tail_pos].IsEmpty());
@@ -97,7 +93,7 @@ TypeLookupTable TypeLookupTable::Open(const uint8_t* dex_data_pointer,
   return TypeLookupTable(dex_data_pointer, mask_bits, entries, /* owned_entries= */ nullptr);
 }
 
-uint32_t TypeLookupTable::Lookup(const char* str, uint32_t hash) const {
+uint32_t TypeLookupTable::Lookup(std::string_view str, uint32_t hash) const {
   uint32_t mask = Entry::GetMask(mask_bits_);
   uint32_t pos = hash & mask;
   // Thanks to special insertion algorithm, the element at position pos can be empty
@@ -107,7 +103,7 @@ uint32_t TypeLookupTable::Lookup(const char* str, uint32_t hash) const {
     return dex::kDexNoIndex;
   }
   // Look for the partial hash match first, even if traversing the wrong bucket's chain.
-  uint32_t compared_hash_bits = (hash << mask_bits_) >> (2 * mask_bits_);
+  uint32_t compared_hash_bits = static_cast<uint64_t>(hash << mask_bits_) >> (2 * mask_bits_);
   while (compared_hash_bits != entry->GetHashBits(mask_bits_)) {
     if (entry->IsLast(mask_bits_)) {
       return dex::kDexNoIndex;
@@ -117,8 +113,8 @@ uint32_t TypeLookupTable::Lookup(const char* str, uint32_t hash) const {
     DCHECK(!entry->IsEmpty());
   }
   // Found partial hash match, compare strings (expecting this to succeed).
-  const char* first_checked_str = GetStringData(*entry);
-  if (ModifiedUtf8StringEquals(str, first_checked_str)) {
+  const std::string_view first_checked_str = GetStringData(*entry);
+  if (str == first_checked_str) {
     return entry->GetClassDefIdx(mask_bits_);
   }
   // If we're at the end of the chain, return before doing further expensive work.
@@ -135,13 +131,25 @@ uint32_t TypeLookupTable::Lookup(const char* str, uint32_t hash) const {
     pos = (pos + entry->GetNextPosDelta(mask_bits_)) & mask;
     entry = &entries_[pos];
     DCHECK(!entry->IsEmpty());
-    if (compared_hash_bits == entry->GetHashBits(mask_bits_) &&
-        ModifiedUtf8StringEquals(str, GetStringData(*entry))) {
+    if (compared_hash_bits == entry->GetHashBits(mask_bits_) && str == GetStringData(*entry)) {
       return entry->GetClassDefIdx(mask_bits_);
     }
   } while (!entry->IsLast(mask_bits_));
   // Not found.
   return dex::kDexNoIndex;
+}
+
+void TypeLookupTable::Dump(std::ostream& os) const {
+  size_t size = 1u << mask_bits_;
+  for (uint32_t i = 0; i < size; i++) {
+    const Entry& entry = entries_[i];
+    if (entry.IsEmpty()) {
+      os << i << ": empty";
+    } else {
+      os << i << ": " << GetStringData(entry);
+    }
+    os << '\n';
+  }
 }
 
 uint32_t TypeLookupTable::RawDataLength(uint32_t num_class_defs) {
@@ -165,12 +173,11 @@ TypeLookupTable::TypeLookupTable(const uint8_t* dex_data_pointer,
       entries_(entries),
       owned_entries_(std::move(owned_entries)) {}
 
-const char* TypeLookupTable::GetStringData(const Entry& entry) const {
+std::string_view TypeLookupTable::GetStringData(const Entry& entry) const {
   DCHECK(dex_data_begin_ != nullptr);
   const uint8_t* ptr = dex_data_begin_ + entry.GetStringOffset();
-  // Skip string length.
-  DecodeUnsignedLeb128(&ptr);
-  return reinterpret_cast<const char*>(ptr);
+  uint32_t utf16_length = DecodeUnsignedLeb128(&ptr);
+  return DexFile::StringViewFromUtf16Length(reinterpret_cast<const char*>(ptr), utf16_length);
 }
 
 }  // namespace art

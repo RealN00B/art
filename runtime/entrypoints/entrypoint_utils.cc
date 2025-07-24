@@ -18,11 +18,13 @@
 
 #include "art_field-inl.h"
 #include "art_method-inl.h"
-#include "base/enums.h"
 #include "base/mutex.h"
+#include "base/pointer_size.h"
 #include "base/sdk_version.h"
 #include "class_linker-inl.h"
+#include "class_root-inl.h"
 #include "dex/dex_file-inl.h"
+#include "dex/method_reference.h"
 #include "entrypoints/entrypoint_utils-inl.h"
 #include "entrypoints/quick/callee_save_frame.h"
 #include "entrypoints/runtime_asm_entrypoints.h"
@@ -31,14 +33,16 @@
 #include "mirror/class-inl.h"
 #include "mirror/method.h"
 #include "mirror/object-inl.h"
-#include "mirror/object_array-inl.h"
+#include "mirror/object_array-alloc-inl.h"
 #include "nth_caller_visitor.h"
-#include "oat_quick_method_header.h"
+#include "oat/index_bss_mapping.h"
+#include "oat/oat_file-inl.h"
+#include "oat/oat_quick_method_header.h"
 #include "reflection.h"
 #include "scoped_thread_state_change-inl.h"
-#include "well_known_classes.h"
+#include "well_known_classes-inl.h"
 
-namespace art {
+namespace art HIDDEN {
 
 void CheckReferenceResult(Handle<mirror::Object> o, Thread* self) {
   if (o == nullptr) {
@@ -61,60 +65,70 @@ JValue InvokeProxyInvocationHandler(ScopedObjectAccessAlreadyRunnable& soa,
                                     jobject rcvr_jobj,
                                     jobject interface_method_jobj,
                                     std::vector<jvalue>& args) {
-  DCHECK(soa.Env()->IsInstanceOf(rcvr_jobj, WellKnownClasses::java_lang_reflect_Proxy));
+  StackHandleScope<4u> hs(soa.Self());
+  DCHECK(rcvr_jobj != nullptr);
+  Handle<mirror::Object> h_receiver = hs.NewHandle(soa.Decode<mirror::Object>(rcvr_jobj));
+  DCHECK(h_receiver->InstanceOf(GetClassRoot(ClassRoot::kJavaLangReflectProxy)));
+  Handle<mirror::Method> h_interface_method =
+      hs.NewHandle(soa.Decode<mirror::Method>(interface_method_jobj));
 
   // Build argument array possibly triggering GC.
   soa.Self()->AssertThreadSuspensionIsAllowable();
-  jobjectArray args_jobj = nullptr;
+  auto h_args = hs.NewHandle<mirror::ObjectArray<mirror::Object>>(nullptr);
   const JValue zero;
-  uint32_t target_sdk_version = Runtime::Current()->GetTargetSdkVersion();
+  Runtime* runtime = Runtime::Current();
+  uint32_t target_sdk_version = runtime->GetTargetSdkVersion();
   // Do not create empty arrays unless needed to maintain Dalvik bug compatibility.
   if (args.size() > 0 || IsSdkVersionSetAndAtMost(target_sdk_version, SdkVersion::kL)) {
-    args_jobj = soa.Env()->NewObjectArray(args.size(), WellKnownClasses::java_lang_Object, nullptr);
-    if (args_jobj == nullptr) {
+    h_args.Assign(mirror::ObjectArray<mirror::Object>::Alloc(
+        soa.Self(), GetClassRoot<mirror::ObjectArray<mirror::Object>>(), args.size()));
+    if (h_args == nullptr) {
       CHECK(soa.Self()->IsExceptionPending());
       return zero;
     }
     for (size_t i = 0; i < args.size(); ++i) {
+      ObjPtr<mirror::Object> value;
       if (shorty[i + 1] == 'L') {
-        jobject val = args[i].l;
-        soa.Env()->SetObjectArrayElement(args_jobj, i, val);
+        value = soa.Decode<mirror::Object>(args[i].l);
       } else {
         JValue jv;
         jv.SetJ(args[i].j);
-        ObjPtr<mirror::Object> val = BoxPrimitive(Primitive::GetType(shorty[i + 1]), jv);
-        if (val == nullptr) {
+        value = BoxPrimitive(Primitive::GetType(shorty[i + 1]), jv);
+        if (value == nullptr) {
           CHECK(soa.Self()->IsExceptionPending());
           return zero;
         }
-        soa.Decode<mirror::ObjectArray<mirror::Object>>(args_jobj)->Set<false>(i, val);
       }
+      // We do not support `Proxy.invoke()` in a transaction.
+      h_args->SetWithoutChecks</*kActiveTransaction=*/ false>(i, value);
     }
   }
 
   // Call Proxy.invoke(Proxy proxy, Method method, Object[] args).
-  jvalue invocation_args[3];
-  invocation_args[0].l = rcvr_jobj;
-  invocation_args[1].l = interface_method_jobj;
-  invocation_args[2].l = args_jobj;
-  jobject result =
-      soa.Env()->CallStaticObjectMethodA(WellKnownClasses::java_lang_reflect_Proxy,
-                                         WellKnownClasses::java_lang_reflect_Proxy_invoke,
-                                         invocation_args);
+  Handle<mirror::Object> h_result = hs.NewHandle(
+      WellKnownClasses::java_lang_reflect_Proxy_invoke->InvokeStatic<'L', 'L', 'L', 'L'>(
+          soa.Self(), h_receiver.Get(), h_interface_method.Get(), h_args.Get()));
 
   // Unbox result and handle error conditions.
   if (LIKELY(!soa.Self()->IsExceptionPending())) {
-    if (shorty[0] == 'V' || (shorty[0] == 'L' && result == nullptr)) {
+    if (shorty[0] == 'V' || (shorty[0] == 'L' && h_result == nullptr)) {
       // Do nothing.
       return zero;
     } else {
-      ArtMethod* interface_method =
-          soa.Decode<mirror::Method>(interface_method_jobj)->GetArtMethod();
-      // This can cause thread suspension.
-      ObjPtr<mirror::Class> result_type = interface_method->ResolveReturnType();
-      ObjPtr<mirror::Object> result_ref = soa.Decode<mirror::Object>(result);
+      ObjPtr<mirror::Class> result_type;
+      if (shorty[0] == 'L') {
+        // This can cause thread suspension.
+        result_type = h_interface_method->GetArtMethod()->ResolveReturnType();
+        if (result_type == nullptr) {
+          DCHECK(soa.Self()->IsExceptionPending());
+          return zero;
+        }
+      } else {
+        result_type = runtime->GetClassLinker()->LookupPrimitiveClass(shorty[0]);
+        DCHECK(result_type != nullptr);
+      }
       JValue result_unboxed;
-      if (!UnboxPrimitiveForResult(result_ref, result_type, &result_unboxed)) {
+      if (!UnboxPrimitiveForResult(h_result.Get(), result_type, &result_unboxed)) {
         DCHECK(soa.Self()->IsExceptionPending());
         return zero;
       }
@@ -193,51 +207,62 @@ static inline std::pair<ArtMethod*, uintptr_t> DoGetCalleeSaveMethodOuterCallerA
   return std::make_pair(outer_method, caller_pc);
 }
 
-static inline ArtMethod* DoGetCalleeSaveMethodCaller(ArtMethod* outer_method,
-                                                     uintptr_t caller_pc,
-                                                     bool do_caller_check)
+static inline ArtMethod* DoGetCalleeSaveMethodCallerAndDexPc(ArtMethod** sp,
+                                                             CalleeSaveType type,
+                                                             ArtMethod* outer_method,
+                                                             uintptr_t caller_pc,
+                                                             uint32_t* dex_pc,
+                                                             bool do_caller_check)
     REQUIRES_SHARED(Locks::mutator_lock_) {
   ArtMethod* caller = outer_method;
-  if (LIKELY(caller_pc != reinterpret_cast<uintptr_t>(GetQuickInstrumentationExitPc()))) {
-    if (outer_method != nullptr) {
-      const OatQuickMethodHeader* current_code = outer_method->GetOatQuickMethodHeader(caller_pc);
-      DCHECK(current_code != nullptr);
-      if (current_code->IsOptimized() &&
-          CodeInfo::HasInlineInfo(current_code->GetOptimizedCodeInfoPtr())) {
-        uintptr_t native_pc_offset = current_code->NativeQuickPcOffset(caller_pc);
-        CodeInfo code_info = CodeInfo::DecodeInlineInfoOnly(current_code);
-        StackMap stack_map = code_info.GetStackMapForNativePcOffset(native_pc_offset);
-        DCHECK(stack_map.IsValid());
-        BitTableRange<InlineInfo> inline_infos = code_info.GetInlineInfosOf(stack_map);
-        if (!inline_infos.empty()) {
-          caller = GetResolvedMethod(outer_method, code_info, inline_infos);
-        }
+  if (outer_method != nullptr) {
+    const OatQuickMethodHeader* current_code = outer_method->GetOatQuickMethodHeader(caller_pc);
+    DCHECK(current_code != nullptr);
+    if (current_code->IsOptimized() &&
+        CodeInfo::HasInlineInfo(current_code->GetOptimizedCodeInfoPtr())) {
+      uintptr_t native_pc_offset = current_code->NativeQuickPcOffset(caller_pc);
+      CodeInfo code_info = CodeInfo::DecodeInlineInfoOnly(current_code);
+      StackMap stack_map = code_info.GetStackMapForNativePcOffset(native_pc_offset);
+      DCHECK(stack_map.IsValid());
+      BitTableRange<InlineInfo> inline_infos = code_info.GetInlineInfosOf(stack_map);
+      if (!inline_infos.empty()) {
+        caller = GetResolvedMethod(outer_method, code_info, inline_infos);
+        *dex_pc = inline_infos.back().GetDexPc();
+      } else {
+        *dex_pc = stack_map.GetDexPc();
       }
+    } else {
+      size_t callee_frame_size = RuntimeCalleeSaveFrame::GetFrameSize(type);
+      ArtMethod** caller_sp = reinterpret_cast<ArtMethod**>(
+          reinterpret_cast<uintptr_t>(sp) + callee_frame_size);
+      *dex_pc = current_code->ToDexPc(caller_sp, caller_pc);
     }
-    if (kIsDebugBuild && do_caller_check) {
-      // Note that do_caller_check is optional, as this method can be called by
-      // stubs, and tests without a proper call stack.
-      NthCallerVisitor visitor(Thread::Current(), 1, true);
-      visitor.WalkStack();
-      CHECK_EQ(caller, visitor.caller);
-    }
-  } else {
-    // We're instrumenting, just use the StackVisitor which knows how to
-    // handle instrumented frames.
+  }
+  if (kIsDebugBuild && do_caller_check) {
+    // Note that do_caller_check is optional, as this method can be called by
+    // stubs, and tests without a proper call stack.
     NthCallerVisitor visitor(Thread::Current(), 1, true);
     visitor.WalkStack();
-    caller = visitor.caller;
+    CHECK_EQ(caller, visitor.caller);
   }
   return caller;
 }
 
-ArtMethod* GetCalleeSaveMethodCaller(ArtMethod** sp, CalleeSaveType type, bool do_caller_check)
+ArtMethod* GetCalleeSaveMethodCallerAndDexPc(ArtMethod** sp,
+                                             CalleeSaveType type,
+                                             uint32_t* dex_pc,
+                                             bool do_caller_check)
     REQUIRES_SHARED(Locks::mutator_lock_) {
   ScopedAssertNoThreadSuspension ants(__FUNCTION__);
   auto outer_caller_and_pc = DoGetCalleeSaveMethodOuterCallerAndPc(sp, type);
   ArtMethod* outer_method = outer_caller_and_pc.first;
   uintptr_t caller_pc = outer_caller_and_pc.second;
-  ArtMethod* caller = DoGetCalleeSaveMethodCaller(outer_method, caller_pc, do_caller_check);
+  ArtMethod* caller = DoGetCalleeSaveMethodCallerAndDexPc(sp,
+                                                          type,
+                                                          outer_method,
+                                                          caller_pc,
+                                                          dex_pc,
+                                                          do_caller_check);
   return caller;
 }
 
@@ -248,8 +273,13 @@ CallerAndOuterMethod GetCalleeSaveMethodCallerAndOuterMethod(Thread* self, Calle
   auto outer_caller_and_pc = DoGetCalleeSaveMethodOuterCallerAndPc(sp, type);
   result.outer_method = outer_caller_and_pc.first;
   uintptr_t caller_pc = outer_caller_and_pc.second;
-  result.caller =
-      DoGetCalleeSaveMethodCaller(result.outer_method, caller_pc, /* do_caller_check= */ true);
+  uint32_t dex_pc;
+  result.caller = DoGetCalleeSaveMethodCallerAndDexPc(sp,
+                                                      type,
+                                                      result.outer_method,
+                                                      caller_pc,
+                                                      &dex_pc,
+                                                      /* do_caller_check= */ true);
   return result;
 }
 
@@ -279,6 +309,58 @@ ObjPtr<mirror::MethodType> ResolveMethodTypeFromCode(ArtMethod* referrer,
     method_type = class_linker->ResolveMethodType(hs.Self(), proto_idx, dex_cache, class_loader);
   }
   return method_type;
+}
+
+void MaybeUpdateBssMethodEntry(ArtMethod* callee,
+                               MethodReference callee_reference,
+                               ArtMethod* outer_method) {
+  DCHECK_NE(callee, nullptr);
+  if (outer_method->GetDexFile()->GetOatDexFile() == nullptr ||
+      outer_method->GetDexFile()->GetOatDexFile()->GetOatFile() == nullptr) {
+    // No OatFile to update.
+    return;
+  }
+  const OatFile* outer_oat_file = outer_method->GetDexFile()->GetOatDexFile()->GetOatFile();
+
+  const DexFile* dex_file = callee_reference.dex_file;
+  const OatDexFile* oat_dex_file = dex_file->GetOatDexFile();
+  const IndexBssMapping* mapping = nullptr;
+  if (oat_dex_file != nullptr && oat_dex_file->GetOatFile() == outer_oat_file) {
+    // DexFiles compiled together to an oat file case.
+    mapping = oat_dex_file->GetMethodBssMapping();
+  } else {
+    // Try to find the DexFile in the BCP of the outer_method.
+    const OatFile::BssMappingInfo* mapping_info = outer_oat_file->FindBcpMappingInfo(dex_file);
+    if (mapping_info != nullptr) {
+      mapping = mapping_info->method_bss_mapping;
+    }
+  }
+
+  // Perform the update if we found a mapping.
+  if (mapping != nullptr) {
+    size_t bss_offset =
+        IndexBssMappingLookup::GetBssOffset(mapping,
+                                            callee_reference.index,
+                                            dex_file->NumMethodIds(),
+                                            static_cast<size_t>(kRuntimePointerSize));
+    if (bss_offset != IndexBssMappingLookup::npos) {
+      DCHECK_ALIGNED(bss_offset, static_cast<size_t>(kRuntimePointerSize));
+      DCHECK_NE(outer_oat_file, nullptr);
+      ArtMethod** method_entry = reinterpret_cast<ArtMethod**>(
+          const_cast<uint8_t*>(outer_oat_file->BssBegin() + bss_offset));
+      DCHECK_GE(method_entry, outer_oat_file->GetBssMethods().data());
+      DCHECK_LT(method_entry,
+                outer_oat_file->GetBssMethods().data() + outer_oat_file->GetBssMethods().size());
+      std::atomic<ArtMethod*>* atomic_entry =
+          reinterpret_cast<std::atomic<ArtMethod*>*>(method_entry);
+      if (kIsDebugBuild) {
+        ArtMethod* existing = atomic_entry->load(std::memory_order_acquire);
+        CHECK(existing->IsRuntimeMethod() || existing == callee);
+      }
+      static_assert(sizeof(*method_entry) == sizeof(*atomic_entry), "Size check.");
+      atomic_entry->store(callee, std::memory_order_release);
+    }
+  }
 }
 
 }  // namespace art

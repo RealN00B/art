@@ -16,11 +16,11 @@
 
 #include "timing_logger.h"
 
-#include "common_runtime_test.h"
+#include "base/common_art_test.h"
 
-namespace art {
+namespace art HIDDEN {
 
-class TimingLoggerTest : public CommonRuntimeTest {};
+class TimingLoggerTest : public CommonArtTest {};
 
 // TODO: Negative test cases (improper pairing of EndSplit, etc.)
 
@@ -46,7 +46,7 @@ TEST_F(TimingLoggerTest, StartNewEnd) {
   logger.NewTiming(split2name);
   logger.NewTiming(split3name);
   logger.EndTiming();
-  // Get the timings and verify that they are sane.
+  // Get the timings and verify that they are appropriate.
   const auto& timings = logger.GetTimings();
   // 6 timings in the timing logger at this point.
   EXPECT_EQ(6U, timings.size());

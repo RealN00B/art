@@ -18,21 +18,25 @@
 #define ART_RUNTIME_MIRROR_CLASS_EXT_H_
 
 #include "array.h"
+#include "base/macros.h"
 #include "class.h"
 #include "dex_cache.h"
 #include "object.h"
 #include "object_array.h"
 #include "string.h"
 
-namespace art {
+namespace art HIDDEN {
 
 struct ClassExtOffsets;
+class DexCacheVisitor;
 
 namespace mirror {
 
 // C++ mirror of dalvik.system.ClassExt
 class MANAGED ClassExt : public Object {
  public:
+  MIRROR_CLASS("Ldalvik/system/ClassExt;");
+
   static uint32_t ClassSize(PointerSize pointer_size);
 
   // Size of an instance of dalvik.system.ClassExt.
@@ -40,10 +44,12 @@ class MANAGED ClassExt : public Object {
     return sizeof(ClassExt);
   }
 
-  void SetVerifyError(ObjPtr<Object> obj) REQUIRES_SHARED(Locks::mutator_lock_);
+  void SetErroneousStateError(ObjPtr<Throwable> obj) REQUIRES_SHARED(Locks::mutator_lock_);
 
-  ObjPtr<Object> GetVerifyError() REQUIRES_SHARED(Locks::mutator_lock_);
+  ObjPtr<Throwable> GetErroneousStateError() REQUIRES_SHARED(Locks::mutator_lock_);
 
+  template<VerifyObjectFlags kVerifyFlags = kDefaultVerifyFlags,
+           ReadBarrierOption kReadBarrierOption = kWithReadBarrier>
   ObjPtr<ObjectArray<DexCache>> GetObsoleteDexCaches() REQUIRES_SHARED(Locks::mutator_lock_);
 
   template<VerifyObjectFlags kVerifyFlags = kDefaultVerifyFlags,
@@ -99,33 +105,46 @@ class MANAGED ClassExt : public Object {
 
   // Used to manually initialize the ext-ids arrays for the ClassExt associated
   // with the Class<ClassExt>. This simplifies the id allocation path.
-  void SetIdsArraysForClassExtExtData(ObjPtr<Object> marker) REQUIRES_SHARED(Locks::mutator_lock_);
+  EXPORT void SetIdsArraysForClassExtExtData(ObjPtr<Object> marker)
+      REQUIRES_SHARED(Locks::mutator_lock_);
 
-  void SetOriginalDexFile(ObjPtr<Object> bytes) REQUIRES_SHARED(Locks::mutator_lock_);
+  EXPORT void SetOriginalDexFile(ObjPtr<Object> bytes) REQUIRES_SHARED(Locks::mutator_lock_);
 
   uint16_t GetPreRedefineClassDefIndex() REQUIRES_SHARED(Locks::mutator_lock_) {
     return static_cast<uint16_t>(
         GetField32(OFFSET_OF_OBJECT_MEMBER(ClassExt, pre_redefine_class_def_index_)));
   }
 
-  void SetPreRedefineClassDefIndex(uint16_t index) REQUIRES_SHARED(Locks::mutator_lock_);
+  EXPORT void SetPreRedefineClassDefIndex(uint16_t index) REQUIRES_SHARED(Locks::mutator_lock_);
 
   const DexFile* GetPreRedefineDexFile() REQUIRES_SHARED(Locks::mutator_lock_) {
     return reinterpret_cast<const DexFile*>(static_cast<uintptr_t>(
         GetField64(OFFSET_OF_OBJECT_MEMBER(ClassExt, pre_redefine_dex_file_ptr_))));
   }
 
-  void SetPreRedefineDexFile(const DexFile* dex_file) REQUIRES_SHARED(Locks::mutator_lock_);
+  EXPORT void SetPreRedefineDexFile(const DexFile* dex_file) REQUIRES_SHARED(Locks::mutator_lock_);
 
-  void SetObsoleteArrays(ObjPtr<PointerArray> methods, ObjPtr<ObjectArray<DexCache>> dex_caches)
+  EXPORT void SetObsoleteArrays(ObjPtr<PointerArray> methods,
+                                ObjPtr<ObjectArray<DexCache>> dex_caches)
       REQUIRES_SHARED(Locks::mutator_lock_);
 
   // Extend the obsolete arrays by the given amount.
-  static bool ExtendObsoleteArrays(Handle<ClassExt> h_this, Thread* self, uint32_t increase)
+  EXPORT static bool ExtendObsoleteArrays(Handle<ClassExt> h_this, Thread* self, uint32_t increase)
       REQUIRES_SHARED(Locks::mutator_lock_);
 
-  template<ReadBarrierOption kReadBarrierOption = kWithReadBarrier, class Visitor>
+  template<ReadBarrierOption kReadBarrierOption = kWithReadBarrier,
+           bool kVisitProxyMethod = true,
+           class Visitor>
   inline void VisitNativeRoots(Visitor& visitor, PointerSize pointer_size)
+      REQUIRES_SHARED(Locks::mutator_lock_);
+
+  // NO_THREAD_SAFETY_ANALYSIS for dex_lock and heap_bitmap_lock_ as both are at
+  // higher lock-level than class-table's lock, which is already acquired and
+  // is at lower (kClassLoaderClassesLock) level.
+  template<VerifyObjectFlags kVerifyFlags = kDefaultVerifyFlags,
+           ReadBarrierOption kReadBarrierOption = kWithReadBarrier>
+  inline void VisitDexCaches(DexCacheVisitor& visitor)
+      NO_THREAD_SAFETY_ANALYSIS
       REQUIRES_SHARED(Locks::mutator_lock_);
 
   template<ReadBarrierOption kReadBarrierOption = kWithReadBarrier, class Visitor>
@@ -140,7 +159,7 @@ class MANAGED ClassExt : public Object {
   template<VerifyObjectFlags kVerifyFlags = kDefaultVerifyFlags,
            ReadBarrierOption kReadBarrierOption = kWithReadBarrier>
   ObjPtr<Class> GetObsoleteClass() REQUIRES_SHARED(Locks::mutator_lock_);
-  void SetObsoleteClass(ObjPtr<Class> classes) REQUIRES_SHARED(Locks::mutator_lock_);
+  EXPORT void SetObsoleteClass(ObjPtr<Class> classes) REQUIRES_SHARED(Locks::mutator_lock_);
 
   template<ReadBarrierOption kReadBarrierOption = kWithReadBarrier, typename Visitor>
   inline void VisitJFieldIDs(Visitor v) REQUIRES_SHARED(Locks::mutator_lock_);
@@ -153,6 +172,13 @@ class MANAGED ClassExt : public Object {
            ReadBarrierOption kReadBarrierOption = kWithReadBarrier>
   bool EnsureJniIdsArrayPresent(MemberOffset off, size_t count)
       REQUIRES_SHARED(Locks::mutator_lock_);
+
+  // Backing store of user-defined values pertaining to a class.
+  // Maintained by the ClassValue class.
+  HeapReference<Object> class_value_map_;
+
+  // The saved error for this class being erroneous.
+  HeapReference<Throwable> erroneous_state_error_;
 
   // Field order required by test "ValidateFieldOrderOfJavaCppUnionClasses".
   // An array containing the jfieldIDs assigned to each field in the corresponding position in the
@@ -176,12 +202,10 @@ class MANAGED ClassExt : public Object {
   // classes sfields_ array or '0' if no id has been assigned to that field yet.
   HeapReference<PointerArray> static_jfield_ids_;
 
-  // The saved verification error of this class.
-  HeapReference<Object> verify_error_;
+  int32_t pre_redefine_class_def_index_;
 
   // Native pointer to DexFile and ClassDef index of this class before it was JVMTI-redefined.
   int64_t pre_redefine_dex_file_ptr_;
-  int32_t pre_redefine_class_def_index_;
 
   friend struct art::ClassExtOffsets;  // for verifying offset information
   DISALLOW_IMPLICIT_CONSTRUCTORS(ClassExt);

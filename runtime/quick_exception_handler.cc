@@ -15,16 +15,21 @@
  */
 
 #include "quick_exception_handler.h"
+
 #include <ios>
+#include <queue>
+#include <sstream>
 
 #include "arch/context.h"
 #include "art_method-inl.h"
-#include "base/enums.h"
+#include "base/array_ref.h"
 #include "base/globals.h"
 #include "base/logging.h"  // For VLOG_IS_ON.
+#include "base/pointer_size.h"
 #include "base/systrace.h"
 #include "dex/dex_file_types.h"
 #include "dex/dex_instruction.h"
+#include "dex/dex_instruction-inl.h"
 #include "entrypoints/entrypoint_utils.h"
 #include "entrypoints/quick/quick_entrypoints_enum.h"
 #include "entrypoints/runtime_asm_entrypoints.h"
@@ -36,26 +41,23 @@
 #include "mirror/class_loader.h"
 #include "mirror/throwable.h"
 #include "nterp_helpers.h"
-#include "oat_quick_method_header.h"
+#include "oat/oat_quick_method_header.h"
+#include "oat/stack_map.h"
 #include "stack.h"
-#include "stack_map.h"
 
-namespace art {
+namespace art HIDDEN {
 
 static constexpr bool kDebugExceptionDelivery = false;
 static constexpr size_t kInvalidFrameDepth = 0xffffffff;
 
 QuickExceptionHandler::QuickExceptionHandler(Thread* self, bool is_deoptimization)
     : self_(self),
-      context_(self->GetLongJumpContext()),
+      context_(Context::Create()),
       is_deoptimization_(is_deoptimization),
-      method_tracing_active_(is_deoptimization ||
-                             Runtime::Current()->GetInstrumentation()->AreExitStubsInstalled()),
       handler_quick_frame_(nullptr),
       handler_quick_frame_pc_(0),
       handler_method_header_(nullptr),
       handler_quick_arg0_(0),
-      handler_dex_pc_(0),
       clear_exception_(false),
       handler_frame_depth_(kInvalidFrameDepth),
       full_fragment_done_(false) {}
@@ -67,12 +69,15 @@ class CatchBlockStackVisitor final : public StackVisitor {
                          Context* context,
                          Handle<mirror::Throwable>* exception,
                          QuickExceptionHandler* exception_handler,
-                         uint32_t skip_frames)
+                         uint32_t skip_frames,
+                         bool skip_top_unwind_callback)
       REQUIRES_SHARED(Locks::mutator_lock_)
       : StackVisitor(self, context, StackVisitor::StackWalkKind::kIncludeInlinedFrames),
         exception_(exception),
         exception_handler_(exception_handler),
-        skip_frames_(skip_frames) {
+        skip_frames_(skip_frames),
+        skip_unwind_callback_(skip_top_unwind_callback) {
+    DCHECK_IMPLIES(skip_unwind_callback_, skip_frames_ == 0);
   }
 
   bool VisitFrame() override REQUIRES_SHARED(Locks::mutator_lock_) {
@@ -95,7 +100,24 @@ class CatchBlockStackVisitor final : public StackVisitor {
       DCHECK(method->IsCalleeSaveMethod());
       return true;
     }
-    return HandleTryItems(method);
+    bool continue_stack_walk = HandleTryItems(method);
+    // Collect methods for which MethodUnwind callback needs to be invoked. MethodUnwind callback
+    // can potentially throw, so we want to call these after we find the catch block.
+    // We stop the stack walk when we find the catch block. If we are ending the stack walk we don't
+    // have to unwind this method so don't record it.
+    if (continue_stack_walk && !skip_unwind_callback_) {
+      // Skip unwind callback is only used when method exit callback has thrown an exception. In
+      // that case, we should have runtime method (artMethodExitHook) on top of stack and the
+      // second should be the method for which method exit was called.
+      DCHECK_IMPLIES(skip_unwind_callback_, GetFrameDepth() == 2);
+      unwound_methods_.push(method);
+    }
+    skip_unwind_callback_ = false;
+    return continue_stack_walk;
+  }
+
+  std::queue<ArtMethod*>& GetUnwoundMethods() {
+    return unwound_methods_;
   }
 
  private:
@@ -112,10 +134,12 @@ class CatchBlockStackVisitor final : public StackVisitor {
       uint32_t found_dex_pc = method->FindCatchBlock(to_find, dex_pc, &clear_exception);
       exception_handler_->SetClearException(clear_exception);
       if (found_dex_pc != dex::kDexNoIndex) {
-        exception_handler_->SetHandlerDexPc(found_dex_pc);
+        exception_handler_->SetHandlerDexPcList(ComputeDexPcList(found_dex_pc));
+        uint32_t stack_map_row = -1;
         exception_handler_->SetHandlerQuickFramePc(
-            GetCurrentOatQuickMethodHeader()->ToNativeQuickPc(
-                method, found_dex_pc, /* is_for_catch_handler= */ true));
+            GetCurrentOatQuickMethodHeader()->ToNativeQuickPcForCatchHandlers(
+                method, exception_handler_->GetHandlerDexPcList(), &stack_map_row));
+        exception_handler_->SetCatchStackMapRow(stack_map_row);
         exception_handler_->SetHandlerQuickFrame(GetCurrentQuickFrame());
         exception_handler_->SetHandlerMethodHeader(GetCurrentOatQuickMethodHeader());
         return false;  // End stack walk.
@@ -139,20 +163,29 @@ class CatchBlockStackVisitor final : public StackVisitor {
   QuickExceptionHandler* const exception_handler_;
   // The number of frames to skip searching for catches in.
   uint32_t skip_frames_;
+  // The list of methods we would skip to reach the catch block. We record these to call
+  // MethodUnwind callbacks.
+  std::queue<ArtMethod*> unwound_methods_;
+  // Specifies if the unwind callback should be ignored for method at the top of the stack.
+  bool skip_unwind_callback_;
 
   DISALLOW_COPY_AND_ASSIGN(CatchBlockStackVisitor);
 };
 
 // Finds the appropriate exception catch after calling all method exit instrumentation functions.
-// Note that this might change the exception being thrown.
-void QuickExceptionHandler::FindCatch(ObjPtr<mirror::Throwable> exception) {
+// Note that this might change the exception being thrown. If is_method_exit_exception is true
+// skip the method unwind call for the method on top of the stack as the exception was thrown by
+// method exit callback.
+void QuickExceptionHandler::FindCatch(ObjPtr<mirror::Throwable> exception,
+                                      bool is_method_exit_exception) {
   DCHECK(!is_deoptimization_);
-  instrumentation::InstrumentationStackPopper popper(self_);
+  instrumentation::Instrumentation* instr = Runtime::Current()->GetInstrumentation();
   // The number of total frames we have so far popped.
   uint32_t already_popped = 0;
   bool popped_to_top = true;
   StackHandleScope<1> hs(self_);
   MutableHandle<mirror::Throwable> exception_ref(hs.NewHandle(exception));
+  bool skip_top_unwind_callback = is_method_exit_exception;
   // Sending the instrumentation events (done by the InstrumentationStackPopper) can cause new
   // exceptions to be thrown which will override the current exception. Therefore we need to perform
   // the search for a catch in a loop until we have successfully popped all the way to a catch or
@@ -166,11 +199,15 @@ void QuickExceptionHandler::FindCatch(ObjPtr<mirror::Throwable> exception) {
     }
 
     // Walk the stack to find catch handler.
-    CatchBlockStackVisitor visitor(self_, context_,
+    CatchBlockStackVisitor visitor(self_,
+                                   context_.get(),
                                    &exception_ref,
                                    this,
-                                   /*skip_frames=*/already_popped);
+                                   /*skip_frames=*/already_popped,
+                                   skip_top_unwind_callback);
     visitor.WalkStack(true);
+    skip_top_unwind_callback = false;
+
     uint32_t new_pop_count = handler_frame_depth_;
     DCHECK_GE(new_pop_count, already_popped);
     already_popped = new_pop_count;
@@ -181,10 +218,25 @@ void QuickExceptionHandler::FindCatch(ObjPtr<mirror::Throwable> exception) {
       }
       if (GetHandlerMethod() != nullptr) {
         const DexFile* dex_file = GetHandlerMethod()->GetDexFile();
-        int line_number =
-            annotations::GetLineNumFromPC(dex_file, GetHandlerMethod(), handler_dex_pc_);
+        DCHECK(handler_dex_pc_list_.has_value());
+        DCHECK_GE(handler_dex_pc_list_->size(), 1u);
+        int line_number = annotations::GetLineNumFromPC(
+            dex_file, GetHandlerMethod(), handler_dex_pc_list_->front());
+
+        // We may have an inlined method. If so, we can add some extra logging.
+        std::stringstream ss;
+        ArtMethod* maybe_inlined_method = visitor.GetMethod();
+        if (maybe_inlined_method != GetHandlerMethod()) {
+          const DexFile* inlined_dex_file = maybe_inlined_method->GetDexFile();
+          DCHECK_GE(handler_dex_pc_list_->size(), 2u);
+          int inlined_line_number = annotations::GetLineNumFromPC(
+              inlined_dex_file, maybe_inlined_method, handler_dex_pc_list_->back());
+          ss << " which ends up calling inlined method " << maybe_inlined_method->PrettyMethod()
+             << " (line: " << inlined_line_number << ")";
+        }
+
         LOG(INFO) << "Handler: " << GetHandlerMethod()->PrettyMethod() << " (line: "
-                  << line_number << ")";
+                  << line_number << ")" << ss.str();
       }
     }
     // Exception was cleared as part of delivery.
@@ -195,9 +247,11 @@ void QuickExceptionHandler::FindCatch(ObjPtr<mirror::Throwable> exception) {
         handler_method_header_->IsOptimized()) {
       SetCatchEnvironmentForOptimizedHandler(&visitor);
     }
-    popped_to_top =
-        popper.PopFramesTo(reinterpret_cast<uintptr_t>(handler_quick_frame_), exception_ref);
+    popped_to_top = instr->ProcessMethodUnwindCallbacks(self_,
+                                                        visitor.GetUnwoundMethods(),
+                                                        exception_ref);
   } while (!popped_to_top);
+
   if (!clear_exception_) {
     // Put exception back in root set with clear throw location.
     self_->SetException(exception_ref.Get());
@@ -245,15 +299,18 @@ void QuickExceptionHandler::SetCatchEnvironmentForOptimizedHandler(StackVisitor*
     self_->DumpStack(LOG_STREAM(INFO) << "Setting catch phis: ");
   }
 
-  CodeItemDataAccessor accessor(GetHandlerMethod()->DexInstructionData());
-  const size_t number_of_vregs = accessor.RegistersSize();
   CodeInfo code_info(handler_method_header_);
 
   // Find stack map of the catch block.
-  StackMap catch_stack_map = code_info.GetCatchStackMapForDexPc(GetHandlerDexPc());
+  ArrayRef<const uint32_t> dex_pc_list = GetHandlerDexPcList();
+  DCHECK_GE(dex_pc_list.size(), 1u);
+  StackMap catch_stack_map = code_info.GetStackMapAt(GetCatchStackMapRow());
   DCHECK(catch_stack_map.IsValid());
-  DexRegisterMap catch_vreg_map = code_info.GetDexRegisterMapOf(catch_stack_map);
-  DCHECK_EQ(catch_vreg_map.size(), number_of_vregs);
+  DCHECK_EQ(catch_stack_map.Row(), code_info.GetCatchStackMapForDexPc(dex_pc_list).Row());
+  const uint32_t catch_depth = dex_pc_list.size() - 1;
+  const size_t number_of_registers = stack_visitor->GetNumberOfRegisters(&code_info, catch_depth);
+  DexRegisterMap catch_vreg_map =
+      code_info.GetDexRegisterMapOf(catch_stack_map, /* first= */ 0, number_of_registers);
 
   if (!catch_vreg_map.HasAnyLiveDexRegisters()) {
     return;
@@ -263,26 +320,47 @@ void QuickExceptionHandler::SetCatchEnvironmentForOptimizedHandler(StackVisitor*
   StackMap throw_stack_map =
       code_info.GetStackMapForNativePcOffset(stack_visitor->GetNativePcOffset());
   DCHECK(throw_stack_map.IsValid());
-  DexRegisterMap throw_vreg_map = code_info.GetDexRegisterMapOf(throw_stack_map);
-  DCHECK_EQ(throw_vreg_map.size(), number_of_vregs);
+  const uint32_t throw_depth = stack_visitor->InlineDepth();
+  DCHECK_EQ(throw_depth, catch_depth);
+  DexRegisterMap throw_vreg_map =
+      code_info.GetDexRegisterMapOf(throw_stack_map, /* first= */ 0, number_of_registers);
+  DCHECK_EQ(throw_vreg_map.size(), catch_vreg_map.size());
 
-  // Copy values between them.
-  for (uint16_t vreg = 0; vreg < number_of_vregs; ++vreg) {
-    DexRegisterLocation::Kind catch_location = catch_vreg_map[vreg].GetKind();
-    if (catch_location == DexRegisterLocation::Kind::kNone) {
+  // First vreg that it is part of the catch's environment.
+  const size_t catch_vreg_start = catch_depth == 0
+    ? 0
+    : stack_visitor->GetNumberOfRegisters(&code_info, catch_depth - 1);
+
+  // We don't need to copy anything in the parent's environment.
+  for (size_t vreg = 0; vreg < catch_vreg_start; ++vreg) {
+    DexRegisterLocation::Kind catch_location_kind = catch_vreg_map[vreg].GetKind();
+    DCHECK(catch_location_kind == DexRegisterLocation::Kind::kNone ||
+           catch_location_kind == DexRegisterLocation::Kind::kConstant ||
+           catch_location_kind == DexRegisterLocation::Kind::kInStack)
+        << "Unexpected catch_location_kind: " << catch_location_kind;
+  }
+
+  // Copy values between the throw and the catch.
+  for (size_t vreg = catch_vreg_start; vreg < catch_vreg_map.size(); ++vreg) {
+    DexRegisterLocation::Kind catch_location_kind = catch_vreg_map[vreg].GetKind();
+    if (catch_location_kind == DexRegisterLocation::Kind::kNone) {
       continue;
     }
-    DCHECK(catch_location == DexRegisterLocation::Kind::kInStack);
 
-    // Get vreg value from its current location.
+    // Consistency checks.
+    DCHECK_EQ(catch_location_kind, DexRegisterLocation::Kind::kInStack);
     uint32_t vreg_value;
     VRegKind vreg_kind = ToVRegKind(throw_vreg_map[vreg].GetKind());
-    bool get_vreg_success =
-        stack_visitor->GetVReg(stack_visitor->GetMethod(),
-                               vreg,
-                               vreg_kind,
-                               &vreg_value,
-                               throw_vreg_map[vreg]);
+    DCHECK_NE(vreg_kind, kReferenceVReg)
+        << "The fast path in GetVReg doesn't expect a kReferenceVReg.";
+
+    // Get vreg value from its current location.
+    bool get_vreg_success = stack_visitor->GetVReg(stack_visitor->GetMethod(),
+                                                   vreg,
+                                                   vreg_kind,
+                                                   &vreg_value,
+                                                   throw_vreg_map[vreg],
+                                                   /* need_full_register_list= */ true);
     CHECK(get_vreg_success) << "VReg " << vreg << " was optimized out ("
                             << "method=" << ArtMethod::PrettyMethod(stack_visitor->GetMethod())
                             << ", dex_pc=" << stack_visitor->GetDexPc() << ", "
@@ -303,18 +381,19 @@ class DeoptimizeStackVisitor final : public StackVisitor {
   DeoptimizeStackVisitor(Thread* self,
                          Context* context,
                          QuickExceptionHandler* exception_handler,
-                         bool single_frame)
-      REQUIRES_SHARED(Locks::mutator_lock_)
+                         bool single_frame,
+                         bool skip_method_exit_callbacks) REQUIRES_SHARED(Locks::mutator_lock_)
       : StackVisitor(self, context, StackVisitor::StackWalkKind::kIncludeInlinedFrames),
         exception_handler_(exception_handler),
         prev_shadow_frame_(nullptr),
+        bottom_shadow_frame_(nullptr),
         stacked_shadow_frame_pushed_(false),
         single_frame_deopt_(single_frame),
         single_frame_done_(false),
         single_frame_deopt_method_(nullptr),
         single_frame_deopt_quick_method_header_(nullptr),
-        callee_method_(nullptr) {
-  }
+        callee_method_(nullptr),
+        skip_method_exit_callbacks_(skip_method_exit_callbacks) {}
 
   ArtMethod* GetSingleFrameDeoptMethod() const {
     return single_frame_deopt_method_;
@@ -322,6 +401,14 @@ class DeoptimizeStackVisitor final : public StackVisitor {
 
   const OatQuickMethodHeader* GetSingleFrameDeoptQuickMethodHeader() const {
     return single_frame_deopt_quick_method_header_;
+  }
+
+  ShadowFrame* GetBottomShadowFrame() const {
+    return bottom_shadow_frame_;
+  }
+
+  const std::vector<uint32_t>& GetDexPcs() const {
+    return dex_pcs_;
   }
 
   void FinishStackWalk() REQUIRES_SHARED(Locks::mutator_lock_) {
@@ -352,22 +439,46 @@ class DeoptimizeStackVisitor final : public StackVisitor {
     ArtMethod* method = GetMethod();
     VLOG(deopt) << "Deoptimizing stack: depth: " << GetFrameDepth()
                 << " at method " << ArtMethod::PrettyMethod(method);
+
     if (method == nullptr || single_frame_done_) {
       FinishStackWalk();
       return false;  // End stack walk.
-    } else if (method->IsRuntimeMethod()) {
+    }
+
+    // Update if method exit event needs to be reported. We should report exit event only if we
+    // have reported an entry event. So tell interpreter if/ an entry event was reported.
+    bool supports_exit_events = Runtime::Current()->GetInstrumentation()->MethodSupportsExitEvents(
+        method, GetCurrentOatQuickMethodHeader());
+
+    if (method->IsRuntimeMethod()) {
       // Ignore callee save method.
       DCHECK(method->IsCalleeSaveMethod());
       return true;
     } else if (method->IsNative()) {
       // If we return from JNI with a pending exception and want to deoptimize, we need to skip
-      // the native method.
-      // The top method is a runtime method, the native method comes next.
-      CHECK_EQ(GetFrameDepth(), 1U);
+      // the native method. The top method is a runtime method, the native method comes next.
+      // We also deoptimize due to method instrumentation reasons from method exit callbacks.
+      // In these cases native method is at the top of stack.
+      CHECK((GetFrameDepth() == 1U) || (GetFrameDepth() == 0U));
+      // We see a native frame when:
+      // 1. returning from JNI with a pending exception
+      // 2. deopting from method exit callbacks (with or without a pending exception).
+      // skip_method_exit_callbacks_ is set in this case
+      // 3. handling async exception on suspend points for fast native methods.
+      // We only need to call method unwind event in the first case.
+      if (supports_exit_events &&
+          !skip_method_exit_callbacks_ &&
+          GetThread()->IsExceptionPending()) {
+        // An exception has occurred in a native method and we are deoptimizing past the native
+        // method. So report method unwind event here.
+        Runtime::Current()->GetInstrumentation()->MethodUnwindEvent(
+            GetThread(), method, dex::kDexNoIndex);
+      }
       callee_method_ = method;
       return true;
     } else if (!single_frame_deopt_ &&
-               !Runtime::Current()->IsAsyncDeoptimizeable(GetCurrentQuickFramePc())) {
+               !Runtime::Current()->IsAsyncDeoptimizeable(GetOuterMethod(),
+                                                          GetCurrentQuickFramePc())) {
       // We hit some code that's not deoptimizeable. However, Single-frame deoptimization triggered
       // from compiled code is always allowed since HDeoptimize always saves the full environment.
       LOG(WARNING) << "Got request to deoptimize un-deoptimizable method "
@@ -382,7 +493,7 @@ class DeoptimizeStackVisitor final : public StackVisitor {
       CodeItemDataAccessor accessor(method->DexInstructionData());
       const size_t num_regs = accessor.RegistersSize();
       if (new_frame == nullptr) {
-        new_frame = ShadowFrame::CreateDeoptimizedFrame(num_regs, nullptr, method, GetDexPc());
+        new_frame = ShadowFrame::CreateDeoptimizedFrame(num_regs, method, GetDexPc());
         updated_vregs = nullptr;
       } else {
         updated_vregs = GetThread()->GetUpdatedVRegFlags(frame_id);
@@ -392,6 +503,20 @@ class DeoptimizeStackVisitor final : public StackVisitor {
         HandleNterpDeoptimization(method, new_frame, updated_vregs);
       } else {
         HandleOptimizingDeoptimization(method, new_frame, updated_vregs);
+      }
+      new_frame->SetSkipMethodExitEvents(!supports_exit_events);
+      // If we are deoptimizing after method exit callback we shouldn't call the method exit
+      // callbacks again for the top frame. We may have to deopt after the callback if the callback
+      // either throws or performs other actions that require a deopt.
+      // We only need to skip for the top frame and the rest of the frames should still run the
+      // callbacks. So only do this check for the top frame.
+      if (GetFrameDepth() == 0U && skip_method_exit_callbacks_) {
+        new_frame->SetSkipMethodExitEvents(true);
+        // This exception was raised by method exit callbacks and we shouldn't report it to
+        // listeners for these exceptions.
+        if (GetThread()->IsExceptionPending()) {
+          new_frame->SetSkipNextExceptionEvent(true);
+        }
       }
       if (updated_vregs != nullptr) {
         // Calling Thread::RemoveDebuggerShadowFrameMapping will also delete the updated_vregs
@@ -405,16 +530,20 @@ class DeoptimizeStackVisitor final : public StackVisitor {
         // Will be popped after the long jump after DeoptimizeStack(),
         // right before interpreter::EnterInterpreterFromDeoptimize().
         stacked_shadow_frame_pushed_ = true;
+        bottom_shadow_frame_ = new_frame;
         GetThread()->PushStackedShadowFrame(
             new_frame, StackedShadowFrameType::kDeoptimizationShadowFrame);
       }
       prev_shadow_frame_ = new_frame;
 
-      if (single_frame_deopt_ && !IsInInlinedFrame()) {
-        // Single-frame deopt ends at the first non-inlined frame and needs to store that method.
-        single_frame_done_ = true;
-        single_frame_deopt_method_ = method;
-        single_frame_deopt_quick_method_header_ = GetCurrentOatQuickMethodHeader();
+      if (single_frame_deopt_) {
+        dex_pcs_.push_back(GetDexPc());
+        if (!IsInInlinedFrame()) {
+          // Single-frame deopt ends at the first non-inlined frame and needs to store that method.
+          single_frame_done_ = true;
+          single_frame_deopt_method_ = method;
+          single_frame_deopt_quick_method_header_ = GetCurrentOatQuickMethodHeader();
+        }
       }
       callee_method_ = method;
       return true;
@@ -504,7 +633,7 @@ class DeoptimizeStackVisitor final : public StackVisitor {
         case DexRegisterLocation::Kind::kInFpuRegister:
         case DexRegisterLocation::Kind::kInFpuRegisterHigh: {
           uint32_t reg = vreg_map[vreg].GetMachineRegister();
-          bool result = GetRegisterIfAccessible(reg, ToVRegKind(location), &value);
+          bool result = GetRegisterIfAccessible(reg, location, &value);
           CHECK(result);
           if (location == DexRegisterLocation::Kind::kInRegister) {
             if (((1u << reg) & register_mask) != 0) {
@@ -543,12 +672,18 @@ class DeoptimizeStackVisitor final : public StackVisitor {
 
   QuickExceptionHandler* const exception_handler_;
   ShadowFrame* prev_shadow_frame_;
+  ShadowFrame* bottom_shadow_frame_;
   bool stacked_shadow_frame_pushed_;
   const bool single_frame_deopt_;
   bool single_frame_done_;
   ArtMethod* single_frame_deopt_method_;
   const OatQuickMethodHeader* single_frame_deopt_quick_method_header_;
   ArtMethod* callee_method_;
+  // This specifies if method exit callbacks should be skipped for the top frame. We may request
+  // a deopt after running method exit callbacks if the callback throws or requests events that
+  // need a deopt.
+  bool skip_method_exit_callbacks_;
+  std::vector<uint32_t> dex_pcs_;
 
   DISALLOW_COPY_AND_ASSIGN(DeoptimizeStackVisitor);
 };
@@ -568,13 +703,13 @@ void QuickExceptionHandler::PrepareForLongJumpToInvokeStubOrInterpreterBridge() 
   }
 }
 
-void QuickExceptionHandler::DeoptimizeStack() {
+void QuickExceptionHandler::DeoptimizeStack(bool skip_method_exit_callbacks) {
   DCHECK(is_deoptimization_);
   if (kDebugExceptionDelivery) {
     self_->DumpStack(LOG_STREAM(INFO) << "Deoptimizing: ");
   }
 
-  DeoptimizeStackVisitor visitor(self_, context_, this, false);
+  DeoptimizeStackVisitor visitor(self_, context_.get(), this, false, skip_method_exit_callbacks);
   visitor.WalkStack(true);
   PrepareForLongJumpToInvokeStubOrInterpreterBridge();
 }
@@ -582,7 +717,10 @@ void QuickExceptionHandler::DeoptimizeStack() {
 void QuickExceptionHandler::DeoptimizeSingleFrame(DeoptimizationKind kind) {
   DCHECK(is_deoptimization_);
 
-  DeoptimizeStackVisitor visitor(self_, context_, this, true);
+  // This deopt is requested while still executing the method. We haven't run method exit callbacks
+  // yet, so don't skip them.
+  DeoptimizeStackVisitor visitor(
+      self_, context_.get(), this, true, /* skip_method_exit_callbacks= */ false);
   visitor.WalkStack(true);
 
   // Compiled code made an explicit deoptimization.
@@ -599,31 +737,69 @@ void QuickExceptionHandler::DeoptimizeSingleFrame(DeoptimizationKind kind) {
               << GetDeoptimizationKindName(kind);
     DumpFramesWithType(self_, /* details= */ true);
   }
-  if (Runtime::Current()->UseJitCompilation()) {
-    Runtime::Current()->GetJit()->GetCodeCache()->InvalidateCompiledCodeFor(
+  // When deoptimizing for debug support the optimized code is still valid and
+  // can be reused when debugging support (like breakpoints) are no longer
+  // needed fot this method.
+  Runtime* runtime = Runtime::Current();
+  if (runtime->UseJitCompilation() && (kind != DeoptimizationKind::kDebugging)) {
+    runtime->GetJit()->GetCodeCache()->InvalidateCompiledCodeFor(
         deopt_method, visitor.GetSingleFrameDeoptQuickMethodHeader());
   } else {
-    // Transfer the code to interpreter.
-    Runtime::Current()->GetInstrumentation()->UpdateMethodsCode(
-        deopt_method, GetQuickToInterpreterBridge());
+    runtime->GetInstrumentation()->InitializeMethodsCode(
+        deopt_method, /*aot_code=*/ nullptr);
+  }
+
+  // If the deoptimization is due to an inline cache, update it with the type
+  // that made us deoptimize. This avoids pathological cases of never seeing
+  // that type while executing baseline generated code.
+  if (kind == DeoptimizationKind::kJitInlineCache || kind == DeoptimizationKind::kJitSameTarget) {
+    DCHECK(runtime->UseJitCompilation());
+    ShadowFrame* shadow_frame = visitor.GetBottomShadowFrame();
+    uint32_t dex_pc = shadow_frame->GetDexPC();
+    CodeItemDataAccessor accessor(shadow_frame->GetMethod()->DexInstructionData());
+    const uint16_t* const insns = accessor.Insns();
+    const Instruction* inst = Instruction::At(insns + dex_pc);
+    switch (inst->Opcode()) {
+      case Instruction::INVOKE_INTERFACE:
+      case Instruction::INVOKE_VIRTUAL:
+      case Instruction::INVOKE_INTERFACE_RANGE:
+      case Instruction::INVOKE_VIRTUAL_RANGE: {
+        uint32_t encoded_dex_pc = InlineCache::EncodeDexPc(
+            visitor.GetSingleFrameDeoptMethod(),
+            visitor.GetDexPcs(),
+            runtime->GetJit()->GetJitCompiler()->GetInlineMaxCodeUnits());
+        if (encoded_dex_pc != static_cast<uint32_t>(-1)) {
+          // The inline cache comes from the top-level method.
+          runtime->GetJit()->GetCodeCache()->MaybeUpdateInlineCache(
+              visitor.GetSingleFrameDeoptMethod(),
+              encoded_dex_pc,
+              shadow_frame->GetVRegReference(inst->VRegC())->GetClass(),
+              self_);
+        } else {
+          // If the top-level inline cache did not exist, update the one for the
+          // bottom method, we know it's the one that was used for compilation.
+          runtime->GetJit()->GetCodeCache()->MaybeUpdateInlineCache(
+              shadow_frame->GetMethod(),
+              dex_pc,
+              shadow_frame->GetVRegReference(inst->VRegC())->GetClass(),
+              self_);
+        }
+        break;
+      }
+      default: {
+        LOG(FATAL) << "Unexpected instruction for inline cache: " << inst->Name();
+      }
+    }
   }
 
   PrepareForLongJumpToInvokeStubOrInterpreterBridge();
 }
 
-void QuickExceptionHandler::DeoptimizePartialFragmentFixup(uintptr_t return_pc) {
-  // At this point, the instrumentation stack has been updated. We need to install
-  // the real return pc on stack, in case instrumentation stub is stored there,
-  // so that the interpreter bridge code can return to the right place.
-  if (return_pc != 0) {
-    uintptr_t* pc_addr = reinterpret_cast<uintptr_t*>(handler_quick_frame_);
-    CHECK(pc_addr != nullptr);
-    pc_addr--;
-    *reinterpret_cast<uintptr_t*>(pc_addr) = return_pc;
-  }
-
+void QuickExceptionHandler::DeoptimizePartialFragmentFixup() {
+  CHECK(handler_quick_frame_ != nullptr);
   // Architecture-dependent work. This is to get the LR right for x86 and x86-64.
-  if (kRuntimeISA == InstructionSet::kX86 || kRuntimeISA == InstructionSet::kX86_64) {
+  if (kRuntimeQuickCodeISA == InstructionSet::kX86 ||
+      kRuntimeQuickCodeISA == InstructionSet::kX86_64) {
     // On x86, the return address is on the stack, so just reuse it. Otherwise we would have to
     // change how longjump works.
     handler_quick_frame_ = reinterpret_cast<ArtMethod**>(
@@ -631,20 +807,8 @@ void QuickExceptionHandler::DeoptimizePartialFragmentFixup(uintptr_t return_pc) 
   }
 }
 
-uintptr_t QuickExceptionHandler::UpdateInstrumentationStack() {
-  DCHECK(is_deoptimization_) << "Non-deoptimization handlers should use FindCatch";
-  uintptr_t return_pc = 0;
-  if (method_tracing_active_) {
-    instrumentation::Instrumentation* instrumentation = Runtime::Current()->GetInstrumentation();
-    return_pc = instrumentation->PopFramesForDeoptimization(
-        self_, reinterpret_cast<uintptr_t>(handler_quick_frame_));
-  }
-  return return_pc;
-}
-
-void QuickExceptionHandler::DoLongJump(bool smash_caller_saves) {
-  // Place context back on thread so it will be available when we continue.
-  self_->ReleaseLongJumpContext(context_);
+std::unique_ptr<Context> QuickExceptionHandler::PrepareLongJump(bool smash_caller_saves) {
+  // Prepare and return the context.
   context_->SetSP(reinterpret_cast<uintptr_t>(handler_quick_frame_));
   CHECK_NE(handler_quick_frame_pc_, 0u);
   context_->SetPC(handler_quick_frame_pc_);
@@ -655,11 +819,15 @@ void QuickExceptionHandler::DoLongJump(bool smash_caller_saves) {
   if (!is_deoptimization_ &&
       handler_method_header_ != nullptr &&
       handler_method_header_->IsNterpMethodHeader()) {
+    // Interpreter procceses one method at a time i.e. not inlining
+    DCHECK(handler_dex_pc_list_.has_value());
+    DCHECK_EQ(handler_dex_pc_list_->size(), 1u) << "We shouldn't have any inlined frames.";
     context_->SetNterpDexPC(reinterpret_cast<uintptr_t>(
-        GetHandlerMethod()->DexInstructions().Insns() + handler_dex_pc_));
+        GetHandlerMethod()->DexInstructions().Insns() + handler_dex_pc_list_->front()));
   }
-  context_->DoLongJump();
-  UNREACHABLE();
+  // Clear the dex_pc list so as not to leak memory.
+  handler_dex_pc_list_.reset();
+  return std::move(context_);
 }
 
 void QuickExceptionHandler::DumpFramesWithType(Thread* self, bool details) {

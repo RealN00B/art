@@ -24,7 +24,7 @@
 #include "base/macros.h"
 #include "handle.h"
 
-namespace art {
+namespace art HIDDEN {
 
 namespace dex {
 struct ClassDef;
@@ -68,6 +68,19 @@ class DdmCallback {
   virtual ~DdmCallback() {}
   virtual void DdmPublishChunk(uint32_t type, const ArrayRef<const uint8_t>& data)
       REQUIRES_SHARED(Locks::mutator_lock_) = 0;
+};
+
+class AppInfoCallback {
+ public:
+  virtual ~AppInfoCallback() {}
+  virtual void SetCurrentProcessName(const std::string& process_name)
+      REQUIRES_SHARED(Locks::mutator_lock_) = 0;
+  virtual void AddApplication(const std::string& package_name)
+      REQUIRES_SHARED(Locks::mutator_lock_) = 0;
+  virtual void RemoveApplication(const std::string& package_name)
+      REQUIRES_SHARED(Locks::mutator_lock_) = 0;
+  virtual void SetWaitingForDebugger(bool waiting) REQUIRES_SHARED(Locks::mutator_lock_) = 0;
+  virtual void SetUserId(int uid) REQUIRES_SHARED(Locks::mutator_lock_) = 0;
 };
 
 class DebuggerControlCallback {
@@ -143,18 +156,8 @@ class MethodInspectionCallback {
  public:
   virtual ~MethodInspectionCallback() {}
 
-  // Returns true if the method is being inspected currently and the runtime should not modify it in
-  // potentially dangerous ways (i.e. replace with compiled version, JIT it, etc).
-  virtual bool IsMethodBeingInspected(ArtMethod* method) REQUIRES_SHARED(Locks::mutator_lock_) = 0;
-
-  // Returns true if the method is safe to Jit, false otherwise.
-  // Note that '!IsMethodSafeToJit(m) implies IsMethodBeingInspected(m)'. That is that if this
-  // method returns false IsMethodBeingInspected must return true.
-  virtual bool IsMethodSafeToJit(ArtMethod* method) REQUIRES_SHARED(Locks::mutator_lock_) = 0;
-
-  // Returns true if we expect the method to be debuggable but are not doing anything unusual with
-  // it currently.
-  virtual bool MethodNeedsDebugVersion(ArtMethod* method) REQUIRES_SHARED(Locks::mutator_lock_) = 0;
+  // Returns true if any locals have changed. If any locals have changed we shouldn't OSR.
+  virtual bool HaveLocalsChanged() REQUIRES_SHARED(Locks::mutator_lock_) = 0;
 };
 
 // Callback to let something request to be notified when reflective objects are being visited and
@@ -168,7 +171,7 @@ class ReflectiveValueVisitCallback {
       REQUIRES(Locks::mutator_lock_) = 0;
 };
 
-class RuntimeCallbacks {
+class EXPORT RuntimeCallbacks {
  public:
   RuntimeCallbacks();
 
@@ -234,19 +237,9 @@ class RuntimeCallbacks {
   void AddParkCallback(ParkCallback* cb) REQUIRES_SHARED(Locks::mutator_lock_);
   void RemoveParkCallback(ParkCallback* cb) REQUIRES_SHARED(Locks::mutator_lock_);
 
-  // Returns true if some MethodInspectionCallback indicates the method is being inspected/depended
-  // on by some code.
-  bool IsMethodBeingInspected(ArtMethod* method) REQUIRES_SHARED(Locks::mutator_lock_);
-
-  // Returns false if some MethodInspectionCallback indicates the method cannot be safetly jitted
-  // (which implies that it is being Inspected). Returns true otherwise. If it returns false the
-  // entrypoint should not be changed to JITed code.
-  bool IsMethodSafeToJit(ArtMethod* method) REQUIRES_SHARED(Locks::mutator_lock_);
-
-  // Returns true if some MethodInspectionCallback indicates the method needs to use a debug
-  // version. This allows later code to set breakpoints or perform other actions that could be
-  // broken by some optimizations.
-  bool MethodNeedsDebugVersion(ArtMethod* method) REQUIRES_SHARED(Locks::mutator_lock_);
+  // Returns true if any locals have changed. This is used to prevent OSRing frames that have
+  // some locals changed.
+  bool HaveLocalsChanged() REQUIRES_SHARED(Locks::mutator_lock_);
 
   void AddMethodInspectionCallback(MethodInspectionCallback* cb)
       REQUIRES_SHARED(Locks::mutator_lock_);
@@ -259,6 +252,15 @@ class RuntimeCallbacks {
 
   void AddDdmCallback(DdmCallback* cb) REQUIRES_SHARED(Locks::mutator_lock_);
   void RemoveDdmCallback(DdmCallback* cb) REQUIRES_SHARED(Locks::mutator_lock_);
+
+  void SetCurrentProcessName(const std::string& process_name) REQUIRES_SHARED(Locks::mutator_lock_);
+  void AddApplication(const std::string& package_name) REQUIRES_SHARED(Locks::mutator_lock_);
+  void RemoveApplication(const std::string& package_name) REQUIRES_SHARED(Locks::mutator_lock_);
+  void SetWaitingForDebugger(bool waiting) REQUIRES_SHARED(Locks::mutator_lock_);
+  void SetUserId(int uid) REQUIRES_SHARED(Locks::mutator_lock_);
+
+  void AddAppInfoCallback(AppInfoCallback* cb) REQUIRES_SHARED(Locks::mutator_lock_);
+  void RemoveAppInfoCallback(AppInfoCallback* cb) REQUIRES_SHARED(Locks::mutator_lock_);
 
   void StartDebugger() REQUIRES_SHARED(Locks::mutator_lock_);
   // NO_THREAD_SAFETY_ANALYSIS since this is only called when we are in the middle of shutting down
@@ -299,6 +301,7 @@ class RuntimeCallbacks {
       GUARDED_BY(callback_lock_);
   std::vector<DdmCallback*> ddm_callbacks_
       GUARDED_BY(callback_lock_);
+  std::vector<AppInfoCallback*> appinfo_callbacks_ GUARDED_BY(callback_lock_);
   std::vector<DebuggerControlCallback*> debugger_control_callbacks_
       GUARDED_BY(callback_lock_);
   std::vector<ReflectiveValueVisitCallback*> reflective_value_visit_callbacks_

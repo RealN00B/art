@@ -22,13 +22,13 @@
  * Also, ODEX files are no longer supported.
  */
 
-#include "dexdump.h"
-
+#include <android-base/logging.h>
+#include <base/mem_map.h>
 #include <stdio.h>
 #include <string.h>
 #include <unistd.h>
 
-#include <android-base/logging.h>
+#include "dexdump.h"
 
 namespace art {
 
@@ -39,19 +39,22 @@ static const char* gProgName = "dexdump";
  */
 static void usage() {
   LOG(ERROR) << "Copyright (C) 2007 The Android Open Source Project\n";
-  LOG(ERROR) << gProgName << ": [-a] [-c] [-d] [-e] [-f] [-h] [-i] [-j] [-l layout] [-o outfile]"
-                  " dexfile...\n";
+  LOG(ERROR) << gProgName
+             << ": [-a] [-c] [-d] [-e] [-f] [-h] [-i] [-j] [-l layout] [-n]"
+                "  [-s] [-o outfile] dexfile...\n";
   LOG(ERROR) << " -a : display annotations";
   LOG(ERROR) << " -c : verify checksum and exit";
   LOG(ERROR) << " -d : disassemble code sections";
   LOG(ERROR) << " -e : display exported items only";
-  LOG(ERROR) << " -f : display summary information from file header";
+  LOG(ERROR) << " -f : display dex file header";
   LOG(ERROR) << " -g : display CFG for dex";
-  LOG(ERROR) << " -h : display file header details";
+  LOG(ERROR) << " -h : display all sections header";
   LOG(ERROR) << " -i : ignore checksum failures";
   LOG(ERROR) << " -j : disable dex file verification";
   LOG(ERROR) << " -l : output layout, either 'plain' or 'xml'";
+  LOG(ERROR) << " -n : don't display debug information";
   LOG(ERROR) << " -o : output file name (defaults to stdout)";
+  LOG(ERROR) << " -s : display all strings from string_ids header section";
 }
 
 /*
@@ -62,10 +65,11 @@ int dexdumpDriver(int argc, char** argv) {
   bool wantUsage = false;
   memset(&gOptions, 0, sizeof(gOptions));
   gOptions.verbose = true;
+  gOptions.showDebugInfo = true;
 
   // Parse all arguments.
   while (true) {
-    const int ic = getopt(argc, argv, "acdefghijl:o:");
+    const int ic = getopt(argc, argv, "acdefghijl:no:s");
     if (ic < 0) {
       break;  // done
     }
@@ -82,7 +86,7 @@ int dexdumpDriver(int argc, char** argv) {
       case 'e':  // exported items only
         gOptions.exportsOnly = true;
         break;
-      case 'f':  // display outer file header
+      case 'f':  // display dex file header
         gOptions.showFileHeaders = true;
         break;
       case 'g':  // display cfg
@@ -107,8 +111,14 @@ int dexdumpDriver(int argc, char** argv) {
           wantUsage = true;
         }
         break;
+      case 'n':  // don't display debug information
+        gOptions.showDebugInfo = false;
+        break;
       case 'o':  // output file
         gOptions.outputFileName = optarg;
+        break;
+      case 's':  // display all strings
+        gOptions.showAllStrings = true;
         break;
       default:
         wantUsage = true;
@@ -132,7 +142,7 @@ int dexdumpDriver(int argc, char** argv) {
 
   // Open alternative output file.
   if (gOptions.outputFileName) {
-    gOutFile = fopen(gOptions.outputFileName, "w");
+    gOutFile = fopen(gOptions.outputFileName, "we");
     if (!gOutFile) {
       PLOG(ERROR) << "Can't open " << gOptions.outputFileName;
       return 1;
@@ -152,6 +162,7 @@ int dexdumpDriver(int argc, char** argv) {
 int main(int argc, char** argv) {
   // Output all logging to stderr.
   android::base::SetLogger(android::base::StderrLogger);
+  art::MemMap::Init();
 
   return art::dexdumpDriver(argc, argv);
 }

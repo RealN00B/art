@@ -20,6 +20,16 @@
 // to be backwards compatible, see
 // https://android.googlesource.com/platform/external/perfetto/+/refs/heads/master/protos/perfetto/ipc/producer_port.proto.
 
+package {
+    // See: http://go/android-license-faq
+    // A large-scale-change added 'default_applicable_licenses' to import
+    // all of the 'license_kinds' from "art_license"
+    // to get the below license kinds:
+    //   SPDX-license-identifier-Apache-2.0
+    default_applicable_licenses: ["art_license"],
+    default_team: "trendy_team_art_performance",
+}
+
 gensrcs {
     name: "art_perfetto_hprof_operator_srcs",
     cmd: "$(location generate_operator_out) art/perfetto_hprof $(in) > $(out)",
@@ -35,30 +45,22 @@ cc_defaults {
     host_supported: false,
     srcs: ["perfetto_hprof.cc"],
     defaults: ["art_defaults"],
-    include_dirs: [
-        "external/perfetto/include",
-        "external/perfetto/protos",
-    ],
 
     // Note that this tool needs to be built for both 32-bit and 64-bit since it requires
     // to be same ISA as what it is attached to.
     compile_multilib: "both",
 
     shared_libs: [
+        "libartpalette",
         "libbase",
         "liblog",
-        "libdexfile",
     ],
     static_libs: [
         "libperfetto_client_experimental",
         "perfetto_trace_protos",
     ],
     generated_sources: [
-        "perfetto_protos_perfetto_config_profiling_zero_gen",
         "art_perfetto_hprof_operator_srcs",
-    ],
-    generated_headers: [
-        "perfetto_protos_perfetto_config_profiling_zero_gen_headers",
     ],
     target: {
         darwin: {
@@ -68,6 +70,12 @@ cc_defaults {
     header_libs: [
         "libnativehelper_header_only",
     ],
+    // FIXME: Workaround LTO build breakage
+    // http://b/241700157
+    lto: {
+        never: true,
+    },
+
 }
 
 art_cc_library {
@@ -76,10 +84,12 @@ art_cc_library {
     shared_libs: [
         "libart",
         "libartbase",
+        "libdexfile#impl",
     ],
     apex_available: [
-        "com.android.art.release",
+        "com.android.art",
         "com.android.art.debug",
+        "test_broken_com.android.art",
     ],
 }
 
@@ -92,6 +102,7 @@ art_cc_library {
     shared_libs: [
         "libartd",
         "libartbased",
+        "libdexfiled#impl",
     ],
     apex_available: [
         "com.android.art.debug",

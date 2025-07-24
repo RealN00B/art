@@ -19,10 +19,10 @@
 #include "android-base/stringprintf.h"
 
 #include "art_method-inl.h"
-#include "base/enums.h"
+#include "base/pointer_size.h"
 #include "base/utils.h"
 #include "class-inl.h"
-#include "class_root.h"
+#include "class_root-inl.h"
 #include "dex/dex_file-inl.h"
 #include "gc/accounting/card_table-inl.h"
 #include "obj_ptr-inl.h"
@@ -31,9 +31,9 @@
 #include "object_array.h"
 #include "stack_trace_element-inl.h"
 #include "string.h"
-#include "well_known_classes.h"
+#include "well_known_classes-inl.h"
 
-namespace art {
+namespace art HIDDEN {
 namespace mirror {
 
 using android::base::StringPrintf;
@@ -70,14 +70,14 @@ void Throwable::SetStackState(ObjPtr<Object> state) REQUIRES_SHARED(Locks::mutat
 }
 
 bool Throwable::IsCheckedException() {
-  if (InstanceOf(WellKnownClasses::ToClass(WellKnownClasses::java_lang_Error))) {
+  if (IsError()) {
     return false;
   }
-  return !InstanceOf(WellKnownClasses::ToClass(WellKnownClasses::java_lang_RuntimeException));
+  return !InstanceOf(WellKnownClasses::java_lang_RuntimeException.Get());
 }
 
 bool Throwable::IsError() {
-  return InstanceOf(WellKnownClasses::ToClass(WellKnownClasses::java_lang_Error));
+  return InstanceOf(WellKnownClasses::java_lang_Error.Get());
 }
 
 int32_t Throwable::GetStackDepth() {
@@ -169,6 +169,10 @@ ObjPtr<Object> Throwable::GetStackTrace() {
 
 ObjPtr<String> Throwable::GetDetailMessage() {
   return GetFieldObject<String>(OFFSET_OF_OBJECT_MEMBER(Throwable, detail_message_));
+}
+
+ObjPtr<Throwable> Throwable::GetCause() {
+  return GetFieldObject<Throwable>(OFFSET_OF_OBJECT_MEMBER(Throwable, cause_));
 }
 
 }  // namespace mirror

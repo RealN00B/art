@@ -23,8 +23,9 @@
 #include "base/bit_utils.h"
 #include "base/globals.h"
 #include "base/logging.h"
+#include "base/macros.h"
 
-namespace art {
+namespace art HIDDEN {
 namespace x86 {
 
 constexpr size_t kFramePointerSize = static_cast<size_t>(PointerSize::k32);
@@ -33,31 +34,45 @@ static_assert(kX86PointerSize == PointerSize::k32, "Unexpected x86 pointer size"
 static constexpr size_t kNativeStackAlignment = 16;  // IA-32 cdecl requires 16 byte alignment.
 static_assert(kNativeStackAlignment == kStackAlignment);
 
-// Get the size of "out args" for @CriticalNative method stub.
+// Get the size of the arguments for a native call.
+inline size_t GetNativeOutArgsSize(size_t num_args, size_t num_long_or_double_args) {
+  size_t num_arg_words = num_args + num_long_or_double_args;
+  return num_arg_words * static_cast<size_t>(kX86PointerSize);
+}
+
+// Get stack args size for @CriticalNative method calls.
+inline size_t GetCriticalNativeCallArgsSize(std::string_view shorty) {
+  size_t num_long_or_double_args =
+      std::count_if(shorty.begin() + 1, shorty.end(), [](char c) { return c == 'J' || c == 'D'; });
+
+  return GetNativeOutArgsSize(/*num_args=*/ shorty.length() - 1u, num_long_or_double_args);
+}
+
+// Get the frame size for @CriticalNative method stub.
 // This must match the size of the frame emitted by the JNI compiler at the native call site.
-inline size_t GetCriticalNativeOutArgsSize(const char* shorty, uint32_t shorty_len) {
-  DCHECK_EQ(shorty_len, strlen(shorty));
-
-  size_t num_long_or_double_args = 0u;
-  for (size_t i = 1; i != shorty_len; ++i) {
-    if (shorty[i] == 'J' || shorty[i] == 'D') {
-      num_long_or_double_args += 1u;
-    }
-  }
-  size_t num_arg_words = shorty_len - 1u + num_long_or_double_args;
-
+inline size_t GetCriticalNativeStubFrameSize(std::string_view shorty) {
   // The size of outgoing arguments.
-  size_t size = num_arg_words * static_cast<size_t>(kX86PointerSize);
+  size_t size = GetCriticalNativeCallArgsSize(shorty);
 
-  // Add return address size.
-  size += kFramePointerSize;
   // We can make a tail call if there are no stack args and the return type is not
   // FP type (needs moving from ST0 to MMX0) and we do not need to extend the result.
   bool return_type_ok = shorty[0] == 'I' || shorty[0] == 'J' || shorty[0] == 'V';
-  if (return_type_ok && size == kFramePointerSize) {
-    return kFramePointerSize;
+  if (return_type_ok && size == 0u) {
+    return 0u;
   }
 
+  // Add return address size.
+  size += kFramePointerSize;
+  return RoundUp(size, kNativeStackAlignment);
+}
+
+// Get the frame size for direct call to a @CriticalNative method.
+// This must match the size of the extra frame emitted by the compiler at the native call site.
+inline size_t GetCriticalNativeDirectCallFrameSize(std::string_view shorty) {
+  // The size of outgoing arguments.
+  size_t size = GetCriticalNativeCallArgsSize(shorty);
+
+  // No return PC to save, zero- and sign-extension and FP value moves are handled by the caller.
   return RoundUp(size, kNativeStackAlignment);
 }
 
@@ -65,4 +80,3 @@ inline size_t GetCriticalNativeOutArgsSize(const char* shorty, uint32_t shorty_l
 }  // namespace art
 
 #endif  // ART_RUNTIME_ARCH_X86_JNI_FRAME_X86_H_
-

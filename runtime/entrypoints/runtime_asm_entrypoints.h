@@ -19,16 +19,13 @@
 
 #include "deoptimization_kind.h"
 
+#include "base/macros.h"
 #include "jni.h"
 
-namespace art {
+namespace art HIDDEN {
 
 class ArtMethod;
 class Thread;
-
-#ifndef BUILDING_LIBART
-#error "File and symbols only for use within libart."
-#endif
 
 extern "C" void* art_jni_dlsym_lookup_stub(JNIEnv*, jobject);
 static inline const void* GetJniDlsymLookupStub() {
@@ -82,23 +79,13 @@ static inline const void* GetQuickDeoptimizationEntryPoint() {
   return reinterpret_cast<const void*>(art_quick_deoptimize);
 }
 
-// Return address of instrumentation entry point used by non-interpreter based tracing.
-extern "C" void art_quick_instrumentation_entry(void*);
-static inline const void* GetQuickInstrumentationEntryPoint() {
-  return reinterpret_cast<const void*>(art_quick_instrumentation_entry);
-}
-
 // Stub to deoptimize from compiled code.
 extern "C" void art_quick_deoptimize_from_compiled_code(DeoptimizationKind);
 
-// The return_pc of instrumentation exit stub.
-extern "C" void art_quick_instrumentation_exit();
-static inline const void* GetQuickInstrumentationExitPc() {
-  return reinterpret_cast<const void*>(art_quick_instrumentation_exit);
-}
-
 extern "C" void* art_quick_string_builder_append(uint32_t format);
 extern "C" void art_quick_compile_optimized(ArtMethod*, Thread*);
+extern "C" void art_quick_method_entry_hook(ArtMethod*, Thread*);
+extern "C" int32_t art_quick_method_exit_hook(Thread*, ArtMethod*, uint64_t*, uint64_t*);
 
 }  // namespace art
 

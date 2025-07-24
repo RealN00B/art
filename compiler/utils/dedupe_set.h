@@ -23,7 +23,7 @@
 
 #include "base/macros.h"
 
-namespace art {
+namespace art HIDDEN {
 
 class Thread;
 
@@ -44,6 +44,8 @@ class DedupeSet {
   DedupeSet(const char* set_name, const Alloc& alloc);
 
   ~DedupeSet();
+
+  size_t Size(Thread* self) const;
 
   std::string DumpStats(Thread* self) const;
 

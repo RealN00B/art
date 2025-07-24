@@ -19,9 +19,11 @@
 #include "base/casts.h"
 #include "base/memory_region.h"
 #include "entrypoints/quick/quick_entrypoints.h"
+#include "indirect_reference_table.h"
+#include "lock_word.h"
 #include "thread.h"
 
-namespace art {
+namespace art HIDDEN {
 namespace x86_64 {
 
 static dwarf::Reg DWARFReg(Register reg) {
@@ -93,7 +95,7 @@ void X86_64JNIMacroAssembler::BuildFrame(size_t frame_size,
 
 void X86_64JNIMacroAssembler::RemoveFrame(size_t frame_size,
                                           ArrayRef<const ManagedRegister> spill_regs,
-                                          bool may_suspend ATTRIBUTE_UNUSED) {
+                                          [[maybe_unused]] bool may_suspend) {
   CHECK_ALIGNED(frame_size, kNativeStackAlignment);
   cfi().RememberState();
   int gpr_count = 0;
@@ -151,43 +153,46 @@ void X86_64JNIMacroAssembler::DecreaseFrameSize(size_t adjust) {
   DecreaseFrameSizeImpl(adjust, &asm_);
 }
 
+ManagedRegister X86_64JNIMacroAssembler::CoreRegisterWithSize(ManagedRegister src, size_t size) {
+  DCHECK(src.AsX86_64().IsCpuRegister());
+  DCHECK(size == 4u || size == 8u) << size;
+  return src;
+}
+
 void X86_64JNIMacroAssembler::Store(FrameOffset offs, ManagedRegister msrc, size_t size) {
+  Store(X86_64ManagedRegister::FromCpuRegister(RSP), MemberOffset(offs.Int32Value()), msrc, size);
+}
+
+void X86_64JNIMacroAssembler::Store(ManagedRegister mbase,
+                                    MemberOffset offs,
+                                    ManagedRegister msrc,
+                                    size_t size) {
+  X86_64ManagedRegister base = mbase.AsX86_64();
   X86_64ManagedRegister src = msrc.AsX86_64();
   if (src.IsNoRegister()) {
     CHECK_EQ(0u, size);
   } else if (src.IsCpuRegister()) {
     if (size == 4) {
       CHECK_EQ(4u, size);
-      __ movl(Address(CpuRegister(RSP), offs), src.AsCpuRegister());
+      __ movl(Address(base.AsCpuRegister(), offs), src.AsCpuRegister());
     } else {
       CHECK_EQ(8u, size);
-      __ movq(Address(CpuRegister(RSP), offs), src.AsCpuRegister());
+      __ movq(Address(base.AsCpuRegister(), offs), src.AsCpuRegister());
     }
-  } else if (src.IsRegisterPair()) {
-    CHECK_EQ(0u, size);
-    __ movq(Address(CpuRegister(RSP), offs), src.AsRegisterPairLow());
-    __ movq(Address(CpuRegister(RSP), FrameOffset(offs.Int32Value()+4)),
-            src.AsRegisterPairHigh());
   } else if (src.IsX87Register()) {
     if (size == 4) {
-      __ fstps(Address(CpuRegister(RSP), offs));
+      __ fstps(Address(base.AsCpuRegister(), offs));
     } else {
-      __ fstpl(Address(CpuRegister(RSP), offs));
+      __ fstpl(Address(base.AsCpuRegister(), offs));
     }
   } else {
     CHECK(src.IsXmmRegister());
     if (size == 4) {
-      __ movss(Address(CpuRegister(RSP), offs), src.AsXmmRegister());
+      __ movss(Address(base.AsCpuRegister(), offs), src.AsXmmRegister());
     } else {
-      __ movsd(Address(CpuRegister(RSP), offs), src.AsXmmRegister());
+      __ movsd(Address(base.AsCpuRegister(), offs), src.AsXmmRegister());
     }
   }
-}
-
-void X86_64JNIMacroAssembler::StoreRef(FrameOffset dest, ManagedRegister msrc) {
-  X86_64ManagedRegister src = msrc.AsX86_64();
-  CHECK(src.IsCpuRegister());
-  __ movl(Address(CpuRegister(RSP), dest), src.AsCpuRegister());
 }
 
 void X86_64JNIMacroAssembler::StoreRawPtr(FrameOffset dest, ManagedRegister msrc) {
@@ -196,118 +201,51 @@ void X86_64JNIMacroAssembler::StoreRawPtr(FrameOffset dest, ManagedRegister msrc
   __ movq(Address(CpuRegister(RSP), dest), src.AsCpuRegister());
 }
 
-void X86_64JNIMacroAssembler::StoreImmediateToFrame(FrameOffset dest, uint32_t imm) {
-  __ movl(Address(CpuRegister(RSP), dest), Immediate(imm));  // TODO(64) movq?
-}
-
-void X86_64JNIMacroAssembler::StoreStackOffsetToThread(ThreadOffset64 thr_offs,
-                                                       FrameOffset fr_offs) {
-  CpuRegister scratch = GetScratchRegister();
-  __ leaq(scratch, Address(CpuRegister(RSP), fr_offs));
-  __ gs()->movq(Address::Absolute(thr_offs, true), scratch);
-}
-
-void X86_64JNIMacroAssembler::StoreStackPointerToThread(ThreadOffset64 thr_offs) {
-  __ gs()->movq(Address::Absolute(thr_offs, true), CpuRegister(RSP));
-}
-
-void X86_64JNIMacroAssembler::StoreSpanning(FrameOffset /*dst*/,
-                                            ManagedRegister /*src*/,
-                                            FrameOffset /*in_off*/) {
-  UNIMPLEMENTED(FATAL);  // this case only currently exists for ARM
+void X86_64JNIMacroAssembler::StoreStackPointerToThread(ThreadOffset64 thr_offs, bool tag_sp) {
+  if (tag_sp) {
+    CpuRegister reg = GetScratchRegister();
+    __ movq(reg, CpuRegister(RSP));
+    __ orq(reg, Immediate(0x2));
+    __ gs()->movq(Address::Absolute(thr_offs, true), reg);
+  } else {
+    __ gs()->movq(Address::Absolute(thr_offs, true), CpuRegister(RSP));
+  }
 }
 
 void X86_64JNIMacroAssembler::Load(ManagedRegister mdest, FrameOffset src, size_t size) {
+  Load(mdest, X86_64ManagedRegister::FromCpuRegister(RSP), MemberOffset(src.Int32Value()), size);
+}
+
+void X86_64JNIMacroAssembler::Load(ManagedRegister mdest,
+                                   ManagedRegister mbase,
+                                   MemberOffset offs,
+                                   size_t size) {
   X86_64ManagedRegister dest = mdest.AsX86_64();
+  X86_64ManagedRegister base = mbase.AsX86_64();
   if (dest.IsNoRegister()) {
     CHECK_EQ(0u, size);
   } else if (dest.IsCpuRegister()) {
     if (size == 4) {
       CHECK_EQ(4u, size);
-      __ movl(dest.AsCpuRegister(), Address(CpuRegister(RSP), src));
+      __ movl(dest.AsCpuRegister(), Address(base.AsCpuRegister(), offs));
     } else {
       CHECK_EQ(8u, size);
-      __ movq(dest.AsCpuRegister(), Address(CpuRegister(RSP), src));
+      __ movq(dest.AsCpuRegister(), Address(base.AsCpuRegister(), offs));
     }
-  } else if (dest.IsRegisterPair()) {
-    CHECK_EQ(0u, size);
-    __ movq(dest.AsRegisterPairLow(), Address(CpuRegister(RSP), src));
-    __ movq(dest.AsRegisterPairHigh(), Address(CpuRegister(RSP), FrameOffset(src.Int32Value()+4)));
   } else if (dest.IsX87Register()) {
     if (size == 4) {
-      __ flds(Address(CpuRegister(RSP), src));
+      __ flds(Address(base.AsCpuRegister(), offs));
     } else {
-      __ fldl(Address(CpuRegister(RSP), src));
+      __ fldl(Address(base.AsCpuRegister(), offs));
     }
   } else {
     CHECK(dest.IsXmmRegister());
     if (size == 4) {
-      __ movss(dest.AsXmmRegister(), Address(CpuRegister(RSP), src));
+      __ movss(dest.AsXmmRegister(), Address(base.AsCpuRegister(), offs));
     } else {
-      __ movsd(dest.AsXmmRegister(), Address(CpuRegister(RSP), src));
+      __ movsd(dest.AsXmmRegister(), Address(base.AsCpuRegister(), offs));
     }
   }
-}
-
-void X86_64JNIMacroAssembler::LoadFromThread(ManagedRegister mdest,
-                                             ThreadOffset64 src, size_t size) {
-  X86_64ManagedRegister dest = mdest.AsX86_64();
-  if (dest.IsNoRegister()) {
-    CHECK_EQ(0u, size);
-  } else if (dest.IsCpuRegister()) {
-    if (size == 1u) {
-      __ gs()->movzxb(dest.AsCpuRegister(), Address::Absolute(src, true));
-    } else {
-      CHECK_EQ(4u, size);
-      __ gs()->movl(dest.AsCpuRegister(), Address::Absolute(src, true));
-    }
-  } else if (dest.IsRegisterPair()) {
-    CHECK_EQ(8u, size);
-    __ gs()->movq(dest.AsRegisterPairLow(), Address::Absolute(src, true));
-  } else if (dest.IsX87Register()) {
-    if (size == 4) {
-      __ gs()->flds(Address::Absolute(src, true));
-    } else {
-      __ gs()->fldl(Address::Absolute(src, true));
-    }
-  } else {
-    CHECK(dest.IsXmmRegister());
-    if (size == 4) {
-      __ gs()->movss(dest.AsXmmRegister(), Address::Absolute(src, true));
-    } else {
-      __ gs()->movsd(dest.AsXmmRegister(), Address::Absolute(src, true));
-    }
-  }
-}
-
-void X86_64JNIMacroAssembler::LoadRef(ManagedRegister mdest, FrameOffset src) {
-  X86_64ManagedRegister dest = mdest.AsX86_64();
-  CHECK(dest.IsCpuRegister());
-  __ movq(dest.AsCpuRegister(), Address(CpuRegister(RSP), src));
-}
-
-void X86_64JNIMacroAssembler::LoadRef(ManagedRegister mdest,
-                                      ManagedRegister mbase,
-                                      MemberOffset offs,
-                                      bool unpoison_reference) {
-  X86_64ManagedRegister base = mbase.AsX86_64();
-  X86_64ManagedRegister dest = mdest.AsX86_64();
-  CHECK(base.IsCpuRegister());
-  CHECK(dest.IsCpuRegister());
-  __ movl(dest.AsCpuRegister(), Address(base.AsCpuRegister(), offs));
-  if (unpoison_reference) {
-    __ MaybeUnpoisonHeapReference(dest.AsCpuRegister());
-  }
-}
-
-void X86_64JNIMacroAssembler::LoadRawPtr(ManagedRegister mdest,
-                                         ManagedRegister mbase,
-                                         Offset offs) {
-  X86_64ManagedRegister base = mbase.AsX86_64();
-  X86_64ManagedRegister dest = mdest.AsX86_64();
-  CHECK(base.IsCpuRegister());
-  CHECK(dest.IsCpuRegister());
-  __ movq(dest.AsCpuRegister(), Address(base.AsCpuRegister(), offs));
 }
 
 void X86_64JNIMacroAssembler::LoadRawPtrFromThread(ManagedRegister mdest, ThreadOffset64 offs) {
@@ -339,8 +277,12 @@ void X86_64JNIMacroAssembler::ZeroExtend(ManagedRegister mreg, size_t size) {
 }
 
 void X86_64JNIMacroAssembler::MoveArguments(ArrayRef<ArgumentLocation> dests,
-                                            ArrayRef<ArgumentLocation> srcs) {
-  DCHECK_EQ(dests.size(), srcs.size());
+                                            ArrayRef<ArgumentLocation> srcs,
+                                            ArrayRef<FrameOffset> refs) {
+  size_t arg_count = dests.size();
+  DCHECK_EQ(arg_count, srcs.size());
+  DCHECK_EQ(arg_count, refs.size());
+
   auto get_mask = [](ManagedRegister reg) -> uint32_t {
     X86_64ManagedRegister x86_64_reg = reg.AsX86_64();
     if (x86_64_reg.IsCpuRegister()) {
@@ -354,14 +296,31 @@ void X86_64JNIMacroAssembler::MoveArguments(ArrayRef<ArgumentLocation> dests,
       return (1u << 16u) << xmm_reg_number;
     }
   };
+
   // Collect registers to move while storing/copying args to stack slots.
+  // Convert all register references and copied stack references to `jobject`.
   uint32_t src_regs = 0u;
   uint32_t dest_regs = 0u;
-  for (size_t i = 0, arg_count = srcs.size(); i != arg_count; ++i) {
+  for (size_t i = 0; i != arg_count; ++i) {
     const ArgumentLocation& src = srcs[i];
     const ArgumentLocation& dest = dests[i];
-    DCHECK_EQ(src.GetSize(), dest.GetSize());
+    const FrameOffset ref = refs[i];
+    if (ref != kInvalidReferenceOffset) {
+      DCHECK_EQ(src.GetSize(), kObjectReferenceSize);
+      DCHECK_EQ(dest.GetSize(), static_cast<size_t>(kX86_64PointerSize));
+    } else {
+      DCHECK_EQ(src.GetSize(), dest.GetSize());
+    }
+    if (src.IsRegister() && ref != kInvalidReferenceOffset) {
+      // Note: We can clobber `src` here as the register cannot hold more than one argument.
+      //       This overload of `CreateJObject()` is currently implemented as "test and branch";
+      //       if it was using a conditional move, it would be better to do this at move time.
+      CreateJObject(src.GetRegister(), ref, src.GetRegister(), /*null_allowed=*/ i != 0u);
+    }
     if (dest.IsRegister()) {
+      // Note: X86_64ManagedRegister makes no distinction between 32-bit and 64-bit core
+      // registers, so the following `Equals()` can return `true` for references; the
+      // reference has already been converted to `jobject` above.
       if (src.IsRegister() && src.GetRegister().Equals(dest.GetRegister())) {
         // Nothing to do.
       } else {
@@ -373,18 +332,22 @@ void X86_64JNIMacroAssembler::MoveArguments(ArrayRef<ArgumentLocation> dests,
     } else {
       if (src.IsRegister()) {
         Store(dest.GetFrameOffset(), src.GetRegister(), dest.GetSize());
+      } else if (ref != kInvalidReferenceOffset) {
+        CreateJObject(dest.GetFrameOffset(), ref, /*null_allowed=*/ i != 0u);
       } else {
         Copy(dest.GetFrameOffset(), src.GetFrameOffset(), dest.GetSize());
       }
     }
   }
-  // Fill destination registers.
+
+  // Fill destination registers. Convert loaded references to `jobject`.
   // There should be no cycles, so this simple algorithm should make progress.
   while (dest_regs != 0u) {
     uint32_t old_dest_regs = dest_regs;
-    for (size_t i = 0, arg_count = srcs.size(); i != arg_count; ++i) {
+    for (size_t i = 0; i != arg_count; ++i) {
       const ArgumentLocation& src = srcs[i];
       const ArgumentLocation& dest = dests[i];
+      const FrameOffset ref = refs[i];
       if (!dest.IsRegister()) {
         continue;  // Stored in first loop above.
       }
@@ -398,6 +361,9 @@ void X86_64JNIMacroAssembler::MoveArguments(ArrayRef<ArgumentLocation> dests,
       if (src.IsRegister()) {
         Move(dest.GetRegister(), src.GetRegister(), dest.GetSize());
         src_regs &= ~get_mask(src.GetRegister());  // Allow clobbering source register.
+      } else if (ref != kInvalidReferenceOffset) {
+        CreateJObject(
+            dest.GetRegister(), ref, ManagedRegister::NoRegister(), /*null_allowed=*/ i != 0u);
       } else {
         Load(dest.GetRegister(), src.GetFrameOffset(), dest.GetSize());
       }
@@ -435,37 +401,10 @@ void X86_64JNIMacroAssembler::Move(ManagedRegister mdest, ManagedRegister msrc, 
   }
 }
 
-void X86_64JNIMacroAssembler::CopyRef(FrameOffset dest, FrameOffset src) {
-  CpuRegister scratch = GetScratchRegister();
-  __ movl(scratch, Address(CpuRegister(RSP), src));
-  __ movl(Address(CpuRegister(RSP), dest), scratch);
-}
 
-void X86_64JNIMacroAssembler::CopyRef(FrameOffset dest,
-                                      ManagedRegister base,
-                                      MemberOffset offs,
-                                      bool unpoison_reference) {
-  CpuRegister scratch = GetScratchRegister();
-  __ movl(scratch, Address(base.AsX86_64().AsCpuRegister(), offs));
-  if (unpoison_reference) {
-    __ MaybeUnpoisonHeapReference(scratch);
-  }
-  __ movl(Address(CpuRegister(RSP), dest), scratch);
-}
-
-void X86_64JNIMacroAssembler::CopyRawPtrFromThread(FrameOffset fr_offs, ThreadOffset64 thr_offs) {
-  CpuRegister scratch = GetScratchRegister();
-  __ gs()->movq(scratch, Address::Absolute(thr_offs, true));
-  __ movq(Address(CpuRegister(RSP), fr_offs), scratch);
-}
-
-void X86_64JNIMacroAssembler::CopyRawPtrToThread(ThreadOffset64 thr_offs,
-                                                 FrameOffset fr_offs,
-                                                 ManagedRegister mscratch) {
-  X86_64ManagedRegister scratch = mscratch.AsX86_64();
-  CHECK(scratch.IsCpuRegister());
-  Load(scratch, fr_offs, 8);
-  __ gs()->movq(Address::Absolute(thr_offs, true), scratch.AsCpuRegister());
+void X86_64JNIMacroAssembler::Move(ManagedRegister mdest, size_t value) {
+  X86_64ManagedRegister dest = mdest.AsX86_64();
+  __ movq(dest.AsCpuRegister(), Immediate(value));
 }
 
 void X86_64JNIMacroAssembler::Copy(FrameOffset dest, FrameOffset src, size_t size) {
@@ -480,78 +419,17 @@ void X86_64JNIMacroAssembler::Copy(FrameOffset dest, FrameOffset src, size_t siz
   }
 }
 
-void X86_64JNIMacroAssembler::Copy(FrameOffset /*dst*/,
-                                   ManagedRegister /*src_base*/,
-                                   Offset /*src_offset*/,
-                                   ManagedRegister /*scratch*/,
-                                   size_t /*size*/) {
-  UNIMPLEMENTED(FATAL);
-}
-
-void X86_64JNIMacroAssembler::Copy(ManagedRegister dest_base,
-                                   Offset dest_offset,
-                                   FrameOffset src,
-                                   ManagedRegister scratch,
-                                   size_t size) {
-  CHECK(scratch.IsNoRegister());
-  CHECK_EQ(size, 4u);
-  __ pushq(Address(CpuRegister(RSP), src));
-  __ popq(Address(dest_base.AsX86_64().AsCpuRegister(), dest_offset));
-}
-
-void X86_64JNIMacroAssembler::Copy(FrameOffset dest,
-                                   FrameOffset src_base,
-                                   Offset src_offset,
-                                   ManagedRegister mscratch,
-                                   size_t size) {
-  CpuRegister scratch = mscratch.AsX86_64().AsCpuRegister();
-  CHECK_EQ(size, 4u);
-  __ movq(scratch, Address(CpuRegister(RSP), src_base));
-  __ movq(scratch, Address(scratch, src_offset));
-  __ movq(Address(CpuRegister(RSP), dest), scratch);
-}
-
-void X86_64JNIMacroAssembler::Copy(ManagedRegister dest,
-                                   Offset dest_offset,
-                                   ManagedRegister src,
-                                   Offset src_offset,
-                                   ManagedRegister scratch,
-                                   size_t size) {
-  CHECK_EQ(size, 4u);
-  CHECK(scratch.IsNoRegister());
-  __ pushq(Address(src.AsX86_64().AsCpuRegister(), src_offset));
-  __ popq(Address(dest.AsX86_64().AsCpuRegister(), dest_offset));
-}
-
-void X86_64JNIMacroAssembler::Copy(FrameOffset dest,
-                                   Offset dest_offset,
-                                   FrameOffset src,
-                                   Offset src_offset,
-                                   ManagedRegister mscratch,
-                                   size_t size) {
-  CpuRegister scratch = mscratch.AsX86_64().AsCpuRegister();
-  CHECK_EQ(size, 4u);
-  CHECK_EQ(dest.Int32Value(), src.Int32Value());
-  __ movq(scratch, Address(CpuRegister(RSP), src));
-  __ pushq(Address(scratch, src_offset));
-  __ popq(Address(scratch, dest_offset));
-}
-
-void X86_64JNIMacroAssembler::MemoryBarrier(ManagedRegister) {
-  __ mfence();
-}
-
-void X86_64JNIMacroAssembler::CreateHandleScopeEntry(ManagedRegister mout_reg,
-                                                     FrameOffset handle_scope_offset,
-                                                     ManagedRegister min_reg,
-                                                     bool null_allowed) {
+void X86_64JNIMacroAssembler::CreateJObject(ManagedRegister mout_reg,
+                                            FrameOffset spilled_reference_offset,
+                                            ManagedRegister min_reg,
+                                            bool null_allowed) {
   X86_64ManagedRegister out_reg = mout_reg.AsX86_64();
   X86_64ManagedRegister in_reg = min_reg.AsX86_64();
   if (in_reg.IsNoRegister()) {  // TODO(64): && null_allowed
     // Use out_reg as indicator of null.
     in_reg = out_reg;
     // TODO: movzwl
-    __ movl(in_reg.AsCpuRegister(), Address(CpuRegister(RSP), handle_scope_offset));
+    __ movl(in_reg.AsCpuRegister(), Address(CpuRegister(RSP), spilled_reference_offset));
   }
   CHECK(in_reg.IsCpuRegister());
   CHECK(out_reg.IsCpuRegister());
@@ -563,45 +441,41 @@ void X86_64JNIMacroAssembler::CreateHandleScopeEntry(ManagedRegister mout_reg,
     }
     __ testl(in_reg.AsCpuRegister(), in_reg.AsCpuRegister());
     __ j(kZero, &null_arg);
-    __ leaq(out_reg.AsCpuRegister(), Address(CpuRegister(RSP), handle_scope_offset));
+    __ leaq(out_reg.AsCpuRegister(), Address(CpuRegister(RSP), spilled_reference_offset));
     __ Bind(&null_arg);
   } else {
-    __ leaq(out_reg.AsCpuRegister(), Address(CpuRegister(RSP), handle_scope_offset));
+    __ leaq(out_reg.AsCpuRegister(), Address(CpuRegister(RSP), spilled_reference_offset));
   }
 }
 
-void X86_64JNIMacroAssembler::CreateHandleScopeEntry(FrameOffset out_off,
-                                                     FrameOffset handle_scope_offset,
-                                                     bool null_allowed) {
+void X86_64JNIMacroAssembler::CreateJObject(FrameOffset out_off,
+                                            FrameOffset spilled_reference_offset,
+                                            bool null_allowed) {
   CpuRegister scratch = GetScratchRegister();
   if (null_allowed) {
     Label null_arg;
-    __ movl(scratch, Address(CpuRegister(RSP), handle_scope_offset));
+    __ movl(scratch, Address(CpuRegister(RSP), spilled_reference_offset));
     __ testl(scratch, scratch);
     __ j(kZero, &null_arg);
-    __ leaq(scratch, Address(CpuRegister(RSP), handle_scope_offset));
+    __ leaq(scratch, Address(CpuRegister(RSP), spilled_reference_offset));
     __ Bind(&null_arg);
   } else {
-    __ leaq(scratch, Address(CpuRegister(RSP), handle_scope_offset));
+    __ leaq(scratch, Address(CpuRegister(RSP), spilled_reference_offset));
   }
   __ movq(Address(CpuRegister(RSP), out_off), scratch);
 }
 
-// Given a handle scope entry, load the associated reference.
-void X86_64JNIMacroAssembler::LoadReferenceFromHandleScope(ManagedRegister mout_reg,
-                                                           ManagedRegister min_reg) {
-  X86_64ManagedRegister out_reg = mout_reg.AsX86_64();
-  X86_64ManagedRegister in_reg = min_reg.AsX86_64();
-  CHECK(out_reg.IsCpuRegister());
-  CHECK(in_reg.IsCpuRegister());
-  Label null_arg;
-  if (!out_reg.Equals(in_reg)) {
-    __ xorl(out_reg.AsCpuRegister(), out_reg.AsCpuRegister());
-  }
-  __ testl(in_reg.AsCpuRegister(), in_reg.AsCpuRegister());
-  __ j(kZero, &null_arg);
-  __ movq(out_reg.AsCpuRegister(), Address(in_reg.AsCpuRegister(), 0));
-  __ Bind(&null_arg);
+void X86_64JNIMacroAssembler::DecodeJNITransitionOrLocalJObject(ManagedRegister reg,
+                                                                JNIMacroLabel* slow_path,
+                                                                JNIMacroLabel* resume) {
+  constexpr uint64_t kGlobalOrWeakGlobalMask = IndirectReferenceTable::GetGlobalOrWeakGlobalMask();
+  constexpr uint64_t kIndirectRefKindMask = IndirectReferenceTable::GetIndirectRefKindMask();
+  // TODO: Add `testq()` with `imm32` to assembler to avoid using 64-bit pointer as 32-bit value.
+  __ testl(reg.AsX86_64().AsCpuRegister(), Immediate(kGlobalOrWeakGlobalMask));
+  __ j(kNotZero, X86_64JNIMacroLabel::Cast(slow_path)->AsX86_64());
+  __ andq(reg.AsX86_64().AsCpuRegister(), Immediate(~kIndirectRefKindMask));
+  __ j(kZero, X86_64JNIMacroLabel::Cast(resume)->AsX86_64());  // Skip load for null.
+  __ movl(reg.AsX86_64().AsCpuRegister(), Address(reg.AsX86_64().AsCpuRegister(), /*disp=*/ 0));
 }
 
 void X86_64JNIMacroAssembler::VerifyObject(ManagedRegister /*src*/, bool /*could_be_null*/) {
@@ -625,12 +499,6 @@ void X86_64JNIMacroAssembler::Call(ManagedRegister mbase, Offset offset) {
   // TODO: place reference map on call
 }
 
-void X86_64JNIMacroAssembler::Call(FrameOffset base, Offset offset) {
-  CpuRegister scratch = GetScratchRegister();
-  __ movq(scratch, Address(CpuRegister(RSP), base));
-  __ call(Address(scratch, offset));
-}
-
 void X86_64JNIMacroAssembler::CallFromThread(ThreadOffset64 offset) {
   __ gs()->call(Address::Absolute(offset, true));
 }
@@ -646,25 +514,103 @@ void X86_64JNIMacroAssembler::GetCurrentThread(FrameOffset offset) {
   __ movq(Address(CpuRegister(RSP), offset), scratch);
 }
 
-// Slowpath entered when Thread::Current()->_exception is non-null
-class X86_64ExceptionSlowPath final : public SlowPath {
- public:
-  explicit X86_64ExceptionSlowPath(size_t stack_adjust) : stack_adjust_(stack_adjust) {}
-  void Emit(Assembler *sp_asm) override;
- private:
-  const size_t stack_adjust_;
-};
+void X86_64JNIMacroAssembler::TryToTransitionFromRunnableToNative(
+    JNIMacroLabel* label, [[maybe_unused]] ArrayRef<const ManagedRegister> scratch_regs) {
+  constexpr uint32_t kNativeStateValue = Thread::StoredThreadStateValue(ThreadState::kNative);
+  constexpr uint32_t kRunnableStateValue = Thread::StoredThreadStateValue(ThreadState::kRunnable);
+  constexpr ThreadOffset64 thread_flags_offset = Thread::ThreadFlagsOffset<kX86_64PointerSize>();
+  constexpr ThreadOffset64 thread_held_mutex_mutator_lock_offset =
+      Thread::HeldMutexOffset<kX86_64PointerSize>(kMutatorLock);
 
-void X86_64JNIMacroAssembler::ExceptionPoll(size_t stack_adjust) {
-  X86_64ExceptionSlowPath* slow = new (__ GetAllocator()) X86_64ExceptionSlowPath(stack_adjust);
-  __ GetBuffer()->EnqueueSlowPath(slow);
+  CpuRegister rax(RAX);  // RAX can be freely clobbered. It does not hold any argument.
+  CpuRegister scratch = GetScratchRegister();
+
+  // CAS release, old_value = kRunnableStateValue, new_value = kNativeStateValue, no flags.
+  static_assert(kRunnableStateValue == 0u);
+  __ xorl(rax, rax);
+  __ movl(scratch, Immediate(kNativeStateValue));
+  __ gs()->LockCmpxchgl(Address::Absolute(thread_flags_offset.Uint32Value(), /*no_rip=*/ true),
+                        scratch);
+  // LOCK CMPXCHG has full barrier semantics, so we don't need barriers here.
+  // If any flags are set, go to the slow path.
+  __ j(kNotZero, X86_64JNIMacroLabel::Cast(label)->AsX86_64());
+
+  // Clear `self->tlsPtr_.held_mutexes[kMutatorLock]`.
+  __ gs()->movq(
+      Address::Absolute(thread_held_mutex_mutator_lock_offset.Uint32Value(), /*no_rip=*/ true),
+      Immediate(0));
+}
+
+void X86_64JNIMacroAssembler::TryToTransitionFromNativeToRunnable(
+    JNIMacroLabel* label,
+    ArrayRef<const ManagedRegister> scratch_regs,
+    ManagedRegister return_reg) {
+  constexpr uint32_t kNativeStateValue = Thread::StoredThreadStateValue(ThreadState::kNative);
+  constexpr uint32_t kRunnableStateValue = Thread::StoredThreadStateValue(ThreadState::kRunnable);
+  constexpr ThreadOffset64 thread_flags_offset = Thread::ThreadFlagsOffset<kX86_64PointerSize>();
+  constexpr ThreadOffset64 thread_held_mutex_mutator_lock_offset =
+      Thread::HeldMutexOffset<kX86_64PointerSize>(kMutatorLock);
+  constexpr ThreadOffset64 thread_mutator_lock_offset =
+      Thread::MutatorLockOffset<kX86_64PointerSize>();
+
+  DCHECK_GE(scratch_regs.size(), 2u);
+  DCHECK(!scratch_regs[0].AsX86_64().Overlaps(return_reg.AsX86_64()));
+  CpuRegister scratch = scratch_regs[0].AsX86_64().AsCpuRegister();
+  DCHECK(!scratch_regs[1].AsX86_64().Overlaps(return_reg.AsX86_64()));
+  CpuRegister saved_rax = scratch_regs[1].AsX86_64().AsCpuRegister();
+  CpuRegister rax(RAX);
+  bool preserve_rax = return_reg.AsX86_64().Overlaps(X86_64ManagedRegister::FromCpuRegister(RAX));
+
+  // CAS acquire, old_value = kNativeStateValue, new_value = kRunnableStateValue, no flags.
+  if (preserve_rax) {
+    __ movq(saved_rax, rax);  // Save RAX.
+  }
+  __ movl(rax, Immediate(kNativeStateValue));
+  static_assert(kRunnableStateValue == 0u);
+  __ xorl(scratch, scratch);
+  __ gs()->LockCmpxchgl(Address::Absolute(thread_flags_offset.Uint32Value(), /*no_rip=*/ true),
+                        scratch);
+  // LOCK CMPXCHG has full barrier semantics, so we don't need barriers here.
+  if (preserve_rax) {
+    __ movq(rax, saved_rax);  // Restore RAX; MOV does not change flags.
+  }
+  // If any flags are set, or the state is not Native, go to the slow path.
+  // (While the thread can theoretically transition between different Suspended states,
+  // it would be very unexpected to see a state other than Native at this point.)
+  __ j(kNotZero, X86_64JNIMacroLabel::Cast(label)->AsX86_64());
+
+  // Set `self->tlsPtr_.held_mutexes[kMutatorLock]` to the mutator lock.
+  __ gs()->movq(scratch,
+                Address::Absolute(thread_mutator_lock_offset.Uint32Value(), /*no_rip=*/ true));
+  __ gs()->movq(
+      Address::Absolute(thread_held_mutex_mutator_lock_offset.Uint32Value(), /*no_rip=*/ true),
+      scratch);
+}
+
+void X86_64JNIMacroAssembler::SuspendCheck(JNIMacroLabel* label) {
+  __ gs()->testl(Address::Absolute(Thread::ThreadFlagsOffset<kX86_64PointerSize>(), true),
+                 Immediate(Thread::SuspendOrCheckpointRequestFlags()));
+  __ j(kNotZero, X86_64JNIMacroLabel::Cast(label)->AsX86_64());
+}
+
+void X86_64JNIMacroAssembler::ExceptionPoll(JNIMacroLabel* label) {
   __ gs()->cmpl(Address::Absolute(Thread::ExceptionOffset<kX86_64PointerSize>(), true),
                 Immediate(0));
-  __ j(kNotEqual, slow->Entry());
+  __ j(kNotEqual, X86_64JNIMacroLabel::Cast(label)->AsX86_64());
+}
+
+void X86_64JNIMacroAssembler::DeliverPendingException() {
+  // Pass exception as argument in RDI
+  __ gs()->movq(CpuRegister(RDI),
+                Address::Absolute(Thread::ExceptionOffset<kX86_64PointerSize>(), true));
+  __ gs()->call(
+      Address::Absolute(QUICK_ENTRYPOINT_OFFSET(kX86_64PointerSize, pDeliverException), true));
+  // this call should never return
+  __ int3();
 }
 
 std::unique_ptr<JNIMacroLabel> X86_64JNIMacroAssembler::CreateLabel() {
-  return std::unique_ptr<JNIMacroLabel>(new X86_64JNIMacroLabel());
+  return std::unique_ptr<JNIMacroLabel>(new (asm_.GetAllocator()) X86_64JNIMacroLabel());
 }
 
 void X86_64JNIMacroAssembler::Jump(JNIMacroLabel* label) {
@@ -672,28 +618,42 @@ void X86_64JNIMacroAssembler::Jump(JNIMacroLabel* label) {
   __ jmp(X86_64JNIMacroLabel::Cast(label)->AsX86_64());
 }
 
-void X86_64JNIMacroAssembler::TestGcMarking(JNIMacroLabel* label, JNIMacroUnaryCondition cond) {
-  CHECK(label != nullptr);
-
-  art::x86_64::Condition x86_64_cond;
+static Condition UnaryConditionToX86_64Condition(JNIMacroUnaryCondition cond) {
   switch (cond) {
     case JNIMacroUnaryCondition::kZero:
-      x86_64_cond = art::x86_64::kZero;
-      break;
+      return kZero;
     case JNIMacroUnaryCondition::kNotZero:
-      x86_64_cond = art::x86_64::kNotZero;
-      break;
-    default:
-      LOG(FATAL) << "Not implemented condition: " << static_cast<int>(cond);
-      UNREACHABLE();
+      return kNotZero;
   }
+}
+
+void X86_64JNIMacroAssembler::TestGcMarking(JNIMacroLabel* label, JNIMacroUnaryCondition cond) {
+  CHECK(label != nullptr);
 
   // CMP self->tls32_.is_gc_marking, 0
   // Jcc <Offset>
   DCHECK_EQ(Thread::IsGcMarkingSize(), 4u);
   __ gs()->cmpl(Address::Absolute(Thread::IsGcMarkingOffset<kX86_64PointerSize>(), true),
                 Immediate(0));
-  __ j(x86_64_cond, X86_64JNIMacroLabel::Cast(label)->AsX86_64());
+  __ j(UnaryConditionToX86_64Condition(cond), X86_64JNIMacroLabel::Cast(label)->AsX86_64());
+}
+
+void X86_64JNIMacroAssembler::TestMarkBit(ManagedRegister mref,
+                                          JNIMacroLabel* label,
+                                          JNIMacroUnaryCondition cond) {
+  DCHECK(kUseBakerReadBarrier);
+  CpuRegister ref = mref.AsX86_64().AsCpuRegister();
+  static_assert(LockWord::kMarkBitStateSize == 1u);
+  __ testl(Address(ref, mirror::Object::MonitorOffset().SizeValue()),
+           Immediate(LockWord::kMarkBitStateMaskShifted));
+  __ j(UnaryConditionToX86_64Condition(cond), X86_64JNIMacroLabel::Cast(label)->AsX86_64());
+}
+
+void X86_64JNIMacroAssembler::TestByteAndJumpIfNotZero(uintptr_t address, JNIMacroLabel* label) {
+  CpuRegister scratch = GetScratchRegister();
+  __ movq(scratch, Immediate(address));
+  __ cmpb(Address(scratch, 0), Immediate(0));
+  __ j(kNotZero, X86_64JNIMacroLabel::Cast(label)->AsX86_64());
 }
 
 void X86_64JNIMacroAssembler::Bind(JNIMacroLabel* label) {
@@ -702,24 +662,6 @@ void X86_64JNIMacroAssembler::Bind(JNIMacroLabel* label) {
 }
 
 #undef __
-
-void X86_64ExceptionSlowPath::Emit(Assembler *sasm) {
-  X86_64Assembler* sp_asm = down_cast<X86_64Assembler*>(sasm);
-#define __ sp_asm->
-  __ Bind(&entry_);
-  // Note: the return value is dead
-  if (stack_adjust_ != 0) {  // Fix up the frame.
-    DecreaseFrameSizeImpl(stack_adjust_, sp_asm);
-  }
-  // Pass exception as argument in RDI
-  __ gs()->movq(CpuRegister(RDI),
-                Address::Absolute(Thread::ExceptionOffset<kX86_64PointerSize>(), true));
-  __ gs()->call(
-      Address::Absolute(QUICK_ENTRYPOINT_OFFSET(kX86_64PointerSize, pDeliverException), true));
-  // this call should never return
-  __ int3();
-#undef __
-}
 
 }  // namespace x86_64
 }  // namespace art

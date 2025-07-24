@@ -26,8 +26,9 @@
 #include "arch/arm/registers_arm.h"
 #include "base/casts.h"
 #include "base/globals.h"
+#include "base/macros.h"
 
-namespace art {
+namespace art HIDDEN {
 namespace arm {
 
 // Defines constants and accessor classes to assemble, disassemble and
@@ -49,13 +50,6 @@ enum DmbOptions {
   ISHST = 0xa,
   NSH = 0x7,
   NSHST = 0x6
-};
-
-enum ScaleFactor {
-  TIMES_1 = 0,
-  TIMES_2 = 1,
-  TIMES_4 = 2,
-  TIMES_8 = 3
 };
 
 // Values for double-precision floating point registers.
@@ -126,8 +120,7 @@ enum Opcode {
 const int kRegisterSize = 4;
 
 // List of registers used in load/store multiple.
-typedef uint16_t RegList;
-
+using RegList = uint16_t;
 
 }  // namespace arm
 }  // namespace art

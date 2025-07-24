@@ -17,25 +17,23 @@
 #ifndef ART_ADBCONNECTION_ADBCONNECTION_H_
 #define ART_ADBCONNECTION_ADBCONNECTION_H_
 
+#include <jni.h>
 #include <stdint.h>
-#include <memory>
-#include <vector>
-#include <limits>
-
-#include "android-base/unique_fd.h"
-#include "adbconnection/client.h"
-
-#include "base/mutex.h"
-#include "base/array_ref.h"
-#include "runtime_callbacks.h"
-
 #include <sys/socket.h>
 #include <sys/un.h>
-#include <jni.h>
+
+#include <limits>
+#include <memory>
+#include <string>
+#include <vector>
+
+#include "adbconnection/client.h"
+#include "base/array_ref.h"
+#include "base/mutex.h"
+#include "runtime_callbacks.h"
 
 namespace adbconnection {
 
-static constexpr char kJdwpControlName[] = "\0jdwp-control";
 static constexpr char kAdbConnectionThreadName[] = "ADB-JDWP Connection Control Thread";
 
 // The default jdwp agent name.
@@ -72,6 +70,21 @@ struct AdbConnectionDdmCallback : public art::DdmCallback {
   AdbConnectionState* connection_;
 };
 
+struct AdbConnectionAppInfoCallback : public art::AppInfoCallback {
+  explicit AdbConnectionAppInfoCallback(AdbConnectionState* connection) : connection_(connection) {}
+
+  void AddApplication(const std::string& package_name) REQUIRES_SHARED(art::Locks::mutator_lock_);
+  void RemoveApplication(const std::string& package_name)
+      REQUIRES_SHARED(art::Locks::mutator_lock_);
+  void SetCurrentProcessName(const std::string& process_name)
+      REQUIRES_SHARED(art::Locks::mutator_lock_);
+  void SetWaitingForDebugger(bool waiting) REQUIRES_SHARED(art::Locks::mutator_lock_);
+  void SetUserId(int uid) REQUIRES_SHARED(art::Locks::mutator_lock_);
+
+ private:
+  AdbConnectionState* connection_;
+};
+
 class AdbConnectionState {
  public:
   explicit AdbConnectionState(const std::string& name);
@@ -85,6 +98,15 @@ class AdbConnectionState {
   // hand-shaking yet.
   void PublishDdmData(uint32_t type, const art::ArrayRef<const uint8_t>& data);
 
+  // Wake up the poll. Call this if the set of interesting event has changed. They will be
+  // recalculated and poll will be called again via fdevent write. This wakeup  relies on fdevent
+  // and should be ACKed via AcknowledgeWakeup.
+  void WakeupPollLoop();
+
+  // After a call to WakeupPollLoop, the fdevent internal counter should be decreased via
+  // this method. This should be called after WakeupPollLoop was called and poll triggered.
+  void AcknowledgeWakeup();
+
   // Stops debugger threads during shutdown.
   void StopDebuggerThreads();
 
@@ -92,6 +114,22 @@ class AdbConnectionState {
   bool DebuggerThreadsStarted() {
     return started_debugger_threads_;
   }
+
+  // Should be called by Framework when it changes its process name.
+  void SetCurrentProcessName(const std::string& process_name);
+
+  // Should be called by Framework when it adds an app to a process.
+  // This can be called several times (see android:process)
+  void AddApplication(const std::string& package_name);
+
+  // Should be called by Framework when it removes an app from a process.
+  void RemoveApplication(const std::string& package_name);
+
+  // Should be called by Framework when its debugging state changes.
+  void SetWaitingForDebugger(bool waiting);
+
+  // Should be called by Framework when the UserID is known.
+  void SetUserId(int uid);
 
  private:
   uint32_t NextDdmId();
@@ -102,8 +140,6 @@ class AdbConnectionState {
   bool SetupAdbConnection();
 
   std::string MakeAgentArg();
-
-  android::base::unique_fd ReadFdFromAdb();
 
   void SendAgentFds(bool require_handshake);
 
@@ -126,6 +162,7 @@ class AdbConnectionState {
 
   AdbConnectionDebuggerController controller_;
   AdbConnectionDdmCallback ddm_callback_;
+  AdbConnectionAppInfoCallback appinfo_callback_;
 
   // Eventfd used to allow the StopDebuggerThreads function to wake up sleeping threads
   android::base::unique_fd sleep_event_fd_;
@@ -163,7 +200,7 @@ class AdbConnectionState {
 
   std::atomic<bool> sent_agent_fds_;
 
-  bool performed_handshake_;
+  std::atomic<bool> performed_handshake_;
 
   bool notified_ddm_active_;
 

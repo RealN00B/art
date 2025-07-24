@@ -18,18 +18,17 @@
 
 #include <memory>
 #include <ostream>
+#include <string_view>
 
 #include <stdio.h>
 
 #include "art_method.h"
 
 // For DumpNativeStack.
-#include <backtrace/Backtrace.h>
-#include <backtrace/BacktraceMap.h>
+#include <unwindstack/AndroidUnwinder.h>
 
 #if defined(__linux__)
 
-#include <memory>
 #include <vector>
 
 #include <linux/unistd.h>
@@ -54,13 +53,13 @@
 #include "base/utils.h"
 #include "class_linker.h"
 #include "entrypoints/runtime_asm_entrypoints.h"
-#include "oat_quick_method_header.h"
+#include "oat/oat_quick_method_header.h"
 #include "runtime.h"
 #include "thread-current-inl.h"
 
 #endif
 
-namespace art {
+namespace art HIDDEN {
 
 #if defined(__linux__)
 
@@ -69,15 +68,16 @@ using android::base::StringPrintf;
 static constexpr bool kUseAddr2line = !kIsTargetBuild;
 
 std::string FindAddr2line() {
-  if (!kIsTargetBuild) {
-    constexpr const char* kAddr2linePrebuiltPath =
-      "/prebuilts/gcc/linux-x86/host/x86_64-linux-glibc2.17-4.8/bin/x86_64-linux-addr2line";
-    const char* env_value = getenv("ANDROID_BUILD_TOP");
-    if (env_value != nullptr) {
-      return std::string(env_value) + kAddr2linePrebuiltPath;
-    }
-  }
-  return std::string("/usr/bin/addr2line");
+#if !defined(ART_TARGET) && !defined(ART_CLANG_PATH)
+  #error "ART_CLANG_PATH must be defined on host build"
+#endif
+#if defined(ART_CLANG_PATH)
+  const char* env_value = getenv("ANDROID_BUILD_TOP");
+  std::string_view top(env_value != nullptr ? env_value : ".");
+  return std::string(top) + "/" + ART_CLANG_PATH + "/bin/llvm-addr2line";
+#else
+  return std::string("llvm-addr2line");
+#endif
 }
 
 ALWAYS_INLINE
@@ -236,7 +236,7 @@ static void Addr2line(const std::string& map_src,
                       std::unique_ptr<Addr2linePipe>* pipe /* inout */) {
   std::array<const char*, 3> kIgnoreSuffixes{ ".dex", ".jar", ".vdex" };
   for (const char* ignore_suffix : kIgnoreSuffixes) {
-    if (android::base::EndsWith(map_src, ignore_suffix)) {
+    if (map_src.ends_with(ignore_suffix)) {
       // Ignore file names that do not have map information addr2line can consume. e.g. vdex
       // files are special frames injected for the interpreter so they don't have any line
       // number information available.
@@ -274,7 +274,7 @@ static void Addr2line(const std::string& map_src,
   }
 
   // Send the offset.
-  const std::string hex_offset = StringPrintf("%zx\n", offset);
+  const std::string hex_offset = StringPrintf("0x%zx\n", offset);
 
   if (!pipe_ptr->out.WriteFully(hex_offset.data(), hex_offset.length())) {
     // Error. :-(
@@ -289,6 +289,10 @@ static void Addr2line(const std::string& map_src,
 static bool RunCommand(const std::string& cmd) {
   FILE* stream = popen(cmd.c_str(), "r");
   if (stream) {
+    // Consume the stdout until we encounter EOF when the tool exits.
+    // Otherwise the tool would complain to stderr when the stream is closed.
+    char buffer[64];
+    while (fread(buffer, 1, sizeof(buffer), stream) == sizeof(buffer)) {}
     pclose(stream);
     return true;
   } else {
@@ -296,50 +300,51 @@ static bool RunCommand(const std::string& cmd) {
   }
 }
 
-static bool PcIsWithinQuickCode(ArtMethod* method, uintptr_t pc) NO_THREAD_SAFETY_ANALYSIS {
-  const void* entry_point = method->GetEntryPointFromQuickCompiledCode();
-  if (entry_point == nullptr) {
-    return pc == 0;
+// Remove method parameters by finding matching top-level parenthesis and removing them.
+// Since functions can be defined inside functions, this can remove multiple substrings.
+std::string StripParameters(std::string name) {
+  size_t end = name.size();
+  int nesting = 0;
+  for (ssize_t i = name.size() - 1; i > 0; i--) {
+    if (name[i] == ')' && nesting++ == 0) {
+      end = i + 1;
+    }
+    if (name[i] == '(' && --nesting == 0) {
+      name = name.erase(i, end - i);
+    }
   }
-  ClassLinker* class_linker = Runtime::Current()->GetClassLinker();
-  if (class_linker->IsQuickGenericJniStub(entry_point) ||
-      class_linker->IsQuickResolutionStub(entry_point) ||
-      class_linker->IsQuickToInterpreterBridge(entry_point)) {
-    return false;
-  }
-  // The backtrace library might have heuristically subracted instruction
-  // size from the pc, to pretend the pc is at the calling instruction.
-  if (reinterpret_cast<uintptr_t>(GetQuickInstrumentationExitPc()) - pc <= 4) {
-    return false;
-  }
-  uintptr_t code = reinterpret_cast<uintptr_t>(EntryPointToCodePointer(entry_point));
-  uintptr_t code_size = reinterpret_cast<const OatQuickMethodHeader*>(code)[-1].GetCodeSize();
-  return code <= pc && pc <= (code + code_size);
+  return name;
 }
 
 void DumpNativeStack(std::ostream& os,
                      pid_t tid,
-                     BacktraceMap* existing_map,
+                     const char* prefix,
+                     ArtMethod* current_method,
+                     void* ucontext_ptr,
+                     bool skip_frames) {
+  unwindstack::AndroidLocalUnwinder unwinder;
+  DumpNativeStack(os, unwinder, tid, prefix, current_method, ucontext_ptr, skip_frames);
+}
+
+void DumpNativeStack(std::ostream& os,
+                     unwindstack::AndroidLocalUnwinder& unwinder,
+                     pid_t tid,
                      const char* prefix,
                      ArtMethod* current_method,
                      void* ucontext_ptr,
                      bool skip_frames) {
   // Historical note: This was disabled when running under Valgrind (b/18119146).
 
-  BacktraceMap* map = existing_map;
-  std::unique_ptr<BacktraceMap> tmp_map;
-  if (map == nullptr) {
-    tmp_map.reset(BacktraceMap::Create(getpid()));
-    map = tmp_map.get();
+  unwindstack::AndroidUnwinderData data(!skip_frames /*show_all_frames*/);
+  bool unwind_ret;
+  if (ucontext_ptr != nullptr) {
+    unwind_ret = unwinder.Unwind(ucontext_ptr, data);
+  } else {
+    unwind_ret = unwinder.Unwind(tid, data);
   }
-  std::unique_ptr<Backtrace> backtrace(Backtrace::Create(BACKTRACE_CURRENT_PROCESS, tid, map));
-  backtrace->SetSkipFrames(skip_frames);
-  if (!backtrace->Unwind(0, reinterpret_cast<ucontext*>(ucontext_ptr))) {
-    os << prefix << "(backtrace::Unwind failed for thread " << tid
-       << ": " <<  backtrace->GetErrorString(backtrace->GetError()) << ")" << std::endl;
-    return;
-  } else if (backtrace->NumFrames() == 0) {
-    os << prefix << "(no native stack frames for thread " << tid << ")" << std::endl;
+  if (!unwind_ret) {
+    os << prefix << "(Unwind failed for thread " << tid << ": "
+       <<  data.GetErrorString() << ")" << std::endl;
     return;
   }
 
@@ -354,9 +359,9 @@ void DumpNativeStack(std::ostream& os,
   }
 
   std::unique_ptr<Addr2linePipe> addr2line_state;
-
-  for (Backtrace::const_iterator it = backtrace->begin();
-       it != backtrace->end(); ++it) {
+  data.DemangleFunctionNames();
+  bool holds_mutator_lock =  Locks::mutator_lock_->IsSharedHeld(Thread::Current());
+  for (const unwindstack::FrameData& frame : data.frames) {
     // We produce output like this:
     // ]    #00 pc 000075bb8  /system/lib/libc.so (unwind_backtrace_thread+536)
     // In order for parsing tools to continue to function, the stack dump
@@ -365,49 +370,57 @@ void DumpNativeStack(std::ostream& os,
     // The parsers require a single space before and after pc, and two spaces
     // after the <RELATIVE_ADDR>. There can be any prefix data before the
     // #XX. <RELATIVE_ADDR> has to be a hex number but with no 0x prefix.
-    os << prefix << StringPrintf("#%02zu pc ", it->num);
+    os << prefix << StringPrintf("#%02zu pc ", frame.num);
     bool try_addr2line = false;
-    if (!BacktraceMap::IsValid(it->map)) {
-      os << StringPrintf(Is64BitInstructionSet(kRuntimeISA) ? "%016" PRIx64 "  ???"
-                                                            : "%08" PRIx64 "  ???",
-                         it->pc);
+    if (frame.map_info == nullptr) {
+      os << StringPrintf("%08" PRIx64 "  ???", frame.pc);
     } else {
-      os << StringPrintf(Is64BitInstructionSet(kRuntimeISA) ? "%016" PRIx64 "  "
-                                                            : "%08" PRIx64 "  ",
-                         it->rel_pc);
-      if (it->map.name.empty()) {
-        os << StringPrintf("<anonymous:%" PRIx64 ">", it->map.start);
+      os << StringPrintf("%08" PRIx64 "  ", frame.rel_pc);
+      const std::shared_ptr<unwindstack::MapInfo>& map_info = frame.map_info;
+      if (map_info->name().empty()) {
+        os << StringPrintf("<anonymous:%" PRIx64 ">", map_info->start());
       } else {
-        os << it->map.name;
+        os << map_info->name().c_str();
       }
-      if (it->map.offset != 0) {
-        os << StringPrintf(" (offset %" PRIx64 ")", it->map.offset);
+      if (map_info->elf_start_offset() != 0) {
+        os << StringPrintf(" (offset %" PRIx64 ")", map_info->elf_start_offset());
       }
       os << " (";
-      if (!it->func_name.empty()) {
-        os << it->func_name;
-        if (it->func_offset != 0) {
-          os << "+" << it->func_offset;
+      if (!frame.function_name.empty()) {
+        // Remove parameters from the printed function name to improve signal/noise in the logs.
+        // Also, ANRs are often trimmed, so printing less means we get more useful data out.
+        // We can still symbolize the function based on the PC and build-id (including inlining).
+        os << StripParameters(frame.function_name.c_str());
+        if (frame.function_offset != 0) {
+          os << "+" << frame.function_offset;
         }
         // Functions found using the gdb jit interface will be in an empty
         // map that cannot be found using addr2line.
-        if (!it->map.name.empty()) {
+        if (!map_info->name().empty()) {
           try_addr2line = true;
         }
-      } else if (current_method != nullptr &&
-          Locks::mutator_lock_->IsSharedHeld(Thread::Current()) &&
-          PcIsWithinQuickCode(current_method, it->pc)) {
-        const void* start_of_code = current_method->GetEntryPointFromQuickCompiledCode();
-        os << current_method->JniLongName() << "+"
-           << (it->pc - reinterpret_cast<uint64_t>(start_of_code));
+      } else if (current_method != nullptr && holds_mutator_lock) {
+        const OatQuickMethodHeader* header = current_method->GetOatQuickMethodHeader(frame.pc);
+        if (header != nullptr) {
+          const void* start_of_code = header->GetCode();
+          os << current_method->JniLongName() << "+"
+             << (frame.pc - reinterpret_cast<uint64_t>(start_of_code));
+        } else {
+          os << "???";
+        }
       } else {
         os << "???";
       }
       os << ")";
+      std::string build_id = map_info->GetPrintableBuildID();
+      if (!build_id.empty()) {
+        os << " (BuildId: " << build_id << ")";
+      }
     }
     os << std::endl;
     if (try_addr2line && use_addr2line) {
-      Addr2line(it->map.name, it->rel_pc, os, prefix, &addr2line_state);
+      // Guaranteed that map_info is not nullptr and name is non-empty.
+      Addr2line(frame.map_info->name(), frame.rel_pc, os, prefix, &addr2line_state);
     }
   }
 
@@ -418,14 +431,20 @@ void DumpNativeStack(std::ostream& os,
 
 #elif defined(__APPLE__)
 
-void DumpNativeStack(std::ostream& os ATTRIBUTE_UNUSED,
-                     pid_t tid ATTRIBUTE_UNUSED,
-                     BacktraceMap* existing_map ATTRIBUTE_UNUSED,
-                     const char* prefix ATTRIBUTE_UNUSED,
-                     ArtMethod* current_method ATTRIBUTE_UNUSED,
-                     void* ucontext_ptr ATTRIBUTE_UNUSED,
-                     bool skip_frames ATTRIBUTE_UNUSED) {
-}
+void DumpNativeStack([[maybe_unused]] std::ostream& os,
+                     [[maybe_unused]] pid_t tid,
+                     [[maybe_unused]] const char* prefix,
+                     [[maybe_unused]] ArtMethod* current_method,
+                     [[maybe_unused]] void* ucontext_ptr,
+                     [[maybe_unused]] bool skip_frames) {}
+
+void DumpNativeStack([[maybe_unused]] std::ostream& os,
+                     [[maybe_unused]] unwindstack::AndroidLocalUnwinder& existing_map,
+                     [[maybe_unused]] pid_t tid,
+                     [[maybe_unused]] const char* prefix,
+                     [[maybe_unused]] ArtMethod* current_method,
+                     [[maybe_unused]] void* ucontext_ptr,
+                     [[maybe_unused]] bool skip_frames) {}
 
 #else
 #error "Unsupported architecture for native stack dumps."

@@ -19,9 +19,9 @@
 #include "nativehelper/jni_macros.h"
 
 #include "art_method-inl.h"
-#include "base/enums.h"
+#include "base/pointer_size.h"
 #include "class_linker.h"
-#include "class_root.h"
+#include "class_root-inl.h"
 #include "dex/dex_file_annotations.h"
 #include "jni/jni_internal.h"
 #include "mirror/class-alloc-inl.h"
@@ -33,9 +33,8 @@
 #include "native_util.h"
 #include "reflection.h"
 #include "scoped_fast_native_object_access-inl.h"
-#include "well_known_classes.h"
 
-namespace art {
+namespace art HIDDEN {
 
 static jobjectArray Constructor_getExceptionTypes(JNIEnv* env, jobject javaMethod) {
   ScopedFastNativeObjectAccess soa(env);
@@ -105,7 +104,7 @@ static jobject Constructor_newInstance0(JNIEnv* env, jobject javaMethod, jobject
 
   // String constructor is replaced by a StringFactory method in InvokeMethod.
   if (UNLIKELY(c->IsStringClass())) {
-    return InvokeMethod(soa, javaMethod, nullptr, javaArgs, 2);
+    return InvokeMethod<kRuntimePointerSize>(soa, javaMethod, nullptr, javaArgs, 2);
   }
 
   ObjPtr<mirror::Object> receiver =
@@ -121,11 +120,13 @@ static jobject Constructor_newInstance0(JNIEnv* env, jobject javaMethod, jobject
   return javaReceiver;
 }
 
-static jobject Constructor_newInstanceFromSerialization(JNIEnv* env, jclass unused ATTRIBUTE_UNUSED,
-                                                        jclass ctorClass, jclass allocClass) {
-    jmethodID ctor = env->GetMethodID(ctorClass, "<init>", "()V");
-    DCHECK(ctor != nullptr);
-    return env->NewObject(allocClass, ctor);
+static jobject Constructor_newInstanceFromSerialization(JNIEnv* env,
+                                                        [[maybe_unused]] jclass unused,
+                                                        jclass ctorClass,
+                                                        jclass allocClass) {
+  jmethodID ctor = env->GetMethodID(ctorClass, "<init>", "()V");
+  DCHECK(ctor != nullptr);
+  return env->NewObject(allocClass, ctor);
 }
 
 static JNINativeMethod gMethods[] = {

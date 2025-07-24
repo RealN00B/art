@@ -17,11 +17,9 @@
 # This script undoes (most of) the work done by tools/buildbot-setup-device.sh.
 # Make sure to keep these files in sync.
 
-if [ -t 1 ]; then
-  # Color sequences if terminal is a tty.
-  green='\033[0;32m'
-  nc='\033[0m'
-fi
+. "$(dirname $0)/buildbot-utils.sh"
+
+[[ -n "$ART_TEST_ON_VM" ]] && exit 0
 
 # Setup as root, as some actions performed here require it.
 adb root
@@ -34,7 +32,7 @@ if [[ -n "$ART_TEST_CHROOT" ]]; then
   if adb shell test -d "$ART_TEST_CHROOT"; then
     # Display users of the chroot dir.
 
-    echo -e "${green}List open files under chroot dir $ART_TEST_CHROOT${nc}"
+    msginfo "List open files under chroot dir $ART_TEST_CHROOT"
     adb shell lsof | grep "$ART_TEST_CHROOT"
 
     # for_all_chroot_process ACTION
@@ -64,12 +62,12 @@ if [[ -n "$ART_TEST_CHROOT" ]]; then
       echo "$cmdline (PID: $pid)"
     }
 
-    echo -e "${green}List processes running from binaries under chroot dir $ART_TEST_CHROOT${nc}"
+    msginfo "List processes running from binaries under chroot dir $ART_TEST_CHROOT"
     for_all_chroot_process display_process
 
     # Tear down the chroot dir.
 
-    echo -e "${green}Tear down the chroot set up in $ART_TEST_CHROOT${nc}"
+    msginfo "Tear down the chroot set up in $ART_TEST_CHROOT"
 
     # remove_filesystem_from_chroot DIR-IN-CHROOT FSTYPE REMOVE-DIR-IN-CHROOT
     # -----------------------------------------------------------------------
@@ -83,7 +81,7 @@ if [[ -n "$ART_TEST_CHROOT" ]]; then
       local remove_dir=$3
       local dir="$ART_TEST_CHROOT/$dir_in_chroot"
       adb shell test -d "$dir" \
-        && adb shell mount | grep -q "^$fstype on $dir type $fstype " \
+        && adb shell mount | grep -q " on $dir type $fstype " \
         && if adb shell umount "$dir"; then
              $remove_dir && adb shell rmdir "$dir"
            else
@@ -92,16 +90,22 @@ if [[ -n "$ART_TEST_CHROOT" ]]; then
            fi
     }
 
+    # Remove /bin symlink from chroot.
+    adb shell rm -f "$ART_TEST_CHROOT/bin"
+
     # Remove /apex from chroot.
     adb shell rm -rf "$ART_TEST_CHROOT/apex"
 
     # Remove /dev from chroot.
+    remove_filesystem_from_chroot dev/cpuset cgroup false
+    remove_filesystem_from_chroot dev/pts devpts false
     remove_filesystem_from_chroot dev tmpfs true
 
-    # Remove /sys/kernel/debug from chroot.
-    # The /sys/kernel/debug directory under the chroot dir cannot be
-    # deleted, as it is part of the host device's /sys filesystem.
+    # Remove /sys/kernel/{debug,tracing} from chroot.
+    # The /sys/kernel/{debug,tracing} directories under the chroot dir cannot be
+    # deleted, as they are part of the host device's /sys filesystem.
     remove_filesystem_from_chroot sys/kernel/debug debugfs false
+    remove_filesystem_from_chroot sys/kernel/tracing tracefs false
     # Remove /sys from chroot.
     remove_filesystem_from_chroot sys sysfs true
 
@@ -140,8 +144,8 @@ if [[ -n "$ART_TEST_CHROOT" ]]; then
       adb shell kill -9 "$pid"
     }
 
-    echo -e "${green}Kill processes still running from binaries under" \
-      "chroot dir $ART_TEST_CHROOT (if any)${nc} "
+    msginfo "Kill processes" \
+      "still running from binaries under chroot dir $ART_TEST_CHROOT (if any)"
     for_all_chroot_process kill_process
   fi
 fi

@@ -33,23 +33,17 @@
 #include "nth_caller_visitor.h"
 #include "scoped_thread_state_change.h"
 #include "thread-current-inl.h"
+#include "thread-inl.h"
 #include "thread_list.h"
 
-namespace art {
+namespace art HIDDEN {
 
 using android::base::StringPrintf;
 
 static constexpr size_t kMonitorsInitial = 32;  // Arbitrary.
-static constexpr size_t kMonitorsMax = 4096;  // Arbitrary sanity check.
+static constexpr size_t kMonitorsMax = 4096;  // Maximum number of monitors held by JNI code.
 
 const JNINativeInterface* JNIEnvExt::table_override_ = nullptr;
-
-bool JNIEnvExt::CheckLocalsValid(JNIEnvExt* in) NO_THREAD_SAFETY_ANALYSIS {
-  if (in == nullptr) {
-    return false;
-  }
-  return in->locals_.IsValid();
-}
 
 jint JNIEnvExt::GetEnvHandler(JavaVMExt* vm, /*out*/void** env, jint version) {
   UNUSED(vm);
@@ -66,18 +60,17 @@ jint JNIEnvExt::GetEnvHandler(JavaVMExt* vm, /*out*/void** env, jint version) {
 }
 
 JNIEnvExt* JNIEnvExt::Create(Thread* self_in, JavaVMExt* vm_in, std::string* error_msg) {
-  std::unique_ptr<JNIEnvExt> ret(new JNIEnvExt(self_in, vm_in, error_msg));
-  if (CheckLocalsValid(ret.get())) {
-    return ret.release();
+  std::unique_ptr<JNIEnvExt> ret(new JNIEnvExt(self_in, vm_in));
+  if (!ret->Initialize(error_msg)) {
+    return nullptr;
   }
-  return nullptr;
+  return ret.release();
 }
 
-JNIEnvExt::JNIEnvExt(Thread* self_in, JavaVMExt* vm_in, std::string* error_msg)
+JNIEnvExt::JNIEnvExt(Thread* self_in, JavaVMExt* vm_in)
     : self_(self_in),
       vm_(vm_in),
-      local_ref_cookie_(kIRTFirstSegment),
-      locals_(kLocalsInitial, kLocal, IndirectReferenceTable::ResizableCapacity::kYes, error_msg),
+      locals_(vm_in->IsCheckJniEnabled()),
       monitors_("monitors", kMonitorsInitial, kMonitorsMax),
       critical_(0),
       check_jni_(false),
@@ -86,6 +79,10 @@ JNIEnvExt::JNIEnvExt(Thread* self_in, JavaVMExt* vm_in, std::string* error_msg)
   check_jni_ = vm_in->IsCheckJniEnabled();
   functions = GetFunctionTable(check_jni_);
   unchecked_functions_ = GetJniNativeInterface();
+}
+
+bool JNIEnvExt::Initialize(std::string* error_msg) {
+  return locals_.Initialize(/*max_count=*/ 1u, error_msg);
 }
 
 void JNIEnvExt::SetFunctionsToRuntimeShutdownFunctions() {
@@ -100,9 +97,9 @@ jobject JNIEnvExt::NewLocalRef(mirror::Object* obj) {
     return nullptr;
   }
   std::string error_msg;
-  jobject ref = reinterpret_cast<jobject>(locals_.Add(local_ref_cookie_, obj, &error_msg));
+  jobject ref = reinterpret_cast<jobject>(locals_.Add(obj, &error_msg));
   if (UNLIKELY(ref == nullptr)) {
-    // This is really unexpected if we allow resizing local IRTs...
+    // This is really unexpected if we allow resizing LRTs...
     LOG(FATAL) << error_msg;
     UNREACHABLE();
   }
@@ -111,12 +108,13 @@ jobject JNIEnvExt::NewLocalRef(mirror::Object* obj) {
 
 void JNIEnvExt::DeleteLocalRef(jobject obj) {
   if (obj != nullptr) {
-    locals_.Remove(local_ref_cookie_, reinterpret_cast<IndirectRef>(obj));
+    locals_.Remove(reinterpret_cast<IndirectRef>(obj));
   }
 }
 
 void JNIEnvExt::SetCheckJniEnabled(bool enabled) {
   check_jni_ = enabled;
+  locals_.SetCheckJniEnabled(enabled);
   MutexLock mu(Thread::Current(), *Locks::jni_function_table_lock_);
   functions = GetFunctionTable(enabled);
   // Check whether this is a no-op because of override.
@@ -132,13 +130,11 @@ void JNIEnvExt::DumpReferenceTables(std::ostream& os) {
 
 void JNIEnvExt::PushFrame(int capacity) {
   DCHECK_GE(locals_.FreeCapacity(), static_cast<size_t>(capacity));
-  stacked_local_ref_cookies_.push_back(local_ref_cookie_);
-  local_ref_cookie_ = locals_.GetSegmentState();
+  stacked_local_ref_cookies_.push_back(PushLocalReferenceFrame());
 }
 
 void JNIEnvExt::PopFrame() {
-  locals_.SetSegmentState(local_ref_cookie_);
-  local_ref_cookie_ = stacked_local_ref_cookies_.back();
+  PopLocalReferenceFrame(stacked_local_ref_cookies_.back());
   stacked_local_ref_cookies_.pop_back();
 }
 
@@ -146,28 +142,28 @@ void JNIEnvExt::PopFrame() {
 //       are tests in jni_internal_test to match the results against the actual values.
 
 // This is encoding the knowledge of the structure and layout of JNIEnv fields.
-static size_t JNIEnvSize(size_t pointer_size) {
+static size_t JNIEnvSize(PointerSize pointer_size) {
   // A single pointer.
-  return pointer_size;
+  return static_cast<size_t>(pointer_size);
 }
 
-Offset JNIEnvExt::SegmentStateOffset(size_t pointer_size) {
-  size_t locals_offset = JNIEnvSize(pointer_size) +
-                         2 * pointer_size +          // Thread* self + JavaVMExt* vm.
-                         4 +                         // local_ref_cookie.
-                         (pointer_size - 4);         // Padding.
-  size_t irt_segment_state_offset =
-      IndirectReferenceTable::SegmentStateOffset(pointer_size).Int32Value();
-  return Offset(locals_offset + irt_segment_state_offset);
+inline MemberOffset JNIEnvExt::LocalReferenceTableOffset(PointerSize pointer_size) {
+  return MemberOffset(JNIEnvSize(pointer_size) +
+                      2 * static_cast<size_t>(pointer_size));  // Thread* self + JavaVMExt* vm
 }
 
-Offset JNIEnvExt::LocalRefCookieOffset(size_t pointer_size) {
-  return Offset(JNIEnvSize(pointer_size) +
-                2 * pointer_size);          // Thread* self + JavaVMExt* vm
+MemberOffset JNIEnvExt::LrtSegmentStateOffset(PointerSize pointer_size) {
+  return MemberOffset(LocalReferenceTableOffset(pointer_size).SizeValue() +
+                      jni::LocalReferenceTable::SegmentStateOffset().SizeValue());
 }
 
-Offset JNIEnvExt::SelfOffset(size_t pointer_size) {
-  return Offset(JNIEnvSize(pointer_size));
+MemberOffset JNIEnvExt::LrtPreviousStateOffset(PointerSize pointer_size) {
+  return MemberOffset(LocalReferenceTableOffset(pointer_size).SizeValue() +
+                      jni::LocalReferenceTable::PreviousStateOffset().SizeValue());
+}
+
+MemberOffset JNIEnvExt::SelfOffset(PointerSize pointer_size) {
+  return MemberOffset(JNIEnvSize(pointer_size));
 }
 
 // Use some defining part of the caller's frame as the identifying mark for the JNI segment.
@@ -290,7 +286,7 @@ void JNIEnvExt::CheckNoHeldMonitors() {
   }
 }
 
-void ThreadResetFunctionTable(Thread* thread, void* arg ATTRIBUTE_UNUSED)
+void ThreadResetFunctionTable(Thread* thread, [[maybe_unused]] void* arg)
     REQUIRES(Locks::jni_function_table_lock_) {
   JNIEnvExt* env = thread->GetJniEnv();
   bool check_jni = env->IsCheckJniEnabled();

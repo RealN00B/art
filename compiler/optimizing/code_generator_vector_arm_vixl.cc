@@ -20,7 +20,7 @@
 namespace vixl32 = vixl::aarch32;
 using namespace vixl32;  // NOLINT(build/namespaces)
 
-namespace art {
+namespace art HIDDEN {
 namespace arm {
 
 using helpers::DRegisterFrom;
@@ -640,7 +640,7 @@ static void CreateVecShiftLocations(ArenaAllocator* allocator, HVecBinaryOperati
     case DataType::Type::kInt16:
     case DataType::Type::kInt32:
       locations->SetInAt(0, Location::RequiresFpuRegister());
-      locations->SetInAt(1, Location::ConstantLocation(instruction->InputAt(1)->AsConstant()));
+      locations->SetInAt(1, Location::ConstantLocation(instruction->InputAt(1)));
       locations->SetOut(Location::RequiresFpuRegister(), Location::kNoOutputOverlap);
       break;
     default:
@@ -749,7 +749,7 @@ void LocationsBuilderARMVIXL::VisitVecSetScalars(HVecSetScalars* instruction) {
 
   switch (instruction->GetPackedType()) {
     case DataType::Type::kInt32:
-      locations->SetInAt(0, is_zero ? Location::ConstantLocation(input->AsConstant())
+      locations->SetInAt(0, is_zero ? Location::ConstantLocation(input)
                                     : Location::RequiresRegister());
       locations->SetOut(Location::RequiresFpuRegister());
       break;
@@ -958,7 +958,8 @@ void InstructionCodeGeneratorARMVIXL::VisitVecLoad(HVecLoad* instruction) {
   UseScratchRegisterScope temps(GetVIXLAssembler());
   vixl32::Register scratch;
 
-  DCHECK(instruction->GetPackedType() != DataType::Type::kUint16 || !instruction->IsStringCharAt());
+  DCHECK_IMPLIES(instruction->GetPackedType() == DataType::Type::kUint16,
+                 !instruction->IsStringCharAt());
 
   switch (instruction->GetPackedType()) {
     case DataType::Type::kBool:
@@ -1046,6 +1047,148 @@ void InstructionCodeGeneratorARMVIXL::VisitVecStore(HVecStore* instruction) {
       LOG(FATAL) << "Unsupported SIMD type: " << instruction->GetPackedType();
       UNREACHABLE();
   }
+}
+
+void LocationsBuilderARMVIXL::VisitVecPredSetAll(HVecPredSetAll* instruction) {
+  LOG(FATAL) << "No SIMD for " << instruction->GetId();
+  UNREACHABLE();
+}
+
+void InstructionCodeGeneratorARMVIXL::VisitVecPredSetAll(HVecPredSetAll* instruction) {
+  LOG(FATAL) << "No SIMD for " << instruction->GetId();
+  UNREACHABLE();
+}
+
+void LocationsBuilderARMVIXL::VisitVecPredWhile(HVecPredWhile* instruction) {
+  LOG(FATAL) << "No SIMD for " << instruction->GetId();
+  UNREACHABLE();
+}
+
+void InstructionCodeGeneratorARMVIXL::VisitVecPredWhile(HVecPredWhile* instruction) {
+  LOG(FATAL) << "No SIMD for " << instruction->GetId();
+  UNREACHABLE();
+}
+
+void LocationsBuilderARMVIXL::VisitVecPredToBoolean(HVecPredToBoolean* instruction) {
+  LOG(FATAL) << "No SIMD for " << instruction->GetId();
+  UNREACHABLE();
+}
+
+void InstructionCodeGeneratorARMVIXL::VisitVecPredToBoolean(HVecPredToBoolean* instruction) {
+  LOG(FATAL) << "No SIMD for " << instruction->GetId();
+  UNREACHABLE();
+}
+
+void LocationsBuilderARMVIXL::VisitVecEqual(HVecEqual* instruction) {
+  LOG(FATAL) << "No SIMD for " << instruction->GetId();
+  UNREACHABLE();
+}
+
+void InstructionCodeGeneratorARMVIXL::VisitVecEqual(HVecEqual* instruction) {
+  LOG(FATAL) << "No SIMD for " << instruction->GetId();
+  UNREACHABLE();
+}
+
+void LocationsBuilderARMVIXL::VisitVecNotEqual(HVecNotEqual* instruction) {
+  LOG(FATAL) << "No SIMD for " << instruction->GetId();
+  UNREACHABLE();
+}
+
+void InstructionCodeGeneratorARMVIXL::VisitVecNotEqual(HVecNotEqual* instruction) {
+  LOG(FATAL) << "No SIMD for " << instruction->GetId();
+  UNREACHABLE();
+}
+
+void LocationsBuilderARMVIXL::VisitVecLessThan(HVecLessThan* instruction) {
+  LOG(FATAL) << "No SIMD for " << instruction->GetId();
+  UNREACHABLE();
+}
+
+void InstructionCodeGeneratorARMVIXL::VisitVecLessThan(HVecLessThan* instruction) {
+  LOG(FATAL) << "No SIMD for " << instruction->GetId();
+  UNREACHABLE();
+}
+
+void LocationsBuilderARMVIXL::VisitVecLessThanOrEqual(HVecLessThanOrEqual* instruction) {
+  LOG(FATAL) << "No SIMD for " << instruction->GetId();
+  UNREACHABLE();
+}
+
+void InstructionCodeGeneratorARMVIXL::VisitVecLessThanOrEqual(HVecLessThanOrEqual* instruction) {
+  LOG(FATAL) << "No SIMD for " << instruction->GetId();
+  UNREACHABLE();
+}
+
+void LocationsBuilderARMVIXL::VisitVecGreaterThan(HVecGreaterThan* instruction) {
+  LOG(FATAL) << "No SIMD for " << instruction->GetId();
+  UNREACHABLE();
+}
+
+void InstructionCodeGeneratorARMVIXL::VisitVecGreaterThan(HVecGreaterThan* instruction) {
+  LOG(FATAL) << "No SIMD for " << instruction->GetId();
+  UNREACHABLE();
+}
+
+void LocationsBuilderARMVIXL::VisitVecGreaterThanOrEqual(
+    HVecGreaterThanOrEqual* instruction) {
+  LOG(FATAL) << "No SIMD for " << instruction->GetId();
+  UNREACHABLE();
+}
+
+void InstructionCodeGeneratorARMVIXL::VisitVecGreaterThanOrEqual(
+    HVecGreaterThanOrEqual* instruction) {
+  LOG(FATAL) << "No SIMD for " << instruction->GetId();
+  UNREACHABLE();
+}
+
+void LocationsBuilderARMVIXL::VisitVecBelow(HVecBelow* instruction) {
+  LOG(FATAL) << "No SIMD for " << instruction->GetId();
+  UNREACHABLE();
+}
+
+void InstructionCodeGeneratorARMVIXL::VisitVecBelow(HVecBelow* instruction) {
+  LOG(FATAL) << "No SIMD for " << instruction->GetId();
+  UNREACHABLE();
+}
+
+void LocationsBuilderARMVIXL::VisitVecBelowOrEqual(HVecBelowOrEqual* instruction) {
+  LOG(FATAL) << "No SIMD for " << instruction->GetId();
+  UNREACHABLE();
+}
+
+void InstructionCodeGeneratorARMVIXL::VisitVecBelowOrEqual(HVecBelowOrEqual* instruction) {
+  LOG(FATAL) << "No SIMD for " << instruction->GetId();
+  UNREACHABLE();
+}
+
+void LocationsBuilderARMVIXL::VisitVecAbove(HVecAbove* instruction) {
+  LOG(FATAL) << "No SIMD for " << instruction->GetId();
+  UNREACHABLE();
+}
+
+void InstructionCodeGeneratorARMVIXL::VisitVecAbove(HVecAbove* instruction) {
+  LOG(FATAL) << "No SIMD for " << instruction->GetId();
+  UNREACHABLE();
+}
+
+void LocationsBuilderARMVIXL::VisitVecAboveOrEqual(HVecAboveOrEqual* instruction) {
+  LOG(FATAL) << "No SIMD for " << instruction->GetId();
+  UNREACHABLE();
+}
+
+void InstructionCodeGeneratorARMVIXL::VisitVecAboveOrEqual(HVecAboveOrEqual* instruction) {
+  LOG(FATAL) << "No SIMD for " << instruction->GetId();
+  UNREACHABLE();
+}
+
+void LocationsBuilderARMVIXL::VisitVecPredNot(HVecPredNot* instruction) {
+  LOG(FATAL) << "No SIMD for " << instruction->GetId();
+  UNREACHABLE();
+}
+
+void InstructionCodeGeneratorARMVIXL::VisitVecPredNot(HVecPredNot* instruction) {
+  LOG(FATAL) << "No SIMD for " << instruction->GetId();
+  UNREACHABLE();
 }
 
 #undef __

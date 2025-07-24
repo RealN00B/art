@@ -18,7 +18,7 @@
 
 #include "android-base/macros.h"
 #include "art_method-inl.h"
-#include "base/enums.h"
+#include "base/pointer_size.h"
 #include "class_linker-inl.h"
 #include "common_runtime_test.h"
 #include "common_throws.h"
@@ -34,7 +34,7 @@
 #include "thread_list.h"
 #include "well_known_classes.h"
 
-namespace art {
+namespace art HIDDEN {
 namespace instrumentation {
 
 class TestInstrumentationListener final : public instrumentation::InstrumentationListener {
@@ -55,101 +55,93 @@ class TestInstrumentationListener final : public instrumentation::Instrumentatio
 
   virtual ~TestInstrumentationListener() {}
 
-  void MethodEntered(Thread* thread ATTRIBUTE_UNUSED,
-                     Handle<mirror::Object> this_object ATTRIBUTE_UNUSED,
-                     ArtMethod* method ATTRIBUTE_UNUSED,
-                     uint32_t dex_pc ATTRIBUTE_UNUSED)
-      override REQUIRES_SHARED(Locks::mutator_lock_) {
+  void MethodEntered([[maybe_unused]] Thread* thread, [[maybe_unused]] ArtMethod* method) override
+      REQUIRES_SHARED(Locks::mutator_lock_) {
     received_method_enter_event = true;
   }
 
-  void MethodExited(Thread* thread ATTRIBUTE_UNUSED,
-                    Handle<mirror::Object> this_object ATTRIBUTE_UNUSED,
-                    ArtMethod* method ATTRIBUTE_UNUSED,
-                    uint32_t dex_pc ATTRIBUTE_UNUSED,
-                    instrumentation::OptionalFrame frame ATTRIBUTE_UNUSED,
-                    MutableHandle<mirror::Object>& return_value ATTRIBUTE_UNUSED)
-      override REQUIRES_SHARED(Locks::mutator_lock_) {
+  void MethodExited([[maybe_unused]] Thread* thread,
+                    [[maybe_unused]] ArtMethod* method,
+                    [[maybe_unused]] instrumentation::OptionalFrame frame,
+                    [[maybe_unused]] MutableHandle<mirror::Object>& return_value) override
+      REQUIRES_SHARED(Locks::mutator_lock_) {
     received_method_exit_object_event = true;
   }
 
-  void MethodExited(Thread* thread ATTRIBUTE_UNUSED,
-                    Handle<mirror::Object> this_object ATTRIBUTE_UNUSED,
-                    ArtMethod* method ATTRIBUTE_UNUSED,
-                    uint32_t dex_pc ATTRIBUTE_UNUSED,
-                    instrumentation::OptionalFrame frame ATTRIBUTE_UNUSED,
-                    JValue& return_value ATTRIBUTE_UNUSED)
-      override REQUIRES_SHARED(Locks::mutator_lock_) {
+  void MethodExited([[maybe_unused]] Thread* thread,
+                    [[maybe_unused]] ArtMethod* method,
+                    [[maybe_unused]] instrumentation::OptionalFrame frame,
+                    [[maybe_unused]] JValue& return_value) override
+      REQUIRES_SHARED(Locks::mutator_lock_) {
     received_method_exit_event = true;
   }
 
-  void MethodUnwind(Thread* thread ATTRIBUTE_UNUSED,
-                    Handle<mirror::Object> this_object ATTRIBUTE_UNUSED,
-                    ArtMethod* method ATTRIBUTE_UNUSED,
-                    uint32_t dex_pc ATTRIBUTE_UNUSED)
-      override REQUIRES_SHARED(Locks::mutator_lock_) {
+  void MethodUnwind([[maybe_unused]] Thread* thread,
+                    [[maybe_unused]] ArtMethod* method,
+                    [[maybe_unused]] uint32_t dex_pc) override
+      REQUIRES_SHARED(Locks::mutator_lock_) {
     received_method_unwind_event = true;
   }
 
-  void DexPcMoved(Thread* thread ATTRIBUTE_UNUSED,
-                  Handle<mirror::Object> this_object ATTRIBUTE_UNUSED,
-                  ArtMethod* method ATTRIBUTE_UNUSED,
-                  uint32_t new_dex_pc ATTRIBUTE_UNUSED)
-      override REQUIRES_SHARED(Locks::mutator_lock_) {
+  void DexPcMoved([[maybe_unused]] Thread* thread,
+                  [[maybe_unused]] Handle<mirror::Object> this_object,
+                  [[maybe_unused]] ArtMethod* method,
+                  [[maybe_unused]] uint32_t new_dex_pc) override
+      REQUIRES_SHARED(Locks::mutator_lock_) {
     received_dex_pc_moved_event = true;
   }
 
-  void FieldRead(Thread* thread ATTRIBUTE_UNUSED,
-                 Handle<mirror::Object> this_object ATTRIBUTE_UNUSED,
-                 ArtMethod* method ATTRIBUTE_UNUSED,
-                 uint32_t dex_pc ATTRIBUTE_UNUSED,
-                 ArtField* field ATTRIBUTE_UNUSED)
-      override REQUIRES_SHARED(Locks::mutator_lock_) {
+  void FieldRead([[maybe_unused]] Thread* thread,
+                 [[maybe_unused]] Handle<mirror::Object> this_object,
+                 [[maybe_unused]] ArtMethod* method,
+                 [[maybe_unused]] uint32_t dex_pc,
+                 [[maybe_unused]] ArtField* field) override REQUIRES_SHARED(Locks::mutator_lock_) {
     received_field_read_event = true;
   }
 
-  void FieldWritten(Thread* thread ATTRIBUTE_UNUSED,
-                    Handle<mirror::Object> this_object ATTRIBUTE_UNUSED,
-                    ArtMethod* method ATTRIBUTE_UNUSED,
-                    uint32_t dex_pc ATTRIBUTE_UNUSED,
-                    ArtField* field ATTRIBUTE_UNUSED,
-                    Handle<mirror::Object> field_value ATTRIBUTE_UNUSED)
-      override REQUIRES_SHARED(Locks::mutator_lock_) {
+  void FieldWritten([[maybe_unused]] Thread* thread,
+                    [[maybe_unused]] Handle<mirror::Object> this_object,
+                    [[maybe_unused]] ArtMethod* method,
+                    [[maybe_unused]] uint32_t dex_pc,
+                    [[maybe_unused]] ArtField* field,
+                    [[maybe_unused]] Handle<mirror::Object> field_value) override
+      REQUIRES_SHARED(Locks::mutator_lock_) {
     received_field_written_object_event = true;
   }
 
-  void FieldWritten(Thread* thread ATTRIBUTE_UNUSED,
-                    Handle<mirror::Object> this_object ATTRIBUTE_UNUSED,
-                    ArtMethod* method ATTRIBUTE_UNUSED,
-                    uint32_t dex_pc ATTRIBUTE_UNUSED,
-                    ArtField* field ATTRIBUTE_UNUSED,
-                    const JValue& field_value ATTRIBUTE_UNUSED)
-      override REQUIRES_SHARED(Locks::mutator_lock_) {
+  void FieldWritten([[maybe_unused]] Thread* thread,
+                    [[maybe_unused]] Handle<mirror::Object> this_object,
+                    [[maybe_unused]] ArtMethod* method,
+                    [[maybe_unused]] uint32_t dex_pc,
+                    [[maybe_unused]] ArtField* field,
+                    [[maybe_unused]] const JValue& field_value) override
+      REQUIRES_SHARED(Locks::mutator_lock_) {
     received_field_written_event = true;
   }
 
-  void ExceptionThrown(Thread* thread ATTRIBUTE_UNUSED,
-                       Handle<mirror::Throwable> exception_object ATTRIBUTE_UNUSED)
-      override REQUIRES_SHARED(Locks::mutator_lock_) {
+  void ExceptionThrown([[maybe_unused]] Thread* thread,
+                       [[maybe_unused]] Handle<mirror::Throwable> exception_object) override
+      REQUIRES_SHARED(Locks::mutator_lock_) {
     received_exception_thrown_event = true;
   }
 
-  void ExceptionHandled(Thread* self ATTRIBUTE_UNUSED,
-                        Handle<mirror::Throwable> throwable ATTRIBUTE_UNUSED)
-      override REQUIRES_SHARED(Locks::mutator_lock_) {
+  void ExceptionHandled([[maybe_unused]] Thread* self,
+                        [[maybe_unused]] Handle<mirror::Throwable> throwable) override
+      REQUIRES_SHARED(Locks::mutator_lock_) {
     received_exception_handled_event = true;
   }
 
-  void Branch(Thread* thread ATTRIBUTE_UNUSED,
-              ArtMethod* method ATTRIBUTE_UNUSED,
-              uint32_t dex_pc ATTRIBUTE_UNUSED,
-              int32_t dex_pc_offset ATTRIBUTE_UNUSED)
-      override REQUIRES_SHARED(Locks::mutator_lock_) {
+  void Branch([[maybe_unused]] Thread* thread,
+              [[maybe_unused]] ArtMethod* method,
+              [[maybe_unused]] uint32_t dex_pc,
+              [[maybe_unused]] int32_t dex_pc_offset) override
+      REQUIRES_SHARED(Locks::mutator_lock_) {
     received_branch_event = true;
   }
 
-  void WatchedFramePop(Thread* thread ATTRIBUTE_UNUSED, const ShadowFrame& frame ATTRIBUTE_UNUSED)
-      override REQUIRES_SHARED(Locks::mutator_lock_) {
+  void WatchedFramePop([[maybe_unused]] Thread* thread,
+                       [[maybe_unused]] const ShadowFrame& frame) override
+      REQUIRES_SHARED(Locks::mutator_lock_) {
     received_watched_frame_pop  = true;
   }
 
@@ -191,15 +183,19 @@ class InstrumentationTest : public CommonRuntimeTest {
   static constexpr const char* kClientOneKey = "TestClient1";
   static constexpr const char* kClientTwoKey = "TestClient2";
 
+  InstrumentationTest() {
+    use_boot_image_ = true;  // Make the Runtime creation cheaper.
+  }
+
   void CheckConfigureStubs(const char* key, Instrumentation::InstrumentationLevel level) {
     ScopedObjectAccess soa(Thread::Current());
     instrumentation::Instrumentation* instr = Runtime::Current()->GetInstrumentation();
-    ScopedThreadSuspension sts(soa.Self(), kSuspended);
+    ScopedThreadSuspension sts(soa.Self(), ThreadState::kSuspended);
     gc::ScopedGCCriticalSection gcs(soa.Self(),
                                     gc::kGcCauseInstrumentation,
                                     gc::kCollectorTypeInstrumentation);
     ScopedSuspendAll ssa("Instrumentation::ConfigureStubs");
-    instr->ConfigureStubs(key, level);
+    instr->ConfigureStubs(key, level, /*try_switch_to_non_debuggable=*/false);
   }
 
   Instrumentation::InstrumentationLevel GetCurrentInstrumentationLevel() {
@@ -223,14 +219,14 @@ class InstrumentationTest : public CommonRuntimeTest {
     instrumentation::Instrumentation* instr = Runtime::Current()->GetInstrumentation();
     TestInstrumentationListener listener;
     {
-      ScopedThreadSuspension sts(soa.Self(), kSuspended);
+      ScopedThreadSuspension sts(soa.Self(), ThreadState::kSuspended);
       ScopedSuspendAll ssa("Add instrumentation listener");
       instr->AddListener(&listener, instrumentation_event);
     }
 
     mirror::Object* const event_obj = nullptr;
     const uint32_t event_dex_pc = 0;
-    ShadowFrameAllocaUniquePtr test_frame = CREATE_SHADOW_FRAME(0, nullptr, event_method, 0);
+    ShadowFrameAllocaUniquePtr test_frame = CREATE_SHADOW_FRAME(0, event_method, 0);
 
     // Check the listener is registered and is notified of the event.
     EXPECT_TRUE(HasEventListener(instr, instrumentation_event));
@@ -247,7 +243,7 @@ class InstrumentationTest : public CommonRuntimeTest {
 
     listener.Reset();
     {
-      ScopedThreadSuspension sts(soa.Self(), kSuspended);
+      ScopedThreadSuspension sts(soa.Self(), ThreadState::kSuspended);
       ScopedSuspendAll ssa("Remove instrumentation listener");
       instr->RemoveListener(&listener, instrumentation_event);
     }
@@ -266,18 +262,15 @@ class InstrumentationTest : public CommonRuntimeTest {
     EXPECT_FALSE(DidListenerReceiveEvent(listener, instrumentation_event, with_object));
   }
 
-  void DeoptimizeMethod(Thread* self, ArtMethod* method, bool enable_deoptimization)
+  void DeoptimizeMethod(Thread* self, ArtMethod* method)
       REQUIRES_SHARED(Locks::mutator_lock_) {
     Runtime* runtime = Runtime::Current();
     instrumentation::Instrumentation* instrumentation = runtime->GetInstrumentation();
-    ScopedThreadSuspension sts(self, kSuspended);
+    ScopedThreadSuspension sts(self, ThreadState::kSuspended);
     gc::ScopedGCCriticalSection gcs(self,
                                     gc::kGcCauseInstrumentation,
                                     gc::kCollectorTypeInstrumentation);
     ScopedSuspendAll ssa("Single method deoptimization");
-    if (enable_deoptimization) {
-      instrumentation->EnableDeoptimization();
-    }
     instrumentation->Deoptimize(method);
   }
 
@@ -286,29 +279,26 @@ class InstrumentationTest : public CommonRuntimeTest {
       REQUIRES_SHARED(Locks::mutator_lock_) {
     Runtime* runtime = Runtime::Current();
     instrumentation::Instrumentation* instrumentation = runtime->GetInstrumentation();
-    ScopedThreadSuspension sts(self, kSuspended);
+    ScopedThreadSuspension sts(self, ThreadState::kSuspended);
     gc::ScopedGCCriticalSection gcs(self,
                                     gc::kGcCauseInstrumentation,
                                     gc::kCollectorTypeInstrumentation);
     ScopedSuspendAll ssa("Single method undeoptimization");
     instrumentation->Undeoptimize(method);
     if (disable_deoptimization) {
-      instrumentation->DisableDeoptimization(key);
+      instrumentation->DisableDeoptimization(key, /*try_switch_to_non_debuggable=*/false);
     }
   }
 
-  void DeoptimizeEverything(Thread* self, const char* key, bool enable_deoptimization)
+  void DeoptimizeEverything(Thread* self, const char* key)
         REQUIRES_SHARED(Locks::mutator_lock_) {
     Runtime* runtime = Runtime::Current();
     instrumentation::Instrumentation* instrumentation = runtime->GetInstrumentation();
-    ScopedThreadSuspension sts(self, kSuspended);
+    ScopedThreadSuspension sts(self, ThreadState::kSuspended);
     gc::ScopedGCCriticalSection gcs(self,
                                     gc::kGcCauseInstrumentation,
                                     gc::kCollectorTypeInstrumentation);
     ScopedSuspendAll ssa("Full deoptimization");
-    if (enable_deoptimization) {
-      instrumentation->EnableDeoptimization();
-    }
     instrumentation->DeoptimizeEverything(key);
   }
 
@@ -316,14 +306,14 @@ class InstrumentationTest : public CommonRuntimeTest {
         REQUIRES_SHARED(Locks::mutator_lock_) {
     Runtime* runtime = Runtime::Current();
     instrumentation::Instrumentation* instrumentation = runtime->GetInstrumentation();
-    ScopedThreadSuspension sts(self, kSuspended);
+    ScopedThreadSuspension sts(self, ThreadState::kSuspended);
     gc::ScopedGCCriticalSection gcs(self,
                                     gc::kGcCauseInstrumentation,
                                     gc::kCollectorTypeInstrumentation);
     ScopedSuspendAll ssa("Full undeoptimization");
     instrumentation->UndeoptimizeEverything(key);
     if (disable_deoptimization) {
-      instrumentation->DisableDeoptimization(key);
+      instrumentation->DisableDeoptimization(key, /*try_switch_to_non_debuggable=*/false);
     }
   }
 
@@ -331,19 +321,20 @@ class InstrumentationTest : public CommonRuntimeTest {
         REQUIRES_SHARED(Locks::mutator_lock_) {
     Runtime* runtime = Runtime::Current();
     instrumentation::Instrumentation* instrumentation = runtime->GetInstrumentation();
-    ScopedThreadSuspension sts(self, kSuspended);
+    TestInstrumentationListener listener;
+    ScopedThreadSuspension sts(self, ThreadState::kSuspended);
     gc::ScopedGCCriticalSection gcs(self,
                                     gc::kGcCauseInstrumentation,
                                     gc::kCollectorTypeInstrumentation);
     ScopedSuspendAll ssa("EnableMethodTracing");
-    instrumentation->EnableMethodTracing(key, needs_interpreter);
+    instrumentation->EnableMethodTracing(key, &listener, needs_interpreter);
   }
 
   void DisableMethodTracing(Thread* self, const char* key)
         REQUIRES_SHARED(Locks::mutator_lock_) {
     Runtime* runtime = Runtime::Current();
     instrumentation::Instrumentation* instrumentation = runtime->GetInstrumentation();
-    ScopedThreadSuspension sts(self, kSuspended);
+    ScopedThreadSuspension sts(self, ThreadState::kSuspended);
     gc::ScopedGCCriticalSection gcs(self,
                                     gc::kGcCauseInstrumentation,
                                     gc::kCollectorTypeInstrumentation);
@@ -392,15 +383,15 @@ class InstrumentationTest : public CommonRuntimeTest {
       REQUIRES_SHARED(Locks::mutator_lock_) {
     switch (event_type) {
       case instrumentation::Instrumentation::kMethodEntered:
-        instr->MethodEnterEvent(self, obj, method, dex_pc);
+        instr->MethodEnterEvent(self, method);
         break;
       case instrumentation::Instrumentation::kMethodExited: {
         JValue value;
-        instr->MethodExitEvent(self, obj, method, dex_pc, {}, value);
+        instr->MethodExitEvent(self, method, {}, value);
         break;
       }
       case instrumentation::Instrumentation::kMethodUnwind:
-        instr->MethodUnwindEvent(self, obj, method, dex_pc);
+        instr->MethodUnwindEvent(self, method, dex_pc);
         break;
       case instrumentation::Instrumentation::kDexPcMoved:
         instr->DexPcMovedEvent(self, obj, method, dex_pc);
@@ -477,13 +468,10 @@ TEST_F(InstrumentationTest, NoInstrumentation) {
   instrumentation::Instrumentation* instr = Runtime::Current()->GetInstrumentation();
   ASSERT_NE(instr, nullptr);
 
-  EXPECT_FALSE(instr->AreExitStubsInstalled());
+  EXPECT_FALSE(instr->RunExitHooks());
+  EXPECT_FALSE(instr->EntryExitStubsInstalled());
   EXPECT_FALSE(instr->AreAllMethodsDeoptimized());
-  EXPECT_FALSE(instr->IsActive());
-  EXPECT_FALSE(instr->ShouldNotifyMethodEnterExitEvents());
-
-  // Test interpreter table is the default one.
-  EXPECT_EQ(instrumentation::kMainHandlerTable, instr->GetInterpreterHandlerTable());
+  EXPECT_FALSE(instr->NeedsSlowInterpreterForListeners());
 
   // Check there is no registered listener.
   EXPECT_FALSE(instr->HasDexPcListeners());
@@ -493,7 +481,6 @@ TEST_F(InstrumentationTest, NoInstrumentation) {
   EXPECT_FALSE(instr->HasFieldWriteListeners());
   EXPECT_FALSE(instr->HasMethodEntryListeners());
   EXPECT_FALSE(instr->HasMethodExitListeners());
-  EXPECT_FALSE(instr->IsActive());
 }
 
 // Test instrumentation listeners for each event.
@@ -504,7 +491,7 @@ TEST_F(InstrumentationTest, MethodEntryEvent) {
   ClassLinker* class_linker = runtime->GetClassLinker();
   StackHandleScope<1> hs(soa.Self());
   Handle<mirror::ClassLoader> loader(hs.NewHandle(soa.Decode<mirror::ClassLoader>(class_loader)));
-  ObjPtr<mirror::Class> klass = class_linker->FindClass(soa.Self(), "LInstrumentation;", loader);
+  ObjPtr<mirror::Class> klass = FindClass("LInstrumentation;", loader);
   ASSERT_TRUE(klass != nullptr);
   ArtMethod* method =
       klass->FindClassMethod("returnReference", "()Ljava/lang/Object;", kRuntimePointerSize);
@@ -525,7 +512,7 @@ TEST_F(InstrumentationTest, MethodExitObjectEvent) {
   StackHandleScope<1> hs(soa.Self());
   MutableHandle<mirror::ClassLoader> loader(
       hs.NewHandle(soa.Decode<mirror::ClassLoader>(class_loader)));
-  ObjPtr<mirror::Class> klass = class_linker->FindClass(soa.Self(), "LInstrumentation;", loader);
+  ObjPtr<mirror::Class> klass = FindClass("LInstrumentation;", loader);
   ASSERT_TRUE(klass != nullptr);
   ArtMethod* method =
       klass->FindClassMethod("returnReference", "()Ljava/lang/Object;", kRuntimePointerSize);
@@ -545,7 +532,7 @@ TEST_F(InstrumentationTest, MethodExitPrimEvent) {
   ClassLinker* class_linker = runtime->GetClassLinker();
   StackHandleScope<1> hs(soa.Self());
   Handle<mirror::ClassLoader> loader(hs.NewHandle(soa.Decode<mirror::ClassLoader>(class_loader)));
-  ObjPtr<mirror::Class> klass = class_linker->FindClass(soa.Self(), "LInstrumentation;", loader);
+  ObjPtr<mirror::Class> klass = FindClass("LInstrumentation;", loader);
   ASSERT_TRUE(klass != nullptr);
   ArtMethod* method = klass->FindClassMethod("returnPrimitive", "()I", kRuntimePointerSize);
   ASSERT_TRUE(method != nullptr);
@@ -580,7 +567,7 @@ TEST_F(InstrumentationTest, FieldWriteObjectEvent) {
   ClassLinker* class_linker = runtime->GetClassLinker();
   StackHandleScope<1> hs(soa.Self());
   Handle<mirror::ClassLoader> loader(hs.NewHandle(soa.Decode<mirror::ClassLoader>(class_loader)));
-  ObjPtr<mirror::Class> klass = class_linker->FindClass(soa.Self(), "LInstrumentation;", loader);
+  ObjPtr<mirror::Class> klass = FindClass("LInstrumentation;", loader);
   ASSERT_TRUE(klass != nullptr);
   ArtField* field = klass->FindDeclaredStaticField("referenceField", "Ljava/lang/Object;");
   ASSERT_TRUE(field != nullptr);
@@ -598,7 +585,7 @@ TEST_F(InstrumentationTest, FieldWritePrimEvent) {
   ClassLinker* class_linker = runtime->GetClassLinker();
   StackHandleScope<1> hs(soa.Self());
   Handle<mirror::ClassLoader> loader(hs.NewHandle(soa.Decode<mirror::ClassLoader>(class_loader)));
-  ObjPtr<mirror::Class> klass = class_linker->FindClass(soa.Self(), "LInstrumentation;", loader);
+  ObjPtr<mirror::Class> klass = FindClass("LInstrumentation;", loader);
   ASSERT_TRUE(klass != nullptr);
   ArtField* field = klass->FindDeclaredStaticField("primitiveField", "I");
   ASSERT_TRUE(field != nullptr);
@@ -629,7 +616,7 @@ TEST_F(InstrumentationTest, DeoptimizeDirectMethod) {
   ClassLinker* class_linker = runtime->GetClassLinker();
   StackHandleScope<1> hs(soa.Self());
   Handle<mirror::ClassLoader> loader(hs.NewHandle(soa.Decode<mirror::ClassLoader>(class_loader)));
-  ObjPtr<mirror::Class> klass = class_linker->FindClass(soa.Self(), "LInstrumentation;", loader);
+  ObjPtr<mirror::Class> klass = FindClass("LInstrumentation;", loader);
   ASSERT_TRUE(klass != nullptr);
   ArtMethod* method_to_deoptimize =
       klass->FindClassMethod("instanceMethod", "()V", kRuntimePointerSize);
@@ -640,10 +627,10 @@ TEST_F(InstrumentationTest, DeoptimizeDirectMethod) {
   EXPECT_FALSE(instr->AreAllMethodsDeoptimized());
   EXPECT_FALSE(instr->IsDeoptimized(method_to_deoptimize));
 
-  DeoptimizeMethod(soa.Self(), method_to_deoptimize, true);
+  DeoptimizeMethod(soa.Self(), method_to_deoptimize);
 
   EXPECT_FALSE(instr->AreAllMethodsDeoptimized());
-  EXPECT_TRUE(instr->AreExitStubsInstalled());
+  EXPECT_TRUE(instr->RunExitHooks());
   EXPECT_TRUE(instr->IsDeoptimized(method_to_deoptimize));
 
   constexpr const char* instrumentation_key = "DeoptimizeDirectMethod";
@@ -660,10 +647,11 @@ TEST_F(InstrumentationTest, FullDeoptimization) {
   EXPECT_FALSE(instr->AreAllMethodsDeoptimized());
 
   constexpr const char* instrumentation_key = "FullDeoptimization";
-  DeoptimizeEverything(soa.Self(), instrumentation_key, true);
+  DeoptimizeEverything(soa.Self(), instrumentation_key);
 
   EXPECT_TRUE(instr->AreAllMethodsDeoptimized());
-  EXPECT_TRUE(instr->AreExitStubsInstalled());
+  EXPECT_TRUE(instr->RunExitHooks());
+  EXPECT_TRUE(instr->InterpreterStubsInstalled());
 
   UndeoptimizeEverything(soa.Self(), instrumentation_key, true);
 
@@ -678,7 +666,7 @@ TEST_F(InstrumentationTest, MixedDeoptimization) {
   ClassLinker* class_linker = runtime->GetClassLinker();
   StackHandleScope<1> hs(soa.Self());
   Handle<mirror::ClassLoader> loader(hs.NewHandle(soa.Decode<mirror::ClassLoader>(class_loader)));
-  ObjPtr<mirror::Class> klass = class_linker->FindClass(soa.Self(), "LInstrumentation;", loader);
+  ObjPtr<mirror::Class> klass = FindClass("LInstrumentation;", loader);
   ASSERT_TRUE(klass != nullptr);
   ArtMethod* method_to_deoptimize =
       klass->FindClassMethod("instanceMethod", "()V", kRuntimePointerSize);
@@ -689,27 +677,27 @@ TEST_F(InstrumentationTest, MixedDeoptimization) {
   EXPECT_FALSE(instr->AreAllMethodsDeoptimized());
   EXPECT_FALSE(instr->IsDeoptimized(method_to_deoptimize));
 
-  DeoptimizeMethod(soa.Self(), method_to_deoptimize, true);
+  DeoptimizeMethod(soa.Self(), method_to_deoptimize);
   // Deoptimizing a method does not change instrumentation level.
   EXPECT_EQ(Instrumentation::InstrumentationLevel::kInstrumentNothing,
             GetCurrentInstrumentationLevel());
   EXPECT_FALSE(instr->AreAllMethodsDeoptimized());
-  EXPECT_TRUE(instr->AreExitStubsInstalled());
+  EXPECT_TRUE(instr->RunExitHooks());
   EXPECT_TRUE(instr->IsDeoptimized(method_to_deoptimize));
 
   constexpr const char* instrumentation_key = "MixedDeoptimization";
-  DeoptimizeEverything(soa.Self(), instrumentation_key, false);
+  DeoptimizeEverything(soa.Self(), instrumentation_key);
   EXPECT_EQ(Instrumentation::InstrumentationLevel::kInstrumentWithInterpreter,
             GetCurrentInstrumentationLevel());
   EXPECT_TRUE(instr->AreAllMethodsDeoptimized());
-  EXPECT_TRUE(instr->AreExitStubsInstalled());
+  EXPECT_TRUE(instr->RunExitHooks());
   EXPECT_TRUE(instr->IsDeoptimized(method_to_deoptimize));
 
   UndeoptimizeEverything(soa.Self(), instrumentation_key, false);
   EXPECT_EQ(Instrumentation::InstrumentationLevel::kInstrumentNothing,
             GetCurrentInstrumentationLevel());
   EXPECT_FALSE(instr->AreAllMethodsDeoptimized());
-  EXPECT_TRUE(instr->AreExitStubsInstalled());
+  EXPECT_TRUE(instr->RunExitHooks());
   EXPECT_TRUE(instr->IsDeoptimized(method_to_deoptimize));
 
   UndeoptimizeMethod(soa.Self(), method_to_deoptimize, instrumentation_key, true);
@@ -730,7 +718,7 @@ TEST_F(InstrumentationTest, MethodTracing_Interpreter) {
   EXPECT_EQ(Instrumentation::InstrumentationLevel::kInstrumentWithInterpreter,
             GetCurrentInstrumentationLevel());
   EXPECT_TRUE(instr->AreAllMethodsDeoptimized());
-  EXPECT_TRUE(instr->AreExitStubsInstalled());
+  EXPECT_TRUE(instr->RunExitHooks());
 
   DisableMethodTracing(soa.Self(), instrumentation_key);
   EXPECT_EQ(Instrumentation::InstrumentationLevel::kInstrumentNothing,
@@ -746,10 +734,10 @@ TEST_F(InstrumentationTest, MethodTracing_InstrumentationEntryExitStubs) {
 
   constexpr const char* instrumentation_key = "MethodTracing";
   EnableMethodTracing(soa.Self(), instrumentation_key, false);
-  EXPECT_EQ(Instrumentation::InstrumentationLevel::kInstrumentWithInstrumentationStubs,
+  EXPECT_EQ(Instrumentation::InstrumentationLevel::kInstrumentWithEntryExitHooks,
             GetCurrentInstrumentationLevel());
   EXPECT_FALSE(instr->AreAllMethodsDeoptimized());
-  EXPECT_TRUE(instr->AreExitStubsInstalled());
+  EXPECT_TRUE(instr->RunExitHooks());
 
   DisableMethodTracing(soa.Self(), instrumentation_key);
   EXPECT_EQ(Instrumentation::InstrumentationLevel::kInstrumentNothing,
@@ -792,9 +780,8 @@ TEST_F(InstrumentationTest, ConfigureStubs_InstrumentationStubs) {
 
   // Check we can switch to instrumentation stubs
   CheckConfigureStubs(kClientOneKey,
-                      Instrumentation::InstrumentationLevel::kInstrumentWithInstrumentationStubs);
-  CHECK_INSTRUMENTATION(Instrumentation::InstrumentationLevel::kInstrumentWithInstrumentationStubs,
-                        1U);
+                      Instrumentation::InstrumentationLevel::kInstrumentWithEntryExitHooks);
+  CHECK_INSTRUMENTATION(Instrumentation::InstrumentationLevel::kInstrumentWithEntryExitHooks, 1U);
 
   // Check we can disable instrumentation.
   CheckConfigureStubs(kClientOneKey, Instrumentation::InstrumentationLevel::kInstrumentNothing);
@@ -819,9 +806,8 @@ TEST_F(InstrumentationTest, ConfigureStubs_InstrumentationStubsToInterpreter) {
 
   // Configure stubs with instrumentation stubs.
   CheckConfigureStubs(kClientOneKey,
-                      Instrumentation::InstrumentationLevel::kInstrumentWithInstrumentationStubs);
-  CHECK_INSTRUMENTATION(Instrumentation::InstrumentationLevel::kInstrumentWithInstrumentationStubs,
-                        1U);
+                      Instrumentation::InstrumentationLevel::kInstrumentWithEntryExitHooks);
+  CHECK_INSTRUMENTATION(Instrumentation::InstrumentationLevel::kInstrumentWithEntryExitHooks, 1U);
 
   // Configure stubs with interpreter.
   CheckConfigureStubs(kClientOneKey,
@@ -843,10 +829,8 @@ TEST_F(InstrumentationTest, ConfigureStubs_InterpreterToInstrumentationStubs) {
 
   // Configure stubs with instrumentation stubs.
   CheckConfigureStubs(kClientOneKey,
-                      Instrumentation::InstrumentationLevel::kInstrumentWithInstrumentationStubs);
-  // Make sure we are still interpreter since going from interpreter->instrumentation is dangerous.
-  CHECK_INSTRUMENTATION(Instrumentation::InstrumentationLevel::kInstrumentWithInterpreter,
-                        1U);
+                      Instrumentation::InstrumentationLevel::kInstrumentWithEntryExitHooks);
+  CHECK_INSTRUMENTATION(Instrumentation::InstrumentationLevel::kInstrumentWithEntryExitHooks, 1U);
 
   // Check we can disable instrumentation.
   CheckConfigureStubs(kClientOneKey, Instrumentation::InstrumentationLevel::kInstrumentNothing);
@@ -859,9 +843,8 @@ TEST_F(InstrumentationTest,
 
   // Configure stubs with instrumentation stubs.
   CheckConfigureStubs(kClientOneKey,
-                      Instrumentation::InstrumentationLevel::kInstrumentWithInstrumentationStubs);
-  CHECK_INSTRUMENTATION(Instrumentation::InstrumentationLevel::kInstrumentWithInstrumentationStubs,
-                        1U);
+                      Instrumentation::InstrumentationLevel::kInstrumentWithEntryExitHooks);
+  CHECK_INSTRUMENTATION(Instrumentation::InstrumentationLevel::kInstrumentWithEntryExitHooks, 1U);
 
   // Configure stubs with interpreter.
   CheckConfigureStubs(kClientOneKey,
@@ -870,9 +853,8 @@ TEST_F(InstrumentationTest,
 
   // Configure stubs with instrumentation stubs again.
   CheckConfigureStubs(kClientOneKey,
-                      Instrumentation::InstrumentationLevel::kInstrumentWithInstrumentationStubs);
-  CHECK_INSTRUMENTATION(Instrumentation::InstrumentationLevel::kInstrumentWithInterpreter,
-                        1U);
+                      Instrumentation::InstrumentationLevel::kInstrumentWithEntryExitHooks);
+  CHECK_INSTRUMENTATION(Instrumentation::InstrumentationLevel::kInstrumentWithEntryExitHooks, 1U);
 
   // Check we can disable instrumentation.
   CheckConfigureStubs(kClientOneKey, Instrumentation::InstrumentationLevel::kInstrumentNothing);
@@ -895,21 +877,18 @@ TEST_F(InstrumentationTest, MultiConfigureStubs_InstrumentationStubs) {
 
   // Configure stubs with instrumentation stubs for 1st client.
   CheckConfigureStubs(kClientOneKey,
-                      Instrumentation::InstrumentationLevel::kInstrumentWithInstrumentationStubs);
-  CHECK_INSTRUMENTATION(Instrumentation::InstrumentationLevel::kInstrumentWithInstrumentationStubs,
-                        1U);
+                      Instrumentation::InstrumentationLevel::kInstrumentWithEntryExitHooks);
+  CHECK_INSTRUMENTATION(Instrumentation::InstrumentationLevel::kInstrumentWithEntryExitHooks, 1U);
 
   // Configure stubs with instrumentation stubs for 2nd client.
   CheckConfigureStubs(kClientTwoKey,
-                      Instrumentation::InstrumentationLevel::kInstrumentWithInstrumentationStubs);
-  CHECK_INSTRUMENTATION(Instrumentation::InstrumentationLevel::kInstrumentWithInstrumentationStubs,
-                        2U);
+                      Instrumentation::InstrumentationLevel::kInstrumentWithEntryExitHooks);
+  CHECK_INSTRUMENTATION(Instrumentation::InstrumentationLevel::kInstrumentWithEntryExitHooks, 2U);
 
   // 1st client requests instrumentation deactivation but 2nd client still needs
   // instrumentation stubs.
   CheckConfigureStubs(kClientOneKey, Instrumentation::InstrumentationLevel::kInstrumentNothing);
-  CHECK_INSTRUMENTATION(Instrumentation::InstrumentationLevel::kInstrumentWithInstrumentationStubs,
-                        1U);
+  CHECK_INSTRUMENTATION(Instrumentation::InstrumentationLevel::kInstrumentWithEntryExitHooks, 1U);
 
   // 2nd client requests instrumentation deactivation
   CheckConfigureStubs(kClientTwoKey, Instrumentation::InstrumentationLevel::kInstrumentNothing);
@@ -943,9 +922,8 @@ TEST_F(InstrumentationTest, MultiConfigureStubs_InstrumentationStubsThenInterpre
 
   // Configure stubs with instrumentation stubs for 1st client.
   CheckConfigureStubs(kClientOneKey,
-                      Instrumentation::InstrumentationLevel::kInstrumentWithInstrumentationStubs);
-  CHECK_INSTRUMENTATION(Instrumentation::InstrumentationLevel::kInstrumentWithInstrumentationStubs,
-                        1U);
+                      Instrumentation::InstrumentationLevel::kInstrumentWithEntryExitHooks);
+  CHECK_INSTRUMENTATION(Instrumentation::InstrumentationLevel::kInstrumentWithEntryExitHooks, 1U);
 
   // Configure stubs with interpreter for 2nd client.
   CheckConfigureStubs(kClientTwoKey,
@@ -971,14 +949,13 @@ TEST_F(InstrumentationTest, MultiConfigureStubs_InterpreterThenInstrumentationSt
 
   // Configure stubs with instrumentation stubs for 2nd client.
   CheckConfigureStubs(kClientTwoKey,
-                      Instrumentation::InstrumentationLevel::kInstrumentWithInstrumentationStubs);
+                      Instrumentation::InstrumentationLevel::kInstrumentWithEntryExitHooks);
   CHECK_INSTRUMENTATION(Instrumentation::InstrumentationLevel::kInstrumentWithInterpreter, 2U);
 
   // 1st client requests instrumentation deactivation but 2nd client still needs
-  // instrumentation stubs. Since we already got interpreter stubs we need to stay there.
+  // instrumentation stubs.
   CheckConfigureStubs(kClientOneKey, Instrumentation::InstrumentationLevel::kInstrumentNothing);
-  CHECK_INSTRUMENTATION(Instrumentation::InstrumentationLevel::kInstrumentWithInterpreter,
-                        1U);
+  CHECK_INSTRUMENTATION(Instrumentation::InstrumentationLevel::kInstrumentWithEntryExitHooks, 1U);
 
   // 2nd client requests instrumentation deactivation
   CheckConfigureStubs(kClientTwoKey, Instrumentation::InstrumentationLevel::kInstrumentNothing);

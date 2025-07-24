@@ -19,7 +19,7 @@
 #include "mirror/array-inl.h"
 #include "mirror/string.h"
 
-namespace art {
+namespace art HIDDEN {
 namespace x86 {
 
 // NOLINT on __ macro to suppress wrong warning/fix (misc-macro-parentheses) from clang-tidy.
@@ -42,13 +42,13 @@ void LocationsBuilderX86::VisitVecReplicateScalar(HVecReplicateScalar* instructi
     case DataType::Type::kUint16:
     case DataType::Type::kInt16:
     case DataType::Type::kInt32:
-      locations->SetInAt(0, is_zero ? Location::ConstantLocation(input->AsConstant())
+      locations->SetInAt(0, is_zero ? Location::ConstantLocation(input)
                                     : Location::RequiresRegister());
       locations->SetOut(Location::RequiresFpuRegister());
       break;
     case DataType::Type::kFloat32:
     case DataType::Type::kFloat64:
-      locations->SetInAt(0, is_zero ? Location::ConstantLocation(input->AsConstant())
+      locations->SetInAt(0, is_zero ? Location::ConstantLocation(input)
                                     : Location::RequiresFpuRegister());
       locations->SetOut(is_zero ? Location::RequiresFpuRegister()
                                 : Location::SameAsFirstInput());
@@ -981,7 +981,7 @@ static void CreateVecShiftLocations(ArenaAllocator* allocator, HVecBinaryOperati
     case DataType::Type::kInt32:
     case DataType::Type::kInt64:
       locations->SetInAt(0, Location::RequiresFpuRegister());
-      locations->SetInAt(1, Location::ConstantLocation(instruction->InputAt(1)->AsConstant()));
+      locations->SetInAt(1, Location::ConstantLocation(instruction->InputAt(1)));
       locations->SetOut(Location::SameAsFirstInput());
       break;
     default:
@@ -1094,13 +1094,13 @@ void LocationsBuilderX86::VisitVecSetScalars(HVecSetScalars* instruction) {
     case DataType::Type::kUint16:
     case DataType::Type::kInt16:
     case DataType::Type::kInt32:
-      locations->SetInAt(0, is_zero ? Location::ConstantLocation(input->AsConstant())
+      locations->SetInAt(0, is_zero ? Location::ConstantLocation(input)
                                     : Location::RequiresRegister());
       locations->SetOut(Location::RequiresFpuRegister());
       break;
     case DataType::Type::kFloat32:
     case DataType::Type::kFloat64:
-      locations->SetInAt(0, is_zero ? Location::ConstantLocation(input->AsConstant())
+      locations->SetInAt(0, is_zero ? Location::ConstantLocation(input)
                                     : Location::RequiresFpuRegister());
       locations->SetOut(Location::RequiresFpuRegister());
       break;
@@ -1379,6 +1379,148 @@ void InstructionCodeGeneratorX86::VisitVecStore(HVecStore* instruction) {
       LOG(FATAL) << "Unsupported SIMD type: " << instruction->GetPackedType();
       UNREACHABLE();
   }
+}
+
+void LocationsBuilderX86::VisitVecPredSetAll(HVecPredSetAll* instruction) {
+  LOG(FATAL) << "No SIMD for " << instruction->GetId();
+  UNREACHABLE();
+}
+
+void InstructionCodeGeneratorX86::VisitVecPredSetAll(HVecPredSetAll* instruction) {
+  LOG(FATAL) << "No SIMD for " << instruction->GetId();
+  UNREACHABLE();
+}
+
+void LocationsBuilderX86::VisitVecPredWhile(HVecPredWhile* instruction) {
+  LOG(FATAL) << "No SIMD for " << instruction->GetId();
+  UNREACHABLE();
+}
+
+void InstructionCodeGeneratorX86::VisitVecPredWhile(HVecPredWhile* instruction) {
+  LOG(FATAL) << "No SIMD for " << instruction->GetId();
+  UNREACHABLE();
+}
+
+void LocationsBuilderX86::VisitVecPredToBoolean(HVecPredToBoolean* instruction) {
+  LOG(FATAL) << "No SIMD for " << instruction->GetId();
+  UNREACHABLE();
+}
+
+void InstructionCodeGeneratorX86::VisitVecPredToBoolean(HVecPredToBoolean* instruction) {
+  LOG(FATAL) << "No SIMD for " << instruction->GetId();
+  UNREACHABLE();
+}
+
+void LocationsBuilderX86::VisitVecEqual(HVecEqual* instruction) {
+  LOG(FATAL) << "No SIMD for " << instruction->GetId();
+  UNREACHABLE();
+}
+
+void InstructionCodeGeneratorX86::VisitVecEqual(HVecEqual* instruction) {
+  LOG(FATAL) << "No SIMD for " << instruction->GetId();
+  UNREACHABLE();
+}
+
+void LocationsBuilderX86::VisitVecNotEqual(HVecNotEqual* instruction) {
+  LOG(FATAL) << "No SIMD for " << instruction->GetId();
+  UNREACHABLE();
+}
+
+void InstructionCodeGeneratorX86::VisitVecNotEqual(HVecNotEqual* instruction) {
+  LOG(FATAL) << "No SIMD for " << instruction->GetId();
+  UNREACHABLE();
+}
+
+void LocationsBuilderX86::VisitVecLessThan(HVecLessThan* instruction) {
+  LOG(FATAL) << "No SIMD for " << instruction->GetId();
+  UNREACHABLE();
+}
+
+void InstructionCodeGeneratorX86::VisitVecLessThan(HVecLessThan* instruction) {
+  LOG(FATAL) << "No SIMD for " << instruction->GetId();
+  UNREACHABLE();
+}
+
+void LocationsBuilderX86::VisitVecLessThanOrEqual(HVecLessThanOrEqual* instruction) {
+  LOG(FATAL) << "No SIMD for " << instruction->GetId();
+  UNREACHABLE();
+}
+
+void InstructionCodeGeneratorX86::VisitVecLessThanOrEqual(HVecLessThanOrEqual* instruction) {
+  LOG(FATAL) << "No SIMD for " << instruction->GetId();
+  UNREACHABLE();
+}
+
+void LocationsBuilderX86::VisitVecGreaterThan(HVecGreaterThan* instruction) {
+  LOG(FATAL) << "No SIMD for " << instruction->GetId();
+  UNREACHABLE();
+}
+
+void InstructionCodeGeneratorX86::VisitVecGreaterThan(HVecGreaterThan* instruction) {
+  LOG(FATAL) << "No SIMD for " << instruction->GetId();
+  UNREACHABLE();
+}
+
+void LocationsBuilderX86::VisitVecGreaterThanOrEqual(
+    HVecGreaterThanOrEqual* instruction) {
+  LOG(FATAL) << "No SIMD for " << instruction->GetId();
+  UNREACHABLE();
+}
+
+void InstructionCodeGeneratorX86::VisitVecGreaterThanOrEqual(
+    HVecGreaterThanOrEqual* instruction) {
+  LOG(FATAL) << "No SIMD for " << instruction->GetId();
+  UNREACHABLE();
+}
+
+void LocationsBuilderX86::VisitVecBelow(HVecBelow* instruction) {
+  LOG(FATAL) << "No SIMD for " << instruction->GetId();
+  UNREACHABLE();
+}
+
+void InstructionCodeGeneratorX86::VisitVecBelow(HVecBelow* instruction) {
+  LOG(FATAL) << "No SIMD for " << instruction->GetId();
+  UNREACHABLE();
+}
+
+void LocationsBuilderX86::VisitVecBelowOrEqual(HVecBelowOrEqual* instruction) {
+  LOG(FATAL) << "No SIMD for " << instruction->GetId();
+  UNREACHABLE();
+}
+
+void InstructionCodeGeneratorX86::VisitVecBelowOrEqual(HVecBelowOrEqual* instruction) {
+  LOG(FATAL) << "No SIMD for " << instruction->GetId();
+  UNREACHABLE();
+}
+
+void LocationsBuilderX86::VisitVecAbove(HVecAbove* instruction) {
+  LOG(FATAL) << "No SIMD for " << instruction->GetId();
+  UNREACHABLE();
+}
+
+void InstructionCodeGeneratorX86::VisitVecAbove(HVecAbove* instruction) {
+  LOG(FATAL) << "No SIMD for " << instruction->GetId();
+  UNREACHABLE();
+}
+
+void LocationsBuilderX86::VisitVecAboveOrEqual(HVecAboveOrEqual* instruction) {
+  LOG(FATAL) << "No SIMD for " << instruction->GetId();
+  UNREACHABLE();
+}
+
+void InstructionCodeGeneratorX86::VisitVecAboveOrEqual(HVecAboveOrEqual* instruction) {
+  LOG(FATAL) << "No SIMD for " << instruction->GetId();
+  UNREACHABLE();
+}
+
+void LocationsBuilderX86::VisitVecPredNot(HVecPredNot* instruction) {
+  LOG(FATAL) << "No SIMD for " << instruction->GetId();
+  UNREACHABLE();
+}
+
+void InstructionCodeGeneratorX86::VisitVecPredNot(HVecPredNot* instruction) {
+  LOG(FATAL) << "No SIMD for " << instruction->GetId();
+  UNREACHABLE();
 }
 
 #undef __

@@ -26,6 +26,7 @@
 #include "common_throws.h"
 #include "dex/dex_file-inl.h"
 #include "dex/dex_file_annotations.h"
+#include "gc/reference_processor.h"
 #include "jni/jni_internal.h"
 #include "jvalue-inl.h"
 #include "mirror/class-inl.h"
@@ -36,7 +37,7 @@
 #include "scoped_fast_native_object_access-inl.h"
 #include "well_known_classes.h"
 
-namespace art {
+namespace art HIDDEN {
 
 using android::base::StringPrintf;
 
@@ -74,7 +75,8 @@ ALWAYS_INLINE inline static bool VerifyFieldAccess(Thread* self,
 }
 
 template<bool kAllowReferences>
-ALWAYS_INLINE inline static bool GetFieldValue(ObjPtr<mirror::Object> o,
+ALWAYS_INLINE inline static bool GetFieldValue(const ScopedFastNativeObjectAccess& soa,
+                                               ObjPtr<mirror::Object> o,
                                                ObjPtr<mirror::Field> f,
                                                Primitive::Type field_type,
                                                JValue* value)
@@ -105,8 +107,20 @@ ALWAYS_INLINE inline static bool GetFieldValue(ObjPtr<mirror::Object> o,
       return true;
     case Primitive::kPrimNot:
       if (kAllowReferences) {
-        value->SetL(is_volatile ? o->GetFieldObjectVolatile<mirror::Object>(offset) :
-            o->GetFieldObject<mirror::Object>(offset));
+        // We need to ensure that a Reference-type object's referent is fetched
+        // via GetReferent and not directly using a read-barrier (See b/174433134)
+        const uint32_t class_flags = o->GetClass()->GetClassFlags();
+        if (UNLIKELY((class_flags & mirror::kClassFlagReference) != 0 &&
+                     mirror::Reference::ReferentOffset() == offset)) {
+          // PhantomReference's get() always returns null.
+          value->SetL((class_flags & mirror::kClassFlagPhantomReference) != 0
+                          ? nullptr
+                          : Runtime::Current()->GetHeap()->GetReferenceProcessor()->GetReferent(
+                                  soa.Self(), o->AsReference()));
+        } else {
+          value->SetL(is_volatile ? o->GetFieldObjectVolatile<mirror::Object>(offset) :
+                      o->GetFieldObject<mirror::Object>(offset));
+        }
         return true;
       }
       // Else break to report an error.
@@ -169,7 +183,7 @@ static jobject Field_get(JNIEnv* env, jobject javaField, jobject javaObj) {
   // Get the field's value, boxing if necessary.
   Primitive::Type field_type = f->GetTypeAsPrimitiveType();
   JValue value;
-  if (!GetFieldValue<true>(o, f, field_type, &value)) {
+  if (!GetFieldValue<true>(soa, o, f, field_type, &value)) {
     DCHECK(soa.Self()->IsExceptionPending());
     return nullptr;
   }
@@ -200,13 +214,13 @@ ALWAYS_INLINE inline static JValue GetPrimitiveField(JNIEnv* env,
   JValue field_value;
   if (field_type == kPrimitiveType) {
     // This if statement should get optimized out since we only pass in valid primitive types.
-    if (UNLIKELY(!GetFieldValue<false>(o, f, kPrimitiveType, &field_value))) {
+    if (UNLIKELY(!GetFieldValue<false>(soa, o, f, kPrimitiveType, &field_value))) {
       DCHECK(soa.Self()->IsExceptionPending());
       return JValue();
     }
     return field_value;
   }
-  if (!GetFieldValue<false>(o, f, field_type, &field_value)) {
+  if (!GetFieldValue<false>(soa, o, f, field_type, &field_value)) {
     DCHECK(soa.Self()->IsExceptionPending());
     return JValue();
   }
@@ -326,12 +340,36 @@ ALWAYS_INLINE inline static void SetFieldValue(ObjPtr<mirror::Object> o,
   }
 }
 
+ALWAYS_INLINE inline static bool ThrowIAEIfRecordFinalField(ObjPtr<mirror::Field> field)
+    REQUIRES_SHARED(Locks::mutator_lock_) {
+  if (!(field->IsFinal())) {
+    return false;
+  }
+  ObjPtr<mirror::Class> declaring_class = field->GetDeclaringClass();
+  DCHECK(declaring_class != nullptr);
+  if (!(declaring_class->IsRecordClass())) {
+    return false;
+  }
+
+  ThrowIllegalAccessException(
+          StringPrintf("Cannot set %s field %s of record class %s",
+              PrettyJavaAccessFlags(field->GetAccessFlags()).c_str(),
+              ArtField::PrettyField(field->GetArtField()).c_str(),
+              declaring_class->PrettyClass().c_str()).c_str());
+
+  return true;
+}
+
 static void Field_set(JNIEnv* env, jobject javaField, jobject javaObj, jobject javaValue) {
   ScopedFastNativeObjectAccess soa(env);
   ObjPtr<mirror::Field> f = soa.Decode<mirror::Field>(javaField);
   // Check that the receiver is non-null and an instance of the field's declaring class.
   ObjPtr<mirror::Object> o;
   if (!CheckReceiver(soa, javaObj, &f, &o)) {
+    DCHECK(soa.Self()->IsExceptionPending());
+    return;
+  }
+  if (ThrowIAEIfRecordFinalField(f)) {
     DCHECK(soa.Self()->IsExceptionPending());
     return;
   }
@@ -373,6 +411,10 @@ static void SetPrimitiveField(JNIEnv* env,
   ObjPtr<mirror::Field> f = soa.Decode<mirror::Field>(javaField);
   ObjPtr<mirror::Object> o;
   if (!CheckReceiver(soa, javaObj, &f, &o)) {
+    return;
+  }
+  if (ThrowIAEIfRecordFinalField(f)) {
+    DCHECK(soa.Self()->IsExceptionPending());
     return;
   }
   Primitive::Type field_type = f->GetTypeAsPrimitiveType();
@@ -477,7 +519,7 @@ static jobjectArray Field_getDeclaredAnnotations(JNIEnv* env, jobject javaField)
   if (field->GetDeclaringClass()->IsProxyClass()) {
     // Return an empty array instead of a null pointer.
     ObjPtr<mirror::Class> annotation_array_class =
-        soa.Decode<mirror::Class>(WellKnownClasses::java_lang_annotation_Annotation__array);
+        WellKnownClasses::ToClass(WellKnownClasses::java_lang_annotation_Annotation__array);
     ObjPtr<mirror::ObjectArray<mirror::Object>> empty_array =
         mirror::ObjectArray<mirror::Object>::Alloc(soa.Self(), annotation_array_class, 0);
     return soa.AddLocalReference<jobjectArray>(empty_array);

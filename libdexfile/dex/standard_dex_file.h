@@ -18,8 +18,11 @@
 #define ART_LIBDEXFILE_DEX_STANDARD_DEX_FILE_H_
 
 #include <iosfwd>
+#include <memory>
 
 #include "dex_file.h"
+
+extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size);
 
 namespace art {
 
@@ -83,12 +86,17 @@ class StandardDexFile : public DexFile {
   // Write the current version, note that the input is the address of the magic.
   static void WriteCurrentVersion(uint8_t* magic);
 
+  // Write the last version before default method support,
+  // note that the input is the address of the magic.
+  static void WriteVersionBeforeDefaultMethods(uint8_t* magic);
+
   static const uint8_t kDexMagic[kDexMagicSize];
-  static constexpr size_t kNumDexVersions = 5;
+  static constexpr size_t kNumDexVersions = 6;
   static const uint8_t kDexMagicVersions[kNumDexVersions][kDexVersionLen];
 
   // Returns true if the byte string points to the magic value.
   static bool IsMagicValid(const uint8_t* magic);
+  static bool IsMagicValid(DexFile::Magic magic) { return IsMagicValid(magic.data()); }
   bool IsMagicValid() const override;
 
   // Returns true if the byte string after the magic is the correct value.
@@ -108,15 +116,12 @@ class StandardDexFile : public DexFile {
 
  private:
   StandardDexFile(const uint8_t* base,
-                  size_t size,
                   const std::string& location,
                   uint32_t location_checksum,
                   const OatDexFile* oat_dex_file,
-                  std::unique_ptr<DexFileContainer> container)
+                  // Shared since several dex files may be stored in the same logical container.
+                  std::shared_ptr<DexFileContainer> container)
       : DexFile(base,
-                size,
-                /*data_begin*/ base,
-                /*data_size*/ size,
                 location,
                 location_checksum,
                 oat_dex_file,
@@ -125,9 +130,11 @@ class StandardDexFile : public DexFile {
 
   friend class DexFileLoader;
   friend class DexFileVerifierTest;
+  friend class FuzzerCorpusTest;  // for constructor
 
   ART_FRIEND_TEST(ClassLinkerTest, RegisterDexFileName);  // for constructor
   friend class OptimizingUnitTestHelper;  // for constructor
+  friend int ::LLVMFuzzerTestOneInput(const uint8_t*, size_t);  // for constructor
 
   DISALLOW_COPY_AND_ASSIGN(StandardDexFile);
 };

@@ -25,13 +25,17 @@
 #include "base/bit_vector-inl.h"
 #include "base/scoped_arena_allocator.h"
 #include "base/scoped_arena_containers.h"
+#include "code_generator.h"
 #include "handle.h"
+#include "intrinsics.h"
 #include "mirror/class.h"
+#include "nodes.h"
 #include "obj_ptr-inl.h"
+#include "optimizing/data_type.h"
 #include "scoped_thread_state_change-inl.h"
 #include "subtype_check.h"
 
-namespace art {
+namespace art HIDDEN {
 
 using android::base::StringPrintf;
 
@@ -62,7 +66,7 @@ static bool IsExitTryBoundaryIntoExitBlock(HBasicBlock* block) {
 size_t GraphChecker::Run(bool pass_change, size_t last_size) {
   size_t current_size = GetGraph()->GetReversePostOrder().size();
   if (!pass_change) {
-    // Nothing changed for certain. Do a quick sanity check on that assertion
+    // Nothing changed for certain. Do a quick check of the validity on that assertion
     // for anything other than the first call (when last size was still 0).
     if (last_size != 0) {
       if (current_size != last_size) {
@@ -79,58 +83,156 @@ size_t GraphChecker::Run(bool pass_change, size_t last_size) {
   // as the latter might visit dead blocks removed by the dominator
   // computation.
   VisitReversePostOrder();
+  CheckGraphFlags();
   return current_size;
+}
+
+void GraphChecker::VisitReversePostOrder() {
+  for (HBasicBlock* block : GetGraph()->GetReversePostOrder()) {
+    if (block->IsInLoop()) {
+      flag_info_.seen_loop = true;
+      if (block->GetLoopInformation()->IsIrreducible()) {
+        flag_info_.seen_irreducible_loop = true;
+      }
+    }
+
+    VisitBasicBlock(block);
+  }
+}
+
+static const char* StrBool(bool val) {
+  return val ? "true" : "false";
+}
+
+void GraphChecker::CheckGraphFlags() {
+  if (GetGraph()->HasMonitorOperations() != flag_info_.seen_monitor_operation) {
+    AddError(
+        StringPrintf("Flag mismatch: HasMonitorOperations() (%s) should be equal to "
+                     "flag_info_.seen_monitor_operation (%s)",
+                     StrBool(GetGraph()->HasMonitorOperations()),
+                     StrBool(flag_info_.seen_monitor_operation)));
+  }
+
+  if (GetGraph()->HasTryCatch() != flag_info_.seen_try_boundary) {
+    AddError(
+        StringPrintf("Flag mismatch: HasTryCatch() (%s) should be equal to "
+                     "flag_info_.seen_try_boundary (%s)",
+                     StrBool(GetGraph()->HasTryCatch()),
+                     StrBool(flag_info_.seen_try_boundary)));
+  }
+
+  if (GetGraph()->HasLoops() != flag_info_.seen_loop) {
+    AddError(
+        StringPrintf("Flag mismatch: HasLoops() (%s) should be equal to "
+                     "flag_info_.seen_loop (%s)",
+                     StrBool(GetGraph()->HasLoops()),
+                     StrBool(flag_info_.seen_loop)));
+  }
+
+  if (GetGraph()->HasIrreducibleLoops() && !GetGraph()->HasLoops()) {
+    AddError(StringPrintf("Flag mismatch: HasIrreducibleLoops() (%s) implies HasLoops() (%s)",
+                          StrBool(GetGraph()->HasIrreducibleLoops()),
+                          StrBool(GetGraph()->HasLoops())));
+  }
+
+  if (GetGraph()->HasIrreducibleLoops() != flag_info_.seen_irreducible_loop) {
+    AddError(
+        StringPrintf("Flag mismatch: HasIrreducibleLoops() (%s) should be equal to "
+                     "flag_info_.seen_irreducible_loop (%s)",
+                     StrBool(GetGraph()->HasIrreducibleLoops()),
+                     StrBool(flag_info_.seen_irreducible_loop)));
+  }
+
+  if (GetGraph()->HasSIMD() != flag_info_.seen_SIMD) {
+    AddError(
+        StringPrintf("Flag mismatch: HasSIMD() (%s) should be equal to "
+                     "flag_info_.seen_SIMD (%s)",
+                     StrBool(GetGraph()->HasSIMD()),
+                     StrBool(flag_info_.seen_SIMD)));
+  }
+
+  if (GetGraph()->HasBoundsChecks() != flag_info_.seen_bounds_checks) {
+    AddError(
+        StringPrintf("Flag mismatch: HasBoundsChecks() (%s) should be equal to "
+                     "flag_info_.seen_bounds_checks (%s)",
+                     StrBool(GetGraph()->HasBoundsChecks()),
+                     StrBool(flag_info_.seen_bounds_checks)));
+  }
+
+  if (GetGraph()->HasAlwaysThrowingInvokes() != flag_info_.seen_always_throwing_invokes) {
+    AddError(
+        StringPrintf("Flag mismatch: HasAlwaysThrowingInvokes() (%s) should be equal to "
+                     "flag_info_.seen_always_throwing_invokes (%s)",
+                     StrBool(GetGraph()->HasAlwaysThrowingInvokes()),
+                     StrBool(flag_info_.seen_always_throwing_invokes)));
+  }
 }
 
 void GraphChecker::VisitBasicBlock(HBasicBlock* block) {
   current_block_ = block;
 
-  // Use local allocator for allocating memory.
-  ScopedArenaAllocator allocator(GetGraph()->GetArenaStack());
+  {
+    // Use local allocator for allocating memory. We use C++ scopes (i.e. `{}`) to reclaim the
+    // memory as soon as possible, and to end the scope of this `ScopedArenaAllocator`.
+    ScopedArenaAllocator allocator(GetGraph()->GetArenaStack());
 
-  // Check consistency with respect to predecessors of `block`.
-  // Note: Counting duplicates with a sorted vector uses up to 6x less memory
-  // than ArenaSafeMap<HBasicBlock*, size_t> and also allows storage reuse.
-  ScopedArenaVector<HBasicBlock*> sorted_predecessors(allocator.Adapter(kArenaAllocGraphChecker));
-  sorted_predecessors.assign(block->GetPredecessors().begin(), block->GetPredecessors().end());
-  std::sort(sorted_predecessors.begin(), sorted_predecessors.end());
-  for (auto it = sorted_predecessors.begin(), end = sorted_predecessors.end(); it != end; ) {
-    HBasicBlock* p = *it++;
-    size_t p_count_in_block_predecessors = 1u;
-    for (; it != end && *it == p; ++it) {
-      ++p_count_in_block_predecessors;
+    {
+      // Check consistency with respect to predecessors of `block`.
+      // Note: Counting duplicates with a sorted vector uses up to 6x less memory
+      // than ArenaSafeMap<HBasicBlock*, size_t> and also allows storage reuse.
+      ScopedArenaVector<HBasicBlock*> sorted_predecessors(
+          allocator.Adapter(kArenaAllocGraphChecker));
+      sorted_predecessors.assign(block->GetPredecessors().begin(), block->GetPredecessors().end());
+      std::sort(sorted_predecessors.begin(), sorted_predecessors.end());
+      for (auto it = sorted_predecessors.begin(), end = sorted_predecessors.end(); it != end;) {
+        HBasicBlock* p = *it++;
+        size_t p_count_in_block_predecessors = 1u;
+        for (; it != end && *it == p; ++it) {
+          ++p_count_in_block_predecessors;
+        }
+        size_t block_count_in_p_successors =
+            std::count(p->GetSuccessors().begin(), p->GetSuccessors().end(), block);
+        if (p_count_in_block_predecessors != block_count_in_p_successors) {
+          AddError(StringPrintf(
+              "Block %d lists %zu occurrences of block %d in its predecessors, whereas "
+              "block %d lists %zu occurrences of block %d in its successors.",
+              block->GetBlockId(),
+              p_count_in_block_predecessors,
+              p->GetBlockId(),
+              p->GetBlockId(),
+              block_count_in_p_successors,
+              block->GetBlockId()));
+        }
+      }
     }
-    size_t block_count_in_p_successors =
-        std::count(p->GetSuccessors().begin(), p->GetSuccessors().end(), block);
-    if (p_count_in_block_predecessors != block_count_in_p_successors) {
-      AddError(StringPrintf(
-          "Block %d lists %zu occurrences of block %d in its predecessors, whereas "
-          "block %d lists %zu occurrences of block %d in its successors.",
-          block->GetBlockId(), p_count_in_block_predecessors, p->GetBlockId(),
-          p->GetBlockId(), block_count_in_p_successors, block->GetBlockId()));
-    }
-  }
 
-  // Check consistency with respect to successors of `block`.
-  // Note: Counting duplicates with a sorted vector uses up to 6x less memory
-  // than ArenaSafeMap<HBasicBlock*, size_t> and also allows storage reuse.
-  ScopedArenaVector<HBasicBlock*> sorted_successors(allocator.Adapter(kArenaAllocGraphChecker));
-  sorted_successors.assign(block->GetSuccessors().begin(), block->GetSuccessors().end());
-  std::sort(sorted_successors.begin(), sorted_successors.end());
-  for (auto it = sorted_successors.begin(), end = sorted_successors.end(); it != end; ) {
-    HBasicBlock* s = *it++;
-    size_t s_count_in_block_successors = 1u;
-    for (; it != end && *it == s; ++it) {
-      ++s_count_in_block_successors;
-    }
-    size_t block_count_in_s_predecessors =
-        std::count(s->GetPredecessors().begin(), s->GetPredecessors().end(), block);
-    if (s_count_in_block_successors != block_count_in_s_predecessors) {
-      AddError(StringPrintf(
-          "Block %d lists %zu occurrences of block %d in its successors, whereas "
-          "block %d lists %zu occurrences of block %d in its predecessors.",
-          block->GetBlockId(), s_count_in_block_successors, s->GetBlockId(),
-          s->GetBlockId(), block_count_in_s_predecessors, block->GetBlockId()));
+    {
+      // Check consistency with respect to successors of `block`.
+      // Note: Counting duplicates with a sorted vector uses up to 6x less memory
+      // than ArenaSafeMap<HBasicBlock*, size_t> and also allows storage reuse.
+      ScopedArenaVector<HBasicBlock*> sorted_successors(allocator.Adapter(kArenaAllocGraphChecker));
+      sorted_successors.assign(block->GetSuccessors().begin(), block->GetSuccessors().end());
+      std::sort(sorted_successors.begin(), sorted_successors.end());
+      for (auto it = sorted_successors.begin(), end = sorted_successors.end(); it != end;) {
+        HBasicBlock* s = *it++;
+        size_t s_count_in_block_successors = 1u;
+        for (; it != end && *it == s; ++it) {
+          ++s_count_in_block_successors;
+        }
+        size_t block_count_in_s_predecessors =
+            std::count(s->GetPredecessors().begin(), s->GetPredecessors().end(), block);
+        if (s_count_in_block_successors != block_count_in_s_predecessors) {
+          AddError(
+              StringPrintf("Block %d lists %zu occurrences of block %d in its successors, whereas "
+                           "block %d lists %zu occurrences of block %d in its predecessors.",
+                           block->GetBlockId(),
+                           s_count_in_block_successors,
+                           s->GetBlockId(),
+                           s->GetBlockId(),
+                           block_count_in_s_predecessors,
+                           block->GetBlockId()));
+        }
+      }
     }
   }
 
@@ -154,6 +256,24 @@ void GraphChecker::VisitBasicBlock(HBasicBlock* block) {
         AddError(StringPrintf("Unexpected instruction %s:%d jumps into the exit block.",
                               last_instruction->DebugName(),
                               last_instruction->GetId()));
+      }
+    }
+  }
+
+  // Make sure the first instruction of a catch block is always a Nop that emits an environment.
+  if (block->IsCatchBlock()) {
+    if (!block->GetFirstInstruction()->IsNop()) {
+      AddError(StringPrintf("Block %d doesn't have a Nop as its first instruction.",
+                            current_block_->GetBlockId()));
+    } else {
+      HNop* nop = block->GetFirstInstruction()->AsNop();
+      if (!nop->NeedsEnvironment()) {
+        AddError(
+            StringPrintf("%s:%d is a Nop and the first instruction of block %d, but it doesn't "
+                         "need an environment.",
+                         nop->DebugName(),
+                         nop->GetId(),
+                         current_block_->GetBlockId()));
       }
     }
   }
@@ -184,10 +304,11 @@ void GraphChecker::VisitBasicBlock(HBasicBlock* block) {
                             current_block_->GetBlockId()));
     }
     if (current->GetNext() == nullptr && current != block->GetLastInstruction()) {
-      AddError(StringPrintf("The recorded last instruction of block %d does not match "
-                            "the actual last instruction %d.",
-                            current_block_->GetBlockId(),
-                            current->GetId()));
+      AddError(
+          StringPrintf("The recorded last instruction of block %d does not match "
+                       "the actual last instruction %d.",
+                       current_block_->GetBlockId(),
+                       current->GetId()));
     }
     current->Accept(this);
   }
@@ -216,6 +337,12 @@ void GraphChecker::VisitBasicBlock(HBasicBlock* block) {
                             block->GetBlockId(),
                             dominated->GetBlockId()));
     }
+  }
+
+  // Ensure all blocks have at least one successor, except the Exit block.
+  if (block->GetSuccessors().empty() && !block->IsExitBlock()) {
+    AddError(StringPrintf("Block %d has no successor and it is not the Exit block.",
+                          block->GetBlockId()));
   }
 
   // Ensure there is no critical edge (i.e., an edge connecting a
@@ -290,27 +417,30 @@ void GraphChecker::VisitBasicBlock(HBasicBlock* block) {
 }
 
 void GraphChecker::VisitBoundsCheck(HBoundsCheck* check) {
+  VisitInstruction(check);
+
   if (!GetGraph()->HasBoundsChecks()) {
-    AddError(StringPrintf("Instruction %s:%d is a HBoundsCheck, "
-                          "but HasBoundsChecks() returns false",
-                          check->DebugName(),
-                          check->GetId()));
+    AddError(
+        StringPrintf("The graph doesn't have the HasBoundsChecks flag set but we saw "
+                     "%s:%d in block %d.",
+                     check->DebugName(),
+                     check->GetId(),
+                     check->GetBlock()->GetBlockId()));
   }
 
-  // Perform the instruction base checks too.
-  VisitInstruction(check);
+  flag_info_.seen_bounds_checks = true;
 }
 
 void GraphChecker::VisitDeoptimize(HDeoptimize* deopt) {
+  VisitInstruction(deopt);
   if (GetGraph()->IsCompilingOsr()) {
     AddError(StringPrintf("A graph compiled OSR cannot have a HDeoptimize instruction"));
   }
-
-  // Perform the instruction base checks too.
-  VisitInstruction(deopt);
 }
 
 void GraphChecker::VisitTryBoundary(HTryBoundary* try_boundary) {
+  VisitInstruction(try_boundary);
+
   ArrayRef<HBasicBlock* const> handlers = try_boundary->GetExceptionHandlers();
 
   // Ensure that all exception handlers are catch blocks.
@@ -337,22 +467,83 @@ void GraphChecker::VisitTryBoundary(HTryBoundary* try_boundary) {
     }
   }
 
-  VisitInstruction(try_boundary);
+  if (!GetGraph()->HasTryCatch()) {
+    AddError(
+        StringPrintf("The graph doesn't have the HasTryCatch flag set but we saw "
+                     "%s:%d in block %d.",
+                     try_boundary->DebugName(),
+                     try_boundary->GetId(),
+                     try_boundary->GetBlock()->GetBlockId()));
+  }
+
+  flag_info_.seen_try_boundary = true;
+}
+
+void GraphChecker::VisitLoadClass(HLoadClass* load) {
+  VisitInstruction(load);
+
+  if (load->GetLoadedClassRTI().IsValid() && !load->GetLoadedClassRTI().IsExact()) {
+    std::stringstream ssRTI;
+    ssRTI << load->GetLoadedClassRTI();
+    AddError(StringPrintf("%s:%d in block %d with RTI %s has valid but inexact RTI.",
+                          load->DebugName(),
+                          load->GetId(),
+                          load->GetBlock()->GetBlockId(),
+                          ssRTI.str().c_str()));
+  }
 }
 
 void GraphChecker::VisitLoadException(HLoadException* load) {
-  // Ensure that LoadException is the first instruction in a catch block.
+  VisitInstruction(load);
+
+  // Ensure that LoadException is the second instruction in a catch block. The first one should be a
+  // Nop (checked separately).
   if (!load->GetBlock()->IsCatchBlock()) {
     AddError(StringPrintf("%s:%d is in a non-catch block %d.",
                           load->DebugName(),
                           load->GetId(),
                           load->GetBlock()->GetBlockId()));
-  } else if (load->GetBlock()->GetFirstInstruction() != load) {
-    AddError(StringPrintf("%s:%d is not the first instruction in catch block %d.",
+  } else if (load->GetBlock()->GetFirstInstruction()->GetNext() != load) {
+    AddError(StringPrintf("%s:%d is not the second instruction in catch block %d.",
                           load->DebugName(),
                           load->GetId(),
                           load->GetBlock()->GetBlockId()));
   }
+}
+
+void GraphChecker::VisitMonitorOperation(HMonitorOperation* monitor_op) {
+  VisitInstruction(monitor_op);
+
+  if (!GetGraph()->HasMonitorOperations()) {
+    AddError(
+        StringPrintf("The graph doesn't have the HasMonitorOperations flag set but we saw "
+                     "%s:%d in block %d.",
+                     monitor_op->DebugName(),
+                     monitor_op->GetId(),
+                     monitor_op->GetBlock()->GetBlockId()));
+  }
+
+  flag_info_.seen_monitor_operation = true;
+}
+
+bool GraphChecker::ContainedInItsBlockList(HInstruction* instruction) {
+  HBasicBlock* block = instruction->GetBlock();
+  ScopedArenaSafeMap<HBasicBlock*, ScopedArenaHashSet<HInstruction*>>& instruction_set =
+      instruction->IsPhi() ? phis_per_block_ : instructions_per_block_;
+  auto map_it = instruction_set.find(block);
+  if (map_it == instruction_set.end()) {
+    // Populate extra bookkeeping.
+    map_it = instruction_set.insert(
+        {block, ScopedArenaHashSet<HInstruction*>(allocator_.Adapter(kArenaAllocGraphChecker))})
+        .first;
+    const HInstructionList& instruction_list = instruction->IsPhi() ?
+                                                   instruction->GetBlock()->GetPhis() :
+                                                   instruction->GetBlock()->GetInstructions();
+    for (HInstructionIterator list_it(instruction_list); !list_it.Done(); list_it.Advance()) {
+        map_it->second.insert(list_it.Current());
+    }
+  }
+  return map_it->second.find(instruction) != map_it->second.end();
 }
 
 void GraphChecker::VisitInstruction(HInstruction* instruction) {
@@ -377,23 +568,19 @@ void GraphChecker::VisitInstruction(HInstruction* instruction) {
                           instruction->GetBlock()->GetBlockId()));
   }
 
-  // Ensure the inputs of `instruction` are defined in a block of the graph.
+  // Ensure the inputs of `instruction` are defined in a block of the graph, and the entry in the
+  // use list is consistent.
   for (HInstruction* input : instruction->GetInputs()) {
     if (input->GetBlock() == nullptr) {
       AddError(StringPrintf("Input %d of instruction %d is not in any "
                             "basic block of the control-flow graph.",
                             input->GetId(),
                             instruction->GetId()));
-    } else {
-      const HInstructionList& list = input->IsPhi()
-          ? input->GetBlock()->GetPhis()
-          : input->GetBlock()->GetInstructions();
-      if (!list.Contains(input)) {
+    } else if (!ContainedInItsBlockList(input)) {
         AddError(StringPrintf("Input %d of instruction %d is not defined "
                               "in a basic block of the control-flow graph.",
                               input->GetId(),
                               instruction->GetId()));
-      }
     }
   }
 
@@ -401,10 +588,7 @@ void GraphChecker::VisitInstruction(HInstruction* instruction) {
   // and the entry in the use list is consistent.
   for (const HUseListNode<HInstruction*>& use : instruction->GetUses()) {
     HInstruction* user = use.GetUser();
-    const HInstructionList& list = user->IsPhi()
-        ? user->GetBlock()->GetPhis()
-        : user->GetBlock()->GetInstructions();
-    if (!list.Contains(user)) {
+    if (!ContainedInItsBlockList(user)) {
       AddError(StringPrintf("User %s:%d of instruction %d is not defined "
                             "in a basic block of the control-flow graph.",
                             user->DebugName(),
@@ -436,107 +620,156 @@ void GraphChecker::VisitInstruction(HInstruction* instruction) {
   }
 
   // Ensure 'instruction' has pointers to its inputs' use entries.
-  auto&& input_records = instruction->GetInputRecords();
-  for (size_t i = 0; i < input_records.size(); ++i) {
-    const HUserRecord<HInstruction*>& input_record = input_records[i];
-    HInstruction* input = input_record.GetInstruction();
-    if ((input_record.GetBeforeUseNode() == input->GetUses().end()) ||
-        (input_record.GetUseNode() == input->GetUses().end()) ||
-        !input->GetUses().ContainsNode(*input_record.GetUseNode()) ||
-        (input_record.GetUseNode()->GetIndex() != i)) {
-      AddError(StringPrintf("Instruction %s:%d has an invalid iterator before use entry "
-                            "at input %u (%s:%d).",
-                            instruction->DebugName(),
-                            instruction->GetId(),
-                            static_cast<unsigned>(i),
-                            input->DebugName(),
-                            input->GetId()));
+  {
+    auto&& input_records = instruction->GetInputRecords();
+    for (size_t i = 0; i < input_records.size(); ++i) {
+      const HUserRecord<HInstruction*>& input_record = input_records[i];
+      HInstruction* input = input_record.GetInstruction();
+
+      // Populate bookkeeping, if needed. See comment in graph_checker.h for uses_per_instruction_.
+      auto it = uses_per_instruction_.find(input->GetId());
+      if (it == uses_per_instruction_.end()) {
+        it = uses_per_instruction_
+                 .insert({input->GetId(),
+                          ScopedArenaSet<const art::HUseListNode<art::HInstruction*>*>(
+                              allocator_.Adapter(kArenaAllocGraphChecker))})
+                 .first;
+        for (auto&& use : input->GetUses()) {
+          it->second.insert(std::addressof(use));
+        }
+      }
+
+      if ((input_record.GetBeforeUseNode() == input->GetUses().end()) ||
+          (input_record.GetUseNode() == input->GetUses().end()) ||
+          (it->second.find(std::addressof(*input_record.GetUseNode())) == it->second.end()) ||
+          (input_record.GetUseNode()->GetIndex() != i)) {
+        AddError(
+            StringPrintf("Instruction %s:%d has an invalid iterator before use entry "
+                         "at input %u (%s:%d).",
+                         instruction->DebugName(),
+                         instruction->GetId(),
+                         static_cast<unsigned>(i),
+                         input->DebugName(),
+                         input->GetId()));
+      }
     }
   }
 
   // Ensure an instruction dominates all its uses.
   for (const HUseListNode<HInstruction*>& use : instruction->GetUses()) {
     HInstruction* user = use.GetUser();
-    if (!user->IsPhi() && !instruction->StrictlyDominates(user)) {
-      AddError(StringPrintf("Instruction %s:%d in block %d does not dominate "
-                            "use %s:%d in block %d.",
-                            instruction->DebugName(),
-                            instruction->GetId(),
-                            current_block_->GetBlockId(),
-                            user->DebugName(),
-                            user->GetId(),
-                            user->GetBlock()->GetBlockId()));
+    if (!user->IsPhi() && (instruction->GetBlock() == user->GetBlock()
+                               ? seen_ids_.IsBitSet(user->GetId())
+                               : !instruction->GetBlock()->Dominates(user->GetBlock()))) {
+      AddError(
+          StringPrintf("Instruction %s:%d in block %d does not dominate "
+                       "use %s:%d in block %d.",
+                       instruction->DebugName(),
+                       instruction->GetId(),
+                       current_block_->GetBlockId(),
+                       user->DebugName(),
+                       user->GetId(),
+                       user->GetBlock()->GetBlockId()));
     }
   }
 
-  if (instruction->NeedsEnvironment() && !instruction->HasEnvironment()) {
-    AddError(StringPrintf("Instruction %s:%d in block %d requires an environment "
-                          "but does not have one.",
+  if (instruction->NeedsEnvironment() != instruction->HasEnvironment()) {
+    const char* str;
+    if (instruction->NeedsEnvironment()) {
+      str = "Instruction %s:%d in block %d requires an environment but does not have one.";
+    } else {
+      str = "Instruction %s:%d in block %d doesn't require an environment but it has one.";
+    }
+
+    AddError(StringPrintf(str,
                           instruction->DebugName(),
                           instruction->GetId(),
                           current_block_->GetBlockId()));
   }
 
-  // Ensure an instruction having an environment is dominated by the
-  // instructions contained in the environment.
-  for (HEnvironment* environment = instruction->GetEnvironment();
-       environment != nullptr;
-       environment = environment->GetParent()) {
-    for (size_t i = 0, e = environment->Size(); i < e; ++i) {
-      HInstruction* env_instruction = environment->GetInstructionAt(i);
-      if (env_instruction != nullptr
-          && !env_instruction->StrictlyDominates(instruction)) {
-        AddError(StringPrintf("Instruction %d in environment of instruction %d "
-                              "from block %d does not dominate instruction %d.",
-                              env_instruction->GetId(),
-                              instruction->GetId(),
-                              current_block_->GetBlockId(),
-                              instruction->GetId()));
-      }
+  // Ensure an instruction dominates all its environment uses.
+  for (const HUseListNode<HEnvironment*>& use : instruction->GetEnvUses()) {
+    HInstruction* user = use.GetUser()->GetHolder();
+    if (user->IsPhi()) {
+      AddError(StringPrintf("Phi %d shouldn't have an environment", instruction->GetId()));
+    }
+    if (instruction->GetBlock() == user->GetBlock()
+            ? seen_ids_.IsBitSet(user->GetId())
+            : !instruction->GetBlock()->Dominates(user->GetBlock())) {
+      AddError(
+          StringPrintf("Instruction %s:%d in block %d does not dominate "
+                       "environment use %s:%d in block %d.",
+                       instruction->DebugName(),
+                       instruction->GetId(),
+                       current_block_->GetBlockId(),
+                       user->DebugName(),
+                       user->GetId(),
+                       user->GetBlock()->GetBlockId()));
     }
   }
 
-  // Ensure that reference type instructions have reference type info.
-  if (check_reference_type_info_ && instruction->GetType() == DataType::Type::kReference) {
-    if (!instruction->GetReferenceTypeInfo().IsValid()) {
-      AddError(StringPrintf("Reference type instruction %s:%d does not have "
-                            "valid reference type information.",
-                            instruction->DebugName(),
-                            instruction->GetId()));
-    }
-  }
-
-  if (instruction->CanThrowIntoCatchBlock()) {
-    // Find the top-level environment. This corresponds to the environment of
-    // the catch block since we do not inline methods with try/catch.
-    HEnvironment* environment = instruction->GetEnvironment();
-    while (environment->GetParent() != nullptr) {
-      environment = environment->GetParent();
-    }
-
-    // Find all catch blocks and test that `instruction` has an environment
-    // value for each one.
+  if (instruction->CanThrow() && !instruction->HasEnvironment()) {
+    AddError(StringPrintf("Throwing instruction %s:%d in block %d does not have an environment.",
+                          instruction->DebugName(),
+                          instruction->GetId(),
+                          current_block_->GetBlockId()));
+  } else if (instruction->CanThrowIntoCatchBlock()) {
+    // Find all catch blocks and test that `instruction` has an environment value for each one.
     const HTryBoundary& entry = instruction->GetBlock()->GetTryCatchInformation()->GetTryEntry();
     for (HBasicBlock* catch_block : entry.GetExceptionHandlers()) {
+      const HEnvironment* environment = catch_block->GetFirstInstruction()->GetEnvironment();
       for (HInstructionIterator phi_it(catch_block->GetPhis()); !phi_it.Done(); phi_it.Advance()) {
         HPhi* catch_phi = phi_it.Current()->AsPhi();
         if (environment->GetInstructionAt(catch_phi->GetRegNumber()) == nullptr) {
-          AddError(StringPrintf("Instruction %s:%d throws into catch block %d "
-                                "with catch phi %d for vreg %d but its "
-                                "corresponding environment slot is empty.",
-                                instruction->DebugName(),
-                                instruction->GetId(),
-                                catch_block->GetBlockId(),
-                                catch_phi->GetId(),
-                                catch_phi->GetRegNumber()));
+          AddError(
+              StringPrintf("Instruction %s:%d throws into catch block %d "
+                           "with catch phi %d for vreg %d but its "
+                           "corresponding environment slot is empty.",
+                           instruction->DebugName(),
+                           instruction->GetId(),
+                           catch_block->GetBlockId(),
+                           catch_phi->GetId(),
+                           catch_phi->GetRegNumber()));
         }
       }
     }
   }
 }
 
-void GraphChecker::VisitInvokeStaticOrDirect(HInvokeStaticOrDirect* invoke) {
+void GraphChecker::VisitInvoke(HInvoke* invoke) {
   VisitInstruction(invoke);
+
+  if (invoke->AlwaysThrows()) {
+    if (!GetGraph()->HasAlwaysThrowingInvokes()) {
+      AddError(
+          StringPrintf("The graph doesn't have the HasAlwaysThrowingInvokes flag set but we saw "
+                       "%s:%d in block %d and it always throws.",
+                       invoke->DebugName(),
+                       invoke->GetId(),
+                       invoke->GetBlock()->GetBlockId()));
+    }
+    flag_info_.seen_always_throwing_invokes = true;
+  }
+
+  // Check for intrinsics which should have been replaced by intermediate representation in the
+  // instruction builder.
+  if (!IsValidIntrinsicAfterBuilder(invoke->GetIntrinsic())) {
+    std::stringstream ss;
+    ss << invoke->GetIntrinsic();
+    AddError(
+        StringPrintf("The graph contains the intrinsic %s which should have been replaced in the "
+                     "instruction builder: %s:%d in block %d.",
+                     ss.str().c_str(),
+                     invoke->DebugName(),
+                     invoke->GetId(),
+                     invoke->GetBlock()->GetBlockId()));
+  }
+}
+
+void GraphChecker::VisitInvokeStaticOrDirect(HInvokeStaticOrDirect* invoke) {
+  // We call VisitInvoke and not VisitInstruction to de-duplicate the common code: always throwing
+  // and intrinsic checks.
+  VisitInvoke(invoke);
 
   if (invoke->IsStaticWithExplicitClinitCheck()) {
     const HInstruction* last_input = invoke->GetInputs().back();
@@ -606,6 +839,17 @@ void GraphChecker::CheckTypeCheckBitstringInput(HTypeCheckInstruction* check,
 
 void GraphChecker::HandleTypeCheckInstruction(HTypeCheckInstruction* check) {
   VisitInstruction(check);
+
+  if (check->GetTargetClassRTI().IsValid() && !check->GetTargetClassRTI().IsExact()) {
+    std::stringstream ssRTI;
+    ssRTI << check->GetTargetClassRTI();
+    AddError(StringPrintf("%s:%d in block %d with RTI %s has valid but inexact RTI.",
+                          check->DebugName(),
+                          check->GetId(),
+                          check->GetBlock()->GetBlockId(),
+                          ssRTI.str().c_str()));
+  }
+
   HInstruction* input = check->InputAt(1);
   if (check->GetTypeCheckKind() == TypeCheckKind::kBitstringCheck) {
     if (!input->IsNullConstant()) {
@@ -668,13 +912,14 @@ void GraphChecker::HandleLoop(HBasicBlock* loop_header) {
         loop_information->GetPreHeader()->GetSuccessors().size()));
   }
 
-  if (loop_information->GetSuspendCheck() == nullptr) {
-    AddError(StringPrintf(
-        "Loop with header %d does not have a suspend check.",
-        loop_header->GetBlockId()));
+  if (!GetGraph()->SuspendChecksAreAllowedToNoOp() &&
+      loop_information->GetSuspendCheck() == nullptr) {
+    AddError(StringPrintf("Loop with header %d does not have a suspend check.",
+                          loop_header->GetBlockId()));
   }
 
-  if (loop_information->GetSuspendCheck() != loop_header->GetFirstInstructionDisregardMoves()) {
+  if (!GetGraph()->SuspendChecksAreAllowedToNoOp() &&
+      loop_information->GetSuspendCheck() != loop_header->GetFirstInstructionDisregardMoves()) {
     AddError(StringPrintf(
         "Loop header %d does not have the loop suspend check as the first instruction.",
         loop_header->GetBlockId()));
@@ -776,8 +1021,7 @@ static bool IsSameSizeConstant(const HInstruction* insn1, const HInstruction* in
 static bool IsConstantEquivalent(const HInstruction* insn1,
                                  const HInstruction* insn2,
                                  BitVector* visited) {
-  if (insn1->IsPhi() &&
-      insn1->AsPhi()->IsVRegEquivalentOf(insn2)) {
+  if (insn1->IsPhi() && insn1->AsPhi()->IsVRegEquivalentOf(insn2)) {
     HConstInputsRef insn1_inputs = insn1->GetInputs();
     HConstInputsRef insn2_inputs = insn2->GetInputs();
     if (insn1_inputs.size() != insn2_inputs.size()) {
@@ -933,7 +1177,6 @@ void GraphChecker::VisitPhi(HPhi* phi) {
                                  GetGraph()->GetCurrentInstructionId(),
                                  /* expandable= */ false,
                                  kArenaAllocGraphChecker);
-          visited.ClearAllBits();
           if (!IsConstantEquivalent(phi, other_phi, &visited)) {
             AddError(StringPrintf("Two phis (%d and %d) found for VReg %d but they "
                                   "are not equivalents of constants.",
@@ -1045,6 +1288,115 @@ void GraphChecker::VisitNeg(HNeg* instruction) {
   }
 }
 
+HInstruction* HuntForOriginalReference(HInstruction* ref) {
+  // An original reference can be transformed by instructions like:
+  //   i0 NewArray
+  //   i1 HInstruction(i0)  <-- NullCheck, BoundType, IntermediateAddress.
+  //   i2 ArraySet(i1, index, value)
+  DCHECK(ref != nullptr);
+  while (ref->IsNullCheck() || ref->IsBoundType() || ref->IsIntermediateAddress()) {
+    ref = ref->InputAt(0);
+  }
+  return ref;
+}
+
+bool IsRemovedWriteBarrier(DataType::Type type,
+                           WriteBarrierKind write_barrier_kind,
+                           HInstruction* value) {
+  return write_barrier_kind == WriteBarrierKind::kDontEmit &&
+         type == DataType::Type::kReference &&
+         !HuntForOriginalReference(value)->IsNullConstant();
+}
+
+void GraphChecker::VisitArraySet(HArraySet* instruction) {
+  VisitInstruction(instruction);
+
+  if (instruction->NeedsTypeCheck() !=
+      instruction->GetSideEffects().Includes(SideEffects::CanTriggerGC())) {
+    AddError(
+        StringPrintf("%s %d has a flag mismatch. An ArraySet instruction can trigger a GC iff it "
+                     "needs a type check. Needs type check: %s, Can trigger GC: %s",
+                     instruction->DebugName(),
+                     instruction->GetId(),
+                     StrBool(instruction->NeedsTypeCheck()),
+                     StrBool(instruction->GetSideEffects().Includes(SideEffects::CanTriggerGC()))));
+  }
+
+  if (IsRemovedWriteBarrier(instruction->GetComponentType(),
+                            instruction->GetWriteBarrierKind(),
+                            instruction->GetValue())) {
+    CheckWriteBarrier(instruction, [](HInstruction* it_instr) {
+      return it_instr->AsArraySet()->GetWriteBarrierKind();
+    });
+  }
+}
+
+void GraphChecker::VisitInstanceFieldSet(HInstanceFieldSet* instruction) {
+  VisitInstruction(instruction);
+  if (IsRemovedWriteBarrier(instruction->GetFieldType(),
+                            instruction->GetWriteBarrierKind(),
+                            instruction->GetValue())) {
+    CheckWriteBarrier(instruction, [](HInstruction* it_instr) {
+      return it_instr->AsInstanceFieldSet()->GetWriteBarrierKind();
+    });
+  }
+}
+
+void GraphChecker::VisitStaticFieldSet(HStaticFieldSet* instruction) {
+  VisitInstruction(instruction);
+  if (IsRemovedWriteBarrier(instruction->GetFieldType(),
+                            instruction->GetWriteBarrierKind(),
+                            instruction->GetValue())) {
+    CheckWriteBarrier(instruction, [](HInstruction* it_instr) {
+      return it_instr->AsStaticFieldSet()->GetWriteBarrierKind();
+    });
+  }
+}
+
+template <typename GetWriteBarrierKind>
+void GraphChecker::CheckWriteBarrier(HInstruction* instruction,
+                                     GetWriteBarrierKind&& get_write_barrier_kind) {
+  DCHECK(instruction->IsStaticFieldSet() ||
+         instruction->IsInstanceFieldSet() ||
+         instruction->IsArraySet());
+
+  // For removed write barriers, we expect that the write barrier they are relying on is:
+  // A) In the same block, and
+  // B) There's no instruction between them that can trigger a GC.
+  HInstruction* object = HuntForOriginalReference(instruction->InputAt(0));
+  bool found = false;
+  for (HBackwardInstructionIterator it(instruction); !it.Done(); it.Advance()) {
+    if (instruction->GetKind() == it.Current()->GetKind() &&
+        object == HuntForOriginalReference(it.Current()->InputAt(0)) &&
+        get_write_barrier_kind(it.Current()) == WriteBarrierKind::kEmitBeingReliedOn) {
+      // Found the write barrier we are relying on.
+      found = true;
+      break;
+    }
+
+    // We check the `SideEffects::CanTriggerGC` after failing to find the write barrier since having
+    // a write barrier that's relying on an ArraySet that can trigger GC is fine because the card
+    // table is marked after the GC happens.
+    if (it.Current()->GetSideEffects().Includes(SideEffects::CanTriggerGC())) {
+      AddError(
+          StringPrintf("%s %d from block %d was expecting a write barrier and it didn't find "
+                       "any. %s %d can trigger GC",
+                       instruction->DebugName(),
+                       instruction->GetId(),
+                       instruction->GetBlock()->GetBlockId(),
+                       it.Current()->DebugName(),
+                       it.Current()->GetId()));
+    }
+  }
+
+  if (!found) {
+    AddError(StringPrintf("%s %d in block %d didn't find a write barrier to latch onto",
+                          instruction->DebugName(),
+                          instruction->GetId(),
+                          instruction->GetBlock()->GetBlockId()));
+  }
+}
+
 void GraphChecker::VisitBinaryOperation(HBinaryOperation* op) {
   VisitInstruction(op);
   DataType::Type lhs_type = op->InputAt(0)->GetType();
@@ -1052,7 +1404,7 @@ void GraphChecker::VisitBinaryOperation(HBinaryOperation* op) {
   DataType::Type result_type = op->GetType();
 
   // Type consistency between inputs.
-  if (op->IsUShr() || op->IsShr() || op->IsShl() || op->IsRor()) {
+  if (op->IsUShr() || op->IsShr() || op->IsShl() || op->IsRol() || op->IsRor()) {
     if (DataType::Kind(rhs_type) != DataType::Type::kInt32) {
       AddError(StringPrintf("Shift/rotate operation %s %d has a non-int kind second input: "
                             "%s of type %s.",
@@ -1076,7 +1428,7 @@ void GraphChecker::VisitBinaryOperation(HBinaryOperation* op) {
                             op->GetId(),
                             DataType::PrettyDescriptor(result_type)));
     }
-  } else if (op->IsUShr() || op->IsShr() || op->IsShl() || op->IsRor()) {
+  } else if (op->IsUShr() || op->IsShr() || op->IsShl() || op->IsRol() || op->IsRor()) {
     // Only check the first input (value), as the second one (distance)
     // must invariably be of kind `int`.
     if (result_type != DataType::Kind(lhs_type)) {
@@ -1105,6 +1457,8 @@ void GraphChecker::VisitBinaryOperation(HBinaryOperation* op) {
 }
 
 void GraphChecker::VisitConstant(HConstant* instruction) {
+  VisitInstruction(instruction);
+
   HBasicBlock* block = instruction->GetBlock();
   if (!block->IsEntryBlock()) {
     AddError(StringPrintf(
@@ -1138,6 +1492,40 @@ void GraphChecker::VisitTypeConversion(HTypeConversion* instruction) {
         instruction->GetId(),
         DataType::PrettyDescriptor(result_type),
         DataType::PrettyDescriptor(input_type)));
+  }
+}
+
+void GraphChecker::VisitVecOperation(HVecOperation* instruction) {
+  VisitInstruction(instruction);
+
+  if (!GetGraph()->HasSIMD()) {
+    AddError(
+        StringPrintf("The graph doesn't have the HasSIMD flag set but we saw "
+                     "%s:%d in block %d.",
+                     instruction->DebugName(),
+                     instruction->GetId(),
+                     instruction->GetBlock()->GetBlockId()));
+  }
+
+  flag_info_.seen_SIMD = true;
+
+  if (codegen_ == nullptr) {
+    return;
+  }
+
+  if (!codegen_->SupportsPredicatedSIMD() && instruction->IsPredicated()) {
+    AddError(StringPrintf(
+             "%s %d must not be predicated.",
+             instruction->DebugName(),
+             instruction->GetId()));
+  }
+
+  if (codegen_->SupportsPredicatedSIMD() &&
+      (instruction->MustBePredicatedInPredicatedSIMDMode() != instruction->IsPredicated())) {
+    AddError(StringPrintf(
+             "%s %d predication mode is incorrect; see HVecOperation::MustBePredicated.",
+             instruction->DebugName(),
+             instruction->GetId()));
   }
 }
 

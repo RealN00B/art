@@ -42,7 +42,7 @@ extern "C" JNIEXPORT void JNICALL Java_art_Test2031_simulateZygoteFork(JNIEnv*, 
   }
   runtime->SetAsZygoteChild(/*is_system_server=*/false, /*is_zygote=*/false);
   runtime->AddCompilerOption("--debuggable");
-  runtime->SetJavaDebuggable(true);
+  runtime->SetRuntimeDebugState(Runtime::RuntimeDebugState::kJavaDebuggableAtInit);
   {
     // Deoptimize the boot image as it may be non-debuggable.
     ScopedSuspendAll ssa(__FUNCTION__);
@@ -59,18 +59,12 @@ extern "C" JNIEXPORT void JNICALL Java_art_Test2031_simulateZygoteFork(JNIEnv*, 
 
 extern "C" JNIEXPORT void JNICALL Java_art_Test2031_setupJvmti(JNIEnv* env,
                                                                jclass,
-                                                               jstring testdir) {
-  const char* td = env->GetStringUTFChars(testdir, nullptr);
-  std::string testdir_str;
-  testdir_str.resize(env->GetStringUTFLength(testdir));
-  memcpy(testdir_str.data(), td, testdir_str.size());
-  env->ReleaseStringUTFChars(testdir, td);
+                                                               [[maybe_unused]] jstring testdir) {
   std::ostringstream oss;
-  Runtime* runtime = Runtime::Current();
-  oss << testdir_str << (kIsDebugBuild ? "libtiagentd.so" : "libtiagent.so")
+  oss << (kIsDebugBuild ? "libtiagentd.so" : "libtiagent.so")
       << "=2031-zygote-compiled-frame-deopt,art";
   LOG(INFO) << "agent " << oss.str();
-  runtime->AttachAgent(env, oss.str(), nullptr);
+  Runtime::Current()->AttachAgent(env, oss.str(), nullptr);
 }
 extern "C" JNIEXPORT void JNICALL Java_art_Test2031_waitForNativeSleep(JNIEnv*, jclass) {
   while (!native_waiting) {

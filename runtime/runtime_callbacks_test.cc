@@ -27,7 +27,7 @@
 
 #include "jni.h"
 
-#include "art_method-inl.h"
+#include "art_method-alloc-inl.h"
 #include "base/mem_map.h"
 #include "base/mutex.h"
 #include "class_linker.h"
@@ -35,7 +35,7 @@
 #include "dex/class_reference.h"
 #include "handle.h"
 #include "handle_scope-inl.h"
-#include "mirror/class-inl.h"
+#include "mirror/class-alloc-inl.h"
 #include "mirror/class_loader.h"
 #include "monitor-inl.h"
 #include "nativehelper/scoped_local_ref.h"
@@ -44,9 +44,9 @@
 #include "scoped_thread_state_change-inl.h"
 #include "thread-inl.h"
 #include "thread_list.h"
-#include "well_known_classes.h"
+#include "well_known_classes-inl.h"
 
-namespace art {
+namespace art HIDDEN {
 
 class RuntimeCallbacksTest : public CommonRuntimeTest {
  protected:
@@ -55,7 +55,7 @@ class RuntimeCallbacksTest : public CommonRuntimeTest {
 
     Thread* self = Thread::Current();
     ScopedObjectAccess soa(self);
-    ScopedThreadSuspension sts(self, kWaitingForDebuggerToAttach);
+    ScopedThreadSuspension sts(self, ThreadState::kWaitingForDebuggerToAttach);
     ScopedSuspendAll ssa("RuntimeCallbacksTest SetUp");
     AddListener();
   }
@@ -64,7 +64,7 @@ class RuntimeCallbacksTest : public CommonRuntimeTest {
     {
       Thread* self = Thread::Current();
       ScopedObjectAccess soa(self);
-      ScopedThreadSuspension sts(self, kWaitingForDebuggerToAttach);
+      ScopedThreadSuspension sts(self, ThreadState::kWaitingForDebuggerToAttach);
       ScopedSuspendAll ssa("RuntimeCallbacksTest TearDown");
       RemoveListener();
     }
@@ -80,7 +80,7 @@ class RuntimeCallbacksTest : public CommonRuntimeTest {
     PointerSize pointer_size = class_linker_->GetImagePointerSize();
     for (auto& m : klass->GetMethods(pointer_size)) {
       if (!m.IsAbstract()) {
-        class_linker_->SetEntryPointsToInterpreter(&m);
+        Runtime::Current()->GetInstrumentation()->InitializeMethodsCode(&m, /*aot_code=*/ nullptr);
       }
     }
   }
@@ -88,7 +88,7 @@ class RuntimeCallbacksTest : public CommonRuntimeTest {
 
 class ThreadLifecycleCallbackRuntimeCallbacksTest : public RuntimeCallbacksTest {
  public:
-  static void* PthreadsCallback(void* arg ATTRIBUTE_UNUSED) {
+  static void* PthreadsCallback([[maybe_unused]] void* arg) {
     // Attach.
     Runtime* runtime = Runtime::Current();
     CHECK(runtime->AttachCurrentThread("ThreadLifecycle test thread", true, nullptr, false));
@@ -118,6 +118,10 @@ class ThreadLifecycleCallbackRuntimeCallbacksTest : public RuntimeCallbacksTest 
 
   struct Callback : public ThreadLifecycleCallback {
     void ThreadStart(Thread* self) override {
+      {
+        ScopedObjectAccess soa(self);
+        LOG(DEBUG) << "ThreadStart callback for thread: " << self->GetThreadName();
+      }
       if (state == CallbackState::kBase) {
         state = CallbackState::kStarted;
         stored_self = self;
@@ -127,6 +131,10 @@ class ThreadLifecycleCallbackRuntimeCallbacksTest : public RuntimeCallbacksTest 
     }
 
     void ThreadDeath(Thread* self) override {
+      {
+        ScopedObjectAccess soa(self);
+        LOG(DEBUG) << "ThreadDeath callback for thread: " << self->GetThreadName();
+      }
       if (state == CallbackState::kStarted && self == stored_self) {
         state = CallbackState::kDied;
       } else {
@@ -150,50 +158,48 @@ TEST_F(ThreadLifecycleCallbackRuntimeCallbacksTest, ThreadLifecycleCallbackJava)
   // Make sure the workers are done starting so we don't get callbacks for them.
   runtime_->WaitForThreadPoolWorkersToStart();
 
+  // The metrics reporting thread will sometimes be slow to start. Synchronously requesting a
+  // metrics report forces us to wait until the thread has started.
+  runtime_->RequestMetricsReport(/*synchronous=*/true);
+
   cb_.state = CallbackState::kBase;  // Ignore main thread attach.
 
-  {
-    ScopedObjectAccess soa(self);
-    MakeExecutable(soa.Decode<mirror::Class>(WellKnownClasses::java_lang_Thread));
-  }
+  ScopedObjectAccess soa(self);
+  MakeExecutable(WellKnownClasses::java_lang_Thread.Get());
 
-  JNIEnv* env = self->GetJniEnv();
+  StackHandleScope<3u> hs(self);
+  Handle<mirror::String> thread_name = hs.NewHandle(
+      mirror::String::AllocFromModifiedUtf8(self, "ThreadLifecycleCallback test thread"));
+  ASSERT_TRUE(thread_name != nullptr);
 
-  ScopedLocalRef<jobject> thread_name(env,
-                                      env->NewStringUTF("ThreadLifecycleCallback test thread"));
-  ASSERT_TRUE(thread_name.get() != nullptr);
+  Handle<mirror::Object> thread_group =
+      hs.NewHandle(soa.Decode<mirror::Object>(runtime_->GetMainThreadGroup()));
+  Handle<mirror::Object> thread =
+      WellKnownClasses::java_lang_Thread_init->NewObject<'L', 'L', 'I', 'Z'>(
+          hs, self, thread_group, thread_name, kMinThreadPriority, /*daemon=*/ false);
+  ASSERT_FALSE(self->IsExceptionPending());
+  ASSERT_TRUE(thread != nullptr);
 
-  ScopedLocalRef<jobject> thread(env, env->AllocObject(WellKnownClasses::java_lang_Thread));
-  ASSERT_TRUE(thread.get() != nullptr);
+  ArtMethod* start_method =
+      thread->GetClass()->FindClassMethod("start", "()V", kRuntimePointerSize);
+  ASSERT_TRUE(start_method != nullptr);
 
-  env->CallNonvirtualVoidMethod(thread.get(),
-                                WellKnownClasses::java_lang_Thread,
-                                WellKnownClasses::java_lang_Thread_init,
-                                runtime_->GetMainThreadGroup(),
-                                thread_name.get(),
-                                kMinThreadPriority,
-                                JNI_FALSE);
-  ASSERT_FALSE(env->ExceptionCheck());
+  start_method->InvokeVirtual<'V'>(self, thread.Get());
+  ASSERT_FALSE(self->IsExceptionPending());
 
-  jmethodID start_id = env->GetMethodID(WellKnownClasses::java_lang_Thread, "start", "()V");
-  ASSERT_TRUE(start_id != nullptr);
+  ArtMethod* join_method = thread->GetClass()->FindClassMethod("join", "()V", kRuntimePointerSize);
+  ASSERT_TRUE(join_method != nullptr);
 
-  env->CallVoidMethod(thread.get(), start_id);
-  ASSERT_FALSE(env->ExceptionCheck());
+  join_method->InvokeFinal<'V'>(self, thread.Get());
+  ASSERT_FALSE(self->IsExceptionPending());
 
-  jmethodID join_id = env->GetMethodID(WellKnownClasses::java_lang_Thread, "join", "()V");
-  ASSERT_TRUE(join_id != nullptr);
-
-  env->CallVoidMethod(thread.get(), join_id);
-  ASSERT_FALSE(env->ExceptionCheck());
-
-  EXPECT_TRUE(cb_.state == CallbackState::kDied) << static_cast<int>(cb_.state);
+  EXPECT_EQ(cb_.state, CallbackState::kDied);
 }
 
 TEST_F(ThreadLifecycleCallbackRuntimeCallbacksTest, ThreadLifecycleCallbackAttach) {
   std::string error_msg;
   MemMap stack = MemMap::MapAnonymous("ThreadLifecycleCallback Thread",
-                                      128 * kPageSize,  // Just some small stack.
+                                      128 * gPageSize,  // Just some small stack.
                                       PROT_READ | PROT_WRITE,
                                       /*low_4gb=*/ false,
                                       &error_msg);
@@ -254,12 +260,12 @@ class ClassLoadCallbackRuntimeCallbacksTest : public RuntimeCallbacksTest {
 
   struct Callback : public ClassLoadCallback {
     void ClassPreDefine(const char* descriptor,
-                        Handle<mirror::Class> klass ATTRIBUTE_UNUSED,
-                        Handle<mirror::ClassLoader> class_loader ATTRIBUTE_UNUSED,
+                        [[maybe_unused]] Handle<mirror::Class> klass,
+                        [[maybe_unused]] Handle<mirror::ClassLoader> class_loader,
                         const DexFile& initial_dex_file,
-                        const dex::ClassDef& initial_class_def ATTRIBUTE_UNUSED,
-                        /*out*/DexFile const** final_dex_file ATTRIBUTE_UNUSED,
-                        /*out*/dex::ClassDef const** final_class_def ATTRIBUTE_UNUSED) override
+                        [[maybe_unused]] const dex::ClassDef& initial_class_def,
+                        [[maybe_unused]] /*out*/ DexFile const** final_dex_file,
+                        [[maybe_unused]] /*out*/ dex::ClassDef const** final_class_def) override
         REQUIRES_SHARED(Locks::mutator_lock_) {
       const std::string& location = initial_dex_file.GetLocation();
       std::string event =
@@ -291,17 +297,17 @@ class ClassLoadCallbackRuntimeCallbacksTest : public RuntimeCallbacksTest {
 TEST_F(ClassLoadCallbackRuntimeCallbacksTest, ClassLoadCallback) {
   ScopedObjectAccess soa(Thread::Current());
   jobject jclass_loader = LoadDex("XandY");
+  cb_.data.clear();  // Clear class loading records from `LoadDex()`, if any.
   VariableSizedHandleScope hs(soa.Self());
   Handle<mirror::ClassLoader> class_loader(hs.NewHandle(
       soa.Decode<mirror::ClassLoader>(jclass_loader)));
 
   const char* descriptor_y = "LY;";
-  Handle<mirror::Class> h_Y(
-      hs.NewHandle(class_linker_->FindClass(soa.Self(), descriptor_y, class_loader)));
+  Handle<mirror::Class> h_Y = hs.NewHandle(FindClass(descriptor_y, class_loader));
   ASSERT_TRUE(h_Y != nullptr);
 
-  bool expect1 = Expect({ "PreDefine:LY; <art-gtest-XandY.jar>",
-                          "PreDefine:LX; <art-gtest-XandY.jar>",
+  bool expect1 = Expect({ "PreDefine:LY; <art-gtest-jars-XandY.jar>",
+                          "PreDefine:LX; <art-gtest-jars-XandY.jar>",
                           "Load:LX;",
                           "Prepare:LX;[LX;]",
                           "Load:LY;",
@@ -312,7 +318,7 @@ TEST_F(ClassLoadCallbackRuntimeCallbacksTest, ClassLoadCallback) {
 
   ASSERT_TRUE(class_linker_->EnsureInitialized(Thread::Current(), h_Y, true, true));
 
-  bool expect2 = Expect({ "PreDefine:LY$Z; <art-gtest-XandY.jar>",
+  bool expect2 = Expect({ "PreDefine:LY$Z; <art-gtest-jars-XandY.jar>",
                           "Load:LY$Z;",
                           "Prepare:LY$Z;[LY$Z;]" });
   EXPECT_TRUE(expect2);
@@ -461,20 +467,20 @@ class MonitorWaitCallbacksTest : public RuntimeCallbacksTest {
       ref_ = { &k->GetDexFile(), k->GetDexClassDefIndex() };
     }
 
-    void MonitorContendedLocking(Monitor* mon ATTRIBUTE_UNUSED) override
-        REQUIRES_SHARED(Locks::mutator_lock_) { }
+    void MonitorContendedLocking([[maybe_unused]] Monitor* mon) override
+        REQUIRES_SHARED(Locks::mutator_lock_) {}
 
-    void MonitorContendedLocked(Monitor* mon ATTRIBUTE_UNUSED) override
-        REQUIRES_SHARED(Locks::mutator_lock_) { }
+    void MonitorContendedLocked([[maybe_unused]] Monitor* mon) override
+        REQUIRES_SHARED(Locks::mutator_lock_) {}
 
-    void ObjectWaitStart(Handle<mirror::Object> obj, int64_t millis ATTRIBUTE_UNUSED) override
+    void ObjectWaitStart(Handle<mirror::Object> obj, [[maybe_unused]] int64_t millis) override
         REQUIRES_SHARED(Locks::mutator_lock_) {
       if (IsInterestingObject(obj.Get())) {
         saw_wait_start_ = true;
       }
     }
 
-    void MonitorWaitFinished(Monitor* m, bool timed_out ATTRIBUTE_UNUSED) override
+    void MonitorWaitFinished(Monitor* m, [[maybe_unused]] bool timed_out) override
         REQUIRES_SHARED(Locks::mutator_lock_) {
       if (IsInterestingObject(m->GetObject())) {
         saw_wait_finished_ = true;
@@ -502,16 +508,15 @@ TEST_F(MonitorWaitCallbacksTest, WaitUnlocked) {
     ASSERT_TRUE(started);
     {
       ScopedObjectAccess soa(self);
-      cb_.SetInterestingObject(
-          soa.Decode<mirror::Class>(WellKnownClasses::java_util_Collections));
+      cb_.SetInterestingObject(WellKnownClasses::java_util_Collections.Get());
       Monitor::Wait(
           self,
           // Just a random class
-          soa.Decode<mirror::Class>(WellKnownClasses::java_util_Collections),
+          WellKnownClasses::java_util_Collections.Get(),
           /*ms=*/0,
           /*ns=*/0,
           /*interruptShouldThrow=*/false,
-          /*why=*/kWaiting);
+          /*why=*/ThreadState::kWaiting);
     }
   }
   ASSERT_TRUE(cb_.saw_wait_start_);

@@ -46,7 +46,7 @@
 #define HAVE_TIMED_RWLOCK 0
 #endif
 
-namespace art {
+namespace art HIDDEN {
 
 class SHARED_LOCKABLE ReaderWriterMutex;
 class SHARED_LOCKABLE MutatorMutex;
@@ -103,11 +103,15 @@ class BaseMutex {
   BaseMutex(const char* name, LockLevel level);
   virtual ~BaseMutex();
 
-  // Add this mutex to those owned by self, and perform appropriate checking.
-  // For this call only, self may also be another suspended thread.
-  void RegisterAsLocked(Thread* self);
+  // Add this mutex to those owned by self, and optionally perform lock order checking.  Caller
+  // may wish to disable checking for trylock calls that cannot result in deadlock.  For this call
+  // only, self may also be another suspended thread.
+  void RegisterAsLocked(Thread* self, bool check = kDebugLocking);
+  void RegisterAsLockedImpl(Thread* self, LockLevel level, bool check);
 
   void RegisterAsUnlocked(Thread* self);
+  void RegisterAsUnlockedImpl(Thread* self, LockLevel level);
+
   void CheckSafeToWait(Thread* self);
 
   friend class ScopedContentionRecorder;
@@ -169,7 +173,7 @@ class BaseMutex {
 // acquired) by a thread in suspended state. Suspending all threads does NOT prevent mutex state
 // from changing.
 std::ostream& operator<<(std::ostream& os, const Mutex& mu);
-class LOCKABLE Mutex : public BaseMutex {
+class EXPORT LOCKABLE Mutex : public BaseMutex {
  public:
   explicit Mutex(const char* name, LockLevel level = kDefaultMutexLevel, bool recursive = false);
   ~Mutex();
@@ -180,7 +184,10 @@ class LOCKABLE Mutex : public BaseMutex {
   void ExclusiveLock(Thread* self) ACQUIRE();
   void Lock(Thread* self) ACQUIRE() {  ExclusiveLock(self); }
 
-  // Returns true if acquires exclusive access, false otherwise.
+  // Returns true if acquires exclusive access, false otherwise. The `check` argument specifies
+  // whether lock level checking should be performed.  Should be defaulted unless we are using
+  // TryLock instead of Lock for deadlock avoidance.
+  template <bool kCheck = kDebugLocking>
   bool ExclusiveTryLock(Thread* self) TRY_ACQUIRE(true);
   bool TryLock(Thread* self) TRY_ACQUIRE(true) { return ExclusiveTryLock(self); }
   // Equivalent to ExclusiveTryLock, but retry for a short period before giving up.
@@ -221,6 +228,18 @@ class LOCKABLE Mutex : public BaseMutex {
 
   void Dump(std::ostream& os) const override;
 
+  void DumpStack(Thread *self, uint64_t wait_start_ms, uint64_t try_times = 1);
+
+  static bool IsDumpFrequent(Thread *self, uint64_t try_times = 1);
+
+  void setEnableMonitorTimeout() {
+    enable_monitor_timeout_ = true;
+  }
+
+  void setMonitorId(uint32_t monitorId) {
+    monitor_id_ = monitorId;
+  }
+
   // For negative capabilities in clang annotations.
   const Mutex& operator!() const { return *this; }
 
@@ -260,7 +279,7 @@ class LOCKABLE Mutex : public BaseMutex {
 
   int32_t get_contenders() {
     // Result is guaranteed to include any contention added by this thread; otherwise approximate.
-    // Treat contenders as unsigned because we're paranoid about overflow; should never matter.
+    // Treat contenders as unsigned because we're concerned about overflow; should never matter.
     return static_cast<uint32_t>(state_and_contenders_.load(std::memory_order_relaxed))
         >> kContenderShift;
   }
@@ -274,6 +293,10 @@ class LOCKABLE Mutex : public BaseMutex {
 
   unsigned int recursion_count_;
   const bool recursive_;  // Can the lock be recursively held?
+
+  bool enable_monitor_timeout_ = false;
+
+  uint32_t monitor_id_;
 
   friend class ConditionVariable;
   DISALLOW_COPY_AND_ASSIGN(Mutex);
@@ -295,8 +318,8 @@ class LOCKABLE Mutex : public BaseMutex {
 // Exclusive | Block         | Free            | Block            | error
 // Shared(n) | Block         | error           | SharedLock(n+1)* | Shared(n-1) or Free
 // * for large values of n the SharedLock may block.
-std::ostream& operator<<(std::ostream& os, const ReaderWriterMutex& mu);
-class SHARED_LOCKABLE ReaderWriterMutex : public BaseMutex {
+EXPORT std::ostream& operator<<(std::ostream& os, const ReaderWriterMutex& mu);
+class EXPORT SHARED_LOCKABLE ReaderWriterMutex : public BaseMutex {
  public:
   explicit ReaderWriterMutex(const char* name, LockLevel level = kDefaultMutexLevel);
   ~ReaderWriterMutex();
@@ -323,7 +346,7 @@ class SHARED_LOCKABLE ReaderWriterMutex : public BaseMutex {
   void ReaderLock(Thread* self) ACQUIRE_SHARED() { SharedLock(self); }
 
   // Try to acquire share of ReaderWriterMutex.
-  bool SharedTryLock(Thread* self) SHARED_TRYLOCK_FUNCTION(true);
+  bool SharedTryLock(Thread* self, bool check = kDebugLocking) SHARED_TRYLOCK_FUNCTION(true);
 
   // Release a share of the access.
   void SharedUnlock(Thread* self) RELEASE_SHARED() ALWAYS_INLINE;
@@ -371,7 +394,7 @@ class SHARED_LOCKABLE ReaderWriterMutex : public BaseMutex {
 
   // Id associated with exclusive owner. No memory ordering semantics if called from a thread other
   // than the owner. Returns 0 if the lock is not held. Returns either 0 or -1 if it is held by
-  // one or more readers.
+  // one or more readers. Not reliable unless the mutex is held.
   pid_t GetExclusiveOwnerTid() const;
 
   void Dump(std::ostream& os) const override;
@@ -437,7 +460,7 @@ class SHARED_LOCKABLE MutatorMutex : public ReaderWriterMutex {
 
 // ConditionVariables allow threads to queue and sleep. Threads may then be resumed individually
 // (Signal) or all at once (Broadcast).
-class ConditionVariable {
+class EXPORT ConditionVariable {
  public:
   ConditionVariable(const char* name, Mutex& mutex);
   ~ConditionVariable();
@@ -499,6 +522,18 @@ class SCOPED_CAPABILITY MutexLock {
   Thread* const self_;
   Mutex& mu_;
   DISALLOW_COPY_AND_ASSIGN(MutexLock);
+};
+
+// Pretend to acquire a mutex for checking purposes, without actually doing so. Use with
+// extreme caution when it is known the condition that the mutex would guard against cannot arise.
+class SCOPED_CAPABILITY FakeMutexLock {
+ public:
+  explicit FakeMutexLock(Mutex& mu) ACQUIRE(mu) NO_THREAD_SAFETY_ANALYSIS {}
+
+  ~FakeMutexLock() RELEASE() NO_THREAD_SAFETY_ANALYSIS {}
+
+ private:
+  DISALLOW_COPY_AND_ASSIGN(FakeMutexLock);
 };
 
 // Scoped locker/unlocker for a ReaderWriterMutex that acquires read access to mu upon

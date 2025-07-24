@@ -17,6 +17,9 @@
 #ifndef ART_RUNTIME_JIT_PROFILE_SAVER_H_
 #define ART_RUNTIME_JIT_PROFILE_SAVER_H_
 
+#include <utility>
+
+#include "app_info.h"
 #include "base/mutex.h"
 #include "base/safe_map.h"
 #include "dex/method_reference.h"
@@ -24,16 +27,22 @@
 #include "profile/profile_compilation_info.h"
 #include "profile_saver_options.h"
 
-namespace art {
+namespace art HIDDEN {
 
 class ProfileSaver {
  public:
   // Starts the profile saver thread if not already started.
   // If the saver is already running it adds (output_filename, code_paths) to its tracked locations.
+  //
+  // The `ref_profile_filename` denotes the path to the reference profile which
+  // might be queried to determine if an initial save should be done earlier.
+  // It can be empty indicating there is no reference profile.
   static void Start(const ProfileSaverOptions& options,
                     const std::string& output_filename,
                     jit::JitCodeCache* jit_code_cache,
-                    const std::vector<std::string>& code_paths)
+                    const std::vector<std::string>& code_paths,
+                    const std::string& ref_profile_filename,
+                    AppInfo::CodeType code_type)
       REQUIRES(!Locks::profiler_lock_, !instance_->wait_lock_);
 
   // Stops the profile saver thread.
@@ -48,20 +57,17 @@ class ProfileSaver {
   static void NotifyJitActivity() REQUIRES(!Locks::profiler_lock_, !instance_->wait_lock_);
 
   // For testing or manual purposes (SIGUSR1).
-  static void ForceProcessProfiles() REQUIRES(!Locks::profiler_lock_, !Locks::mutator_lock_);
-
-  // Just for testing purposes.
-  static bool HasSeenMethod(const std::string& profile, bool hot, MethodReference ref)
-      REQUIRES(!Locks::profiler_lock_);
+  EXPORT static void ForceProcessProfiles() REQUIRES(!Locks::profiler_lock_, !Locks::mutator_lock_);
 
   // Notify that startup has completed.
   static void NotifyStartupCompleted() REQUIRES(!Locks::profiler_lock_, !instance_->wait_lock_);
 
  private:
-  ProfileSaver(const ProfileSaverOptions& options,
-               const std::string& output_filename,
-               jit::JitCodeCache* jit_code_cache,
-               const std::vector<std::string>& code_paths);
+  // Helper classes for collecting classes and methods.
+  class GetClassesAndMethodsHelper;
+  class ScopedDefaultPriority;
+
+  ProfileSaver(const ProfileSaverOptions& options, jit::JitCodeCache* jit_code_cache);
   ~ProfileSaver();
 
   static void* RunProfileSaverThread(void* arg)
@@ -89,8 +95,9 @@ class ProfileSaver {
   bool ShuttingDown(Thread* self) REQUIRES(!Locks::profiler_lock_);
 
   void AddTrackedLocations(const std::string& output_filename,
-                           const std::vector<std::string>& code_paths)
-      REQUIRES(Locks::profiler_lock_);
+                           const std::vector<std::string>& code_paths,
+                           const std::string& ref_profile_filename,
+                           AppInfo::CodeType code_type) REQUIRES(Locks::profiler_lock_);
 
   // Fetches the current resolved classes and methods from the ClassLinker and stores them in the
   // profile_cache_ for later save.
@@ -105,6 +112,9 @@ class ProfileSaver {
   // Get the profile metadata that should be associated with the profile session during the current
   // profile saver session.
   ProfileCompilationInfo::ProfileSampleAnnotation GetProfileSampleAnnotation();
+
+  // Get extra global flags if necessary (e.g. the running architecture), otherwise 0.
+  static uint32_t GetExtraMethodHotnessFlags(const ProfileSaverOptions& options);
 
   // Extends the given set of flags with global flags if necessary (e.g. the running architecture).
   ProfileCompilationInfo::MethodHotness::Flag AnnotateSampleFlags(uint32_t flags);
@@ -127,6 +137,14 @@ class ProfileSaver {
   SafeMap<std::string, std::set<std::string>> tracked_dex_base_locations_to_be_resolved_
       GUARDED_BY(Locks::profiler_lock_);
 
+  // Collection of output profiles that the profile tracks.
+  // It maps output profile locations to reference profiles and code types.
+  // This is used to determine if any profile is non-empty at the start of the ProfileSaver, which
+  // influences the time of the first ever save.
+  // It's also used to determine the save order.
+  SafeMap<std::string, std::pair<std::string, AppInfo::CodeType>> tracked_profiles_
+      GUARDED_BY(Locks::profiler_lock_);
+
   bool shutting_down_ GUARDED_BY(Locks::profiler_lock_);
   uint64_t last_time_ns_saver_woke_up_ GUARDED_BY(wait_lock_);
   uint32_t jit_activity_notifications_;
@@ -136,7 +154,13 @@ class ProfileSaver {
   // we don't hammer the disk to save them right away.
   // The size of this cache is usually very small and tops
   // to just a few hundreds entries in the ProfileCompilationInfo objects.
-  SafeMap<std::string, ProfileCompilationInfo*> profile_cache_;
+  SafeMap<std::string, ProfileCompilationInfo*> profile_cache_ GUARDED_BY(Locks::profiler_lock_);
+
+  // Whether or not this is the first ever profile save.
+  // Note this is an approximation and is not 100% precise. It relies on checking
+  // whether or not the profiles are empty which is not a precise indication
+  // of being the first save (they could have been cleared in the meantime).
+  bool IsFirstSave() REQUIRES(!Locks::profiler_lock_);
 
   // Save period condition support.
   Mutex wait_lock_ DEFAULT_MUTEX_ACQUIRED_AFTER;

@@ -31,7 +31,7 @@
 #include <zircon/syscalls/object.h>
 #endif
 
-namespace art {
+namespace art HIDDEN {
 
 #if defined(__linux__)
 static void arch_prctl(int code, void* val) {
@@ -58,7 +58,7 @@ void Thread::InitCpu() {
   // Allow easy indirection back to Thread*.
   tlsPtr_.self = this;
 
-  // Sanity check that reads from %gs point to this Thread*.
+  // Check that the reads from %gs point to this Thread*.
   Thread* self_check;
   __asm__ __volatile__("movq %%gs:(%1), %0"
       : "=r"(self_check)  // output
@@ -68,7 +68,7 @@ void Thread::InitCpu() {
 }
 
 void Thread::CleanupCpu() {
-  // Sanity check that reads from %gs point to this Thread*.
+  // Check that the reads from %gs point to this Thread*.
   Thread* self_check;
   __asm__ __volatile__("movq %%gs:(%1), %0"
       : "=r"(self_check)  // output

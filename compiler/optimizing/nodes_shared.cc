@@ -21,9 +21,9 @@
 
 #include "nodes_shared.h"
 
-#include "common_arm64.h"
+#include "instruction_simplifier_shared.h"
 
-namespace art {
+namespace art HIDDEN {
 
 using helpers::CanFitInShifterOperand;
 

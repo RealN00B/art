@@ -52,6 +52,7 @@ Class #0            -
       name          : '<init>'
       type          : '()V'
       access        : 0x10001 (PUBLIC CONSTRUCTOR)
+      method_idx    : 0
       code          -
       registers     : 1
       ins           : 1
@@ -61,15 +62,16 @@ Class #0            -
 0003c0: 7010 0a00 0000                         |0000: invoke-direct {v0}, Ljava/lang/Object;.<init>:()V // method@000a
 0003c6: 0e00                                   |0003: return-void
       catches       : (none)
-      positions     : 
+      positions     :
         0x0000 line=22
-      locals        : 
-        0x0000 - 0x0004 reg=0 this LMain; 
+      locals        :
+        0x0000 - 0x0004 reg=0 this LMain;
 
     #1              : (in LMain;)
       name          : 'main'
       type          : '([Ljava/lang/String;)V'
       access        : 0x0009 (PUBLIC STATIC)
+      method_idx    : 1
       code          -
       registers     : 6
       ins           : 1
@@ -89,13 +91,13 @@ Class #0            -
 000400: fa20 1200 5000 1000                    |0014: invoke-polymorphic {v0, v5}, Ljava/lang/invoke/MethodHandle;.invokeExact:([Ljava/lang/Object;)Ljava/lang/Object;, ([Ljava/lang/String;)V // method@0012, proto@0010
 000408: 0e00                                   |0018: return-void
       catches       : (none)
-      positions     : 
+      positions     :
         0x0000 line=26
         0x000c line=27
         0x0014 line=28
         0x0018 line=29
-      locals        : 
-        0x0000 - 0x0019 reg=5 (null) [Ljava/lang/String; 
+      locals        :
+        0x0000 - 0x0019 reg=5 (null) [Ljava/lang/String;
 
   Virtual methods   -
   source_file_idx   : 29 (Main.java)
@@ -129,6 +131,7 @@ Class #1            -
       name          : '<init>'
       type          : '()V'
       access        : 0x10001 (PUBLIC CONSTRUCTOR)
+      method_idx    : 2
       code          -
       registers     : 1
       ins           : 1
@@ -138,15 +141,16 @@ Class #1            -
 00041c: 7010 0a00 0000                         |0000: invoke-direct {v0}, Ljava/lang/Object;.<init>:()V // method@000a
 000422: 0e00                                   |0003: return-void
       catches       : (none)
-      positions     : 
+      positions     :
         0x0000 line=22
-      locals        : 
-        0x0000 - 0x0004 reg=0 this Lconstmethodhandle/ConstTest; 
+      locals        :
+        0x0000 - 0x0004 reg=0 this Lconstmethodhandle/ConstTest;
 
     #1              : (in Lconstmethodhandle/ConstTest;)
       name          : 'displayMethodHandle'
       type          : '(Ljava/lang/invoke/MethodHandle;)V'
       access        : 0x000a (PRIVATE STATIC)
+      method_idx    : 3
       code          -
       registers     : 4
       ins           : 1
@@ -176,18 +180,19 @@ Class #1            -
 00048a: 6e20 0800 1000                         |002b: invoke-virtual {v0, v1}, Ljava/io/PrintStream;.println:(Ljava/lang/String;)V // method@0008
 000490: 0e00                                   |002e: return-void
       catches       : (none)
-      positions     : 
+      positions     :
         0x0000 line=24
         0x001a line=25
         0x002b line=24
         0x002e line=26
-      locals        : 
-        0x0000 - 0x002f reg=3 (null) Ljava/lang/invoke/MethodHandle; 
+      locals        :
+        0x0000 - 0x002f reg=3 (null) Ljava/lang/invoke/MethodHandle;
 
     #2              : (in Lconstmethodhandle/ConstTest;)
       name          : 'displayMethodType'
       type          : '(Ljava/lang/invoke/MethodType;)V'
       access        : 0x000a (PRIVATE STATIC)
+      method_idx    : 4
       code          -
       registers     : 4
       ins           : 1
@@ -207,16 +212,17 @@ Class #1            -
 0004ce: 6e20 0800 1000                         |0015: invoke-virtual {v0, v1}, Ljava/io/PrintStream;.println:(Ljava/lang/String;)V // method@0008
 0004d4: 0e00                                   |0018: return-void
       catches       : (none)
-      positions     : 
+      positions     :
         0x0000 line=29
         0x0018 line=30
-      locals        : 
-        0x0000 - 0x0019 reg=3 (null) Ljava/lang/invoke/MethodType; 
+      locals        :
+        0x0000 - 0x0019 reg=3 (null) Ljava/lang/invoke/MethodType;
 
     #3              : (in Lconstmethodhandle/ConstTest;)
       name          : 'main'
       type          : '([Ljava/lang/String;)V'
       access        : 0x0009 (PUBLIC STATIC)
+      method_idx    : 5
       code          -
       registers     : 2
       ins           : 1
@@ -231,13 +237,14 @@ Class #1            -
 0004fe: 7110 0400 0000                         |000b: invoke-static {v0}, Lconstmethodhandle/ConstTest;.displayMethodType:(Ljava/lang/invoke/MethodType;)V // method@0004
 000504: 0e00                                   |000e: return-void
       catches       : (none)
-      positions     : 
-      locals        : 
+      positions     :
+      locals        :
 
     #4              : (in Lconstmethodhandle/ConstTest;)
       name          : 'test1'
       type          : '()Ljava/lang/invoke/MethodHandle;'
       access        : 0x0009 (PUBLIC STATIC)
+      method_idx    : 6
       code          -
       registers     : 1
       ins           : 0
@@ -247,13 +254,14 @@ Class #1            -
 000518: fe00 0000                              |0000: const-method-handle v0, method_handle@0000
 00051c: 1100                                   |0002: return-object v0
       catches       : (none)
-      positions     : 
-      locals        : 
+      positions     :
+      locals        :
 
     #5              : (in Lconstmethodhandle/ConstTest;)
       name          : 'test2'
       type          : '()Ljava/lang/invoke/MethodType;'
       access        : 0x0009 (PUBLIC STATIC)
+      method_idx    : 7
       code          -
       registers     : 1
       ins           : 0
@@ -263,8 +271,8 @@ Class #1            -
 000530: ff00 1100                              |0000: const-method-type v0, (CSIJFDLjava/lang/Object;)Z // proto@0011
 000534: 1100                                   |0002: return-object v0
       catches       : (none)
-      positions     : 
-      locals        : 
+      positions     :
+      locals        :
 
   Virtual methods   -
   source_file_idx   : 3 (ConstTest.java)

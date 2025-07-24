@@ -17,9 +17,12 @@
 #ifndef ART_RUNTIME_RUNTIME_INTRINSICS_H_
 #define ART_RUNTIME_RUNTIME_INTRINSICS_H_
 
-namespace art {
+#include "base/locks.h"
+#include "base/macros.h"
 
-void InitializeIntrinsics();
+namespace art HIDDEN {
+
+EXPORT void InitializeIntrinsics() REQUIRES_SHARED(Locks::mutator_lock_);
 
 }  // namespace art
 

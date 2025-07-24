@@ -23,11 +23,11 @@
 #include "scoped_fast_native_object_access-inl.h"
 #include "thread.h"
 
-namespace art {
+namespace art HIDDEN {
 
 static jobject Throwable_nativeFillInStackTrace(JNIEnv* env, jclass) {
   ScopedFastNativeObjectAccess soa(env);
-  return soa.Self()->CreateInternalStackTrace<false>(soa);
+  return soa.AddLocalReference<jobject>(soa.Self()->CreateInternalStackTrace(soa));
 }
 
 static jobjectArray Throwable_nativeGetStackTrace(JNIEnv* env, jclass, jobject javaStackState) {

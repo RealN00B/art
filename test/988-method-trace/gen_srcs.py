@@ -38,10 +38,10 @@ IDX_METHOD_NAME = -2
 IDX_CLASS_NAME = -3
 
 # Exclude all hidden API.
-KLASS_BLACK_LIST = ['sun.misc.Unsafe', 'libcore.io.Memory', 'java.lang.StringFactory',
+KLASS_BLOCK_LIST = ['sun.misc.Unsafe', 'libcore.io.Memory', 'java.lang.StringFactory',
                     'java.lang.invoke.MethodHandle', # invokes are tested by 956-method-handles
                     'java.lang.invoke.VarHandle' ]  # TODO(b/65872996): will tested separately
-METHOD_BLACK_LIST = [('java.lang.ref.Reference', 'getReferent'),
+METHOD_BLOCK_LIST = [('java.lang.ref.Reference', 'getReferent'),
                      ('java.lang.String', 'getCharsNoCheck'),
                      ('java.lang.System', 'arraycopy')]  # arraycopy has a manual test.
 
@@ -179,8 +179,8 @@ class MethodInfo:
   def __str__(self):
     return "MethodInfo " + str(self.__dict__)
 
-  def dummy_parameters(self):
-    dummy_values = {
+  def placeholder_parameters(self):
+    placeholder_values = {
      'boolean' : 'false',
      'byte' : '(byte)0',
      'char' : "'x'",
@@ -191,22 +191,22 @@ class MethodInfo:
      'double' : '0.0'
     }
 
-    def object_dummy(name):
+    def object_placeholder(name):
       if name == "java.lang.String":
         return '"hello"'
       else:
         return "(%s)null" %(name)
-    return [ dummy_values.get(param, object_dummy(param)) for param in self.parameters ]
+    return [ placeholder_values.get(param, object_placeholder(param)) for param in self.parameters ]
 
-  def dummy_instance_value(self):
+  def placeholder_instance_value(self):
     return KLASS_INSTANCE_INITIALIZERS.get(self.klass, 'new %s()' %(self.klass))
 
-  def is_blacklisted(self):
-    for blk in KLASS_BLACK_LIST:
+  def is_blocklisted(self):
+    for blk in KLASS_BLOCK_LIST:
       if self.klass.startswith(blk):
         return True
 
-    return (self.klass, self.method_name) in METHOD_BLACK_LIST
+    return (self.klass, self.method_name) in METHOD_BLOCK_LIST
 
 # parse the V(...) \ list of items into a MethodInfo
 def parse_method_info(items):
@@ -257,19 +257,19 @@ def format_receiver_name(method_info):
     receiver = "instance_" + method_info.klass.replace(".", "_")
   return receiver
 
-# Format a dummy call with dummy method parameters to the requested method.
+# Format a placeholder call with placeholder method parameters to the requested method.
 def format_call_to(method_info):
-  dummy_args = ", ".join(method_info.dummy_parameters())
+  placeholder_args = ", ".join(method_info.placeholder_parameters())
   receiver = format_receiver_name(method_info)
 
-  return ("%s.%s(%s);" %(receiver, method_info.method_name, dummy_args))
+  return ("%s.%s(%s);" %(receiver, method_info.method_name, placeholder_args))
 
 # Format a static variable with an instance that could be used as the receiver
 # (or None for non-static methods).
 def format_instance_variable(method_info):
   if method_info.staticness == 'static':
     return None
-  return "static %s %s = %s;" %(method_info.klass, format_receiver_name(method_info), method_info.dummy_instance_value())
+  return "static %s %s = %s;" %(method_info.klass, format_receiver_name(method_info), method_info.placeholder_instance_value())
 
 def format_initialize_klass(method_info):
   return "%s.class.toString();" %(method_info.klass)
@@ -293,8 +293,8 @@ def main():
   initialize_klass_dict = collections.OrderedDict()
   for i in parse_all_method_infos():
     debug_print(i)
-    if i.is_blacklisted():
-      debug_print("Blacklisted: " + str(i))
+    if i.is_blocklisted():
+      debug_print("Blocklisted: " + str(i))
       continue
 
     call_str = format_call_to(i)

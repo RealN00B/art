@@ -32,7 +32,7 @@
 #include "obj_ptr-inl.h"
 #include "thread-current-inl.h"
 
-namespace art {
+namespace art HIDDEN {
 
 inline bool ArtField::IsProxyField() {
   // No read barrier needed, we're reading the constant declaring class only to read
@@ -40,15 +40,11 @@ inline bool ArtField::IsProxyField() {
   return GetDeclaringClass<kWithoutReadBarrier>()->IsProxyClass<kVerifyNone>();
 }
 
-// We are only ever allowed to set our own final fields. We do need to be careful since if a
-// structural redefinition occurs during <clinit> we can end up trying to set the non-obsolete
-// class's fields from the obsolete class. This is something we want to allow. This is tested by
-// run-test 2002-virtual-structural-initializing.
+// We are only ever allowed to set our own final fields
 inline bool ArtField::CanBeChangedBy(ArtMethod* method) {
   ObjPtr<mirror::Class> declaring_class(GetDeclaringClass());
   ObjPtr<mirror::Class> referring_class(method->GetDeclaringClass());
-  return !IsFinal() || (declaring_class == referring_class) ||
-         UNLIKELY(referring_class->IsObsoleteVersionOf(declaring_class));
+  return !IsFinal() || (declaring_class == referring_class);
 }
 
 template<ReadBarrierOption kReadBarrierOption>
@@ -62,6 +58,32 @@ inline ObjPtr<mirror::Class> ArtField::GetDeclaringClass() {
 
 inline void ArtField::SetDeclaringClass(ObjPtr<mirror::Class> new_declaring_class) {
   declaring_class_ = GcRoot<mirror::Class>(new_declaring_class);
+}
+
+template<typename RootVisitorType>
+void ArtField::VisitArrayRoots(RootVisitorType& visitor,
+                               uint8_t* start_boundary,
+                               uint8_t* end_boundary,
+                               LengthPrefixedArray<ArtField>* array) {
+  DCHECK_LE(start_boundary, end_boundary);
+  DCHECK_NE(array->size(), 0u);
+  ArtField* first_field = &array->At(0);
+  end_boundary = std::min(end_boundary, reinterpret_cast<uint8_t*>(first_field + array->size()));
+  static constexpr size_t kFieldSize = sizeof(ArtField);
+  // Confirm the assumption that ArtField size is power of two. It's important
+  // as we assume so below (RoundUp).
+  static_assert(IsPowerOfTwo(kFieldSize));
+  uint8_t* declaring_class =
+      reinterpret_cast<uint8_t*>(first_field) + DeclaringClassOffset().Int32Value();
+  // Jump to the first class to visit.
+  if (declaring_class < start_boundary) {
+    declaring_class += RoundUp(start_boundary - declaring_class, kFieldSize);
+  }
+  while (declaring_class < end_boundary) {
+    visitor.VisitRoot(
+        reinterpret_cast<mirror::CompressedReference<mirror::Object>*>(declaring_class));
+    declaring_class += kFieldSize;
+  }
 }
 
 inline MemberOffset ArtField::GetOffsetDuringLinking() {
@@ -109,14 +131,17 @@ inline void ArtField::Set64(ObjPtr<mirror::Object> object, uint64_t new_value) {
   }
 }
 
-template<class MirrorType>
+template<class MirrorType, ReadBarrierOption kReadBarrierOption>
 inline ObjPtr<MirrorType> ArtField::GetObj(ObjPtr<mirror::Object> object) {
   DCHECK(object != nullptr) << PrettyField();
-  DCHECK(!IsStatic() || (object == GetDeclaringClass()) || !Runtime::Current()->IsStarted());
+  DCHECK(!IsStatic() ||
+         (object == GetDeclaringClass<kReadBarrierOption>()) ||
+         !Runtime::Current()->IsStarted());
   if (UNLIKELY(IsVolatile())) {
-    return object->GetFieldObjectVolatile<MirrorType>(GetOffset());
+    return object->GetFieldObjectVolatile<MirrorType, kDefaultVerifyFlags, kReadBarrierOption>(
+        GetOffset());
   }
-  return object->GetFieldObject<MirrorType>(GetOffset());
+  return object->GetFieldObject<MirrorType, kDefaultVerifyFlags, kReadBarrierOption>(GetOffset());
 }
 
 template<bool kTransactionActive>
@@ -177,6 +202,10 @@ inline uint16_t ArtField::GetChar(ObjPtr<mirror::Object> object) {
   FIELD_GET(object, Char);
 }
 
+inline uint16_t ArtField::GetCharacter(ObjPtr<mirror::Object> object) {
+  return GetChar(object);
+}
+
 template<bool kTransactionActive>
 inline void ArtField::SetChar(ObjPtr<mirror::Object> object, uint16_t c) {
   if (kIsDebugBuild) {
@@ -209,6 +238,10 @@ inline int32_t ArtField::GetInt(ObjPtr<mirror::Object> object) {
     CHECK(type == Primitive::kPrimInt || type == Primitive::kPrimFloat) << PrettyField();
   }
   return Get32(object);
+}
+
+inline int32_t ArtField::GetInteger(ObjPtr<mirror::Object> object) {
+  return GetInt(object);
 }
 
 template<bool kTransactionActive>
@@ -273,9 +306,10 @@ inline void ArtField::SetDouble(ObjPtr<mirror::Object> object, double d) {
   Set64<kTransactionActive>(object, bits.GetJ());
 }
 
+template<ReadBarrierOption kReadBarrierOption>
 inline ObjPtr<mirror::Object> ArtField::GetObject(ObjPtr<mirror::Object> object) {
   DCHECK_EQ(Primitive::kPrimNot, GetTypeAsPrimitiveType()) << PrettyField();
-  return GetObj(object);
+  return GetObj<mirror::Object, kReadBarrierOption>(object);
 }
 
 template<bool kTransactionActive>
@@ -284,18 +318,27 @@ inline void ArtField::SetObject(ObjPtr<mirror::Object> object, ObjPtr<mirror::Ob
   SetObj<kTransactionActive>(object, l);
 }
 
-inline const char* ArtField::GetName() REQUIRES_SHARED(Locks::mutator_lock_) {
+inline const char* ArtField::GetName() {
   uint32_t field_index = GetDexFieldIndex();
   if (UNLIKELY(IsProxyField())) {
     DCHECK(IsStatic());
     DCHECK_LT(field_index, 2U);
     return field_index == 0 ? "interfaces" : "throws";
   }
-  const DexFile* dex_file = GetDexFile();
-  return dex_file->GetFieldName(dex_file->GetFieldId(field_index));
+  return GetDexFile()->GetFieldName(field_index);
 }
 
-inline const char* ArtField::GetTypeDescriptor() REQUIRES_SHARED(Locks::mutator_lock_) {
+inline std::string_view ArtField::GetNameView() {
+  uint32_t field_index = GetDexFieldIndex();
+  if (UNLIKELY(IsProxyField())) {
+    DCHECK(IsStatic());
+    DCHECK_LT(field_index, 2U);
+    return field_index == 0 ? "interfaces" : "throws";
+  }
+  return GetDexFile()->GetFieldNameView(field_index);
+}
+
+inline const char* ArtField::GetTypeDescriptor() {
   uint32_t field_index = GetDexFieldIndex();
   if (UNLIKELY(IsProxyField())) {
     DCHECK(IsStatic());
@@ -303,24 +346,32 @@ inline const char* ArtField::GetTypeDescriptor() REQUIRES_SHARED(Locks::mutator_
     // 0 == Class[] interfaces; 1 == Class[][] throws;
     return field_index == 0 ? "[Ljava/lang/Class;" : "[[Ljava/lang/Class;";
   }
-  const DexFile* dex_file = GetDexFile();
-  const dex::FieldId& field_id = dex_file->GetFieldId(field_index);
-  return dex_file->GetFieldTypeDescriptor(field_id);
+  return GetDexFile()->GetFieldTypeDescriptor(field_index);
 }
 
-inline Primitive::Type ArtField::GetTypeAsPrimitiveType()
-    REQUIRES_SHARED(Locks::mutator_lock_) {
+inline std::string_view ArtField::GetTypeDescriptorView() {
+  uint32_t field_index = GetDexFieldIndex();
+  if (UNLIKELY(IsProxyField())) {
+    DCHECK(IsStatic());
+    DCHECK_LT(field_index, 2U);
+    // 0 == Class[] interfaces; 1 == Class[][] throws;
+    return field_index == 0 ? "[Ljava/lang/Class;" : "[[Ljava/lang/Class;";
+  }
+  return GetDexFile()->GetFieldTypeDescriptorView(field_index);
+}
+
+inline Primitive::Type ArtField::GetTypeAsPrimitiveType() {
   return Primitive::GetType(GetTypeDescriptor()[0]);
 }
 
-inline bool ArtField::IsPrimitiveType() REQUIRES_SHARED(Locks::mutator_lock_) {
+inline bool ArtField::IsPrimitiveType() {
   return GetTypeAsPrimitiveType() != Primitive::kPrimNot;
 }
 
 inline ObjPtr<mirror::Class> ArtField::LookupResolvedType() {
   ScopedAssertNoThreadSuspension ants(__FUNCTION__);
   if (UNLIKELY(IsProxyField())) {
-    return ProxyFindSystemClass(GetTypeDescriptor());
+    return ProxyFindSystemClass(GetTypeDescriptorView());
   }
   ObjPtr<mirror::Class> type = Runtime::Current()->GetClassLinker()->LookupResolvedType(
       GetDexFile()->GetFieldId(GetDexFieldIndex()).type_idx_, this);
@@ -330,7 +381,7 @@ inline ObjPtr<mirror::Class> ArtField::LookupResolvedType() {
 
 inline ObjPtr<mirror::Class> ArtField::ResolveType() {
   if (UNLIKELY(IsProxyField())) {
-    return ProxyFindSystemClass(GetTypeDescriptor());
+    return ProxyFindSystemClass(GetTypeDescriptorView());
   }
   ObjPtr<mirror::Class> type = Runtime::Current()->GetClassLinker()->ResolveType(
       GetDexFile()->GetFieldId(GetDexFieldIndex()).type_idx_, this);
@@ -338,18 +389,28 @@ inline ObjPtr<mirror::Class> ArtField::ResolveType() {
   return type;
 }
 
-inline size_t ArtField::FieldSize() REQUIRES_SHARED(Locks::mutator_lock_) {
+inline size_t ArtField::FieldSize() {
   return Primitive::ComponentSize(GetTypeAsPrimitiveType());
 }
 
 template <ReadBarrierOption kReadBarrierOption>
-inline ObjPtr<mirror::DexCache> ArtField::GetDexCache() REQUIRES_SHARED(Locks::mutator_lock_) {
+inline ObjPtr<mirror::DexCache> ArtField::GetDexCache() {
   ObjPtr<mirror::Class> klass = GetDeclaringClass<kReadBarrierOption>();
   return klass->GetDexCache<kDefaultVerifyFlags, kReadBarrierOption>();
 }
 
-inline const DexFile* ArtField::GetDexFile() REQUIRES_SHARED(Locks::mutator_lock_) {
+inline const DexFile* ArtField::GetDexFile() {
   return GetDexCache<kWithoutReadBarrier>()->GetDexFile();
+}
+
+inline const char* ArtField::GetDeclaringClassDescriptor() {
+  DCHECK(!IsProxyField());
+  return GetDexFile()->GetFieldDeclaringClassDescriptor(GetDexFieldIndex());
+}
+
+inline std::string_view ArtField::GetDeclaringClassDescriptorView() {
+  DCHECK(!IsProxyField());
+  return GetDexFile()->GetFieldDeclaringClassDescriptorView(GetDexFieldIndex());
 }
 
 inline ObjPtr<mirror::String> ArtField::ResolveNameString() {
@@ -383,7 +444,7 @@ static inline ArtField* FindFieldWithOffset(
   return nullptr;
 }
 
-template <bool kExactOffset>
+template <bool kExactOffset, VerifyObjectFlags kVerifyFlags, ReadBarrierOption kReadBarrierOption>
 inline ArtField* ArtField::FindInstanceFieldWithOffset(ObjPtr<mirror::Class> klass,
                                                        uint32_t field_offset) {
   DCHECK(klass != nullptr);
@@ -392,8 +453,11 @@ inline ArtField* ArtField::FindInstanceFieldWithOffset(ObjPtr<mirror::Class> kla
     return field;
   }
   // We did not find field in the class: look into superclass.
-  return (klass->GetSuperClass() != nullptr) ?
-      FindInstanceFieldWithOffset<kExactOffset>(klass->GetSuperClass(), field_offset) : nullptr;
+  ObjPtr<mirror::Class> super_class = klass->GetSuperClass<kVerifyFlags, kReadBarrierOption>();
+  return (super_class != nullptr)
+      ? FindInstanceFieldWithOffset<kExactOffset, kVerifyFlags, kReadBarrierOption>(
+          super_class, field_offset) :
+      nullptr;
 }
 
 template <bool kExactOffset>

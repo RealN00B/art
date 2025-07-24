@@ -21,7 +21,7 @@
 #include "base/scoped_arena_containers.h"
 #include "base/bit_vector-inl.h"
 
-namespace art {
+namespace art HIDDEN {
 
 bool SsaDeadPhiElimination::Run() {
   MarkDeadPhis();
@@ -76,7 +76,7 @@ void SsaDeadPhiElimination::MarkDeadPhis() {
     HPhi* phi = worklist.back();
     worklist.pop_back();
     for (HInstruction* raw_input : phi->GetInputs()) {
-      HPhi* input = raw_input->AsPhi();
+      HPhi* input = raw_input->AsPhiOrNull();
       if (input != nullptr && input->IsDead()) {
         // Input is a dead phi. Revive it and add to the worklist. We make sure
         // that the phi was not dead initially (see definition of `initially_live`).
@@ -143,7 +143,6 @@ bool SsaRedundantPhiElimination::Run() {
                                        graph_->GetCurrentInstructionId(),
                                        /* expandable= */ false,
                                        kArenaAllocSsaPhiElimination);
-  visited_phis_in_cycle.ClearAllBits();
   ScopedArenaVector<HPhi*> cycle_worklist(allocator.Adapter(kArenaAllocSsaPhiElimination));
 
   while (!worklist.empty()) {
@@ -189,8 +188,8 @@ bool SsaRedundantPhiElimination::Run() {
       // We iterate over the array as long as it grows.
       for (size_t i = 0; i < cycle_worklist.size(); ++i) {
         HPhi* current = cycle_worklist[i];
-        DCHECK(!current->IsLoopHeaderPhi() ||
-               current->GetBlock()->IsLoopPreHeaderFirstPredecessor());
+        DCHECK_IMPLIES(current->IsLoopHeaderPhi(),
+                       current->GetBlock()->IsLoopPreHeaderFirstPredecessor());
 
         for (HInstruction* input : current->GetInputs()) {
           if (input == current) {

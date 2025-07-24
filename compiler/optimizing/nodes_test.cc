@@ -17,50 +17,142 @@
 #include "nodes.h"
 
 #include "base/arena_allocator.h"
+#include "base/macros.h"
 #include "optimizing_unit_test.h"
 
 #include "gtest/gtest.h"
 
-namespace art {
+namespace art HIDDEN {
 
 class NodeTest : public OptimizingUnitTest {};
+
+/**
+ * Test that we can clear loop and dominator information in either order.
+ * Code is:
+ * while (true) {
+ *   if (foobar) { break; }
+ *   if (baz) { xyz; } else { abc; }
+ * }
+ * dosomething();
+ */
+TEST_F(NodeTest, ClearLoopThenDominanceInformation) {
+  CreateGraph();
+  AdjacencyListGraph alg(graph_,
+                         GetAllocator(),
+                         "entry",
+                         "exit",
+                         {{"entry", "loop_pre_header"},
+
+                          {"loop_pre_header", "loop_header"},
+                          {"loop_header", "critical_break"},
+                          {"loop_header", "loop_body"},
+                          {"loop_body", "loop_if_left"},
+                          {"loop_body", "loop_if_right"},
+                          {"loop_if_left", "loop_merge"},
+                          {"loop_if_right", "loop_merge"},
+                          {"loop_merge", "loop_header"},
+
+                          {"critical_break", "breturn"},
+                          {"breturn", "exit"}});
+  graph_->ClearDominanceInformation();
+  graph_->BuildDominatorTree();
+
+  // Test
+  EXPECT_TRUE(
+      std::all_of(graph_->GetBlocks().begin(), graph_->GetBlocks().end(), [&](HBasicBlock* b) {
+        return b == graph_->GetEntryBlock() || b == nullptr || b->GetDominator() != nullptr;
+      }));
+  EXPECT_TRUE(
+      std::any_of(graph_->GetBlocks().begin(), graph_->GetBlocks().end(), [&](HBasicBlock* b) {
+        return b != nullptr && b->GetLoopInformation() != nullptr;
+      }));
+
+  // Clear
+  graph_->ClearLoopInformation();
+  graph_->ClearDominanceInformation();
+
+  // Test
+  EXPECT_TRUE(
+      std::none_of(graph_->GetBlocks().begin(), graph_->GetBlocks().end(), [&](HBasicBlock* b) {
+        return b != nullptr && b->GetDominator() != nullptr;
+      }));
+  EXPECT_TRUE(
+      std::all_of(graph_->GetBlocks().begin(), graph_->GetBlocks().end(), [&](HBasicBlock* b) {
+        return b == nullptr || b->GetLoopInformation() == nullptr;
+      }));
+}
+
+/**
+ * Test that we can clear loop and dominator information in either order.
+ * Code is:
+ * while (true) {
+ *   if (foobar) { break; }
+ *   if (baz) { xyz; } else { abc; }
+ * }
+ * dosomething();
+ */
+TEST_F(NodeTest, ClearDominanceThenLoopInformation) {
+  CreateGraph();
+  AdjacencyListGraph alg(graph_,
+                         GetAllocator(),
+                         "entry",
+                         "exit",
+                         {{"entry", "loop_pre_header"},
+
+                          {"loop_pre_header", "loop_header"},
+                          {"loop_header", "critical_break"},
+                          {"loop_header", "loop_body"},
+                          {"loop_body", "loop_if_left"},
+                          {"loop_body", "loop_if_right"},
+                          {"loop_if_left", "loop_merge"},
+                          {"loop_if_right", "loop_merge"},
+                          {"loop_merge", "loop_header"},
+
+                          {"critical_break", "breturn"},
+                          {"breturn", "exit"}});
+  graph_->ClearDominanceInformation();
+  graph_->BuildDominatorTree();
+
+  // Test
+  EXPECT_TRUE(
+      std::all_of(graph_->GetBlocks().begin(), graph_->GetBlocks().end(), [&](HBasicBlock* b) {
+        return b == graph_->GetEntryBlock() || b == nullptr || b->GetDominator() != nullptr;
+      }));
+  EXPECT_TRUE(
+      std::any_of(graph_->GetBlocks().begin(), graph_->GetBlocks().end(), [&](HBasicBlock* b) {
+        return b != nullptr && b->GetLoopInformation() != nullptr;
+      }));
+
+  // Clear
+  graph_->ClearDominanceInformation();
+  graph_->ClearLoopInformation();
+
+  // Test
+  EXPECT_TRUE(
+      std::none_of(graph_->GetBlocks().begin(), graph_->GetBlocks().end(), [&](HBasicBlock* b) {
+        return b != nullptr && b->GetDominator() != nullptr;
+      }));
+  EXPECT_TRUE(
+      std::all_of(graph_->GetBlocks().begin(), graph_->GetBlocks().end(), [&](HBasicBlock* b) {
+        return b == nullptr || b->GetLoopInformation() == nullptr;
+      }));
+}
 
 /**
  * Test that removing instruction from the graph removes itself from user lists
  * and environment lists.
  */
 TEST_F(NodeTest, RemoveInstruction) {
-  HGraph* graph = CreateGraph();
-  HBasicBlock* entry = new (GetAllocator()) HBasicBlock(graph);
-  graph->AddBlock(entry);
-  graph->SetEntryBlock(entry);
-  HInstruction* parameter = new (GetAllocator()) HParameterValue(
-      graph->GetDexFile(), dex::TypeIndex(0), 0, DataType::Type::kReference);
-  entry->AddInstruction(parameter);
-  entry->AddInstruction(new (GetAllocator()) HGoto());
+  HBasicBlock* main = InitEntryMainExitGraphWithReturnVoid();
 
-  HBasicBlock* first_block = new (GetAllocator()) HBasicBlock(graph);
-  graph->AddBlock(first_block);
-  entry->AddSuccessor(first_block);
-  HInstruction* null_check = new (GetAllocator()) HNullCheck(parameter, 0);
-  first_block->AddInstruction(null_check);
-  first_block->AddInstruction(new (GetAllocator()) HReturnVoid());
+  HInstruction* parameter = MakeParam(DataType::Type::kReference);
 
-  HBasicBlock* exit_block = new (GetAllocator()) HBasicBlock(graph);
-  graph->AddBlock(exit_block);
-  first_block->AddSuccessor(exit_block);
-  exit_block->AddInstruction(new (GetAllocator()) HExit());
-
-  HEnvironment* environment = new (GetAllocator()) HEnvironment(
-      GetAllocator(), 1, graph->GetArtMethod(), 0, null_check);
-  null_check->SetRawEnvironment(environment);
-  environment->SetRawEnvAt(0, parameter);
-  parameter->AddEnvUseAt(null_check->GetEnvironment(), 0);
+  HInstruction* null_check = MakeNullCheck(main, parameter, /*env=*/ {parameter});
 
   ASSERT_TRUE(parameter->HasEnvironmentUses());
   ASSERT_TRUE(parameter->HasUses());
 
-  first_block->RemoveInstruction(null_check);
+  main->RemoveInstruction(null_check);
 
   ASSERT_FALSE(parameter->HasEnvironmentUses());
   ASSERT_FALSE(parameter->HasUses());
@@ -74,13 +166,9 @@ TEST_F(NodeTest, InsertInstruction) {
   HBasicBlock* entry = new (GetAllocator()) HBasicBlock(graph);
   graph->AddBlock(entry);
   graph->SetEntryBlock(entry);
-  HInstruction* parameter1 = new (GetAllocator()) HParameterValue(
-      graph->GetDexFile(), dex::TypeIndex(0), 0, DataType::Type::kReference);
-  HInstruction* parameter2 = new (GetAllocator()) HParameterValue(
-      graph->GetDexFile(), dex::TypeIndex(0), 0, DataType::Type::kReference);
-  entry->AddInstruction(parameter1);
-  entry->AddInstruction(parameter2);
-  entry->AddInstruction(new (GetAllocator()) HExit());
+  HInstruction* parameter1 = MakeParam(DataType::Type::kReference);
+  HInstruction* parameter2 = MakeParam(DataType::Type::kReference);
+  MakeExit(entry);
 
   ASSERT_FALSE(parameter1->HasUses());
 
@@ -99,14 +187,11 @@ TEST_F(NodeTest, AddInstruction) {
   HBasicBlock* entry = new (GetAllocator()) HBasicBlock(graph);
   graph->AddBlock(entry);
   graph->SetEntryBlock(entry);
-  HInstruction* parameter = new (GetAllocator()) HParameterValue(
-      graph->GetDexFile(), dex::TypeIndex(0), 0, DataType::Type::kReference);
-  entry->AddInstruction(parameter);
+  HInstruction* parameter = MakeParam(DataType::Type::kReference);
 
   ASSERT_FALSE(parameter->HasUses());
 
-  HInstruction* to_add = new (GetAllocator()) HNullCheck(parameter, 0);
-  entry->AddInstruction(to_add);
+  MakeNullCheck(entry, parameter);
 
   ASSERT_TRUE(parameter->HasUses());
   ASSERT_TRUE(parameter->GetUses().HasExactlyOneElement());
@@ -117,42 +202,40 @@ TEST_F(NodeTest, ParentEnvironment) {
   HBasicBlock* entry = new (GetAllocator()) HBasicBlock(graph);
   graph->AddBlock(entry);
   graph->SetEntryBlock(entry);
-  HInstruction* parameter1 = new (GetAllocator()) HParameterValue(
-      graph->GetDexFile(), dex::TypeIndex(0), 0, DataType::Type::kReference);
-  HInstruction* with_environment = new (GetAllocator()) HNullCheck(parameter1, 0);
-  entry->AddInstruction(parameter1);
-  entry->AddInstruction(with_environment);
-  entry->AddInstruction(new (GetAllocator()) HExit());
+  HInstruction* parameter1 = MakeParam(DataType::Type::kReference);
+  HInstruction* with_environment = MakeNullCheck(entry, parameter1, /*env=*/ {parameter1});
+  MakeExit(entry);
 
   ASSERT_TRUE(parameter1->HasUses());
   ASSERT_TRUE(parameter1->GetUses().HasExactlyOneElement());
 
-  HEnvironment* environment = new (GetAllocator()) HEnvironment(
-      GetAllocator(), 1, graph->GetArtMethod(), 0, with_environment);
-  HInstruction* const array[] = { parameter1 };
-
-  environment->CopyFrom(ArrayRef<HInstruction* const>(array));
-  with_environment->SetRawEnvironment(environment);
-
   ASSERT_TRUE(parameter1->HasEnvironmentUses());
   ASSERT_TRUE(parameter1->GetEnvUses().HasExactlyOneElement());
 
-  HEnvironment* parent1 = new (GetAllocator()) HEnvironment(
-      GetAllocator(), 1, graph->GetArtMethod(), 0, nullptr);
-  parent1->CopyFrom(ArrayRef<HInstruction* const>(array));
+  HEnvironment* parent1 = HEnvironment::Create(
+      GetAllocator(),
+      /*number_of_vregs=*/ 1,
+      graph->GetArtMethod(),
+      /*dex_pc=*/ 0,
+      /*holder=*/ nullptr);
+  parent1->CopyFrom(ArrayRef<HInstruction* const>(&parameter1, 1u));
 
   ASSERT_EQ(parameter1->GetEnvUses().SizeSlow(), 2u);
 
-  HEnvironment* parent2 = new (GetAllocator()) HEnvironment(
-      GetAllocator(), 1, graph->GetArtMethod(), 0, nullptr);
-  parent2->CopyFrom(ArrayRef<HInstruction* const>(array));
+  HEnvironment* parent2 = HEnvironment::Create(
+      GetAllocator(),
+      /*number_of_vregs=*/ 1,
+      graph->GetArtMethod(),
+      /*dex_pc=*/ 0,
+      /*holder=*/ nullptr);
+  parent2->CopyFrom(ArrayRef<HInstruction* const>(&parameter1, 1u));
   parent1->SetAndCopyParentChain(GetAllocator(), parent2);
 
   // One use for parent2, and one other use for the new parent of parent1.
   ASSERT_EQ(parameter1->GetEnvUses().SizeSlow(), 4u);
 
   // We have copied the parent chain. So we now have two more uses.
-  environment->SetAndCopyParentChain(GetAllocator(), parent1);
+  with_environment->GetEnvironment()->SetAndCopyParentChain(GetAllocator(), parent1);
   ASSERT_EQ(parameter1->GetEnvUses().SizeSlow(), 6u);
 }
 

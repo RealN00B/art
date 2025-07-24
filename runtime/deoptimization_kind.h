@@ -18,8 +18,9 @@
 #define ART_RUNTIME_DEOPTIMIZATION_KIND_H_
 
 #include "base/logging.h"
+#include "base/macros.h"
 
-namespace art {
+namespace art HIDDEN {
 
 enum class DeoptimizationKind {
   kAotInlineCache = 0,
@@ -29,6 +30,7 @@ enum class DeoptimizationKind {
   kLoopNullBCE,
   kBlockBCE,
   kCHA,
+  kDebugging,
   kFullFrame,
   kLast = kFullFrame
 };
@@ -42,6 +44,7 @@ inline const char* GetDeoptimizationKindName(DeoptimizationKind kind) {
     case DeoptimizationKind::kLoopNullBCE: return "loop bounds check elimination on null";
     case DeoptimizationKind::kBlockBCE: return "block bounds check elimination";
     case DeoptimizationKind::kCHA: return "class hierarchy analysis";
+    case DeoptimizationKind::kDebugging: return "Deopt requested for debug support";
     case DeoptimizationKind::kFullFrame: return "full frame";
   }
   LOG(FATAL) << "Unexpected kind " << static_cast<size_t>(kind);
@@ -49,6 +52,16 @@ inline const char* GetDeoptimizationKindName(DeoptimizationKind kind) {
 }
 
 std::ostream& operator<<(std::ostream& os, const DeoptimizationKind& kind);
+
+// We use a DeoptimizationStackSlot to record if a deoptimization is required
+// for functions that are already on stack. The value in the slot specifies the
+// reason we need to deoptimize.
+enum class DeoptimizeFlagValue: uint8_t {
+  kCHA = 0b001,
+  kForceDeoptForRedefinition = 0b010,
+  kCheckCallerForDeopt = 0b100,
+  kAll = kCHA | kForceDeoptForRedefinition | kCheckCallerForDeopt
+};
 
 }  // namespace art
 

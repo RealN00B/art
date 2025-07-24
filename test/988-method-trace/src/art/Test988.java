@@ -23,29 +23,43 @@ import java.lang.reflect.InvocationHandler;
 import java.lang.reflect.Method;
 import java.lang.reflect.Proxy;
 import java.util.ArrayList;
-import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Set;
 import java.util.function.Function;
 import java.util.function.IntUnaryOperator;
+import java.util.function.Predicate;
 
 public class Test988 {
 
     // Methods with non-deterministic output that should not be printed.
-    static Set<Method> NON_DETERMINISTIC_OUTPUT_METHODS = new HashSet<>();
-    static Set<Method> NON_DETERMINISTIC_OUTPUT_TYPE_METHODS = new HashSet<>();
+    static List<Predicate<Executable>> NON_DETERMINISTIC_OUTPUT_METHODS = new ArrayList<>();
+    static List<Predicate<Executable>> NON_DETERMINISTIC_OUTPUT_TYPE_METHODS = new ArrayList<>();
     static List<Class<?>> NON_DETERMINISTIC_TYPE_NAMES = new ArrayList<>();
 
+    static Predicate<Executable> IS_NON_DETERMINISTIC_OUTPUT =
+        (x) -> NON_DETERMINISTIC_OUTPUT_METHODS.stream().anyMatch((pred) -> pred.test(x));
+    static Predicate<Executable> IS_NON_DETERMINISTIC_OUTPUT_TYPE =
+        (x) -> NON_DETERMINISTIC_OUTPUT_TYPE_METHODS.stream().anyMatch((pred) -> pred.test(x));
+
+    public static final Predicate<Executable> EqPred(Executable m) {
+      return (Executable n) -> n.equals(m);
+    }
+
     static {
+      // Throwable.nativeFillInStackTrace is only on android and hiddenapi so we
+      // should avoid trying to find it at all.
+      NON_DETERMINISTIC_OUTPUT_METHODS.add(
+        (Executable ex) -> {
+          return ex.getDeclaringClass().equals(Throwable.class)
+              && ex.getName().equals("nativeFillInStackTrace");
+        });
       try {
         NON_DETERMINISTIC_OUTPUT_METHODS.add(
-            Throwable.class.getDeclaredMethod("nativeFillInStackTrace"));
-      } catch (Exception e) {}
-      try {
-        NON_DETERMINISTIC_OUTPUT_METHODS.add(Thread.class.getDeclaredMethod("currentThread"));
-        NON_DETERMINISTIC_OUTPUT_TYPE_METHODS.add(Thread.class.getDeclaredMethod("currentThread"));
+            EqPred(Thread.class.getDeclaredMethod("currentThread")));
+        NON_DETERMINISTIC_OUTPUT_TYPE_METHODS.add(
+            EqPred(Thread.class.getDeclaredMethod("currentThread")));
       } catch (Exception e) {}
       try {
         NON_DETERMINISTIC_TYPE_NAMES.add(
@@ -160,7 +174,7 @@ public class Test988 {
         @Override
         public void Print() {
             String print;
-            if (NON_DETERMINISTIC_OUTPUT_METHODS.contains(m)) {
+            if (IS_NON_DETERMINISTIC_OUTPUT.test(m)) {
                 print = "<non-deterministic>";
             } else {
                 print = genericToString(val);
@@ -175,7 +189,7 @@ public class Test988 {
             } else if (NON_DETERMINISTIC_TYPE_NAMES.contains(klass)) {
               klass_print = "<non-deterministic-class " +
                   NON_DETERMINISTIC_TYPE_NAMES.indexOf(klass) + ">";
-            } else if (NON_DETERMINISTIC_OUTPUT_TYPE_METHODS.contains(m)) {
+            } else if (IS_NON_DETERMINISTIC_OUTPUT_TYPE.test(m)) {
               klass_print = "<non-deterministic>";
             } else {
               klass_print = klass.toString();
@@ -239,10 +253,21 @@ public class Test988 {
         }
     }
 
-    private static List<Printable> results = new ArrayList<>();
+    private static ArrayList<Printable> results = new ArrayList<>();
+    private static int results_index = 0;
     // Starts with => enableMethodTracing
     //             .=> enableTracing
     private static int cnt = 2;
+
+    static void addToResults(Printable obj) {
+      // Reserve space for the current object. If any other method entry callbacks are called they
+      // will reserve more space. Without this we may get into strange problems where ArrayList::add
+      // cecks there is enough space (which involves a couple of method calls) which then use up the
+      // space and by the time we actually add this record there is no capacity left.
+      results_index++;
+      results.ensureCapacity(results_index + 1);
+      results.add(obj);
+    }
 
     // Iterative version
     static final class IterOp implements IntUnaryOperator {
@@ -305,7 +330,7 @@ public class Test988 {
         if ((cnt - 1) > METHOD_TRACING_IGNORE_DEPTH && sMethodTracingIgnore) {
           return;
         }
-        results.add(new MethodEntry(m, cnt - 1));
+        addToResults(new MethodEntry(m, cnt - 1));
     }
 
     public static void notifyMethodExit(Executable m, boolean exception, Object result) {
@@ -316,9 +341,9 @@ public class Test988 {
         }
 
         if (exception) {
-            results.add(new MethodThrownThrough(m, cnt));
+            addToResults(new MethodThrownThrough(m, cnt));
         } else {
-            results.add(new MethodReturn(m, result, cnt));
+            addToResults(new MethodReturn(m, result, cnt));
         }
     }
 
@@ -386,9 +411,9 @@ public class Test988 {
     public static void doFibTest(int x, IntUnaryOperator op) {
       try {
         int y = op.applyAsInt(x);
-        results.add(new FibResult("fibonacci(%d)=%d\n", x, y));
+        addToResults(new FibResult("fibonacci(%d)=%d\n", x, y));
       } catch (Throwable t) {
-        results.add(new FibThrow("fibonacci(%d) -> %s\n", x, t));
+        addToResults(new FibThrow("fibonacci(%d) -> %s\n", x, t));
       }
     }
 

@@ -16,6 +16,7 @@
 
 #include "dead_code_elimination.h"
 
+#include "base/macros.h"
 #include "driver/compiler_options.h"
 #include "graph_checker.h"
 #include "optimizing_unit_test.h"
@@ -23,9 +24,9 @@
 
 #include "gtest/gtest.h"
 
-namespace art {
+namespace art HIDDEN {
 
-class DeadCodeEliminationTest : public OptimizingUnitTest {
+class DeadCodeEliminationTest : public CommonCompilerTest, public OptimizingUnitTestHelper {
  protected:
   void TestCode(const std::vector<uint16_t>& data,
                 const std::string& expected_before,
@@ -98,8 +99,9 @@ TEST_F(DeadCodeEliminationTest, AdditionAndConditionalJump) {
 
   // Expected difference after dead code elimination.
   diff_t expected_diff = {
-    { "  3: IntConstant [9, 8, 5]\n",  "  3: IntConstant [8, 5]\n" },
-    { "  8: Phi(4, 3) [9]\n",          "  8: Phi(4, 3)\n" },
+    { "  3: IntConstant [9, 8, 5]\n",  "  3: IntConstant [5]\n" },
+    { "  4: IntConstant [8, 5]\n",     "  4: IntConstant [5]\n" },
+    { "  8: Phi(4, 3) [9]\n",          removed },
     { "  9: Add(8, 3)\n",              removed }
   };
   std::string expected_after = Patch(expected_before, expected_diff);
@@ -113,7 +115,7 @@ TEST_F(DeadCodeEliminationTest, AdditionAndConditionalJump) {
  *
  * The intent of this test is to ensure that all dead instructions are
  * actually pruned at compile-time, thanks to the (backward)
- * post-order traversal of the the dominator tree.
+ * post-order traversal of the dominator tree.
  *
  *                              16-bit
  *                              offset

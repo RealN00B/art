@@ -130,7 +130,7 @@ class ElfBuilder final {
     }
 
     // Start writing file data of this section.
-    void Start() {
+    virtual void Start() {
       CHECK(owner_->current_section_ == nullptr);
       Elf_Word align = AddSection();
       CHECK_EQ(header_.sh_offset, 0u);
@@ -139,7 +139,7 @@ class ElfBuilder final {
     }
 
     // Finish writing file data of this section.
-    void End() {
+    virtual void End() {
       CHECK(owner_->current_section_ == this);
       Elf_Word position = GetPosition();
       CHECK(header_.sh_size == 0u || header_.sh_size == position);
@@ -202,7 +202,7 @@ class ElfBuilder final {
         std::vector<Section*>& sections = owner_->sections_;
         Elf_Word last = sections.empty() ? PF_R : sections.back()->phdr_flags_;
         if (phdr_flags_ != last) {
-          header_.sh_addralign = kPageSize;  // Page-align if R/W/X flags changed.
+          header_.sh_addralign = kElfSegmentAlignment;  // Page-align if R/W/X flags changed.
         }
         sections.push_back(this);
         section_index_ = sections.size();  // First ELF section has index 1.
@@ -310,7 +310,12 @@ class ElfBuilder final {
       last_offset_ = 0;
     }
 
-    Elf_Word Write(const std::string& name) {
+    void Start() {
+      Section::Start();
+      Write("");  // ELF specification requires that the section starts with empty string.
+    }
+
+    Elf_Word Write(std::string_view name) {
       if (current_offset_ == 0) {
         DCHECK(name.empty());
       } else if (name == last_name_) {
@@ -318,7 +323,9 @@ class ElfBuilder final {
       }
       last_name_ = name;
       last_offset_ = current_offset_;
-      this->WriteFully(name.c_str(), name.length() + 1);
+      this->WriteFully(name.data(), name.length());
+      char null_terminator = '\0';
+      this->WriteFully(&null_terminator, sizeof(null_terminator));
       current_offset_ += name.length() + 1;
       return last_offset_;
     }
@@ -366,10 +373,13 @@ class ElfBuilder final {
 
     // Buffer symbol for this section.  It will be written later.
     void Add(Elf_Sym sym, const Section* section) {
-      DCHECK(section != nullptr);
-      DCHECK_LE(section->GetAddress(), sym.st_value);
-      DCHECK_LE(sym.st_value, section->GetAddress() + section->header_.sh_size);
-      sym.st_shndx = section->GetSectionIndex();
+      if (section != nullptr) {
+        DCHECK_LE(section->GetAddress(), sym.st_value);
+        DCHECK_LE(sym.st_value, section->GetAddress() + section->header_.sh_size);
+        sym.st_shndx = section->GetSectionIndex();
+      } else {
+        sym.st_shndx = SHN_UNDEF;
+      }
       syms_.push_back(sym);
     }
 
@@ -450,16 +460,18 @@ class ElfBuilder final {
   ElfBuilder(InstructionSet isa, OutputStream* output)
       : isa_(isa),
         stream_(output),
-        rodata_(this, ".rodata", SHT_PROGBITS, SHF_ALLOC, nullptr, 0, kPageSize, 0),
-        text_(this, ".text", SHT_PROGBITS, SHF_ALLOC | SHF_EXECINSTR, nullptr, 0, kPageSize, 0),
-        data_bimg_rel_ro_(
-            this, ".data.bimg.rel.ro", SHT_PROGBITS, SHF_ALLOC, nullptr, 0, kPageSize, 0),
-        bss_(this, ".bss", SHT_NOBITS, SHF_ALLOC, nullptr, 0, kPageSize, 0),
-        dex_(this, ".dex", SHT_NOBITS, SHF_ALLOC, nullptr, 0, kPageSize, 0),
-        dynstr_(this, ".dynstr", SHF_ALLOC, kPageSize),
+        rodata_(this, ".rodata", SHT_PROGBITS, SHF_ALLOC, nullptr, 0, kElfSegmentAlignment, 0),
+        text_(this, ".text", SHT_PROGBITS, SHF_ALLOC | SHF_EXECINSTR, nullptr, 0,
+            kElfSegmentAlignment, 0),
+        data_img_rel_ro_(this, ".data.img.rel.ro", SHT_PROGBITS, SHF_ALLOC, nullptr, 0,
+            kElfSegmentAlignment, 0),
+        bss_(this, ".bss", SHT_NOBITS, SHF_ALLOC, nullptr, 0, kElfSegmentAlignment, 0),
+        dex_(this, ".dex", SHT_NOBITS, SHF_ALLOC, nullptr, 0, kElfSegmentAlignment, 0),
+        dynstr_(this, ".dynstr", SHF_ALLOC, kElfSegmentAlignment),
         dynsym_(this, ".dynsym", SHT_DYNSYM, SHF_ALLOC, &dynstr_),
         hash_(this, ".hash", SHT_HASH, SHF_ALLOC, &dynsym_, 0, sizeof(Elf_Word), sizeof(Elf_Word)),
-        dynamic_(this, ".dynamic", SHT_DYNAMIC, SHF_ALLOC, &dynstr_, 0, kPageSize, sizeof(Elf_Dyn)),
+        dynamic_(this, ".dynamic", SHT_DYNAMIC, SHF_ALLOC, &dynstr_, 0, kElfSegmentAlignment,
+            sizeof(Elf_Dyn)),
         strtab_(this, ".strtab", 0, 1),
         symtab_(this, ".symtab", SHT_SYMTAB, 0, &strtab_),
         debug_frame_(this, ".debug_frame", SHT_PROGBITS, 0, nullptr, 0, sizeof(Elf_Addr), 0),
@@ -476,7 +488,7 @@ class ElfBuilder final {
         loaded_size_(0u),
         virtual_address_(0) {
     text_.phdr_flags_ = PF_R | PF_X;
-    data_bimg_rel_ro_.phdr_flags_ = PF_R | PF_W;  // Shall be made read-only at run time.
+    data_img_rel_ro_.phdr_flags_ = PF_R | PF_W;  // Shall be made read-only at run time.
     bss_.phdr_flags_ = PF_R | PF_W;
     dex_.phdr_flags_ = PF_R;
     dynamic_.phdr_flags_ = PF_R | PF_W;
@@ -489,7 +501,7 @@ class ElfBuilder final {
   BuildIdSection* GetBuildId() { return &build_id_; }
   Section* GetRoData() { return &rodata_; }
   Section* GetText() { return &text_; }
-  Section* GetDataBimgRelRo() { return &data_bimg_rel_ro_; }
+  Section* GetDataImgRelRo() { return &data_img_rel_ro_; }
   Section* GetBss() { return &bss_; }
   Section* GetDex() { return &dex_; }
   StringSection* GetStrTab() { return &strtab_; }
@@ -530,7 +542,7 @@ class ElfBuilder final {
 
     // Note: loaded_size_ == 0 for tests that don't write .rodata, .text, .bss,
     // .dynstr, dynsym, .hash and .dynamic. These tests should not read loaded_size_.
-    CHECK(loaded_size_ == 0 || loaded_size_ == RoundUp(virtual_address_, kPageSize))
+    CHECK(loaded_size_ == 0 || loaded_size_ == RoundUp(virtual_address_, kElfSegmentAlignment))
         << loaded_size_ << " " << virtual_address_;
 
     // Write section names and finish the section headers.
@@ -605,7 +617,8 @@ class ElfBuilder final {
         section->section_index_ = 0;
       } else {
         if (section->header_.sh_type != SHT_NOBITS) {
-          DCHECK_LE(section->header_.sh_offset, end + kPageSize) << "Large gap between sections";
+          DCHECK_LE(section->header_.sh_offset, end + kElfSegmentAlignment)
+              << "Large gap between sections";
           end = std::max<off_t>(end, section->header_.sh_offset + section->header_.sh_size);
         }
         non_debug_sections.push_back(section);
@@ -627,7 +640,8 @@ class ElfBuilder final {
   void PrepareDynamicSection(const std::string& elf_file_path,
                              Elf_Word rodata_size,
                              Elf_Word text_size,
-                             Elf_Word data_bimg_rel_ro_size,
+                             Elf_Word data_img_rel_ro_size,
+                             Elf_Word data_img_rel_ro_app_image_offset,
                              Elf_Word bss_size,
                              Elf_Word bss_methods_offset,
                              Elf_Word bss_roots_offset,
@@ -641,8 +655,8 @@ class ElfBuilder final {
     // Allocate all pre-dynamic sections.
     rodata_.AllocateVirtualMemory(rodata_size);
     text_.AllocateVirtualMemory(text_size);
-    if (data_bimg_rel_ro_size != 0) {
-      data_bimg_rel_ro_.AllocateVirtualMemory(data_bimg_rel_ro_size);
+    if (data_img_rel_ro_size != 0) {
+      data_img_rel_ro_.AllocateVirtualMemory(data_img_rel_ro_size);
     }
     if (bss_size != 0) {
       bss_.AllocateVirtualMemory(bss_size);
@@ -669,23 +683,31 @@ class ElfBuilder final {
       Elf_Word oatlastword_address = rodata_.GetAddress() + rodata_size - 4;
       dynsym_.Add(oatlastword, &rodata_, oatlastword_address, 4, STB_GLOBAL, STT_OBJECT);
     }
-    if (data_bimg_rel_ro_size != 0u) {
-      Elf_Word oatdatabimgrelro = dynstr_.Add("oatdatabimgrelro");
-      dynsym_.Add(oatdatabimgrelro,
-                  &data_bimg_rel_ro_,
-                  data_bimg_rel_ro_.GetAddress(),
-                  data_bimg_rel_ro_size,
+    DCHECK_LE(data_img_rel_ro_app_image_offset, data_img_rel_ro_size);
+    if (data_img_rel_ro_size != 0u) {
+      Elf_Word oatdataimgrelro = dynstr_.Add("oatdataimgrelro");
+      dynsym_.Add(oatdataimgrelro,
+                  &data_img_rel_ro_,
+                  data_img_rel_ro_.GetAddress(),
+                  data_img_rel_ro_size,
                   STB_GLOBAL,
                   STT_OBJECT);
-      Elf_Word oatdatabimgrelrolastword = dynstr_.Add("oatdatabimgrelrolastword");
-      Elf_Word oatdatabimgrelrolastword_address =
-          data_bimg_rel_ro_.GetAddress() + data_bimg_rel_ro_size - 4;
-      dynsym_.Add(oatdatabimgrelrolastword,
-                  &data_bimg_rel_ro_,
-                  oatdatabimgrelrolastword_address,
+      Elf_Word oatdataimgrelrolastword = dynstr_.Add("oatdataimgrelrolastword");
+      dynsym_.Add(oatdataimgrelrolastword,
+                  &data_img_rel_ro_,
+                  data_img_rel_ro_.GetAddress() + data_img_rel_ro_size - 4,
                   4,
                   STB_GLOBAL,
                   STT_OBJECT);
+      if (data_img_rel_ro_app_image_offset != data_img_rel_ro_size) {
+        Elf_Word oatdataimgrelroappimage = dynstr_.Add("oatdataimgrelroappimage");
+        dynsym_.Add(oatdataimgrelroappimage,
+                    &data_img_rel_ro_,
+                    data_img_rel_ro_.GetAddress() + data_img_rel_ro_app_image_offset,
+                    data_img_rel_ro_app_image_offset,
+                    STB_GLOBAL,
+                    STT_OBJECT);
+      }
     }
     DCHECK_LE(bss_roots_offset, bss_size);
     if (bss_size != 0u) {
@@ -733,7 +755,7 @@ class ElfBuilder final {
     // Buckets.  Having just one makes it linear search.
     hash.push_back(1);  // Point to first non-NULL symbol.
     // Chains.  This creates linked list of symbols.
-    hash.push_back(0);  // Dummy entry for the NULL symbol.
+    hash.push_back(0);  // Placeholder entry for the NULL symbol.
     for (int i = 1; i < count - 1; i++) {
       hash.push_back(i + 1);  // Each symbol points to the next one.
     }
@@ -757,7 +779,7 @@ class ElfBuilder final {
     dynamic_.Add(&dyns, sizeof(dyns));
     dynamic_.AllocateVirtualMemory(dynamic_.GetCacheSize());
 
-    loaded_size_ = RoundUp(virtual_address_, kPageSize);
+    loaded_size_ = RoundUp(virtual_address_, kElfSegmentAlignment);
   }
 
   void WriteDynamicSection() {
@@ -798,6 +820,23 @@ class ElfBuilder final {
      return stream_.Seek(RoundUp(stream_.Seek(0, kSeekCurrent), alignment), kSeekSet);
   }
 
+  static InstructionSet GetIsaFromHeader(const Elf_Ehdr& header) {
+    switch (header.e_machine) {
+      case EM_ARM:
+        return InstructionSet::kThumb2;
+      case EM_AARCH64:
+        return InstructionSet::kArm64;
+      case EM_RISCV:
+        return InstructionSet::kRiscv64;
+      case EM_386:
+        return InstructionSet::kX86;
+      case EM_X86_64:
+        return InstructionSet::kX86_64;
+    }
+    LOG(FATAL) << "Unknown architecture: " << header.e_machine;
+    UNREACHABLE();
+  }
+
  private:
   static Elf_Ehdr MakeElfHeader(InstructionSet isa) {
     Elf_Ehdr elf_header = Elf_Ehdr();
@@ -812,6 +851,11 @@ class ElfBuilder final {
       case InstructionSet::kArm64: {
         elf_header.e_machine = EM_AARCH64;
         elf_header.e_flags = 0;
+        break;
+      }
+      case InstructionSet::kRiscv64: {
+        elf_header.e_machine = EM_RISCV;
+        elf_header.e_flags = EF_RISCV_RVC | EF_RISCV_FLOAT_ABI_DOUBLE;
         break;
       }
       case InstructionSet::kX86: {
@@ -832,6 +876,8 @@ class ElfBuilder final {
         LOG(FATAL) << "Unknown instruction set " << isa;
       }
     }
+    DCHECK_EQ(GetIsaFromHeader(elf_header),
+              (isa == InstructionSet::kArm) ? InstructionSet::kThumb2 : isa);
 
     elf_header.e_ident[EI_MAG0]       = ELFMAG0;
     elf_header.e_ident[EI_MAG1]       = ELFMAG1;
@@ -872,7 +918,7 @@ class ElfBuilder final {
       load.p_flags   = PF_R;
       load.p_offset  = load.p_vaddr = load.p_paddr = 0;
       load.p_filesz  = load.p_memsz = sizeof(Elf_Ehdr) + sizeof(Elf_Phdr) * kMaxProgramHeaders;
-      load.p_align   = kPageSize;
+      load.p_align   = kElfSegmentAlignment;
       phdrs.push_back(load);
     }
     // Create program headers for sections.
@@ -902,7 +948,7 @@ class ElfBuilder final {
           prev.p_memsz  = size;
         } else {
           // If we are adding new load, it must be aligned.
-          CHECK_EQ(shdr.sh_addralign, (Elf_Word)kPageSize);
+          CHECK_EQ(shdr.sh_addralign, (Elf_Word)kElfSegmentAlignment);
           phdrs.push_back(load);
         }
       }
@@ -937,7 +983,7 @@ class ElfBuilder final {
 
   Section rodata_;
   Section text_;
-  Section data_bimg_rel_ro_;
+  Section data_img_rel_ro_;
   Section bss_;
   Section dex_;
   CachedStringSection dynstr_;

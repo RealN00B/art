@@ -30,9 +30,9 @@
 #include "art_field-inl.h"
 #include "art_method-inl.h"
 #include "base/endian_utils.h"
-#include "base/enums.h"
 #include "base/logging.h"
 #include "base/memory_tool.h"
+#include "base/pointer_size.h"
 #include "base/safe_map.h"
 #include "base/strlcpy.h"
 #include "base/time_utils.h"
@@ -68,7 +68,7 @@
 #include "mirror/throwable.h"
 #include "nativehelper/scoped_local_ref.h"
 #include "nativehelper/scoped_primitive_array.h"
-#include "oat_file.h"
+#include "oat/oat_file.h"
 #include "obj_ptr-inl.h"
 #include "reflection.h"
 #include "reflective_handle.h"
@@ -83,7 +83,7 @@
 #include "thread_pool.h"
 #include "well_known_classes.h"
 
-namespace art {
+namespace art HIDDEN {
 
 using android::base::StringPrintf;
 
@@ -187,33 +187,28 @@ bool Dbg::DdmHandleChunk(JNIEnv* env,
                          const ArrayRef<const jbyte>& data,
                          /*out*/uint32_t* out_type,
                          /*out*/std::vector<uint8_t>* out_data) {
-  ScopedLocalRef<jbyteArray> dataArray(env, env->NewByteArray(data.size()));
-  if (dataArray.get() == nullptr) {
+  ScopedObjectAccess soa(env);
+  StackHandleScope<1u> hs(soa.Self());
+  Handle<mirror::ByteArray> data_array =
+      hs.NewHandle(mirror::ByteArray::Alloc(soa.Self(), data.size()));
+  if (data_array == nullptr) {
     LOG(WARNING) << "byte[] allocation failed: " << data.size();
     env->ExceptionClear();
     return false;
   }
-  env->SetByteArrayRegion(dataArray.get(),
-                          0,
-                          data.size(),
-                          reinterpret_cast<const jbyte*>(data.data()));
+  memcpy(data_array->GetData(), data.data(), data.size());
   // Call "private static Chunk dispatch(int type, byte[] data, int offset, int length)".
-  ScopedLocalRef<jobject> chunk(
-      env,
-      env->CallStaticObjectMethod(
-          WellKnownClasses::org_apache_harmony_dalvik_ddmc_DdmServer,
-          WellKnownClasses::org_apache_harmony_dalvik_ddmc_DdmServer_dispatch,
-          type, dataArray.get(), 0, data.size()));
-  if (env->ExceptionCheck()) {
-    Thread* self = Thread::Current();
-    ScopedObjectAccess soa(self);
+  ArtMethod* dispatch = WellKnownClasses::org_apache_harmony_dalvik_ddmc_DdmServer_dispatch;
+  ObjPtr<mirror::Object> chunk = dispatch->InvokeStatic<'L', 'I', 'L', 'I', 'I'>(
+      soa.Self(), type, data_array.Get(), 0, static_cast<jint>(data.size()));
+  if (soa.Self()->IsExceptionPending()) {
     LOG(INFO) << StringPrintf("Exception thrown by dispatcher for 0x%08x", type) << std::endl
-              << self->GetException()->Dump();
-    self->ClearException();
+              << soa.Self()->GetException()->Dump();
+    soa.Self()->ClearException();
     return false;
   }
 
-  if (chunk.get() == nullptr) {
+  if (chunk == nullptr) {
     return false;
   }
 
@@ -229,37 +224,32 @@ bool Dbg::DdmHandleChunk(JNIEnv* env,
    *
    * So we're pretty much stuck with copying data around multiple times.
    */
-  ScopedLocalRef<jbyteArray> replyData(
-      env,
-      reinterpret_cast<jbyteArray>(
-          env->GetObjectField(
-              chunk.get(), WellKnownClasses::org_apache_harmony_dalvik_ddmc_Chunk_data)));
-  jint offset = env->GetIntField(chunk.get(),
-                                 WellKnownClasses::org_apache_harmony_dalvik_ddmc_Chunk_offset);
-  jint length = env->GetIntField(chunk.get(),
-                                 WellKnownClasses::org_apache_harmony_dalvik_ddmc_Chunk_length);
-  *out_type = env->GetIntField(chunk.get(),
-                               WellKnownClasses::org_apache_harmony_dalvik_ddmc_Chunk_type);
+  ObjPtr<mirror::ByteArray> reply_data = ObjPtr<mirror::ByteArray>::DownCast(
+      WellKnownClasses::org_apache_harmony_dalvik_ddmc_Chunk_data->GetObject(chunk));
+  jint offset = WellKnownClasses::org_apache_harmony_dalvik_ddmc_Chunk_offset->GetInt(chunk);
+  jint length = WellKnownClasses::org_apache_harmony_dalvik_ddmc_Chunk_length->GetInt(chunk);
+  *out_type = WellKnownClasses::org_apache_harmony_dalvik_ddmc_Chunk_type->GetInt(chunk);
 
   VLOG(jdwp) << StringPrintf("DDM reply: type=0x%08x data=%p offset=%d length=%d",
                              type,
-                             replyData.get(),
+                             reply_data.Ptr(),
                              offset,
                              length);
-  out_data->resize(length);
-  env->GetByteArrayRegion(replyData.get(),
-                          offset,
-                          length,
-                          reinterpret_cast<jbyte*>(out_data->data()));
 
-  if (env->ExceptionCheck()) {
-    Thread* self = Thread::Current();
-    ScopedObjectAccess soa(self);
-    LOG(INFO) << StringPrintf("Exception thrown when reading response data from dispatcher 0x%08x",
-                              type) << std::endl << self->GetException()->Dump();
-    self->ClearException();
+  if (reply_data == nullptr) {
+    LOG(INFO) << "Null reply data";
     return false;
   }
+
+  jint reply_length = reply_data->GetLength();
+  if (offset < 0 || offset > reply_length || length < 0 || length > reply_length - offset) {
+    LOG(INFO) << "Invalid reply data range: offset=" << offset << ", length=" << length
+              << " reply_length=" << reply_length;
+    return false;
+  }
+
+  out_data->resize(length);
+  memcpy(out_data->data(), reply_data->GetData() + offset, length);
 
   return true;
 }
@@ -268,17 +258,18 @@ void Dbg::DdmBroadcast(bool connect) {
   VLOG(jdwp) << "Broadcasting DDM " << (connect ? "connect" : "disconnect") << "...";
 
   Thread* self = Thread::Current();
-  if (self->GetState() != kRunnable) {
+  if (self->GetState() != ThreadState::kRunnable) {
     LOG(ERROR) << "DDM broadcast in thread state " << self->GetState();
     /* try anyway? */
   }
 
+  // TODO: Can we really get here while not `Runnable`? If not, we do not need the `soa`.
+  ScopedObjectAccessUnchecked soa(self);
   JNIEnv* env = self->GetJniEnv();
   jint event = connect ? 1 /*DdmServer.CONNECTED*/ : 2 /*DdmServer.DISCONNECTED*/;
-  env->CallStaticVoidMethod(WellKnownClasses::org_apache_harmony_dalvik_ddmc_DdmServer,
-                            WellKnownClasses::org_apache_harmony_dalvik_ddmc_DdmServer_broadcast,
-                            event);
-  if (env->ExceptionCheck()) {
+  ArtMethod* broadcast = WellKnownClasses::org_apache_harmony_dalvik_ddmc_DdmServer_broadcast;
+  broadcast->InvokeStatic<'V', 'I'>(self, event);
+  if (self->IsExceptionPending()) {
     LOG(ERROR) << "DdmServer.broadcast " << event << " failed";
     env->ExceptionDescribe();
     env->ExceptionClear();
@@ -349,7 +340,11 @@ void Dbg::DdmSetThreadNotification(bool enable) {
       Dbg::DdmSendThreadNotification(thread, CHUNK_TYPE("THCR"));
       finish_barrier.Pass(cls_self);
     });
-    size_t checkpoints = Runtime::Current()->GetThreadList()->RunCheckpoint(&fc);
+    // TODO(b/253671779): The above eventually results in calls to EventHandler::DispatchEvent,
+    // which does a ScopedThreadStateChange, which amounts to a thread state change inside the
+    // checkpoint run method. Hence the normal check would fail, and thus we specify Unchecked
+    // here.
+    size_t checkpoints = Runtime::Current()->GetThreadList()->RunCheckpointUnchecked(&fc);
     ScopedThreadSuspension sts(self, ThreadState::kWaitingForCheckPointsToRun);
     finish_barrier.Increment(self, checkpoints);
   }
@@ -510,7 +505,7 @@ class HeapChunkContext {
     Write4BE(&p_, reinterpret_cast<uintptr_t>(chunk_ptr));  // virtual address of segment start.
     Write4BE(&p_, 0);  // offset of this piece (relative to the virtual address).
     // [u4]: length of piece, in allocation units
-    // We won't know this until we're done, so save the offset and stuff in a dummy value.
+    // We won't know this until we're done, so save the offset and stuff in a fake value.
     pieceLenField_ = p_;
     Write4BE(&p_, 0x55555555);
     needHeader_ = false;
@@ -577,7 +572,7 @@ class HeapChunkContext {
       // of the use of mmaps, so don't report. If not free memory then start a new segment.
       bool flush = true;
       if (start > startOfNextMemoryChunk_) {
-        const size_t kMaxFreeLen = 2 * kPageSize;
+        const size_t kMaxFreeLen = 2 * gPageSize;
         void* free_start = startOfNextMemoryChunk_;
         void* free_end = start;
         const size_t free_len =
@@ -747,7 +742,7 @@ void Dbg::DdmSendHeapSegments(bool native) {
         context.SetChunkOverhead(0);
         // Need to acquire the mutator lock before the heap bitmap lock with exclusive access since
         // RosAlloc's internal logic doesn't know to release and reacquire the heap bitmap lock.
-        ScopedThreadSuspension sts(self, kSuspended);
+        ScopedThreadSuspension sts(self, ThreadState::kSuspended);
         ScopedSuspendAll ssa(__FUNCTION__);
         ReaderMutexLock mu(self, *Locks::heap_bitmap_lock_);
         space->AsRosAllocSpace()->Walk(HeapChunkContext::HeapChunkJavaCallback, &context);
@@ -759,7 +754,7 @@ void Dbg::DdmSendHeapSegments(bool native) {
       } else if (space->IsRegionSpace()) {
         heap->IncrementDisableMovingGC(self);
         {
-          ScopedThreadSuspension sts(self, kSuspended);
+          ScopedThreadSuspension sts(self, ThreadState::kSuspended);
           ScopedSuspendAll ssa(__FUNCTION__);
           ReaderMutexLock mu(self, *Locks::heap_bitmap_lock_);
           context.SetChunkOverhead(0);
@@ -951,12 +946,12 @@ jbyteArray Dbg::GetRecentAllocations() {
   {
     MutexLock mu(self, *Locks::alloc_tracker_lock_);
     gc::AllocRecordObjectMap* records = Runtime::Current()->GetHeap()->GetAllocationRecords();
-    // In case this method is called when allocation tracker is disabled,
+    // In case this method is called when allocation tracker is not enabled,
     // we should still send some data back.
-    gc::AllocRecordObjectMap dummy;
+    gc::AllocRecordObjectMap fallback_record_map;
     if (records == nullptr) {
       CHECK(!Runtime::Current()->GetHeap()->IsAllocTrackingEnabled());
-      records = &dummy;
+      records = &fallback_record_map;
     }
     // We don't need to wait on the condition variable records->new_record_condition_, because this
     // function only reads the class objects, which are already marked so it doesn't change their

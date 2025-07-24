@@ -38,7 +38,7 @@ void InitializeNativeLoader();
 
 __attribute__((visibility("default"))) jstring CreateClassLoaderNamespace(
     JNIEnv* env, int32_t target_sdk_version, jobject class_loader, bool is_shared, jstring dex_path,
-    jstring library_path, jstring permitted_path);
+    jstring library_path, jstring permitted_path, jstring uses_library_list);
 
 __attribute__((visibility("default"))) void* OpenNativeLibrary(
     JNIEnv* env, int32_t target_sdk_version, const char* path, jobject class_loader,
@@ -65,6 +65,9 @@ FindNativeLoaderNamespaceByClassLoader(JNIEnv* env, jobject class_loader);
 __attribute__((visibility("default"))) void* OpenNativeLibraryInNamespace(
     struct NativeLoaderNamespace* ns, const char* path, bool* needs_native_bridge,
     char** error_msg);
+
+__attribute__((visibility("default"))) bool IsNamespaceNativeBridged(
+    const struct NativeLoaderNamespace* ns);
 #endif
 
 __attribute__((visibility("default")))

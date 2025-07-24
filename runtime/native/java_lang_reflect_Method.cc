@@ -19,10 +19,10 @@
 #include "nativehelper/jni_macros.h"
 
 #include "art_method-inl.h"
-#include "base/enums.h"
+#include "base/pointer_size.h"
 #include "class_linker-inl.h"
 #include "class_linker.h"
-#include "class_root.h"
+#include "class_root-inl.h"
 #include "dex/dex_file_annotations.h"
 #include "jni/jni_internal.h"
 #include "mirror/class-inl.h"
@@ -31,9 +31,8 @@
 #include "native_util.h"
 #include "reflection.h"
 #include "scoped_fast_native_object_access-inl.h"
-#include "well_known_classes.h"
 
-namespace art {
+namespace art HIDDEN {
 
 static jobject Method_getDefaultValue(JNIEnv* env, jobject javaMethod) {
   ScopedFastNativeObjectAccess soa(env);
@@ -80,10 +79,11 @@ static jobjectArray Method_getExceptionTypes(JNIEnv* env, jobject javaMethod) {
   }
 }
 
+NO_STACK_PROTECTOR
 static jobject Method_invoke(JNIEnv* env, jobject javaMethod, jobject javaReceiver,
                              jobjectArray javaArgs) {
   ScopedFastNativeObjectAccess soa(env);
-  return InvokeMethod(soa, javaMethod, javaReceiver, javaArgs);
+  return InvokeMethod<kRuntimePointerSize>(soa, javaMethod, javaReceiver, javaArgs);
 }
 
 static JNINativeMethod gMethods[] = {

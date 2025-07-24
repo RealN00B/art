@@ -29,11 +29,17 @@ See target_config.py for the configuration syntax.
 import argparse
 import os
 import pathlib
+import re
 import subprocess
 import sys
 
 from target_config import target_config
 import env
+
+# Check that we are using reasonably recent version of python
+print("Using", sys.executable, sys.version, flush=True)
+version = tuple(map(int, re.match(r"(\d*)\.(\d*)", sys.version).groups()))
+assert (version >= (3, 9)), "Python version is too old"
 
 parser = argparse.ArgumentParser()
 parser.add_argument('-j', default='1', dest='n_threads')
@@ -60,15 +66,28 @@ target = target_config[options.build_target]
 n_threads = options.n_threads
 custom_env = target.get('env', {})
 custom_env['SOONG_ALLOW_MISSING_DEPENDENCIES'] = 'true'
+# Switch the build system to unbundled mode in the reduced manifest branch.
+if not os.path.isdir(env.ANDROID_BUILD_TOP + '/frameworks/base'):
+  custom_env['TARGET_BUILD_UNBUNDLED'] = 'true'
 print(custom_env)
 os.environ.update(custom_env)
+
+# always run installclean first remove any old installed files from previous builds.
+# this does not remove intermediate files, so it still avoids recompilation.
+clean_command = 'build/soong/soong_ui.bash --make-mode installclean'
+if env.DIST_DIR:
+  clean_command += ' dist'
+sys.stdout.write(str(clean_command) + '\n')
+sys.stdout.flush()
+if subprocess.call(clean_command.split()):
+  sys.exit(1)
 
 # build is just a binary/script that is directly executed to build any artifacts needed for the
 # test.
 if 'build' in target:
   build_command = target.get('build').format(
       ANDROID_BUILD_TOP = env.ANDROID_BUILD_TOP,
-      MAKE_OPTIONS='DX=  -j{threads}'.format(threads = n_threads))
+      MAKE_OPTIONS='D8= -j{threads}'.format(threads = n_threads))
   sys.stdout.write(str(build_command) + '\n')
   sys.stdout.flush()
   if subprocess.call(build_command.split()):
@@ -77,7 +96,7 @@ if 'build' in target:
 # make runs soong/kati to build the target listed in the entry.
 if 'make' in target:
   build_command = 'build/soong/soong_ui.bash --make-mode'
-  build_command += ' DX='
+  build_command += ' D8='
   build_command += ' -j' + str(n_threads)
   build_command += ' ' + target.get('make')
   if env.DIST_DIR:
@@ -106,7 +125,8 @@ if 'golem' in target:
     sys.exit(1)
 
 if 'run-test' in target:
-  run_test_command = [os.path.join(env.ANDROID_BUILD_TOP,
+  run_test_command = [sys.executable, # Use the same python as we are using now.
+                      os.path.join(env.ANDROID_BUILD_TOP,
                                    'art/test/testrunner/testrunner.py')]
   test_flags = target.get('run-test', [])
   out_dir = pathlib.PurePath(env.SOONG_OUT_DIR)
@@ -125,6 +145,8 @@ if 'run-test' in target:
     run_test_command += ['4']
   if '--no-build-dependencies' not in test_flags:
     run_test_command += ['-b']
+    if env.DIST_DIR:
+      run_test_command += ['--dist']
   run_test_command += ['--verbose']
 
   sys.stdout.write(str(run_test_command) + '\n')

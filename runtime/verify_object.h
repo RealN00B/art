@@ -22,21 +22,21 @@
 #include "base/macros.h"
 #include "obj_ptr.h"
 
-namespace art {
+namespace art HIDDEN {
 
 namespace mirror {
 class Class;
 class Object;
 }  // namespace mirror
 
-// How we want to sanity check the heap's correctness.
+// How we want to check the heap's correctness.
 enum VerifyObjectMode {
   kVerifyObjectModeDisabled,  // Heap verification is disabled.
-  kVerifyObjectModeFast,  // Sanity heap accesses quickly by using VerifyClassClass.
-  kVerifyObjectModeAll  // Sanity heap accesses thoroughly.
+  kVerifyObjectModeFast,  // Check heap accesses quickly by using VerifyClassClass.
+  kVerifyObjectModeAll  // Check heap accesses thoroughly.
 };
 
-enum VerifyObjectFlags {
+enum EXPORT VerifyObjectFlags {
   kVerifyNone = 0x0,
   // Verify self when we are doing an operation.
   kVerifyThis = 0x1,

@@ -27,17 +27,19 @@
 #include "base/array_ref.h"
 #include "base/locks.h"
 #include "base/logging.h"
+#include "base/macros.h"
 #include "jni.h"
+#include "runtime.h"
 #include "runtime_callbacks.h"
 #include "thread.h"
 #include "thread_state.h"
 
-namespace art {
+namespace art HIDDEN {
 
 class Dbg {
  public:
-  static void SetJdwpAllowed(bool allowed);
-  static bool IsJdwpAllowed();
+  EXPORT static void SetJdwpAllowed(bool allowed);
+  EXPORT static bool IsJdwpAllowed();
 
   // Invoked by the GC in case we need to keep DDMS informed.
   static void GcDidFinish() REQUIRES(!Locks::mutator_lock_);
@@ -64,7 +66,10 @@ class Dbg {
   // the deoptimized frames.
   static bool IsForcedInterpreterNeededForException(Thread* thread)
       REQUIRES_SHARED(Locks::mutator_lock_) {
-    if (LIKELY(!thread->HasDebuggerShadowFrames())) {
+    // A quick check to avoid walking the stack. If there are no shadow frames or no method
+    // that needs to be deoptimized we can safely continue with optimized code.
+    if (LIKELY(!thread->HasDebuggerShadowFrames() &&
+               Runtime::Current()->GetInstrumentation()->IsDeoptimizedMethodsEmpty())) {
       return false;
     }
     return IsForcedInterpreterNeededForExceptionImpl(thread);
@@ -78,15 +83,14 @@ class Dbg {
       REQUIRES_SHARED(Locks::mutator_lock_);
   static void DdmSetThreadNotification(bool enable)
       REQUIRES(!Locks::thread_list_lock_);
-  static bool DdmHandleChunk(
-      JNIEnv* env,
-      uint32_t type,
-      const ArrayRef<const jbyte>& data,
-      /*out*/uint32_t* out_type,
-      /*out*/std::vector<uint8_t>* out_data);
+  EXPORT static bool DdmHandleChunk(JNIEnv* env,
+                                    uint32_t type,
+                                    const ArrayRef<const jbyte>& data,
+                                    /*out*/ uint32_t* out_type,
+                                    /*out*/ std::vector<uint8_t>* out_data);
 
-  static void DdmConnected() REQUIRES_SHARED(Locks::mutator_lock_);
-  static void DdmDisconnected() REQUIRES_SHARED(Locks::mutator_lock_);
+  EXPORT static void DdmConnected() REQUIRES_SHARED(Locks::mutator_lock_);
+  EXPORT static void DdmDisconnected() REQUIRES_SHARED(Locks::mutator_lock_);
 
   /*
    * Allocation tracking support.

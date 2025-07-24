@@ -32,17 +32,17 @@
 #include "dex/dex_file-inl.h"
 #include "dex/invoke_type.h"
 #include "dex_cache.h"
+#include "hidden_api.h"
 #include "iftable-inl.h"
 #include "imtable.h"
 #include "object-inl.h"
-#include "object_array.h"
 #include "read_barrier-inl.h"
 #include "runtime.h"
 #include "string.h"
 #include "subtype_check.h"
 #include "thread-current-inl.h"
 
-namespace art {
+namespace art HIDDEN {
 namespace mirror {
 
 template<VerifyObjectFlags kVerifyFlags>
@@ -131,7 +131,7 @@ inline uint32_t Class::GetVirtualMethodsStartOffset() {
 
 template<VerifyObjectFlags kVerifyFlags>
 inline ArraySlice<ArtMethod> Class::GetDirectMethodsSlice(PointerSize pointer_size) {
-  DCHECK(IsLoaded() || IsErroneous());
+  DCHECK(IsLoaded() || IsErroneous()) << GetStatus();
   return GetDirectMethodsSliceUnchecked(pointer_size);
 }
 
@@ -144,7 +144,7 @@ inline ArraySlice<ArtMethod> Class::GetDirectMethodsSliceUnchecked(PointerSize p
 
 template<VerifyObjectFlags kVerifyFlags>
 inline ArraySlice<ArtMethod> Class::GetDeclaredMethodsSlice(PointerSize pointer_size) {
-  DCHECK(IsLoaded() || IsErroneous());
+  DCHECK(IsLoaded() || IsErroneous()) << GetStatus();
   return GetDeclaredMethodsSliceUnchecked(pointer_size);
 }
 
@@ -157,7 +157,7 @@ inline ArraySlice<ArtMethod> Class::GetDeclaredMethodsSliceUnchecked(PointerSize
 
 template<VerifyObjectFlags kVerifyFlags>
 inline ArraySlice<ArtMethod> Class::GetDeclaredVirtualMethodsSlice(PointerSize pointer_size) {
-  DCHECK(IsLoaded() || IsErroneous());
+  DCHECK(IsLoaded() || IsErroneous()) << GetStatus();
   return GetDeclaredVirtualMethodsSliceUnchecked(pointer_size);
 }
 
@@ -412,6 +412,18 @@ inline void Class::SetObjectSize(uint32_t new_object_size) {
   return SetField32<false>(OFFSET_OF_OBJECT_MEMBER(Class, object_size_), new_object_size);
 }
 
+template<typename T>
+inline bool Class::IsDiscoverable(bool public_only,
+                                  const hiddenapi::AccessContext& access_context,
+                                  T* member) {
+  if (public_only && ((member->GetAccessFlags() & kAccPublic) == 0)) {
+    return false;
+  }
+
+  return !hiddenapi::ShouldDenyAccessToMember(
+      member, access_context, hiddenapi::AccessMethod::kNone);
+}
+
 // Determine whether "this" is assignable from "src", where both of these
 // are array classes.
 //
@@ -468,7 +480,7 @@ inline bool Class::ResolvedFieldAccessTest(ObjPtr<Class> access_to,
     ObjPtr<Class> dex_access_to = Runtime::Current()->GetClassLinker()->LookupResolvedType(
         class_idx,
         dex_cache,
-        access_to->GetClassLoader());
+        GetClassLoader());
     DCHECK(dex_access_to != nullptr);
     if (UNLIKELY(!this->CanAccess(dex_access_to))) {
       if (throw_on_failure) {
@@ -486,45 +498,6 @@ inline bool Class::ResolvedFieldAccessTest(ObjPtr<Class> access_to,
   return false;
 }
 
-template <bool throw_on_failure>
-inline bool Class::ResolvedMethodAccessTest(ObjPtr<Class> access_to,
-                                            ArtMethod* method,
-                                            ObjPtr<DexCache> dex_cache,
-                                            uint32_t method_idx,
-                                            InvokeType throw_invoke_type) {
-  DCHECK(throw_on_failure || throw_invoke_type == kStatic);
-  DCHECK(dex_cache != nullptr);
-  if (UNLIKELY(!this->CanAccess(access_to))) {
-    // The referrer class can't access the method's declaring class but may still be able
-    // to access the method if the MethodId specifies an accessible subclass of the declaring
-    // class rather than the declaring class itself.
-    dex::TypeIndex class_idx = dex_cache->GetDexFile()->GetMethodId(method_idx).class_idx_;
-    // The referenced class has already been resolved with the method, but may not be in the dex
-    // cache.
-    ObjPtr<Class> dex_access_to = Runtime::Current()->GetClassLinker()->LookupResolvedType(
-        class_idx,
-        dex_cache,
-        access_to->GetClassLoader());
-    DCHECK(dex_access_to != nullptr);
-    if (UNLIKELY(!this->CanAccess(dex_access_to))) {
-      if (throw_on_failure) {
-        ThrowIllegalAccessErrorClassForMethodDispatch(this,
-                                                      dex_access_to,
-                                                      method,
-                                                      throw_invoke_type);
-      }
-      return false;
-    }
-  }
-  if (LIKELY(this->CanAccessMember(access_to, method->GetAccessFlags()))) {
-    return true;
-  }
-  if (throw_on_failure) {
-    ThrowIllegalAccessErrorMethod(this, method);
-  }
-  return false;
-}
-
 inline bool Class::CanAccessResolvedField(ObjPtr<Class> access_to,
                                           ArtField* field,
                                           ObjPtr<DexCache> dex_cache,
@@ -537,22 +510,6 @@ inline bool Class::CheckResolvedFieldAccess(ObjPtr<Class> access_to,
                                             ObjPtr<DexCache> dex_cache,
                                             uint32_t field_idx) {
   return ResolvedFieldAccessTest<true>(access_to, field, dex_cache, field_idx);
-}
-
-inline bool Class::CanAccessResolvedMethod(ObjPtr<Class> access_to,
-                                           ArtMethod* method,
-                                           ObjPtr<DexCache> dex_cache,
-                                           uint32_t method_idx) {
-  return ResolvedMethodAccessTest<false>(access_to, method, dex_cache, method_idx, kStatic);
-}
-
-inline bool Class::CheckResolvedMethodAccess(ObjPtr<Class> access_to,
-                                             ArtMethod* method,
-                                             ObjPtr<DexCache> dex_cache,
-                                             uint32_t method_idx,
-                                             InvokeType throw_invoke_type) {
-  return ResolvedMethodAccessTest<true>(
-      access_to, method, dex_cache, method_idx, throw_invoke_type);
 }
 
 inline bool Class::IsObsoleteVersionOf(ObjPtr<Class> klass) {
@@ -639,6 +596,9 @@ inline ArtMethod* Class::FindVirtualMethodForInterface(ArtMethod* method,
 inline ArtMethod* Class::FindVirtualMethodForVirtual(ArtMethod* method, PointerSize pointer_size) {
   // Only miranda or default methods may come from interfaces and be used as a virtual.
   DCHECK(!method->GetDeclaringClass()->IsInterface() || method->IsDefault() || method->IsMiranda());
+  DCHECK(method->GetDeclaringClass()->IsAssignableFrom(this))
+      << "Method " << method->PrettyMethod()
+      << " is not declared in " << PrettyDescriptor() << " or its super classes";
   // The argument method may from a super class.
   // Use the index to a potentially overridden one for this instance's class.
   return GetVTableEntry(method->GetMethodIndex(), pointer_size);
@@ -646,6 +606,9 @@ inline ArtMethod* Class::FindVirtualMethodForVirtual(ArtMethod* method, PointerS
 
 inline ArtMethod* Class::FindVirtualMethodForSuper(ArtMethod* method, PointerSize pointer_size) {
   DCHECK(!method->GetDeclaringClass()->IsInterface());
+  DCHECK(method->GetDeclaringClass()->IsAssignableFrom(this))
+      << "Method " << method->PrettyMethod()
+      << " is not declared in " << PrettyDescriptor() << " or its super classes";
   return GetSuperClass()->GetVTableEntry(method->GetMethodIndex(), pointer_size);
 }
 
@@ -700,7 +663,7 @@ inline MemberOffset Class::GetFirstReferenceStaticFieldOffset(PointerSize pointe
   if (ShouldHaveEmbeddedVTable<kVerifyFlags>()) {
     // Static fields come after the embedded tables.
     base = Class::ComputeClassSize(
-        true, GetEmbeddedVTableLength<kVerifyFlags>(), 0, 0, 0, 0, 0, pointer_size);
+        true, GetEmbeddedVTableLength<kVerifyFlags>(), 0, 0, 0, 0, 0, 0, pointer_size);
   }
   return MemberOffset(base);
 }
@@ -711,8 +674,8 @@ inline MemberOffset Class::GetFirstReferenceStaticFieldOffsetDuringLinking(
   uint32_t base = sizeof(Class);  // Static fields come after the class.
   if (ShouldHaveEmbeddedVTable()) {
     // Static fields come after the embedded tables.
-    base = Class::ComputeClassSize(true, GetVTableDuringLinking()->GetLength(),
-                                           0, 0, 0, 0, 0, pointer_size);
+    base = Class::ComputeClassSize(
+        true, GetVTableDuringLinking()->GetLength(), 0, 0, 0, 0, 0, 0, pointer_size);
   }
   return MemberOffset(base);
 }
@@ -800,6 +763,127 @@ inline size_t Class::GetPrimitiveTypeSizeShift() {
   return size_shift;
 }
 
+template <VerifyObjectFlags kVerifyFlags, ReadBarrierOption kReadBarrierOption>
+inline void Class::VerifyOverflowReferenceBitmap() {
+  // Can't reliably access super-classes during CMC compaction.
+  if (Runtime::Current() != nullptr && Runtime::Current()->GetHeap() != nullptr &&
+      Runtime::Current()->GetHeap()->IsPerformingUffdCompaction()) {
+    return;
+  }
+  CHECK(!IsVariableSize<kVerifyFlags>());
+  ObjPtr<Class> klass;
+  ObjPtr<mirror::Class> super_class;
+  size_t num_bits =
+      (RoundUp(GetObjectSize<kVerifyFlags>(), sizeof(mirror::HeapReference<mirror::Object>)) -
+       mirror::kObjectHeaderSize) /
+      sizeof(mirror::HeapReference<mirror::Object>);
+  std::vector<bool> check_bitmap(num_bits, false);
+  for (klass = this; klass != nullptr; klass = super_class) {
+    super_class = klass->GetSuperClass<kVerifyFlags, kReadBarrierOption>();
+    if (klass->NumReferenceInstanceFields<kVerifyFlags>() != 0) {
+      break;
+    }
+  }
+
+  if (super_class != nullptr) {
+    std::vector<ObjPtr<Class>> klasses;
+    for (; klass != nullptr; klass = super_class) {
+      super_class = klass->GetSuperClass<kVerifyFlags, kReadBarrierOption>();
+      if (super_class != nullptr) {
+        klasses.push_back(klass);
+      }
+    }
+
+    for (auto iter = klasses.rbegin(); iter != klasses.rend(); iter++) {
+      klass = *iter;
+      size_t idx = (klass->GetFirstReferenceInstanceFieldOffset<kVerifyFlags, kReadBarrierOption>()
+                        .Uint32Value() -
+                    mirror::kObjectHeaderSize) /
+                   sizeof(mirror::HeapReference<mirror::Object>);
+      uint32_t num_refs = klass->NumReferenceInstanceFields<kVerifyFlags>();
+      for (uint32_t i = 0; i < num_refs; i++) {
+        check_bitmap[idx++] = true;
+      }
+      CHECK_LE(idx, num_bits) << PrettyClass();
+    }
+  }
+
+  uint32_t ref_offsets =
+      GetField32<kVerifyFlags>(OFFSET_OF_OBJECT_MEMBER(Class, reference_instance_offsets_));
+  CHECK_NE(ref_offsets, 0u) << PrettyClass();
+  CHECK((ref_offsets & kVisitReferencesSlowpathMask) != 0) << PrettyClass();
+  uint32_t bitmap_num_words = ref_offsets & ~kVisitReferencesSlowpathMask;
+  uint32_t* overflow_bitmap = reinterpret_cast<uint32_t*>(
+      reinterpret_cast<uint8_t*>(this) +
+      (GetClassSize<kVerifyFlags>() - bitmap_num_words * sizeof(uint32_t)));
+  for (uint32_t i = 0, field_offset = 0; i < bitmap_num_words; i++, field_offset += 32) {
+    ref_offsets = overflow_bitmap[i];
+    uint32_t check_bitmap_idx = field_offset;
+    // Confirm that all the bits in check_bitmap that ought to be set, are set.
+    while (ref_offsets != 0) {
+      if ((ref_offsets & 1) != 0) {
+        CHECK(check_bitmap[check_bitmap_idx])
+            << PrettyClass() << " i:" << i << " field_offset:" << field_offset
+            << " check_bitmap_idx:" << check_bitmap_idx << " bitmap_word:" << overflow_bitmap[i];
+        check_bitmap[check_bitmap_idx] = false;
+      }
+      ref_offsets >>= 1;
+      check_bitmap_idx++;
+    }
+  }
+  // Confirm that there is no other bit set.
+  std::ostringstream oss;
+  bool found = false;
+  for (size_t i = 0; i < check_bitmap.size(); i++) {
+    if (check_bitmap[i]) {
+      if (!found) {
+        DumpClass(oss, kDumpClassFullDetail);
+        oss << " set-bits:";
+      }
+      found = true;
+      oss << i << ",";
+    }
+  }
+  if (found) {
+    oss << " stored-bitmap:";
+    for (size_t i = 0; i < bitmap_num_words; i++) {
+      oss << overflow_bitmap[i] << ":";
+    }
+    LOG(FATAL) << oss.str();
+  }
+}
+
+inline size_t Class::AdjustClassSizeForReferenceOffsetBitmapDuringLinking(ObjPtr<Class> klass,
+                                                                          size_t class_size) {
+  if (klass->IsInstantiable()) {
+    // Find the first class with non-zero instance field count and its super-class'
+    // object-size together will tell us the required size.
+    for (ObjPtr<Class> k = klass; k != nullptr; k = k->GetSuperClass()) {
+      size_t num_reference_fields = k->NumReferenceInstanceFieldsDuringLinking();
+      if (num_reference_fields != 0) {
+        ObjPtr<Class> super = k->GetSuperClass();
+        // Leave it for mirror::Object (the class field is handled specially).
+        if (super != nullptr) {
+          // All of the fields that contain object references are guaranteed to be grouped in
+          // memory starting at an appropriately aligned address after super class object data.
+          uint32_t start_offset =
+              RoundUp(super->GetObjectSize(), sizeof(mirror::HeapReference<mirror::Object>));
+          uint32_t start_bit = (start_offset - mirror::kObjectHeaderSize) /
+                               sizeof(mirror::HeapReference<mirror::Object>);
+          if (start_bit + num_reference_fields > 31) {
+            // Alignment that maybe required at the end of static fields smaller than 32-bit.
+            class_size = RoundUp(class_size, sizeof(uint32_t));
+            // 32-bit words required for the overflow bitmap.
+            class_size += RoundUp(start_bit + num_reference_fields, 32) / 32 * sizeof(uint32_t);
+          }
+        }
+        break;
+      }
+    }
+  }
+  return class_size;
+}
+
 inline uint32_t Class::ComputeClassSize(bool has_embedded_vtable,
                                         uint32_t num_vtable_entries,
                                         uint32_t num_8bit_static_fields,
@@ -807,6 +891,7 @@ inline uint32_t Class::ComputeClassSize(bool has_embedded_vtable,
                                         uint32_t num_32bit_static_fields,
                                         uint32_t num_64bit_static_fields,
                                         uint32_t num_ref_static_fields,
+                                        uint32_t num_ref_bitmap_entries,
                                         PointerSize pointer_size) {
   // Space used by java.lang.Class and its instance fields.
   uint32_t size = sizeof(Class);
@@ -842,6 +927,12 @@ inline uint32_t Class::ComputeClassSize(bool has_embedded_vtable,
   // Space used for primitive static fields.
   size += num_8bit_static_fields * sizeof(uint8_t) + num_16bit_static_fields * sizeof(uint16_t) +
       num_32bit_static_fields * sizeof(uint32_t) + num_64bit_static_fields * sizeof(uint64_t);
+
+  // Space used by reference-offset bitmap.
+  if (num_ref_bitmap_entries > 0) {
+    size = RoundUp(size, sizeof(uint32_t));
+    size += num_ref_bitmap_entries * sizeof(uint32_t);
+  }
   return size;
 }
 
@@ -861,27 +952,62 @@ inline const DexFile& Class::GetDexFile() {
   return *GetDexCache<kDefaultVerifyFlags, kWithoutReadBarrier>()->GetDexFile();
 }
 
-inline bool Class::DescriptorEquals(const char* match) {
+inline std::string_view Class::GetDescriptorView() {
+  DCHECK(!IsArrayClass());
+  DCHECK(!IsPrimitive());
+  DCHECK(!IsProxyClass());
+  return GetDexFile().GetTypeDescriptorView(GetDexTypeIndex());
+}
+
+inline bool Class::DescriptorEquals(std::string_view match) {
   ObjPtr<mirror::Class> klass = this;
   while (klass->IsArrayClass()) {
-    if (match[0] != '[') {
+    if (UNLIKELY(match.empty()) || match[0] != '[') {
       return false;
     }
-    ++match;
+    match.remove_prefix(1u);
     // No read barrier needed, we're reading a chain of constant references for comparison
     // with null. Then we follow up below with reading constant references to read constant
     // primitive data in both proxy and non-proxy paths. See ReadBarrierOption.
     klass = klass->GetComponentType<kDefaultVerifyFlags, kWithoutReadBarrier>();
   }
   if (klass->IsPrimitive()) {
-    return strcmp(Primitive::Descriptor(klass->GetPrimitiveType()), match) == 0;
-  } else if (klass->IsProxyClass()) {
+    return match.length() == 1u && match[0] == Primitive::Descriptor(klass->GetPrimitiveType())[0];
+  } else if (UNLIKELY(klass->IsProxyClass())) {
     return klass->ProxyDescriptorEquals(match);
   } else {
     const DexFile& dex_file = klass->GetDexFile();
     const dex::TypeId& type_id = dex_file.GetTypeId(klass->GetDexTypeIndex());
-    return strcmp(dex_file.GetTypeDescriptor(type_id), match) == 0;
+    return dex_file.GetTypeDescriptorView(type_id) == match;
   }
+}
+
+inline uint32_t Class::DescriptorHash() {
+  // No read barriers needed, we're reading a chain of constant references for comparison with null
+  // and retrieval of constant primitive data. See `ReadBarrierOption` and `Class::GetDescriptor()`.
+  ObjPtr<mirror::Class> klass = this;
+  uint32_t hash = StartModifiedUtf8Hash();
+  while (klass->IsArrayClass()) {
+    klass = klass->GetComponentType<kDefaultVerifyFlags, kWithoutReadBarrier>();
+    hash = UpdateModifiedUtf8Hash(hash, '[');
+  }
+  if (UNLIKELY(klass->IsProxyClass())) {
+    hash = UpdateHashForProxyClass(hash, klass);
+  } else if (klass->IsPrimitive()) {
+    hash = UpdateModifiedUtf8Hash(hash, Primitive::Descriptor(klass->GetPrimitiveType())[0]);
+  } else {
+    const DexFile& dex_file = klass->GetDexFile();
+    const dex::TypeId& type_id = dex_file.GetTypeId(klass->GetDexTypeIndex());
+    std::string_view descriptor = dex_file.GetTypeDescriptorView(type_id);
+    hash = UpdateModifiedUtf8Hash(hash, descriptor);
+  }
+
+  if (kIsDebugBuild) {
+    std::string temp;
+    CHECK_EQ(hash, ComputeModifiedUtf8Hash(GetDescriptor(&temp)));
+  }
+
+  return hash;
 }
 
 inline void Class::AssertInitializedOrInitializingInThread(Thread* self) {
@@ -937,9 +1063,6 @@ inline void Class::SetAccessFlagsDuringLinking(uint32_t new_access_flags) {
 }
 
 inline void Class::SetAccessFlags(uint32_t new_access_flags) {
-  if (kIsDebugBuild) {
-    SetAccessFlagsDCheck(new_access_flags);
-  }
   // Called inside a transaction when setting pre-verified flag during boot image compilation.
   if (Runtime::Current()->IsActiveTransaction()) {
     SetField32<true>(AccessFlagsOffset(), new_access_flags);
@@ -1038,10 +1161,9 @@ inline size_t Class::GetComponentSize() {
   return 1U << GetComponentSizeShift();
 }
 
+template <ReadBarrierOption kReadBarrierOption>
 inline size_t Class::GetComponentSizeShift() {
-  // No read barrier is needed for reading a constant primitive field through
-  // constant reference field. See ReadBarrierOption.
-  return GetComponentType<kDefaultVerifyFlags, kWithoutReadBarrier>()->GetPrimitiveTypeSizeShift();
+  return GetComponentType<kDefaultVerifyFlags, kReadBarrierOption>()->GetPrimitiveTypeSizeShift();
 }
 
 inline bool Class::IsObjectClass() {
@@ -1067,11 +1189,9 @@ inline bool Class::IsArrayClass() {
   return GetComponentType<kVerifyFlags, kWithoutReadBarrier>() != nullptr;
 }
 
-template<VerifyObjectFlags kVerifyFlags>
+template<VerifyObjectFlags kVerifyFlags, ReadBarrierOption kReadBarrierOption>
 inline bool Class::IsObjectArrayClass() {
-  // We do not need a read barrier here as the primitive type is constant,
-  // both from-space and to-space component type classes shall yield the same result.
-  const ObjPtr<Class> component_type = GetComponentType<kVerifyFlags, kWithoutReadBarrier>();
+  const ObjPtr<Class> component_type = GetComponentType<kVerifyFlags, kReadBarrierOption>();
   constexpr VerifyObjectFlags kNewFlags = RemoveThisFlags(kVerifyFlags);
   return component_type != nullptr && !component_type->IsPrimitive<kNewFlags>();
 }
@@ -1164,7 +1284,7 @@ inline void Class::FixupNativePointers(Class* dest,
 }
 
 inline bool Class::CanAccess(ObjPtr<Class> that) {
-  return that->IsPublic() || this->IsInSamePackage(that);
+  return this == that || that->IsPublic() || this->IsInSamePackage(that);
 }
 
 
@@ -1183,7 +1303,16 @@ inline bool Class::CanAccessMember(ObjPtr<Class> access_to, uint32_t member_flag
   }
   // Check for protected access from a sub-class, which may or may not be in the same package.
   if (member_flags & kAccProtected) {
-    if (!this->IsInterface() && this->IsSubClass(access_to)) {
+    // This implementation is not compliant. We should actually check whether
+    // the caller is a subclass of the static type of the receiver, instead of the declaring
+    // class of the method we are trying to access.
+    //
+    // For example, a class outside of java.lang should not ne able to access `Object.clone`,
+    // but this implementation allows it.
+    //
+    // To not break existing code, we decided not to fix this and accept the
+    // leniency.
+    if (access_to->IsAssignableFrom(this)) {
       return true;
     }
   }
@@ -1214,6 +1343,26 @@ inline void Class::SetHasDefaultMethods() {
   DCHECK_EQ(GetLockOwnerThreadId(), Thread::Current()->GetThreadId());
   uint32_t flags = GetField32(OFFSET_OF_OBJECT_MEMBER(Class, access_flags_));
   SetAccessFlagsDuringLinking(flags | kAccHasDefaultMethod);
+}
+
+inline void Class::ClearFinalizable() {
+  // We're clearing the finalizable flag only for `Object` and `Enum`
+  // during early setup without the boot image.
+  DCHECK(IsObjectClass() ||
+         (IsBootStrapClassLoaded() && DescriptorEquals("Ljava/lang/Enum;")));
+  uint32_t flags = GetField32(OFFSET_OF_OBJECT_MEMBER(Class, access_flags_));
+  SetAccessFlagsDuringLinking(flags & ~kAccClassIsFinalizable);
+}
+
+inline ImTable* Class::FindSuperImt(PointerSize pointer_size) {
+  ObjPtr<mirror::Class> klass = this;
+  while (klass->HasSuperClass()) {
+    klass = klass->GetSuperClass();
+    if (klass->ShouldHaveImt()) {
+      return klass->GetImt(pointer_size);
+    }
+  }
+  return nullptr;
 }
 
 }  // namespace mirror

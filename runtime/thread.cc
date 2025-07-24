@@ -19,25 +19,24 @@
 #include <limits.h>  // for INT_MAX
 #include <pthread.h>
 #include <signal.h>
+#include <stdlib.h>
 #include <sys/resource.h>
 #include <sys/time.h>
 
-#if __has_feature(hwaddress_sanitizer)
-#include <sanitizer/hwasan_interface.h>
-#else
-#define __hwasan_tag_pointer(p, t) (p)
-#endif
-
 #include <algorithm>
+#include <atomic>
 #include <bitset>
 #include <cerrno>
 #include <iostream>
 #include <list>
+#include <optional>
 #include <sstream>
 
 #include "android-base/file.h"
 #include "android-base/stringprintf.h"
 #include "android-base/strings.h"
+
+#include "unwindstack/AndroidUnwinder.h"
 
 #include "arch/context-inl.h"
 #include "arch/context.h"
@@ -46,17 +45,18 @@
 #include "base/atomic.h"
 #include "base/bit_utils.h"
 #include "base/casts.h"
-#include "arch/context.h"
 #include "base/file_utils.h"
 #include "base/memory_tool.h"
 #include "base/mutex.h"
 #include "base/stl_util.h"
 #include "base/systrace.h"
+#include "base/time_utils.h"
 #include "base/timing_logger.h"
 #include "base/to_str.h"
 #include "base/utils.h"
 #include "class_linker-inl.h"
-#include "class_root.h"
+#include "class_root-inl.h"
+#include "com_android_art_flags.h"
 #include "debugger.h"
 #include "dex/descriptors_names.h"
 #include "dex/dex_file-inl.h"
@@ -64,6 +64,7 @@
 #include "dex/dex_file_types.h"
 #include "entrypoints/entrypoint_utils.h"
 #include "entrypoints/quick/quick_alloc_entrypoints.h"
+#include "entrypoints/quick/runtime_entrypoints_list.h"
 #include "gc/accounting/card_table-inl.h"
 #include "gc/accounting/heap_bitmap-inl.h"
 #include "gc/allocator/rosalloc.h"
@@ -73,8 +74,8 @@
 #include "handle_scope-inl.h"
 #include "indirect_reference_table-inl.h"
 #include "instrumentation.h"
+#include "intern_table.h"
 #include "interpreter/interpreter.h"
-#include "interpreter/mterp/mterp.h"
 #include "interpreter/shadow_frame-inl.h"
 #include "java_frame_root_info.h"
 #include "jni/java_vm_ext.h"
@@ -83,6 +84,7 @@
 #include "mirror/class_loader.h"
 #include "mirror/object_array-alloc-inl.h"
 #include "mirror/object_array-inl.h"
+#include "mirror/stack_frame_info.h"
 #include "mirror/stack_trace_element.h"
 #include "monitor.h"
 #include "monitor_objects_stack_visitor.h"
@@ -91,7 +93,8 @@
 #include "nativehelper/scoped_utf_chars.h"
 #include "nterp_helpers.h"
 #include "nth_caller_visitor.h"
-#include "oat_quick_method_header.h"
+#include "oat/oat_quick_method_header.h"
+#include "oat/stack_map.h"
 #include "obj_ptr-inl.h"
 #include "object_lock.h"
 #include "palette/palette.h"
@@ -104,46 +107,50 @@
 #include "runtime.h"
 #include "runtime_callbacks.h"
 #include "scoped_thread_state_change-inl.h"
+#include "scoped_disable_public_sdk_checker.h"
 #include "stack.h"
-#include "stack_map.h"
 #include "thread-inl.h"
 #include "thread_list.h"
-#include "verifier/method_verifier.h"
+#include "trace.h"
+#include "trace_profile.h"
 #include "verify_object.h"
-#include "well_known_classes.h"
+#include "well_known_classes-inl.h"
+
+#ifdef ART_TARGET_ANDROID
+#include <android/set_abort_message.h>
+#endif
 
 #if ART_USE_FUTEXES
-#include "linux/futex.h"
-#include "sys/syscall.h"
-#ifndef SYS_futex
-#define SYS_futex __NR_futex
-#endif
+#include <linux/futex.h>
+#include <sys/syscall.h>
 #endif  // ART_USE_FUTEXES
 
-namespace art {
+#pragma clang diagnostic push
+#pragma clang diagnostic error "-Wconversion"
+
+extern "C" __attribute__((weak)) void* __hwasan_tag_pointer(const volatile void* p,
+                                                            unsigned char tag);
+
+namespace art_flags = com::android::art::flags;
+
+namespace art HIDDEN {
 
 using android::base::StringAppendV;
 using android::base::StringPrintf;
 
-extern "C" NO_RETURN void artDeoptimize(Thread* self);
-
 bool Thread::is_started_ = false;
 pthread_key_t Thread::pthread_key_self_;
 ConditionVariable* Thread::resume_cond_ = nullptr;
-const size_t Thread::kStackOverflowImplicitCheckSize = GetStackOverflowReservedBytes(kRuntimeISA);
+const size_t Thread::kStackOverflowImplicitCheckSize =
+    GetStackOverflowReservedBytes(kRuntimeQuickCodeISA);
 bool (*Thread::is_sensitive_thread_hook_)() = nullptr;
 Thread* Thread::jit_sensitive_thread_ = nullptr;
+std::atomic<Mutex*> Thread::cp_placeholder_mutex_(nullptr);
 #ifndef __BIONIC__
 thread_local Thread* Thread::self_tls_ = nullptr;
 #endif
 
 static constexpr bool kVerifyImageObjectsMarked = kIsDebugBuild;
-
-// For implicit overflow checks we reserve an extra piece of memory at the bottom
-// of the stack (lowest memory).  The higher portion of the memory
-// is protected against reads and the lower is available for use while
-// throwing the StackOverflow exception.
-constexpr size_t kStackOverflowProtectedSize = 4 * kMemoryToolStackGuardSizeScale * KB;
 
 static const char* kThreadNameDuringStartup = "<native thread without managed peer>";
 
@@ -155,14 +162,20 @@ static void UnimplementedEntryPoint() {
   UNIMPLEMENTED(FATAL);
 }
 
-void InitEntryPoints(JniEntryPoints* jpoints, QuickEntryPoints* qpoints);
+void InitEntryPoints(JniEntryPoints* jpoints,
+                     QuickEntryPoints* qpoints,
+                     bool monitor_jni_entry_exit);
 void UpdateReadBarrierEntrypoints(QuickEntryPoints* qpoints, bool is_active);
+void UpdateLowOverheadTraceEntrypoints(QuickEntryPoints* qpoints, bool enable);
+
+void Thread::UpdateTlsLowOverheadTraceEntrypoints(bool enable) {
+  UpdateLowOverheadTraceEntrypoints(&tlsPtr_.quick_entrypoints, enable);
+}
 
 void Thread::SetIsGcMarkingAndUpdateEntrypoints(bool is_marking) {
-  CHECK(kUseReadBarrier);
+  CHECK(gUseReadBarrier);
   tls32_.is_gc_marking = is_marking;
   UpdateReadBarrierEntrypoints(&tlsPtr_.quick_entrypoints, /* is_active= */ is_marking);
-  ResetQuickAllocEntryPointsForThread(is_marking);
 }
 
 void Thread::InitTlsEntryPoints() {
@@ -174,15 +187,16 @@ void Thread::InitTlsEntryPoints() {
   for (uintptr_t* it = begin; it != end; ++it) {
     *it = reinterpret_cast<uintptr_t>(UnimplementedEntryPoint);
   }
-  InitEntryPoints(&tlsPtr_.jni_entrypoints, &tlsPtr_.quick_entrypoints);
+  bool monitor_jni_entry_exit = false;
+  PaletteShouldReportJniInvocations(&monitor_jni_entry_exit);
+  if (monitor_jni_entry_exit) {
+    AtomicSetFlag(ThreadFlag::kMonitorJniEntryExit);
+  }
+  InitEntryPoints(&tlsPtr_.jni_entrypoints, &tlsPtr_.quick_entrypoints, monitor_jni_entry_exit);
 }
 
-void Thread::ResetQuickAllocEntryPointsForThread(bool is_marking) {
-  if (kUseReadBarrier && kRuntimeISA != InstructionSet::kX86_64) {
-    // Allocation entrypoint switching is currently only implemented for X86_64.
-    is_marking = true;
-  }
-  ResetQuickAllocEntryPoints(&tlsPtr_.quick_entrypoints, is_marking);
+void Thread::ResetQuickAllocEntryPointsForThread() {
+  ResetQuickAllocEntryPoints(&tlsPtr_.quick_entrypoints);
 }
 
 class DeoptimizationContextRecord {
@@ -203,7 +217,9 @@ class DeoptimizationContextRecord {
   JValue GetReturnValue() const { return ret_val_; }
   bool IsReference() const { return is_reference_; }
   bool GetFromCode() const { return from_code_; }
-  ObjPtr<mirror::Throwable> GetPendingException() const { return pending_exception_; }
+  ObjPtr<mirror::Throwable> GetPendingException() const REQUIRES_SHARED(Locks::mutator_lock_) {
+    return pending_exception_;
+  }
   DeoptimizationContextRecord* GetLink() const { return link_; }
   mirror::Object** GetReturnValueAsGCRoot() {
     DCHECK(is_reference_);
@@ -265,6 +281,7 @@ void Thread::PushDeoptimizationContext(const JValue& return_value,
                                        ObjPtr<mirror::Throwable> exception,
                                        bool from_code,
                                        DeoptimizationMethodType method_type) {
+  DCHECK(exception != Thread::GetDeoptimizationException());
   DeoptimizationContextRecord* record = new DeoptimizationContextRecord(
       return_value,
       is_reference,
@@ -345,7 +362,7 @@ void Thread::Park(bool is_absolute, int64_t time) {
       if (is_absolute) {
         // Time is millis when scheduled for an absolute time
         timespec.tv_nsec = (time % 1000) * 1000000;
-        timespec.tv_sec = time / 1000;
+        timespec.tv_sec = SaturatedTimeT(time / 1000);
         // This odd looking pattern is recommended by futex documentation to
         // wait until an absolute deadline, with otherwise identical behavior to
         // FUTEX_WAIT_PRIVATE. This also allows parkUntil() to return at the
@@ -355,10 +372,10 @@ void Thread::Park(bool is_absolute, int64_t time) {
                        /* sleep if val = */ kNoPermitWaiterWaiting,
                        &timespec,
                        nullptr,
-                       FUTEX_BITSET_MATCH_ANY);
+                       static_cast<int>(FUTEX_BITSET_MATCH_ANY));
       } else {
         // Time is nanos when scheduled for a relative time
-        timespec.tv_sec = time / 1000000000;
+        timespec.tv_sec = SaturatedTimeT(time / 1000000000);
         timespec.tv_nsec = time % 1000000000;
         result = futex(tls32_.park_state_.Address(),
                        FUTEX_WAIT_PRIVATE,
@@ -426,15 +443,18 @@ void Thread::PushStackedShadowFrame(ShadowFrame* sf, StackedShadowFrameType type
   tlsPtr_.stacked_shadow_frame_record = record;
 }
 
-ShadowFrame* Thread::PopStackedShadowFrame(StackedShadowFrameType type, bool must_be_present) {
+ShadowFrame* Thread::MaybePopDeoptimizedStackedShadowFrame() {
   StackedShadowFrameRecord* record = tlsPtr_.stacked_shadow_frame_record;
-  if (must_be_present) {
-    DCHECK(record != nullptr);
-  } else {
-    if (record == nullptr || record->GetType() != type) {
-      return nullptr;
-    }
+  if (record == nullptr ||
+      record->GetType() != StackedShadowFrameType::kDeoptimizationShadowFrame) {
+    return nullptr;
   }
+  return PopStackedShadowFrame();
+}
+
+ShadowFrame* Thread::PopStackedShadowFrame() {
+  StackedShadowFrameRecord* record = tlsPtr_.stacked_shadow_frame_record;
+  DCHECK_NE(record, nullptr);
   tlsPtr_.stacked_shadow_frame_record = record->GetLink();
   ShadowFrame* shadow_frame = record->GetShadowFrame();
   delete record;
@@ -487,7 +507,7 @@ static FrameIdToShadowFrame* FindFrameIdToShadowFrame(FrameIdToShadowFrame* head
   for (FrameIdToShadowFrame* record = head; record != nullptr; record = record->GetNext()) {
     if (record->GetFrameId() == frame_id) {
       if (kIsDebugBuild) {
-        // Sanity check we have at most one record for this frame.
+        // Check we have at most one record for this frame.
         CHECK(found == nullptr) << "Multiple records for the frame " << frame_id;
         found = record;
       } else {
@@ -524,7 +544,7 @@ ShadowFrame* Thread::FindOrCreateDebuggerShadowFrame(size_t frame_id,
     return shadow_frame;
   }
   VLOG(deopt) << "Create pre-deopted ShadowFrame for " << ArtMethod::PrettyMethod(method);
-  shadow_frame = ShadowFrame::CreateDeoptimizedFrame(num_vregs, nullptr, method, dex_pc);
+  shadow_frame = ShadowFrame::CreateDeoptimizedFrame(num_vregs, method, dex_pc);
   FrameIdToShadowFrame* record = FrameIdToShadowFrame::Create(frame_id,
                                                               shadow_frame,
                                                               tlsPtr_.frame_id_to_shadow_frame,
@@ -594,6 +614,10 @@ void Thread::DeleteJPeer(JNIEnv* env) {
   env->DeleteGlobalRef(old_jpeer);
 }
 
+void* Thread::CreateCallbackWithUffdGc(void* arg) {
+  return Thread::CreateCallback(arg);
+}
+
 void* Thread::CreateCallback(void* arg) {
   Thread* self = reinterpret_cast<Thread*>(arg);
   Runtime* runtime = Runtime::Current();
@@ -609,7 +633,7 @@ void* Thread::CreateCallback(void* arg) {
     // while threads are being born).
     CHECK(!runtime->IsShuttingDownLocked());
     // Note: given that the JNIEnv is created in the parent thread, the only failure point here is
-    //       a mess in InitStackHwm. We do not have a reasonable way to recover from that, so abort
+    //       a mess in InitStack. We do not have a reasonable way to recover from that, so abort
     //       the runtime in such a case. In case this ever changes, we need to make sure here to
     //       delete the tmp_jni_env, as we own it at this point.
     CHECK(self->Init(runtime->GetThreadList(), runtime->GetJavaVM(), self->tlsPtr_.tmp_jni_env));
@@ -627,7 +651,7 @@ void* Thread::CreateCallback(void* arg) {
     self->DeleteJPeer(self->GetJniEnv());
     self->SetThreadName(self->GetThreadName()->ToModifiedUtf8().c_str());
 
-    ArtField* priorityField = jni::DecodeArtField(WellKnownClasses::java_lang_Thread_priority);
+    ArtField* priorityField = WellKnownClasses::java_lang_Thread_priority;
     self->SetNativePriority(priorityField->GetInt(self->tlsPtr_.opeer));
 
     runtime->GetRuntimeCallbacks()->ThreadStart(self);
@@ -635,8 +659,7 @@ void* Thread::CreateCallback(void* arg) {
     // Unpark ourselves if the java peer was unparked before it started (see
     // b/28845097#comment49 for more information)
 
-    ArtField* unparkedField = jni::DecodeArtField(
-        WellKnownClasses::java_lang_Thread_unparkedBeforeStart);
+    ArtField* unparkedField = WellKnownClasses::java_lang_Thread_unparkedBeforeStart;
     bool should_unpark = false;
     {
       // Hold the lock here, so that if another thread calls unpark before the thread starts
@@ -650,26 +673,23 @@ void* Thread::CreateCallback(void* arg) {
     }
     // Invoke the 'run' method of our java.lang.Thread.
     ObjPtr<mirror::Object> receiver = self->tlsPtr_.opeer;
-    jmethodID mid = WellKnownClasses::java_lang_Thread_run;
-    ScopedLocalRef<jobject> ref(soa.Env(), soa.AddLocalReference<jobject>(receiver));
-    InvokeVirtualOrInterfaceWithJValues(soa, ref.get(), mid, nullptr);
+    WellKnownClasses::java_lang_Thread_run->InvokeVirtual<'V'>(self, receiver);
   }
   // Detach and delete self.
-  Runtime::Current()->GetThreadList()->Unregister(self);
+  Runtime::Current()->GetThreadList()->Unregister(self, /* should_run_callbacks= */ true);
 
   return nullptr;
 }
 
-Thread* Thread::FromManagedThread(const ScopedObjectAccessAlreadyRunnable& soa,
-                                  ObjPtr<mirror::Object> thread_peer) {
-  ArtField* f = jni::DecodeArtField(WellKnownClasses::java_lang_Thread_nativePeer);
+Thread* Thread::FromManagedThread(Thread* self, ObjPtr<mirror::Object> thread_peer) {
+  ArtField* f = WellKnownClasses::java_lang_Thread_nativePeer;
   Thread* result = reinterpret_cast64<Thread*>(f->GetLong(thread_peer));
-  // Sanity check that if we have a result it is either suspended or we hold the thread_list_lock_
+  // Check that if we have a result it is either suspended or we hold the thread_list_lock_
   // to stop it from going away.
   if (kIsDebugBuild) {
-    MutexLock mu(soa.Self(), *Locks::thread_suspend_count_lock_);
+    MutexLock mu(self, *Locks::thread_suspend_count_lock_);
     if (result != nullptr && !result->IsSuspended()) {
-      Locks::thread_list_lock_->AssertHeld(soa.Self());
+      Locks::thread_list_lock_->AssertHeld(self);
     }
   }
   return result;
@@ -677,7 +697,7 @@ Thread* Thread::FromManagedThread(const ScopedObjectAccessAlreadyRunnable& soa,
 
 Thread* Thread::FromManagedThread(const ScopedObjectAccessAlreadyRunnable& soa,
                                   jobject java_thread) {
-  return FromManagedThread(soa, soa.Decode<mirror::Object>(java_thread));
+  return FromManagedThread(soa.Self(), soa.Decode<mirror::Object>(java_thread));
 }
 
 static size_t FixStackSize(size_t stack_size) {
@@ -702,47 +722,48 @@ static size_t FixStackSize(size_t stack_size) {
     stack_size = PTHREAD_STACK_MIN;
   }
 
-  if (Runtime::Current()->ExplicitStackOverflowChecks()) {
-    // It's likely that callers are trying to ensure they have at least a certain amount of
-    // stack space, so we should add our reserved space on top of what they requested, rather
-    // than implicitly take it away from them.
-    stack_size += GetStackOverflowReservedBytes(kRuntimeISA);
-  } else {
+  if (Runtime::Current()->GetImplicitStackOverflowChecks()) {
     // If we are going to use implicit stack checks, allocate space for the protected
     // region at the bottom of the stack.
     stack_size += Thread::kStackOverflowImplicitCheckSize +
-        GetStackOverflowReservedBytes(kRuntimeISA);
+        GetStackOverflowReservedBytes(kRuntimeQuickCodeISA);
+  } else {
+    // It's likely that callers are trying to ensure they have at least a certain amount of
+    // stack space, so we should add our reserved space on top of what they requested, rather
+    // than implicitly take it away from them.
+    stack_size += GetStackOverflowReservedBytes(kRuntimeQuickCodeISA);
   }
 
   // Some systems require the stack size to be a multiple of the system page size, so round up.
-  stack_size = RoundUp(stack_size, kPageSize);
+  stack_size = RoundUp(stack_size, gPageSize);
 
   return stack_size;
 }
 
-// Return the nearest page-aligned address below the current stack top.
-NO_INLINE
-static uint8_t* FindStackTop() {
+template <>
+NO_INLINE uint8_t* Thread::FindStackTop<StackType::kHardware>() {
   return reinterpret_cast<uint8_t*>(
-      AlignDown(__builtin_frame_address(0), kPageSize));
+      AlignDown(__builtin_frame_address(0), gPageSize));
 }
 
 // Install a protected region in the stack.  This is used to trigger a SIGSEGV if a stack
 // overflow is detected.  It is located right below the stack_begin_.
+template <StackType stack_type>
 ATTRIBUTE_NO_SANITIZE_ADDRESS
 void Thread::InstallImplicitProtection() {
-  uint8_t* pregion = tlsPtr_.stack_begin - kStackOverflowProtectedSize;
+  uint8_t* pregion = GetStackBegin<stack_type>() - GetStackOverflowProtectedSize();
   // Page containing current top of stack.
-  uint8_t* stack_top = FindStackTop();
+  uint8_t* stack_top = FindStackTop<stack_type>();
 
   // Try to directly protect the stack.
   VLOG(threads) << "installing stack protected region at " << std::hex <<
         static_cast<void*>(pregion) << " to " <<
-        static_cast<void*>(pregion + kStackOverflowProtectedSize - 1);
-  if (ProtectStack(/* fatal_on_error= */ false)) {
+        static_cast<void*>(pregion + GetStackOverflowProtectedSize() - 1);
+  if (ProtectStack<stack_type>(/* fatal_on_error= */ false)) {
     // Tell the kernel that we won't be needing these pages any more.
     // NB. madvise will probably write zeroes into the memory (on linux it does).
-    uint32_t unwanted_size = stack_top - pregion - kPageSize;
+    size_t unwanted_size =
+        reinterpret_cast<uintptr_t>(stack_top) - reinterpret_cast<uintptr_t>(pregion) - gPageSize;
     madvise(pregion, unwanted_size, MADV_DONTNEED);
     return;
   }
@@ -768,7 +789,7 @@ void Thread::InstallImplicitProtection() {
 
   // (Defensively) first remove the protection on the protected region as we'll want to read
   // and write it. Ignore errors.
-  UnprotectStack();
+  UnprotectStack<stack_type>();
 
   VLOG(threads) << "Need to map in stack for thread at " << std::hex <<
       static_cast<void*>(pregion);
@@ -778,7 +799,7 @@ void Thread::InstallImplicitProtection() {
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wframe-larger-than="
     NO_INLINE
-    static void Touch(uintptr_t target) {
+    __attribute__((no_sanitize("memtag"))) static void Touch(uintptr_t target) {
       volatile size_t zero = 0;
       // Use a large local volatile array to ensure a large frame size. Do not use anything close
       // to a full page for ASAN. It would be nice to ensure the frame size is at most a page, but
@@ -792,11 +813,12 @@ void Thread::InstallImplicitProtection() {
 #endif
       // Keep space uninitialized as it can overflow the stack otherwise (should Clang actually
       // auto-initialize this local variable).
-      volatile char space[kPageSize - (kAsanMultiplier * 256)] __attribute__((uninitialized));
-      char sink ATTRIBUTE_UNUSED = space[zero];  // NOLINT
+      volatile char space[gPageSize - (kAsanMultiplier * 256)] __attribute__((uninitialized));
+      [[maybe_unused]] char sink = space[zero];
       // Remove tag from the pointer. Nop in non-hwasan builds.
-      uintptr_t addr = reinterpret_cast<uintptr_t>(__hwasan_tag_pointer(space, 0));
-      if (addr >= target + kPageSize) {
+      uintptr_t addr = reinterpret_cast<uintptr_t>(
+          __hwasan_tag_pointer != nullptr ? __hwasan_tag_pointer(space, 0) : space);
+      if (addr >= target + gPageSize) {
         Touch(target);
       }
       zero *= 2;  // Try to avoid tail recursion.
@@ -807,15 +829,32 @@ void Thread::InstallImplicitProtection() {
 
   VLOG(threads) << "(again) installing stack protected region at " << std::hex <<
       static_cast<void*>(pregion) << " to " <<
-      static_cast<void*>(pregion + kStackOverflowProtectedSize - 1);
+      static_cast<void*>(pregion + GetStackOverflowProtectedSize() - 1);
 
   // Protect the bottom of the stack to prevent read/write to it.
-  ProtectStack(/* fatal_on_error= */ true);
+  ProtectStack<stack_type>(/* fatal_on_error= */ true);
 
   // Tell the kernel that we won't be needing these pages any more.
   // NB. madvise will probably write zeroes into the memory (on linux it does).
-  uint32_t unwanted_size = stack_top - pregion - kPageSize;
+  size_t unwanted_size =
+      reinterpret_cast<uintptr_t>(stack_top) - reinterpret_cast<uintptr_t>(pregion) - gPageSize;
   madvise(pregion, unwanted_size, MADV_DONTNEED);
+}
+
+template <bool kSupportTransaction>
+static void SetNativePeer(ObjPtr<mirror::Object> java_peer, Thread* thread)
+    REQUIRES_SHARED(Locks::mutator_lock_) {
+  ArtField* field = WellKnownClasses::java_lang_Thread_nativePeer;
+  if (kSupportTransaction && Runtime::Current()->IsActiveTransaction()) {
+    field->SetLong</*kTransactionActive=*/ true>(java_peer, reinterpret_cast<jlong>(thread));
+  } else {
+    field->SetLong</*kTransactionActive=*/ false>(java_peer, reinterpret_cast<jlong>(thread));
+  }
+}
+
+static void SetNativePeer(JNIEnv* env, jobject java_peer, Thread* thread) {
+  ScopedObjectAccess soa(env);
+  SetNativePeer</*kSupportTransaction=*/ false>(soa.Decode<mirror::Object>(java_peer), thread);
 }
 
 void Thread::CreateNativeThread(JNIEnv* env, jobject java_peer, size_t stack_size, bool is_daemon) {
@@ -825,7 +864,7 @@ void Thread::CreateNativeThread(JNIEnv* env, jobject java_peer, size_t stack_siz
   if (VLOG_IS_ON(threads)) {
     ScopedObjectAccess soa(env);
 
-    ArtField* f = jni::DecodeArtField(WellKnownClasses::java_lang_Thread_name);
+    ArtField* f = WellKnownClasses::java_lang_Thread_name;
     ObjPtr<mirror::String> java_name =
         f->GetObject(soa.Decode<mirror::Object>(java_peer))->AsString();
     std::string thread_name;
@@ -864,8 +903,7 @@ void Thread::CreateNativeThread(JNIEnv* env, jobject java_peer, size_t stack_siz
 
   // Thread.start is synchronized, so we know that nativePeer is 0, and know that we're not racing
   // to assign it.
-  env->SetLongField(java_peer, WellKnownClasses::java_lang_Thread_nativePeer,
-                    reinterpret_cast<jlong>(child_thread));
+  SetNativePeer(env, java_peer, child_thread);
 
   // Try to allocate a JNIEnvExt for the thread. We do this here as we might be out of memory and
   // do not have a good way to report this on the child's side.
@@ -884,7 +922,8 @@ void Thread::CreateNativeThread(JNIEnv* env, jobject java_peer, size_t stack_siz
     CHECK_PTHREAD_CALL(pthread_attr_setstacksize, (&attr, stack_size), stack_size);
     pthread_create_result = pthread_create(&new_pthread,
                                            &attr,
-                                           Thread::CreateCallback,
+                                           gUseUserfaultfd ? Thread::CreateCallbackWithUffdGc
+                                                           : Thread::CreateCallback,
                                            child_thread);
     CHECK_PTHREAD_CALL(pthread_attr_destroy, (&attr), "new thread");
 
@@ -909,7 +948,7 @@ void Thread::CreateNativeThread(JNIEnv* env, jobject java_peer, size_t stack_siz
   delete child_thread;
   child_thread = nullptr;
   // TODO: remove from thread group?
-  env->SetLongField(java_peer, WellKnownClasses::java_lang_Thread_nativePeer, 0);
+  SetNativePeer(env, java_peer, nullptr);
   {
     std::string msg(child_jni_env_ext.get() == nullptr ?
         StringPrintf("Could not allocate JNI Env: %s", error_msg.c_str()) :
@@ -918,318 +957,6 @@ void Thread::CreateNativeThread(JNIEnv* env, jobject java_peer, size_t stack_siz
     ScopedObjectAccess soa(env);
     soa.Self()->ThrowOutOfMemoryError(msg.c_str());
   }
-}
-
-bool Thread::Init(ThreadList* thread_list, JavaVMExt* java_vm, JNIEnvExt* jni_env_ext) {
-  // This function does all the initialization that must be run by the native thread it applies to.
-  // (When we create a new thread from managed code, we allocate the Thread* in Thread::Create so
-  // we can handshake with the corresponding native thread when it's ready.) Check this native
-  // thread hasn't been through here already...
-  CHECK(Thread::Current() == nullptr);
-
-  // Set pthread_self_ ahead of pthread_setspecific, that makes Thread::Current function, this
-  // avoids pthread_self_ ever being invalid when discovered from Thread::Current().
-  tlsPtr_.pthread_self = pthread_self();
-  CHECK(is_started_);
-
-  ScopedTrace trace("Thread::Init");
-
-  SetUpAlternateSignalStack();
-  if (!InitStackHwm()) {
-    return false;
-  }
-  InitCpu();
-  InitTlsEntryPoints();
-  RemoveSuspendTrigger();
-  InitCardTable();
-  InitTid();
-  {
-    ScopedTrace trace2("InitInterpreterTls");
-    interpreter::InitInterpreterTls(this);
-  }
-
-#ifdef __BIONIC__
-  __get_tls()[TLS_SLOT_ART_THREAD_SELF] = this;
-#else
-  CHECK_PTHREAD_CALL(pthread_setspecific, (Thread::pthread_key_self_, this), "attach self");
-  Thread::self_tls_ = this;
-#endif
-  DCHECK_EQ(Thread::Current(), this);
-
-  tls32_.thin_lock_thread_id = thread_list->AllocThreadId(this);
-
-  if (jni_env_ext != nullptr) {
-    DCHECK_EQ(jni_env_ext->GetVm(), java_vm);
-    DCHECK_EQ(jni_env_ext->GetSelf(), this);
-    tlsPtr_.jni_env = jni_env_ext;
-  } else {
-    std::string error_msg;
-    tlsPtr_.jni_env = JNIEnvExt::Create(this, java_vm, &error_msg);
-    if (tlsPtr_.jni_env == nullptr) {
-      LOG(ERROR) << "Failed to create JNIEnvExt: " << error_msg;
-      return false;
-    }
-  }
-
-  ScopedTrace trace3("ThreadList::Register");
-  thread_list->Register(this);
-  return true;
-}
-
-template <typename PeerAction>
-Thread* Thread::Attach(const char* thread_name, bool as_daemon, PeerAction peer_action) {
-  Runtime* runtime = Runtime::Current();
-  ScopedTrace trace("Thread::Attach");
-  if (runtime == nullptr) {
-    LOG(ERROR) << "Thread attaching to non-existent runtime: " <<
-        ((thread_name != nullptr) ? thread_name : "(Unnamed)");
-    return nullptr;
-  }
-  Thread* self;
-  {
-    ScopedTrace trace2("Thread birth");
-    MutexLock mu(nullptr, *Locks::runtime_shutdown_lock_);
-    if (runtime->IsShuttingDownLocked()) {
-      LOG(WARNING) << "Thread attaching while runtime is shutting down: " <<
-          ((thread_name != nullptr) ? thread_name : "(Unnamed)");
-      return nullptr;
-    } else {
-      Runtime::Current()->StartThreadBirth();
-      self = new Thread(as_daemon);
-      bool init_success = self->Init(runtime->GetThreadList(), runtime->GetJavaVM());
-      Runtime::Current()->EndThreadBirth();
-      if (!init_success) {
-        delete self;
-        return nullptr;
-      }
-    }
-  }
-
-  self->InitStringEntryPoints();
-
-  CHECK_NE(self->GetState(), kRunnable);
-  self->SetState(kNative);
-
-  // Run the action that is acting on the peer.
-  if (!peer_action(self)) {
-    runtime->GetThreadList()->Unregister(self);
-    // Unregister deletes self, no need to do this here.
-    return nullptr;
-  }
-
-  if (VLOG_IS_ON(threads)) {
-    if (thread_name != nullptr) {
-      VLOG(threads) << "Attaching thread " << thread_name;
-    } else {
-      VLOG(threads) << "Attaching unnamed thread.";
-    }
-    ScopedObjectAccess soa(self);
-    self->Dump(LOG_STREAM(INFO));
-  }
-
-  {
-    ScopedObjectAccess soa(self);
-    runtime->GetRuntimeCallbacks()->ThreadStart(self);
-  }
-
-  return self;
-}
-
-Thread* Thread::Attach(const char* thread_name,
-                       bool as_daemon,
-                       jobject thread_group,
-                       bool create_peer) {
-  auto create_peer_action = [&](Thread* self) {
-    // If we're the main thread, ClassLinker won't be created until after we're attached,
-    // so that thread needs a two-stage attach. Regular threads don't need this hack.
-    // In the compiler, all threads need this hack, because no-one's going to be getting
-    // a native peer!
-    if (create_peer) {
-      self->CreatePeer(thread_name, as_daemon, thread_group);
-      if (self->IsExceptionPending()) {
-        // We cannot keep the exception around, as we're deleting self. Try to be helpful and log
-        // it.
-        {
-          ScopedObjectAccess soa(self);
-          LOG(ERROR) << "Exception creating thread peer:";
-          LOG(ERROR) << self->GetException()->Dump();
-          self->ClearException();
-        }
-        return false;
-      }
-    } else {
-      // These aren't necessary, but they improve diagnostics for unit tests & command-line tools.
-      if (thread_name != nullptr) {
-        self->tlsPtr_.name->assign(thread_name);
-        ::art::SetThreadName(thread_name);
-      } else if (self->GetJniEnv()->IsCheckJniEnabled()) {
-        LOG(WARNING) << *Thread::Current() << " attached without supplying a name";
-      }
-    }
-    return true;
-  };
-  return Attach(thread_name, as_daemon, create_peer_action);
-}
-
-Thread* Thread::Attach(const char* thread_name, bool as_daemon, jobject thread_peer) {
-  auto set_peer_action = [&](Thread* self) {
-    // Install the given peer.
-    {
-      DCHECK(self == Thread::Current());
-      ScopedObjectAccess soa(self);
-      self->tlsPtr_.opeer = soa.Decode<mirror::Object>(thread_peer).Ptr();
-    }
-    self->GetJniEnv()->SetLongField(thread_peer,
-                                    WellKnownClasses::java_lang_Thread_nativePeer,
-                                    reinterpret_cast64<jlong>(self));
-    return true;
-  };
-  return Attach(thread_name, as_daemon, set_peer_action);
-}
-
-void Thread::CreatePeer(const char* name, bool as_daemon, jobject thread_group) {
-  Runtime* runtime = Runtime::Current();
-  CHECK(runtime->IsStarted());
-  JNIEnv* env = tlsPtr_.jni_env;
-
-  if (thread_group == nullptr) {
-    thread_group = runtime->GetMainThreadGroup();
-  }
-  ScopedLocalRef<jobject> thread_name(env, env->NewStringUTF(name));
-  // Add missing null check in case of OOM b/18297817
-  if (name != nullptr && thread_name.get() == nullptr) {
-    CHECK(IsExceptionPending());
-    return;
-  }
-  jint thread_priority = GetNativePriority();
-  jboolean thread_is_daemon = as_daemon;
-
-  ScopedLocalRef<jobject> peer(env, env->AllocObject(WellKnownClasses::java_lang_Thread));
-  if (peer.get() == nullptr) {
-    CHECK(IsExceptionPending());
-    return;
-  }
-  {
-    ScopedObjectAccess soa(this);
-    tlsPtr_.opeer = soa.Decode<mirror::Object>(peer.get()).Ptr();
-  }
-  env->CallNonvirtualVoidMethod(peer.get(),
-                                WellKnownClasses::java_lang_Thread,
-                                WellKnownClasses::java_lang_Thread_init,
-                                thread_group, thread_name.get(), thread_priority, thread_is_daemon);
-  if (IsExceptionPending()) {
-    return;
-  }
-
-  Thread* self = this;
-  DCHECK_EQ(self, Thread::Current());
-  env->SetLongField(peer.get(),
-                    WellKnownClasses::java_lang_Thread_nativePeer,
-                    reinterpret_cast64<jlong>(self));
-
-  ScopedObjectAccess soa(self);
-  StackHandleScope<1> hs(self);
-  MutableHandle<mirror::String> peer_thread_name(hs.NewHandle(GetThreadName()));
-  if (peer_thread_name == nullptr) {
-    // The Thread constructor should have set the Thread.name to a
-    // non-null value. However, because we can run without code
-    // available (in the compiler, in tests), we manually assign the
-    // fields the constructor should have set.
-    if (runtime->IsActiveTransaction()) {
-      InitPeer<true>(soa,
-                     tlsPtr_.opeer,
-                     thread_is_daemon,
-                     thread_group,
-                     thread_name.get(),
-                     thread_priority);
-    } else {
-      InitPeer<false>(soa,
-                      tlsPtr_.opeer,
-                      thread_is_daemon,
-                      thread_group,
-                      thread_name.get(),
-                      thread_priority);
-    }
-    peer_thread_name.Assign(GetThreadName());
-  }
-  // 'thread_name' may have been null, so don't trust 'peer_thread_name' to be non-null.
-  if (peer_thread_name != nullptr) {
-    SetThreadName(peer_thread_name->ToModifiedUtf8().c_str());
-  }
-}
-
-jobject Thread::CreateCompileTimePeer(JNIEnv* env,
-                                      const char* name,
-                                      bool as_daemon,
-                                      jobject thread_group) {
-  Runtime* runtime = Runtime::Current();
-  CHECK(!runtime->IsStarted());
-
-  if (thread_group == nullptr) {
-    thread_group = runtime->GetMainThreadGroup();
-  }
-  ScopedLocalRef<jobject> thread_name(env, env->NewStringUTF(name));
-  // Add missing null check in case of OOM b/18297817
-  if (name != nullptr && thread_name.get() == nullptr) {
-    CHECK(Thread::Current()->IsExceptionPending());
-    return nullptr;
-  }
-  jint thread_priority = kNormThreadPriority;  // Always normalize to NORM priority.
-  jboolean thread_is_daemon = as_daemon;
-
-  ScopedLocalRef<jobject> peer(env, env->AllocObject(WellKnownClasses::java_lang_Thread));
-  if (peer.get() == nullptr) {
-    CHECK(Thread::Current()->IsExceptionPending());
-    return nullptr;
-  }
-
-  // We cannot call Thread.init, as it will recursively ask for currentThread.
-
-  // The Thread constructor should have set the Thread.name to a
-  // non-null value. However, because we can run without code
-  // available (in the compiler, in tests), we manually assign the
-  // fields the constructor should have set.
-  ScopedObjectAccessUnchecked soa(Thread::Current());
-  if (runtime->IsActiveTransaction()) {
-    InitPeer<true>(soa,
-                   soa.Decode<mirror::Object>(peer.get()),
-                   thread_is_daemon,
-                   thread_group,
-                   thread_name.get(),
-                   thread_priority);
-  } else {
-    InitPeer<false>(soa,
-                    soa.Decode<mirror::Object>(peer.get()),
-                    thread_is_daemon,
-                    thread_group,
-                    thread_name.get(),
-                    thread_priority);
-  }
-
-  return peer.release();
-}
-
-template<bool kTransactionActive>
-void Thread::InitPeer(ScopedObjectAccessAlreadyRunnable& soa,
-                      ObjPtr<mirror::Object> peer,
-                      jboolean thread_is_daemon,
-                      jobject thread_group,
-                      jobject thread_name,
-                      jint thread_priority) {
-  jni::DecodeArtField(WellKnownClasses::java_lang_Thread_daemon)->
-      SetBoolean<kTransactionActive>(peer, thread_is_daemon);
-  jni::DecodeArtField(WellKnownClasses::java_lang_Thread_group)->
-      SetObject<kTransactionActive>(peer, soa.Decode<mirror::Object>(thread_group));
-  jni::DecodeArtField(WellKnownClasses::java_lang_Thread_name)->
-      SetObject<kTransactionActive>(peer, soa.Decode<mirror::Object>(thread_name));
-  jni::DecodeArtField(WellKnownClasses::java_lang_Thread_priority)->
-      SetInt<kTransactionActive>(peer, thread_priority);
-}
-
-void Thread::SetThreadName(const char* name) {
-  tlsPtr_.name->assign(name);
-  ::art::SetThreadName(name);
-  Dbg::DdmSendThreadNotification(this, CHUNK_TYPE("THNM"));
 }
 
 static void GetThreadStack(pthread_t thread,
@@ -1265,7 +992,7 @@ static void GetThreadStack(pthread_t thread,
   // If we're the main thread, check whether we were run with an unlimited stack. In that case,
   // glibc will have reported a 2GB stack for our 32-bit process, and our stack overflow detection
   // will be broken because we'll die long before we get close to 2GB.
-  bool is_main_thread = (::art::GetTid() == getpid());
+  bool is_main_thread = (::art::GetTid() == static_cast<uint32_t>(getpid()));
   if (is_main_thread) {
     rlimit stack_limit;
     if (getrlimit(RLIMIT_STACK, &stack_limit) == -1) {
@@ -1288,22 +1015,373 @@ static void GetThreadStack(pthread_t thread,
 #endif
 }
 
-bool Thread::InitStackHwm() {
-  ScopedTrace trace("InitStackHwm");
-  void* read_stack_base;
-  size_t read_stack_size;
-  size_t read_guard_size;
+bool Thread::Init(ThreadList* thread_list, JavaVMExt* java_vm, JNIEnvExt* jni_env_ext) {
+  // This function does all the initialization that must be run by the native thread it applies to.
+  // (When we create a new thread from managed code, we allocate the Thread* in Thread::Create so
+  // we can handshake with the corresponding native thread when it's ready.) Check this native
+  // thread hasn't been through here already...
+  CHECK(Thread::Current() == nullptr);
+
+  // Set pthread_self ahead of pthread_setspecific, that makes Thread::Current function, this
+  // avoids pthread_self ever being invalid when discovered from Thread::Current().
+  tlsPtr_.pthread_self = pthread_self();
+  CHECK(is_started_);
+
+  ScopedTrace trace("Thread::Init");
+
+  SetUpAlternateSignalStack();
+
+  void* read_stack_base = nullptr;
+  size_t read_stack_size = 0;
+  size_t read_guard_size = 0;
   GetThreadStack(tlsPtr_.pthread_self, &read_stack_base, &read_stack_size, &read_guard_size);
+  if (!InitStack<kNativeStackType>(reinterpret_cast<uint8_t*>(read_stack_base),
+                                   read_stack_size,
+                                   read_guard_size)) {
+    return false;
+  }
+  InitCpu();
+  InitTlsEntryPoints();
+  RemoveSuspendTrigger();
+  InitCardTable();
+  InitTid();
 
-  tlsPtr_.stack_begin = reinterpret_cast<uint8_t*>(read_stack_base);
-  tlsPtr_.stack_size = read_stack_size;
+#ifdef __BIONIC__
+  __get_tls()[TLS_SLOT_ART_THREAD_SELF] = this;
+#else
+  CHECK_PTHREAD_CALL(pthread_setspecific, (Thread::pthread_key_self_, this), "attach self");
+  Thread::self_tls_ = this;
+#endif
+  DCHECK_EQ(Thread::Current(), this);
 
-  // The minimum stack size we can cope with is the overflow reserved bytes (typically
-  // 8K) + the protected region size (4K) + another page (4K).  Typically this will
-  // be 8+4+4 = 16K.  The thread won't be able to do much with this stack even the GC takes
-  // between 8K and 12K.
-  uint32_t min_stack = GetStackOverflowReservedBytes(kRuntimeISA) + kStackOverflowProtectedSize
-    + 4 * KB;
+  tls32_.thin_lock_thread_id = thread_list->AllocThreadId(this);
+
+  if (jni_env_ext != nullptr) {
+    DCHECK_EQ(jni_env_ext->GetVm(), java_vm);
+    DCHECK_EQ(jni_env_ext->GetSelf(), this);
+    tlsPtr_.jni_env = jni_env_ext;
+  } else {
+    std::string error_msg;
+    tlsPtr_.jni_env = JNIEnvExt::Create(this, java_vm, &error_msg);
+    if (tlsPtr_.jni_env == nullptr) {
+      LOG(ERROR) << "Failed to create JNIEnvExt: " << error_msg;
+      return false;
+    }
+  }
+
+  ScopedTrace trace3("ThreadList::Register");
+  thread_list->Register(this);
+  if (art_flags::always_enable_profile_code()) {
+    UpdateTlsLowOverheadTraceEntrypoints(!Trace::IsTracingEnabled());
+  }
+  return true;
+}
+
+template <typename PeerAction>
+Thread* Thread::Attach(const char* thread_name,
+                       bool as_daemon,
+                       PeerAction peer_action,
+                       bool should_run_callbacks) {
+  Runtime* runtime = Runtime::Current();
+  ScopedTrace trace("Thread::Attach");
+  if (runtime == nullptr) {
+    LOG(ERROR) << "Thread attaching to non-existent runtime: " <<
+        ((thread_name != nullptr) ? thread_name : "(Unnamed)");
+    return nullptr;
+  }
+  Thread* self;
+  {
+    ScopedTrace trace2("Thread birth");
+    MutexLock mu(nullptr, *Locks::runtime_shutdown_lock_);
+    if (runtime->IsShuttingDownLocked()) {
+      LOG(WARNING) << "Thread attaching while runtime is shutting down: " <<
+          ((thread_name != nullptr) ? thread_name : "(Unnamed)");
+      return nullptr;
+    } else {
+      Runtime::Current()->StartThreadBirth();
+      self = new Thread(as_daemon);
+      bool init_success = self->Init(runtime->GetThreadList(), runtime->GetJavaVM());
+      Runtime::Current()->EndThreadBirth();
+      if (!init_success) {
+        delete self;
+        return nullptr;
+      }
+    }
+  }
+
+  self->InitStringEntryPoints();
+
+  CHECK_NE(self->GetState(), ThreadState::kRunnable);
+  self->SetState(ThreadState::kNative);
+
+  // Run the action that is acting on the peer.
+  if (!peer_action(self)) {
+    runtime->GetThreadList()->Unregister(self, should_run_callbacks);
+    // Unregister deletes self, no need to do this here.
+    return nullptr;
+  }
+
+  if (VLOG_IS_ON(threads)) {
+    if (thread_name != nullptr) {
+      VLOG(threads) << "Attaching thread " << thread_name;
+    } else {
+      VLOG(threads) << "Attaching unnamed thread.";
+    }
+    ScopedObjectAccess soa(self);
+    self->Dump(LOG_STREAM(INFO));
+  }
+
+  TraceProfiler::AllocateBuffer(self);
+  if (should_run_callbacks) {
+    ScopedObjectAccess soa(self);
+    runtime->GetRuntimeCallbacks()->ThreadStart(self);
+  }
+
+  return self;
+}
+
+Thread* Thread::Attach(const char* thread_name,
+                       bool as_daemon,
+                       jobject thread_group,
+                       bool create_peer,
+                       bool should_run_callbacks) {
+  auto create_peer_action = [&](Thread* self) {
+    // If we're the main thread, ClassLinker won't be created until after we're attached,
+    // so that thread needs a two-stage attach. Regular threads don't need this hack.
+    // In the compiler, all threads need this hack, because no-one's going to be getting
+    // a native peer!
+    if (create_peer) {
+      self->CreatePeer(thread_name, as_daemon, thread_group);
+      if (self->IsExceptionPending()) {
+        // We cannot keep the exception around, as we're deleting self. Try to be helpful and log
+        // the failure but do not dump the exception details. If we fail to allocate the peer, we
+        // usually also fail to allocate an exception object and throw a pre-allocated OOME without
+        // any useful information. If we do manage to allocate the exception object, the memory
+        // information in the message could have been collected too late and therefore misleading.
+        {
+          ScopedObjectAccess soa(self);
+          LOG(ERROR) << "Exception creating thread peer: "
+                     << ((thread_name != nullptr) ? thread_name : "<null>");
+          self->ClearException();
+        }
+        return false;
+      }
+    } else {
+      // These aren't necessary, but they improve diagnostics for unit tests & command-line tools.
+      if (thread_name != nullptr) {
+        self->SetCachedThreadName(thread_name);
+        ::art::SetThreadName(thread_name);
+      } else if (self->GetJniEnv()->IsCheckJniEnabled()) {
+        LOG(WARNING) << *Thread::Current() << " attached without supplying a name";
+      }
+    }
+    return true;
+  };
+  return Attach(thread_name, as_daemon, create_peer_action, should_run_callbacks);
+}
+
+Thread* Thread::Attach(const char* thread_name, bool as_daemon, jobject thread_peer) {
+  auto set_peer_action = [&](Thread* self) {
+    // Install the given peer.
+    DCHECK(self == Thread::Current());
+    ScopedObjectAccess soa(self);
+    ObjPtr<mirror::Object> peer = soa.Decode<mirror::Object>(thread_peer);
+    self->tlsPtr_.opeer = peer.Ptr();
+    SetNativePeer</*kSupportTransaction=*/ false>(peer, self);
+    return true;
+  };
+  return Attach(thread_name, as_daemon, set_peer_action, /* should_run_callbacks= */ true);
+}
+
+void Thread::CreatePeer(const char* name, bool as_daemon, jobject thread_group) {
+  Runtime* runtime = Runtime::Current();
+  CHECK(runtime->IsStarted());
+  Thread* self = this;
+  DCHECK_EQ(self, Thread::Current());
+
+  ScopedObjectAccess soa(self);
+  StackHandleScope<4u> hs(self);
+  DCHECK(WellKnownClasses::java_lang_ThreadGroup->IsInitialized());
+  Handle<mirror::Object> thr_group = hs.NewHandle(soa.Decode<mirror::Object>(
+      thread_group != nullptr ? thread_group : runtime->GetMainThreadGroup()));
+  Handle<mirror::String> thread_name = hs.NewHandle(
+      name != nullptr ? mirror::String::AllocFromModifiedUtf8(self, name) : nullptr);
+  // Add missing null check in case of OOM b/18297817
+  if (name != nullptr && UNLIKELY(thread_name == nullptr)) {
+    CHECK(self->IsExceptionPending());
+    return;
+  }
+  jint thread_priority = GetNativePriority();
+
+  DCHECK(WellKnownClasses::java_lang_Thread->IsInitialized());
+  Handle<mirror::Object> peer =
+      hs.NewHandle(WellKnownClasses::java_lang_Thread->AllocObject(self));
+  if (UNLIKELY(peer == nullptr)) {
+    CHECK(IsExceptionPending());
+    return;
+  }
+  tlsPtr_.opeer = peer.Get();
+  WellKnownClasses::java_lang_Thread_init->InvokeInstance<'V', 'L', 'L', 'I', 'Z'>(
+      self, peer.Get(), thr_group.Get(), thread_name.Get(), thread_priority, as_daemon);
+  if (self->IsExceptionPending()) {
+    return;
+  }
+
+  SetNativePeer</*kSupportTransaction=*/ false>(peer.Get(), self);
+
+  MutableHandle<mirror::String> peer_thread_name(hs.NewHandle(GetThreadName()));
+  if (peer_thread_name == nullptr) {
+    // The Thread constructor should have set the Thread.name to a
+    // non-null value. However, because we can run without code
+    // available (in the compiler, in tests), we manually assign the
+    // fields the constructor should have set.
+    if (runtime->IsActiveTransaction()) {
+      InitPeer<true>(tlsPtr_.opeer,
+                     as_daemon,
+                     thr_group.Get(),
+                     thread_name.Get(),
+                     thread_priority);
+    } else {
+      InitPeer<false>(tlsPtr_.opeer,
+                      as_daemon,
+                      thr_group.Get(),
+                      thread_name.Get(),
+                      thread_priority);
+    }
+    peer_thread_name.Assign(GetThreadName());
+  }
+  // 'thread_name' may have been null, so don't trust 'peer_thread_name' to be non-null.
+  if (peer_thread_name != nullptr) {
+    SetThreadName(peer_thread_name->ToModifiedUtf8().c_str());
+  }
+}
+
+ObjPtr<mirror::Object> Thread::CreateCompileTimePeer(const char* name,
+                                                     bool as_daemon,
+                                                     jobject thread_group) {
+  Runtime* runtime = Runtime::Current();
+  CHECK(!runtime->IsStarted());
+  Thread* self = this;
+  DCHECK_EQ(self, Thread::Current());
+
+  ScopedObjectAccessUnchecked soa(self);
+  StackHandleScope<3u> hs(self);
+  DCHECK(WellKnownClasses::java_lang_ThreadGroup->IsInitialized());
+  Handle<mirror::Object> thr_group = hs.NewHandle(soa.Decode<mirror::Object>(
+      thread_group != nullptr ? thread_group : runtime->GetMainThreadGroup()));
+  Handle<mirror::String> thread_name = hs.NewHandle(
+      name != nullptr ? mirror::String::AllocFromModifiedUtf8(self, name) : nullptr);
+  // Add missing null check in case of OOM b/18297817
+  if (name != nullptr && UNLIKELY(thread_name == nullptr)) {
+    CHECK(self->IsExceptionPending());
+    return nullptr;
+  }
+  jint thread_priority = kNormThreadPriority;  // Always normalize to NORM priority.
+
+  DCHECK(WellKnownClasses::java_lang_Thread->IsInitialized());
+  Handle<mirror::Object> peer = hs.NewHandle(
+      WellKnownClasses::java_lang_Thread->AllocObject(self));
+  if (peer == nullptr) {
+    CHECK(Thread::Current()->IsExceptionPending());
+    return nullptr;
+  }
+
+  // We cannot call Thread.init, as it will recursively ask for currentThread.
+
+  // The Thread constructor should have set the Thread.name to a
+  // non-null value. However, because we can run without code
+  // available (in the compiler, in tests), we manually assign the
+  // fields the constructor should have set.
+  if (runtime->IsActiveTransaction()) {
+    InitPeer<true>(peer.Get(),
+                   as_daemon,
+                   thr_group.Get(),
+                   thread_name.Get(),
+                   thread_priority);
+  } else {
+    InitPeer<false>(peer.Get(),
+                    as_daemon,
+                    thr_group.Get(),
+                    thread_name.Get(),
+                    thread_priority);
+  }
+
+  return peer.Get();
+}
+
+template<bool kTransactionActive>
+void Thread::InitPeer(ObjPtr<mirror::Object> peer,
+                      bool as_daemon,
+                      ObjPtr<mirror::Object> thread_group,
+                      ObjPtr<mirror::String> thread_name,
+                      jint thread_priority) {
+  WellKnownClasses::java_lang_Thread_daemon->SetBoolean<kTransactionActive>(peer,
+      static_cast<uint8_t>(as_daemon ? 1u : 0u));
+  WellKnownClasses::java_lang_Thread_group->SetObject<kTransactionActive>(peer, thread_group);
+  WellKnownClasses::java_lang_Thread_name->SetObject<kTransactionActive>(peer, thread_name);
+  WellKnownClasses::java_lang_Thread_priority->SetInt<kTransactionActive>(peer, thread_priority);
+}
+
+void Thread::SetCachedThreadName(const char* name) {
+  DCHECK(name != kThreadNameDuringStartup);
+  const char* old_name = tlsPtr_.name.exchange(name == nullptr ? nullptr : strdup(name));
+  if (old_name != nullptr && old_name !=  kThreadNameDuringStartup) {
+    // Deallocate it, carefully. Note that the load has to be ordered wrt the store of the xchg.
+    for (uint32_t i = 0; UNLIKELY(tls32_.num_name_readers.load(std::memory_order_seq_cst) != 0);
+         ++i) {
+      static constexpr uint32_t kNumSpins = 1000;
+      // Ugly, but keeps us from having to do anything on the reader side.
+      if (i > kNumSpins) {
+        usleep(500);
+      }
+    }
+    // We saw the reader count drop to zero since we replaced the name; old one is now safe to
+    // deallocate.
+    free(const_cast<char *>(old_name));
+  }
+}
+
+void Thread::SetThreadName(const char* name) {
+  DCHECK(this == Thread::Current() || IsSuspended());  // O.w. `this` may disappear.
+  SetCachedThreadName(name);
+  if (!IsStillStarting() || this == Thread::Current()) {
+    // The RI is documented to do this only in the this == self case, which would avoid the
+    // IsStillStarting() issue below. We instead use a best effort approach.
+    ::art::SetThreadName(tlsPtr_.pthread_self /* Not necessarily current thread! */, name);
+  }  // O.w. this will normally be set when we finish starting. We can rarely fail to set the
+     // pthread name. See TODO in IsStillStarting().
+  Dbg::DdmSendThreadNotification(this, CHUNK_TYPE("THNM"));
+}
+
+template <StackType stack_type>
+bool Thread::InitStack(uint8_t* read_stack_base, size_t read_stack_size, size_t read_guard_size) {
+  ScopedTrace trace("InitStack");
+
+  SetStackBegin<stack_type>(read_stack_base);
+  SetStackSize<stack_type>(read_stack_size);
+
+  // The minimum stack size we can cope with is the protected region size + stack overflow check
+  // region size + some memory for normal stack usage.
+  //
+  // The protected region is located at the beginning (lowest address) of the stack region.
+  // Therefore, it starts at a page-aligned address. Its size should be a multiple of page sizes.
+  // Typically, it is one page in size, however this varies in some configurations.
+  //
+  // The overflow reserved bytes is size of the stack overflow check region, located right after
+  // the protected region, so also starts at a page-aligned address. The size is discretionary.
+  // Typically it is 8K, but this varies in some configurations.
+  //
+  // The rest of the stack memory is available for normal stack usage. It is located right after
+  // the stack overflow check region, so its starting address isn't necessarily page-aligned. The
+  // size of the region is discretionary, however should be chosen in a way that the overall stack
+  // size is a multiple of page sizes. Historically, it is chosen to be at least 4 KB.
+  //
+  // On systems with 4K page size, typically the minimum stack size will be 4+8+4 = 16K.
+  // The thread won't be able to do much with this stack: even the GC takes between 8K and 12K.
+  DCHECK_ALIGNED_PARAM(static_cast<size_t>(GetStackOverflowProtectedSize()),
+                       static_cast<int32_t>(gPageSize));
+  size_t min_stack = GetStackOverflowProtectedSize() +
+      RoundUp(GetStackOverflowReservedBytes(kRuntimeQuickCodeISA) + 4 * KB, gPageSize);
   if (read_stack_size <= min_stack) {
     // Note, as we know the stack is small, avoid operations that could use a lot of stack.
     LogHelper::LogLineLowStack(__PRETTY_FUNCTION__,
@@ -1313,8 +1391,16 @@ bool Thread::InitStackHwm() {
     return false;
   }
 
+  const char* stack_type_str = "";
+  if constexpr (stack_type == kNativeStackType) {
+    stack_type_str = "Native";
+  } else if constexpr (stack_type == kQuickStackType) {
+    stack_type_str = "Quick";
+  }
+
   // This is included in the SIGQUIT output, but it's useful here for thread debugging.
-  VLOG(threads) << StringPrintf("Native stack is at %p (%s with %s guard)",
+  VLOG(threads) << StringPrintf("%s stack is at %p (%s with %s guard)",
+                                stack_type_str,
                                 read_stack_base,
                                 PrettySize(read_stack_size).c_str(),
                                 PrettySize(read_guard_size).c_str());
@@ -1322,9 +1408,10 @@ bool Thread::InitStackHwm() {
   // Set stack_end_ to the bottom of the stack saving space of stack overflows
 
   Runtime* runtime = Runtime::Current();
-  bool implicit_stack_check = !runtime->ExplicitStackOverflowChecks() && !runtime->IsAotCompiler();
+  bool implicit_stack_check =
+      runtime->GetImplicitStackOverflowChecks() && !runtime->IsAotCompiler();
 
-  ResetDefaultStackEnd();
+  ResetDefaultStackEnd<stack_type>();
 
   // Install the protected region if we are doing implicit overflow checks.
   if (implicit_stack_check) {
@@ -1332,15 +1419,18 @@ bool Thread::InitStackHwm() {
     // to install our own region so we need to move the limits
     // of the stack to make room for it.
 
-    tlsPtr_.stack_begin += read_guard_size + kStackOverflowProtectedSize;
-    tlsPtr_.stack_end += read_guard_size + kStackOverflowProtectedSize;
-    tlsPtr_.stack_size -= read_guard_size;
+    SetStackBegin<stack_type>(
+        GetStackBegin<stack_type>() + read_guard_size + GetStackOverflowProtectedSize());
+    SetStackEnd<stack_type>(
+        GetStackEnd<stack_type>() + read_guard_size + GetStackOverflowProtectedSize());
+    SetStackSize<stack_type>(
+        GetStackSize<stack_type>() - (read_guard_size + GetStackOverflowProtectedSize()));
 
-    InstallImplicitProtection();
+    InstallImplicitProtection<stack_type>();
   }
 
-  // Sanity check.
-  CHECK_GT(FindStackTop(), reinterpret_cast<void*>(tlsPtr_.stack_end));
+  // Consistency check.
+  CHECK_GT(FindStackTop<stack_type>(), reinterpret_cast<void*>(GetStackEnd<stack_type>()));
 
   return true;
 }
@@ -1352,30 +1442,45 @@ void Thread::ShortDump(std::ostream& os) const {
     os << GetThreadId()
        << ",tid=" << GetTid() << ',';
   }
+  tls32_.num_name_readers.fetch_add(1, std::memory_order_seq_cst);
+  const char* name = tlsPtr_.name.load();
   os << GetState()
      << ",Thread*=" << this
      << ",peer=" << tlsPtr_.opeer
-     << ",\"" << (tlsPtr_.name != nullptr ? *tlsPtr_.name : "null") << "\""
+     << ",\"" << (name == nullptr ? "null" : name) << "\""
      << "]";
+  tls32_.num_name_readers.fetch_sub(1 /* at least memory_order_release */);
 }
 
-void Thread::Dump(std::ostream& os, bool dump_native_stack, BacktraceMap* backtrace_map,
-                  bool force_dump_stack) const {
+Thread::DumpOrder Thread::Dump(std::ostream& os,
+                               bool dump_native_stack,
+                               bool force_dump_stack) const {
   DumpState(os);
-  DumpStack(os, dump_native_stack, backtrace_map, force_dump_stack);
+  return DumpStack(os, dump_native_stack, force_dump_stack);
+}
+
+Thread::DumpOrder Thread::Dump(std::ostream& os,
+                               unwindstack::AndroidLocalUnwinder& unwinder,
+                               bool dump_native_stack,
+                               bool force_dump_stack) const {
+  DumpState(os);
+  return DumpStack(os, unwinder, dump_native_stack, force_dump_stack);
 }
 
 ObjPtr<mirror::String> Thread::GetThreadName() const {
-  ArtField* f = jni::DecodeArtField(WellKnownClasses::java_lang_Thread_name);
   if (tlsPtr_.opeer == nullptr) {
     return nullptr;
   }
-  ObjPtr<mirror::Object> name = f->GetObject(tlsPtr_.opeer);
+  ObjPtr<mirror::Object> name = WellKnownClasses::java_lang_Thread_name->GetObject(tlsPtr_.opeer);
   return name == nullptr ? nullptr : name->AsString();
 }
 
 void Thread::GetThreadName(std::string& name) const {
-  name.assign(*tlsPtr_.name);
+  tls32_.num_name_readers.fetch_add(1, std::memory_order_seq_cst);
+  // The store part of the increment has to be ordered with respect to the following load.
+  const char* c_name = tlsPtr_.name.load(std::memory_order_seq_cst);
+  name.assign(c_name == nullptr ? "<no name>" : c_name);
+  tls32_.num_name_readers.fetch_sub(1 /* at least memory_order_release */);
 }
 
 uint64_t Thread::GetCpuMicroTime() const {
@@ -1384,7 +1489,8 @@ uint64_t Thread::GetCpuMicroTime() const {
   pthread_getcpuclockid(tlsPtr_.pthread_self, &cpu_clock_id);
   timespec now;
   clock_gettime(cpu_clock_id, &now);
-  return static_cast<uint64_t>(now.tv_sec) * UINT64_C(1000000) + now.tv_nsec / UINT64_C(1000);
+  return static_cast<uint64_t>(now.tv_sec) * UINT64_C(1000000) +
+         static_cast<uint64_t>(now.tv_nsec) / UINT64_C(1000);
 #else  // __APPLE__
   UNIMPLEMENTED(WARNING);
   return -1;
@@ -1392,7 +1498,7 @@ uint64_t Thread::GetCpuMicroTime() const {
 }
 
 // Attempt to rectify locks so that we dump thread list with required locks before exiting.
-static void UnsafeLogFatalForSuspendCount(Thread* self, Thread* thread) NO_THREAD_SAFETY_ANALYSIS {
+void Thread::UnsafeLogFatalForSuspendCount(Thread* self, Thread* thread) NO_THREAD_SAFETY_ANALYSIS {
   LOG(ERROR) << *thread << " suspend count already zero.";
   Locks::thread_suspend_count_lock_->Unlock(self);
   if (!Locks::mutator_lock_->IsSharedHeld(self)) {
@@ -1410,143 +1516,68 @@ static void UnsafeLogFatalForSuspendCount(Thread* self, Thread* thread) NO_THREA
   std::ostringstream ss;
   Runtime::Current()->GetThreadList()->Dump(ss);
   LOG(FATAL) << ss.str();
+  UNREACHABLE();
 }
 
-bool Thread::ModifySuspendCountInternal(Thread* self,
-                                        int delta,
-                                        AtomicInteger* suspend_barrier,
-                                        SuspendReason reason) {
-  if (kIsDebugBuild) {
-    DCHECK(delta == -1 || delta == +1 || delta == -tls32_.debug_suspend_count)
-          << reason << " " << delta << " " << tls32_.debug_suspend_count << " " << this;
-    DCHECK_GE(tls32_.suspend_count, tls32_.debug_suspend_count) << this;
-    Locks::thread_suspend_count_lock_->AssertHeld(self);
-    if (this != self && !IsSuspended()) {
-      Locks::thread_list_lock_->AssertHeld(self);
-    }
-  }
-  // User code suspensions need to be checked more closely since they originate from code outside of
-  // the runtime's control.
-  if (UNLIKELY(reason == SuspendReason::kForUserCode)) {
-    Locks::user_code_suspension_lock_->AssertHeld(self);
-    if (UNLIKELY(delta + tls32_.user_code_suspend_count < 0)) {
-      LOG(ERROR) << "attempting to modify suspend count in an illegal way.";
+bool Thread::PassActiveSuspendBarriers() {
+  DCHECK_EQ(this, Thread::Current());
+  DCHECK_NE(GetState(), ThreadState::kRunnable);
+  // Grab the suspend_count lock and copy the current set of barriers. Then clear the list and the
+  // flag. The IncrementSuspendCount function requires the lock so we prevent a race between setting
+  // the kActiveSuspendBarrier flag and clearing it.
+  // TODO: Consider doing this without the temporary vector. That code will be a bit
+  // tricky, since the WrappedSuspend1Barrier may disappear once the barrier is decremented.
+  std::vector<AtomicInteger*> pass_barriers{};
+  {
+    MutexLock mu(this, *Locks::thread_suspend_count_lock_);
+    if (!ReadFlag(ThreadFlag::kActiveSuspendBarrier)) {
+      // Quick exit test: The barriers have already been claimed - this is possible as there may
+      // be a race to claim and it doesn't matter who wins.  All of the callers of this function
+      // (except SuspendAllInternal) will first test the kActiveSuspendBarrier flag without the
+      // lock. Here we double-check whether the barrier has been passed with the
+      // suspend_count_lock_.
       return false;
     }
-  }
-  if (UNLIKELY(delta < 0 && tls32_.suspend_count <= 0)) {
-    UnsafeLogFatalForSuspendCount(self, this);
-    return false;
-  }
-
-  if (kUseReadBarrier && delta > 0 && this != self && tlsPtr_.flip_function != nullptr) {
-    // Force retry of a suspend request if it's in the middle of a thread flip to avoid a
-    // deadlock. b/31683379.
-    return false;
-  }
-
-  uint16_t flags = kSuspendRequest;
-  if (delta > 0 && suspend_barrier != nullptr) {
-    uint32_t available_barrier = kMaxSuspendBarriers;
-    for (uint32_t i = 0; i < kMaxSuspendBarriers; ++i) {
-      if (tlsPtr_.active_suspend_barriers[i] == nullptr) {
-        available_barrier = i;
-        break;
+    if (tlsPtr_.active_suspendall_barrier != nullptr) {
+      // We have at most one active active_suspendall_barrier. See thread.h comment.
+      pass_barriers.push_back(tlsPtr_.active_suspendall_barrier);
+      tlsPtr_.active_suspendall_barrier = nullptr;
+    }
+    for (WrappedSuspend1Barrier* w = tlsPtr_.active_suspend1_barriers; w != nullptr; w = w->next_) {
+      CHECK_EQ(w->magic_, WrappedSuspend1Barrier::kMagic)
+          << "first = " << tlsPtr_.active_suspend1_barriers << " current = " << w
+          << " next = " << w->next_;
+      pass_barriers.push_back(&(w->barrier_));
+    }
+    tlsPtr_.active_suspend1_barriers = nullptr;
+    AtomicClearFlag(ThreadFlag::kActiveSuspendBarrier);
+    CHECK_GT(pass_barriers.size(), 0U);  // Since kActiveSuspendBarrier was set.
+    // Decrement suspend barrier(s) while we still hold the lock, since SuspendThread may
+    // remove and deallocate suspend barriers while holding suspend_count_lock_ .
+    // There will typically only be a single barrier to pass here.
+    for (AtomicInteger*& barrier : pass_barriers) {
+      int32_t old_val = barrier->fetch_sub(1, std::memory_order_release);
+      CHECK_GT(old_val, 0) << "Unexpected value for PassActiveSuspendBarriers(): " << old_val;
+      if (old_val != 1) {
+        // We're done with it.
+        barrier = nullptr;
       }
     }
-    if (available_barrier == kMaxSuspendBarriers) {
-      // No barrier spaces available, we can't add another.
-      return false;
-    }
-    tlsPtr_.active_suspend_barriers[available_barrier] = suspend_barrier;
-    flags |= kActiveSuspendBarrier;
   }
-
-  tls32_.suspend_count += delta;
-  switch (reason) {
-    case SuspendReason::kForUserCode:
-      tls32_.user_code_suspend_count += delta;
-      break;
-    case SuspendReason::kInternal:
-      break;
-  }
-
-  if (tls32_.suspend_count == 0) {
-    AtomicClearFlag(kSuspendRequest);
-  } else {
-    // Two bits might be set simultaneously.
-    tls32_.state_and_flags.as_atomic_int.fetch_or(flags, std::memory_order_seq_cst);
-    TriggerSuspend();
-  }
-  return true;
-}
-
-bool Thread::PassActiveSuspendBarriers(Thread* self) {
-  // Grab the suspend_count lock and copy the current set of
-  // barriers. Then clear the list and the flag. The ModifySuspendCount
-  // function requires the lock so we prevent a race between setting
-  // the kActiveSuspendBarrier flag and clearing it.
-  AtomicInteger* pass_barriers[kMaxSuspendBarriers];
-  {
-    MutexLock mu(self, *Locks::thread_suspend_count_lock_);
-    if (!ReadFlag(kActiveSuspendBarrier)) {
-      // quick exit test: the barriers have already been claimed - this is
-      // possible as there may be a race to claim and it doesn't matter
-      // who wins.
-      // All of the callers of this function (except the SuspendAllInternal)
-      // will first test the kActiveSuspendBarrier flag without lock. Here
-      // double-check whether the barrier has been passed with the
-      // suspend_count lock.
-      return false;
-    }
-
-    for (uint32_t i = 0; i < kMaxSuspendBarriers; ++i) {
-      pass_barriers[i] = tlsPtr_.active_suspend_barriers[i];
-      tlsPtr_.active_suspend_barriers[i] = nullptr;
-    }
-    AtomicClearFlag(kActiveSuspendBarrier);
-  }
-
-  uint32_t barrier_count = 0;
-  for (uint32_t i = 0; i < kMaxSuspendBarriers; i++) {
-    AtomicInteger* pending_threads = pass_barriers[i];
-    if (pending_threads != nullptr) {
-      bool done = false;
-      do {
-        int32_t cur_val = pending_threads->load(std::memory_order_relaxed);
-        CHECK_GT(cur_val, 0) << "Unexpected value for PassActiveSuspendBarriers(): " << cur_val;
-        // Reduce value by 1.
-        done = pending_threads->CompareAndSetWeakRelaxed(cur_val, cur_val - 1);
+  // Finally do futex_wakes after releasing the lock.
+  for (AtomicInteger* barrier : pass_barriers) {
 #if ART_USE_FUTEXES
-        if (done && (cur_val - 1) == 0) {  // Weak CAS may fail spuriously.
-          futex(pending_threads->Address(), FUTEX_WAKE_PRIVATE, INT_MAX, nullptr, nullptr, 0);
-        }
+    if (barrier != nullptr) {
+      futex(barrier->Address(), FUTEX_WAKE_PRIVATE, INT_MAX, nullptr, nullptr, 0);
+    }
 #endif
-      } while (!done);
-      ++barrier_count;
-    }
   }
-  CHECK_GT(barrier_count, 0U);
   return true;
-}
-
-void Thread::ClearSuspendBarrier(AtomicInteger* target) {
-  CHECK(ReadFlag(kActiveSuspendBarrier));
-  bool clear_flag = true;
-  for (uint32_t i = 0; i < kMaxSuspendBarriers; ++i) {
-    AtomicInteger* ptr = tlsPtr_.active_suspend_barriers[i];
-    if (ptr == target) {
-      tlsPtr_.active_suspend_barriers[i] = nullptr;
-    } else if (ptr != nullptr) {
-      clear_flag = false;
-    }
-  }
-  if (LIKELY(clear_flag)) {
-    AtomicClearFlag(kActiveSuspendBarrier);
-  }
 }
 
 void Thread::RunCheckpointFunction() {
+  DCHECK_EQ(Thread::Current(), this);
+  CHECK(!GetStateAndFlags(std::memory_order_relaxed).IsAnyOfFlagsSet(FlipFunctionFlags()));
   // Grab the suspend_count lock, get the next checkpoint and update all the checkpoint fields. If
   // there are no more checkpoints we will also clear the kCheckpointRequest flag.
   Closure* checkpoint;
@@ -1560,7 +1591,7 @@ void Thread::RunCheckpointFunction() {
     } else {
       // No overflow checkpoints. Clear the kCheckpointRequest flag
       tlsPtr_.checkpoint_function = nullptr;
-      AtomicClearFlag(kCheckpointRequest);
+      AtomicClearFlag(ThreadFlag::kCheckpointRequest);
     }
   }
   // Outside the lock, run the checkpoint function.
@@ -1570,54 +1601,50 @@ void Thread::RunCheckpointFunction() {
 }
 
 void Thread::RunEmptyCheckpoint() {
+  // Note: Empty checkpoint does not access the thread's stack,
+  // so we do not need to check for the flip function.
   DCHECK_EQ(Thread::Current(), this);
-  AtomicClearFlag(kEmptyCheckpointRequest);
+  AtomicClearFlag(ThreadFlag::kEmptyCheckpointRequest);
   Runtime::Current()->GetThreadList()->EmptyCheckpointBarrier()->Pass(this);
 }
 
 bool Thread::RequestCheckpoint(Closure* function) {
-  union StateAndFlags old_state_and_flags;
-  old_state_and_flags.as_int = tls32_.state_and_flags.as_int;
-  if (old_state_and_flags.as_struct.state != kRunnable) {
-    return false;  // Fail, thread is suspended and so can't run a checkpoint.
-  }
-
-  // We must be runnable to request a checkpoint.
-  DCHECK_EQ(old_state_and_flags.as_struct.state, kRunnable);
-  union StateAndFlags new_state_and_flags;
-  new_state_and_flags.as_int = old_state_and_flags.as_int;
-  new_state_and_flags.as_struct.flags |= kCheckpointRequest;
-  bool success = tls32_.state_and_flags.as_atomic_int.CompareAndSetStrongSequentiallyConsistent(
-      old_state_and_flags.as_int, new_state_and_flags.as_int);
-  if (success) {
-    // Succeeded setting checkpoint flag, now insert the actual checkpoint.
-    if (tlsPtr_.checkpoint_function == nullptr) {
-      tlsPtr_.checkpoint_function = function;
-    } else {
-      checkpoint_overflow_.push_back(function);
+  bool success;
+  do {
+    StateAndFlags old_state_and_flags = GetStateAndFlags(std::memory_order_relaxed);
+    if (old_state_and_flags.GetState() != ThreadState::kRunnable) {
+      return false;  // Fail, thread is suspended and so can't run a checkpoint.
     }
-    CHECK_EQ(ReadFlag(kCheckpointRequest), true);
-    TriggerSuspend();
+    StateAndFlags new_state_and_flags = old_state_and_flags;
+    new_state_and_flags.SetFlag(ThreadFlag::kCheckpointRequest);
+    success = tls32_.state_and_flags.CompareAndSetWeakSequentiallyConsistent(
+        old_state_and_flags.GetValue(), new_state_and_flags.GetValue());
+  } while (!success);
+  // Succeeded setting checkpoint flag, now insert the actual checkpoint.
+  if (tlsPtr_.checkpoint_function == nullptr) {
+    tlsPtr_.checkpoint_function = function;
+  } else {
+    checkpoint_overflow_.push_back(function);
   }
-  return success;
+  DCHECK(ReadFlag(ThreadFlag::kCheckpointRequest));
+  TriggerSuspend();
+  return true;
 }
 
 bool Thread::RequestEmptyCheckpoint() {
-  union StateAndFlags old_state_and_flags;
-  old_state_and_flags.as_int = tls32_.state_and_flags.as_int;
-  if (old_state_and_flags.as_struct.state != kRunnable) {
+  StateAndFlags old_state_and_flags = GetStateAndFlags(std::memory_order_relaxed);
+  if (old_state_and_flags.GetState() != ThreadState::kRunnable) {
     // If it's not runnable, we don't need to do anything because it won't be in the middle of a
     // heap access (eg. the read barrier).
     return false;
   }
 
   // We must be runnable to request a checkpoint.
-  DCHECK_EQ(old_state_and_flags.as_struct.state, kRunnable);
-  union StateAndFlags new_state_and_flags;
-  new_state_and_flags.as_int = old_state_and_flags.as_int;
-  new_state_and_flags.as_struct.flags |= kEmptyCheckpointRequest;
-  bool success = tls32_.state_and_flags.as_atomic_int.CompareAndSetStrongSequentiallyConsistent(
-      old_state_and_flags.as_int, new_state_and_flags.as_int);
+  DCHECK_EQ(old_state_and_flags.GetState(), ThreadState::kRunnable);
+  StateAndFlags new_state_and_flags = old_state_and_flags;
+  new_state_and_flags.SetFlag(ThreadFlag::kEmptyCheckpointRequest);
+  bool success = tls32_.state_and_flags.CompareAndSetStrongSequentiallyConsistent(
+      old_state_and_flags.GetValue(), new_state_and_flags.GetValue());
   if (success) {
     TriggerSuspend();
   }
@@ -1633,8 +1660,8 @@ class BarrierClosure : public Closure {
     barrier_.Pass(self);
   }
 
-  void Wait(Thread* self, ThreadState suspend_state) {
-    if (suspend_state != ThreadState::kRunnable) {
+  void Wait(Thread* self, ThreadState wait_state) {
+    if (wait_state != ThreadState::kRunnable) {
       barrier_.Increment<Barrier::kDisallowHoldingLocks>(self, 1);
     } else {
       barrier_.Increment<Barrier::kAllowHoldingLocks>(self, 1);
@@ -1647,9 +1674,9 @@ class BarrierClosure : public Closure {
 };
 
 // RequestSynchronousCheckpoint releases the thread_list_lock_ as a part of its execution.
-bool Thread::RequestSynchronousCheckpoint(Closure* function, ThreadState suspend_state) {
+bool Thread::RequestSynchronousCheckpoint(Closure* function, ThreadState wait_state) {
   Thread* self = Thread::Current();
-  if (this == Thread::Current()) {
+  if (this == self) {
     Locks::thread_list_lock_->AssertExclusiveHeld(self);
     // Unlock the tll before running so that the state is the same regardless of thread.
     Locks::thread_list_lock_->ExclusiveUnlock(self);
@@ -1660,124 +1687,306 @@ bool Thread::RequestSynchronousCheckpoint(Closure* function, ThreadState suspend
 
   // The current thread is not this thread.
 
-  if (GetState() == ThreadState::kTerminated) {
-    Locks::thread_list_lock_->ExclusiveUnlock(self);
-    return false;
+  VerifyState();
+
+  Locks::thread_list_lock_->AssertExclusiveHeld(self);
+  // If target "this" thread is runnable, try to schedule a checkpoint. Do some gymnastics to not
+  // hold the suspend-count lock for too long.
+  if (GetState() == ThreadState::kRunnable) {
+    BarrierClosure barrier_closure(function);
+    bool installed = false;
+    {
+      MutexLock mu(self, *Locks::thread_suspend_count_lock_);
+      installed = RequestCheckpoint(&barrier_closure);
+    }
+    if (installed) {
+      // Relinquish the thread-list lock. We should not wait holding any locks. We cannot
+      // reacquire it since we don't know if 'this' hasn't been deleted yet.
+      Locks::thread_list_lock_->ExclusiveUnlock(self);
+      ScopedThreadStateChange sts(self, wait_state);
+      // Wait state can be kRunnable, in which case, for lock ordering purposes, it's as if we ran
+      // the closure ourselves. This means that the target thread should not acquire a pre-mutator
+      // lock without running the checkpoint, and the closure should not acquire a pre-mutator
+      // lock or suspend.
+      barrier_closure.Wait(self, wait_state);
+      return true;
+    }
+    // No longer runnable. Fall-through.
   }
 
-  struct ScopedThreadListLockUnlock {
-    explicit ScopedThreadListLockUnlock(Thread* self_in) RELEASE(*Locks::thread_list_lock_)
-        : self_thread(self_in) {
-      Locks::thread_list_lock_->AssertHeld(self_thread);
-      Locks::thread_list_lock_->Unlock(self_thread);
-    }
-
-    ~ScopedThreadListLockUnlock() ACQUIRE(*Locks::thread_list_lock_) {
-      Locks::thread_list_lock_->AssertNotHeld(self_thread);
-      Locks::thread_list_lock_->Lock(self_thread);
-    }
-
-    Thread* self_thread;
-  };
-
-  for (;;) {
-    Locks::thread_list_lock_->AssertExclusiveHeld(self);
-    // If this thread is runnable, try to schedule a checkpoint. Do some gymnastics to not hold the
-    // suspend-count lock for too long.
-    if (GetState() == ThreadState::kRunnable) {
-      BarrierClosure barrier_closure(function);
-      bool installed = false;
-      {
-        MutexLock mu(self, *Locks::thread_suspend_count_lock_);
-        installed = RequestCheckpoint(&barrier_closure);
-      }
-      if (installed) {
-        // Relinquish the thread-list lock. We should not wait holding any locks. We cannot
-        // reacquire it since we don't know if 'this' hasn't been deleted yet.
-        Locks::thread_list_lock_->ExclusiveUnlock(self);
-        ScopedThreadStateChange sts(self, suspend_state);
-        barrier_closure.Wait(self, suspend_state);
-        return true;
-      }
-      // Fall-through.
-    }
-
-    // This thread is not runnable, make sure we stay suspended, then run the checkpoint.
-    // Note: ModifySuspendCountInternal also expects the thread_list_lock to be held in
-    //       certain situations.
-    {
-      MutexLock mu2(self, *Locks::thread_suspend_count_lock_);
-
-      if (!ModifySuspendCount(self, +1, nullptr, SuspendReason::kInternal)) {
-        // Just retry the loop.
-        sched_yield();
-        continue;
-      }
-    }
+  // Target "this" thread was not runnable. Suspend it, hopefully redundantly,
+  // but it might have become runnable in the meantime.
+  // Although this is a thread suspension, the target thread only blocks while we run the
+  // checkpoint, which is presumed to terminate quickly even if other threads are blocked.
+  // Note: IncrementSuspendCount also expects the thread_list_lock to be held unless this == self.
+  WrappedSuspend1Barrier wrapped_barrier{};
+  {
+    bool is_suspended = false;
 
     {
-      // Release for the wait. The suspension will keep us from being deleted. Reacquire after so
-      // that we can call ModifySuspendCount without racing against ThreadList::Unregister.
-      ScopedThreadListLockUnlock stllu(self);
-      {
-        ScopedThreadStateChange sts(self, suspend_state);
-        while (GetState() == ThreadState::kRunnable) {
-          // We became runnable again. Wait till the suspend triggered in ModifySuspendCount
-          // moves us to suspended.
-          sched_yield();
+      MutexLock suspend_count_mu(self, *Locks::thread_suspend_count_lock_);
+      // If wait_state is kRunnable, function may not suspend. We thus never block because
+      // we ourselves are being asked to suspend.
+      if (UNLIKELY(wait_state != ThreadState::kRunnable && self->GetSuspendCount() != 0)) {
+        // We are being asked to suspend while we are suspending another thread that may be
+        // responsible for our suspension. This is likely to result in deadlock if we each
+        // block on the suspension request. Instead we wait for the situation to change.
+        ThreadExitFlag target_status;
+        NotifyOnThreadExit(&target_status);
+        for (int iter_count = 1; self->GetSuspendCount() != 0; ++iter_count) {
+          Locks::thread_suspend_count_lock_->ExclusiveUnlock(self);
+          Locks::thread_list_lock_->ExclusiveUnlock(self);
+          {
+            ScopedThreadStateChange sts(self, wait_state);
+            usleep(ThreadList::kThreadSuspendSleepUs);
+          }
+          CHECK_LT(iter_count, ThreadList::kMaxSuspendRetries);
+          Locks::thread_list_lock_->ExclusiveLock(self);
+          if (target_status.HasExited()) {
+            Locks::thread_list_lock_->ExclusiveUnlock(self);
+            DCheckUnregisteredEverywhere(&target_status, &target_status);
+            return false;
+          }
+          Locks::thread_suspend_count_lock_->ExclusiveLock(self);
         }
+        UnregisterThreadExitFlag(&target_status);
       }
-
-      function->Run(this);
+      IncrementSuspendCount(self, nullptr, &wrapped_barrier, SuspendReason::kInternal);
+      VerifyState();
+      DCHECK_GT(GetSuspendCount(), 0);
+      if (wait_state != ThreadState::kRunnable) {
+        DCHECK_EQ(self->GetSuspendCount(), 0);
+      }
+      // Since we've incremented the suspend count, "this" thread can no longer disappear.
+      Locks::thread_list_lock_->ExclusiveUnlock(self);
+      if (IsSuspended()) {
+        // See the discussion in mutator_gc_coord.md and SuspendAllInternal for the race here.
+        RemoveFirstSuspend1Barrier(&wrapped_barrier);
+        if (!HasActiveSuspendBarrier()) {
+          AtomicClearFlag(ThreadFlag::kActiveSuspendBarrier);
+        }
+        is_suspended = true;
+      }
+    }
+    if (!is_suspended) {
+      // This waits while holding the mutator lock. Effectively `self` becomes
+      // impossible to suspend until `this` responds to the suspend request.
+      // Arguably that's not making anything qualitatively worse.
+      bool success = !Runtime::Current()
+                          ->GetThreadList()
+                          ->WaitForSuspendBarrier(&wrapped_barrier.barrier_)
+                          .has_value();
+      CHECK(success);
     }
 
-    {
-      MutexLock mu2(self, *Locks::thread_suspend_count_lock_);
-
-      DCHECK_NE(GetState(), ThreadState::kRunnable);
-      bool updated = ModifySuspendCount(self, -1, nullptr, SuspendReason::kInternal);
-      DCHECK(updated);
+    // Ensure that the flip function for this thread, if pending, is finished *before*
+    // the checkpoint function is run. Otherwise, we may end up with both `to' and 'from'
+    // space references on the stack, confusing the GC's thread-flip logic. The caller is
+    // runnable so can't have a pending flip function.
+    DCHECK_EQ(self->GetState(), ThreadState::kRunnable);
+    DCHECK(IsSuspended());
+    DCHECK(!self->GetStateAndFlags(std::memory_order_relaxed).IsAnyOfFlagsSet(FlipFunctionFlags()));
+    EnsureFlipFunctionStarted(self, this);
+    // Since we're runnable, and kPendingFlipFunction is set with all threads suspended, it
+    // cannot be set again here. Thus kRunningFlipFunction is either already set after the
+    // EnsureFlipFunctionStarted call, or will not be set before we call Run().
+    if (ReadFlag(ThreadFlag::kRunningFlipFunction)) {
+      WaitForFlipFunction(self);
     }
-
-    {
-      // Imitate ResumeAll, the thread may be waiting on Thread::resume_cond_ since we raised its
-      // suspend count. Now the suspend_count_ is lowered so we must do the broadcast.
-      MutexLock mu2(self, *Locks::thread_suspend_count_lock_);
-      Thread::resume_cond_->Broadcast(self);
-    }
-
-    // Release the thread_list_lock_ to be consistent with the barrier-closure path.
-    Locks::thread_list_lock_->ExclusiveUnlock(self);
-
-    return true;  // We're done, break out of the loop.
+    function->Run(this);
   }
-}
 
-Closure* Thread::GetFlipFunction() {
-  Atomic<Closure*>* atomic_func = reinterpret_cast<Atomic<Closure*>*>(&tlsPtr_.flip_function);
-  Closure* func;
-  do {
-    func = atomic_func->load(std::memory_order_relaxed);
-    if (func == nullptr) {
-      return nullptr;
+  {
+    MutexLock mu2(self, *Locks::thread_suspend_count_lock_);
+    DCHECK_NE(GetState(), ThreadState::kRunnable);
+    DCHECK_GT(GetSuspendCount(), 0);
+    DecrementSuspendCount(self);
+    if (kIsDebugBuild) {
+      CheckBarrierInactive(&wrapped_barrier);
     }
-  } while (!atomic_func->CompareAndSetWeakSequentiallyConsistent(func, nullptr));
-  DCHECK(func != nullptr);
-  return func;
+    resume_cond_->Broadcast(self);
+  }
+
+  Locks::thread_list_lock_->AssertNotHeld(self);
+  return true;
 }
 
 void Thread::SetFlipFunction(Closure* function) {
-  CHECK(function != nullptr);
-  Atomic<Closure*>* atomic_func = reinterpret_cast<Atomic<Closure*>*>(&tlsPtr_.flip_function);
-  atomic_func->store(function, std::memory_order_seq_cst);
+  // This is called with all threads suspended, except for the calling thread.
+  DCHECK(IsSuspended() || Thread::Current() == this);
+  DCHECK(function != nullptr);
+  DCHECK(GetFlipFunction() == nullptr);
+  tlsPtr_.flip_function.store(function, std::memory_order_relaxed);
+  DCHECK(!GetStateAndFlags(std::memory_order_relaxed).IsAnyOfFlagsSet(FlipFunctionFlags()));
+  AtomicSetFlag(ThreadFlag::kPendingFlipFunction, std::memory_order_release);
 }
 
-void Thread::FullSuspendCheck() {
+bool Thread::EnsureFlipFunctionStarted(Thread* self,
+                                       Thread* target,
+                                       StateAndFlags old_state_and_flags,
+                                       ThreadExitFlag* tef,
+                                       bool* finished) {
+  //  Note: If tef is non-null, *target may have been destroyed. We have to be careful about
+  //  accessing it. That is the reason this is static and not a member function.
+  DCHECK(self == Current());
+  bool check_exited = (tef != nullptr);
+  // Check that the thread can't unexpectedly exit while we are running.
+  DCHECK(self == target || check_exited || target->ReadFlag(ThreadFlag::kSuspendRequest) ||
+         Locks::thread_list_lock_->IsExclusiveHeld(self))
+      << *target;
+  bool become_runnable;
+  auto maybe_release = [=]() NO_THREAD_SAFETY_ANALYSIS /* conditionally unlocks */ {
+    if (check_exited) {
+      Locks::thread_list_lock_->Unlock(self);
+    }
+  };
+  auto set_finished = [=](bool value) {
+    if (finished != nullptr) {
+      *finished = value;
+    }
+  };
+
+  if (check_exited) {
+    Locks::thread_list_lock_->Lock(self);
+    if (tef->HasExited()) {
+      Locks::thread_list_lock_->Unlock(self);
+      set_finished(true);
+      return false;
+    }
+  }
+  target->VerifyState();
+  if (old_state_and_flags.GetValue() == 0) {
+    become_runnable = false;
+    old_state_and_flags = target->GetStateAndFlags(std::memory_order_relaxed);
+  } else {
+    become_runnable = true;
+    DCHECK(!check_exited);
+    DCHECK(target == self);
+    DCHECK(old_state_and_flags.IsFlagSet(ThreadFlag::kPendingFlipFunction));
+    DCHECK(!old_state_and_flags.IsFlagSet(ThreadFlag::kSuspendRequest));
+  }
+  while (true) {
+    DCHECK(!check_exited || (Locks::thread_list_lock_->IsExclusiveHeld(self) && !tef->HasExited()));
+    if (!old_state_and_flags.IsFlagSet(ThreadFlag::kPendingFlipFunction)) {
+      maybe_release();
+      set_finished(!old_state_and_flags.IsFlagSet(ThreadFlag::kRunningFlipFunction));
+      return false;
+    }
+    DCHECK(!old_state_and_flags.IsFlagSet(ThreadFlag::kRunningFlipFunction));
+    StateAndFlags new_state_and_flags =
+        old_state_and_flags.WithFlag(ThreadFlag::kRunningFlipFunction)
+                           .WithoutFlag(ThreadFlag::kPendingFlipFunction);
+    if (become_runnable) {
+      DCHECK_EQ(self, target);
+      DCHECK_NE(self->GetState(), ThreadState::kRunnable);
+      new_state_and_flags = new_state_and_flags.WithState(ThreadState::kRunnable);
+    }
+    if (target->tls32_.state_and_flags.CompareAndSetWeakAcquire(old_state_and_flags.GetValue(),
+                                                                new_state_and_flags.GetValue())) {
+      if (become_runnable) {
+        self->GetMutatorLock()->TransitionFromSuspendedToRunnable(self);
+      }
+      art::Locks::mutator_lock_->AssertSharedHeld(self);
+      maybe_release();
+      // Thread will not go away while kRunningFlipFunction is set.
+      target->RunFlipFunction(self);
+      // At this point, no flip function flags should be set. It's unsafe to DCHECK that, since
+      // the thread may now have exited.
+      set_finished(true);
+      return become_runnable;
+    }
+    if (become_runnable) {
+      DCHECK(!check_exited);  // We didn't acquire thread_list_lock_ .
+      // Let caller retry.
+      return false;
+    }
+    old_state_and_flags = target->GetStateAndFlags(std::memory_order_acquire);
+  }
+  // Unreachable.
+}
+
+void Thread::RunFlipFunction(Thread* self) {
+  // This function is called either by the thread running `ThreadList::FlipThreadRoots()` or when
+  // a thread becomes runnable, after we've successfully set the kRunningFlipFunction ThreadFlag.
+  DCHECK(ReadFlag(ThreadFlag::kRunningFlipFunction));
+
+  Closure* flip_function = GetFlipFunction();
+  tlsPtr_.flip_function.store(nullptr, std::memory_order_relaxed);
+  DCHECK(flip_function != nullptr);
+  VerifyState();
+  flip_function->Run(this);
+  DCHECK(!ReadFlag(ThreadFlag::kPendingFlipFunction));
+  VerifyState();
+  AtomicClearFlag(ThreadFlag::kRunningFlipFunction, std::memory_order_release);
+  // From here on this thread may go away, and it is no longer safe to access.
+
+  // Notify all threads that are waiting for completion.
+  // TODO: Should we create a separate mutex and condition variable instead
+  // of piggy-backing on the `thread_suspend_count_lock_` and `resume_cond_`?
+  MutexLock mu(self, *Locks::thread_suspend_count_lock_);
+  resume_cond_->Broadcast(self);
+}
+
+void Thread::WaitForFlipFunction(Thread* self) const {
+  // Another thread is running the flip function. Wait for it to complete.
+  // Check the flag while holding the mutex so that we do not miss the broadcast.
+  // Repeat the check after waiting to guard against spurious wakeups (and because
+  // we share the `thread_suspend_count_lock_` and `resume_cond_` with other code).
+  // Check that the thread can't unexpectedly exit while we are running.
+  DCHECK(self == this || ReadFlag(ThreadFlag::kSuspendRequest) ||
+         Locks::thread_list_lock_->IsExclusiveHeld(self));
+  MutexLock mu(self, *Locks::thread_suspend_count_lock_);
+  while (true) {
+    StateAndFlags old_state_and_flags = GetStateAndFlags(std::memory_order_acquire);
+    if (!old_state_and_flags.IsFlagSet(ThreadFlag::kRunningFlipFunction)) {
+      return;
+    }
+    // We sometimes hold mutator lock here. OK since the flip function must complete quickly.
+    resume_cond_->WaitHoldingLocks(self);
+  }
+}
+
+void Thread::WaitForFlipFunctionTestingExited(Thread* self, ThreadExitFlag* tef) {
+  Locks::thread_list_lock_->Lock(self);
+  if (tef->HasExited()) {
+    Locks::thread_list_lock_->Unlock(self);
+    return;
+  }
+  // We need to hold suspend_count_lock_ to avoid missed wakeups when the flip function finishes.
+  // We need to hold thread_list_lock_ because the tef test result is only valid while we hold the
+  // lock, and once kRunningFlipFunction is no longer set, "this" may be deallocated. Hence the
+  // complicated locking dance.
+  MutexLock mu(self, *Locks::thread_suspend_count_lock_);
+  while (true) {
+    StateAndFlags old_state_and_flags = GetStateAndFlags(std::memory_order_acquire);
+    Locks::thread_list_lock_->Unlock(self);  // So we can wait or return.
+    if (!old_state_and_flags.IsFlagSet(ThreadFlag::kRunningFlipFunction)) {
+      return;
+    }
+    resume_cond_->WaitHoldingLocks(self);
+    Locks::thread_suspend_count_lock_->Unlock(self);  // To re-lock thread_list_lock.
+    Locks::thread_list_lock_->Lock(self);
+    Locks::thread_suspend_count_lock_->Lock(self);
+    if (tef->HasExited()) {
+      Locks::thread_list_lock_->Unlock(self);
+      return;
+    }
+  }
+}
+
+void Thread::FullSuspendCheck(bool implicit) {
   ScopedTrace trace(__FUNCTION__);
+  DCHECK(!ReadFlag(ThreadFlag::kSuspensionImmune));
+  DCHECK(this == Thread::Current());
   VLOG(threads) << this << " self-suspending";
   // Make thread appear suspended to other threads, release mutator_lock_.
   // Transition to suspended and back to runnable, re-acquire share on mutator_lock_.
-  ScopedThreadSuspension(this, kSuspended);  // NOLINT
+  ScopedThreadSuspension(this, ThreadState::kSuspended);  // NOLINT
+  if (implicit) {
+    // For implicit suspend check we want to `madvise()` away
+    // the alternate signal stack to avoid wasting memory.
+    MadviseAwayAlternateSignalStack();
+  }
   VLOG(threads) << this << " self-reviving";
 }
 
@@ -1807,52 +2016,34 @@ static std::string GetSchedulerGroupName(pid_t tid) {
   return "";
 }
 
-
 void Thread::DumpState(std::ostream& os, const Thread* thread, pid_t tid) {
   std::string group_name;
   int priority;
   bool is_daemon = false;
   Thread* self = Thread::Current();
 
-  // If flip_function is not null, it means we have run a checkpoint
-  // before the thread wakes up to execute the flip function and the
-  // thread roots haven't been forwarded.  So the following access to
-  // the roots (opeer or methods in the frames) would be bad. Run it
-  // here. TODO: clean up.
-  if (thread != nullptr) {
-    ScopedObjectAccessUnchecked soa(self);
-    Thread* this_thread = const_cast<Thread*>(thread);
-    Closure* flip_func = this_thread->GetFlipFunction();
-    if (flip_func != nullptr) {
-      flip_func->Run(this_thread);
-    }
-  }
-
   // Don't do this if we are aborting since the GC may have all the threads suspended. This will
   // cause ScopedObjectAccessUnchecked to deadlock.
   if (gAborting == 0 && self != nullptr && thread != nullptr && thread->tlsPtr_.opeer != nullptr) {
     ScopedObjectAccessUnchecked soa(self);
-    priority = jni::DecodeArtField(WellKnownClasses::java_lang_Thread_priority)
-        ->GetInt(thread->tlsPtr_.opeer);
-    is_daemon = jni::DecodeArtField(WellKnownClasses::java_lang_Thread_daemon)
-        ->GetBoolean(thread->tlsPtr_.opeer);
+    priority = WellKnownClasses::java_lang_Thread_priority->GetInt(thread->tlsPtr_.opeer);
+    is_daemon = WellKnownClasses::java_lang_Thread_daemon->GetBoolean(thread->tlsPtr_.opeer);
 
     ObjPtr<mirror::Object> thread_group =
-        jni::DecodeArtField(WellKnownClasses::java_lang_Thread_group)
-            ->GetObject(thread->tlsPtr_.opeer);
+        WellKnownClasses::java_lang_Thread_group->GetObject(thread->tlsPtr_.opeer);
 
     if (thread_group != nullptr) {
-      ArtField* group_name_field =
-          jni::DecodeArtField(WellKnownClasses::java_lang_ThreadGroup_name);
-      ObjPtr<mirror::String> group_name_string =
-          group_name_field->GetObject(thread_group)->AsString();
-      group_name = (group_name_string != nullptr) ? group_name_string->ToModifiedUtf8() : "<null>";
+      ObjPtr<mirror::Object> group_name_object =
+          WellKnownClasses::java_lang_ThreadGroup_name->GetObject(thread_group);
+      group_name = (group_name_object != nullptr)
+          ? group_name_object->AsString()->ToModifiedUtf8()
+          : "<null>";
     }
   } else if (thread != nullptr) {
     priority = thread->GetNativePriority();
   } else {
-    PaletteStatus status = PaletteSchedGetPriority(tid, &priority);
-    CHECK(status == PaletteStatus::kOkay || status == PaletteStatus::kCheckErrno);
+    palette_status_t status = PaletteSchedGetPriority(tid, &priority);
+    CHECK(status == PALETTE_STATUS_OK || status == PALETTE_STATUS_CHECK_ERRNO);
   }
 
   std::string scheduler_group_name(GetSchedulerGroupName(tid));
@@ -1861,7 +2052,9 @@ void Thread::DumpState(std::ostream& os, const Thread* thread, pid_t tid) {
   }
 
   if (thread != nullptr) {
-    os << '"' << *thread->tlsPtr_.name << '"';
+    thread->tls32_.num_name_readers.fetch_add(1, std::memory_order_seq_cst);
+    os << '"' << thread->tlsPtr_.name.load() << '"';
+    thread->tls32_.num_name_readers.fetch_sub(1 /* at least memory_order_release */);
     if (is_daemon) {
       os << " daemon";
     }
@@ -1870,6 +2063,9 @@ void Thread::DumpState(std::ostream& os, const Thread* thread, pid_t tid) {
        << " " << thread->GetState();
     if (thread->IsStillStarting()) {
       os << " (still starting up)";
+    }
+    if (thread->tls32_.disable_thread_flip_count != 0) {
+      os << " DisableFlipCount = " << thread->tls32_.disable_thread_flip_count;
     }
     os << "\n";
   } else {
@@ -1880,10 +2076,14 @@ void Thread::DumpState(std::ostream& os, const Thread* thread, pid_t tid) {
 
   if (thread != nullptr) {
     auto suspend_log_fn = [&]() REQUIRES(Locks::thread_suspend_count_lock_) {
+      StateAndFlags state_and_flags = thread->GetStateAndFlags(std::memory_order_relaxed);
+      static_assert(
+          static_cast<std::underlying_type_t<ThreadState>>(ThreadState::kRunnable) == 0u);
+      state_and_flags.SetState(ThreadState::kRunnable);  // Clear state bits.
       os << "  | group=\"" << group_name << "\""
          << " sCount=" << thread->tls32_.suspend_count
-         << " dsCount=" << thread->tls32_.debug_suspend_count
-         << " flags=" << thread->tls32_.state_and_flags.as_struct.flags
+         << " ucsCount=" << thread->tls32_.user_code_suspend_count
+         << " flags=" << state_and_flags.GetValue()
          << " obj=" << reinterpret_cast<void*>(thread->tlsPtr_.opeer)
          << " self=" << reinterpret_cast<const void*>(thread) << "\n";
     };
@@ -1897,7 +2097,7 @@ void Thread::DumpState(std::ostream& os, const Thread* thread, pid_t tid) {
   }
 
   os << "  | sysTid=" << tid
-     << " nice=" << getpriority(PRIO_PROCESS, tid)
+     << " nice=" << getpriority(PRIO_PROCESS, static_cast<id_t>(tid))
      << " cgrp=" << scheduler_group_name;
   if (thread != nullptr) {
     int policy;
@@ -1945,9 +2145,10 @@ void Thread::DumpState(std::ostream& os, const Thread* thread, pid_t tid) {
      << " core=" << task_cpu
      << " HZ=" << sysconf(_SC_CLK_TCK) << "\n";
   if (thread != nullptr) {
-    os << "  | stack=" << reinterpret_cast<void*>(thread->tlsPtr_.stack_begin) << "-"
-        << reinterpret_cast<void*>(thread->tlsPtr_.stack_end) << " stackSize="
-        << PrettySize(thread->tlsPtr_.stack_size) << "\n";
+    // TODO(Simulator): Also dump the simulated stack if one exists.
+    os << "  | stack=" << reinterpret_cast<void*>(thread->GetStackBegin<kNativeStackType>())
+        << "-" << reinterpret_cast<void*>(thread->GetStackEnd<kNativeStackType>())
+        << " stackSize=" << PrettySize(thread->GetStackSize<kNativeStackType>()) << "\n";
     // Dump the held mutexes.
     os << "  | held mutexes=";
     for (size_t i = 0; i < kLockLevelCount; ++i) {
@@ -1999,15 +2200,15 @@ struct StackDumpVisitor : public MonitorObjectsStackVisitor {
 
   static constexpr size_t kMaxRepetition = 3u;
 
-  VisitMethodResult StartMethod(ArtMethod* m, size_t frame_nr ATTRIBUTE_UNUSED)
-      override
+  VisitMethodResult StartMethod(ArtMethod* m, [[maybe_unused]] size_t frame_nr) override
       REQUIRES_SHARED(Locks::mutator_lock_) {
     m = m->GetInterfaceMethodIfProxy(kRuntimePointerSize);
     ObjPtr<mirror::DexCache> dex_cache = m->GetDexCache();
     int line_number = -1;
+    uint32_t dex_pc = GetDexPc(false);
     if (dex_cache != nullptr) {  // be tolerant of bad input
       const DexFile* dex_file = dex_cache->GetDexFile();
-      line_number = annotations::GetLineNumFromPC(dex_file, m, GetDexPc(false));
+      line_number = annotations::GetLineNumFromPC(dex_file, m, dex_pc);
     }
     if (line_number == last_line_number && last_method == m) {
       ++repetition_count;
@@ -2030,6 +2231,12 @@ struct StackDumpVisitor : public MonitorObjectsStackVisitor {
       os << "(Native method)";
     } else {
       const char* source_file(m->GetDeclaringClassSourceFile());
+      if (line_number == -1) {
+        // If we failed to map to a line number, use
+        // the dex pc as the line number and leave source file null
+        source_file = nullptr;
+        line_number = static_cast<int32_t>(dex_pc);
+      }
       os << "(" << (source_file != nullptr ? source_file : "unavailable")
                        << ":" << line_number << ")";
     }
@@ -2038,12 +2245,11 @@ struct StackDumpVisitor : public MonitorObjectsStackVisitor {
     return VisitMethodResult::kContinueMethod;
   }
 
-  VisitMethodResult EndMethod(ArtMethod* m ATTRIBUTE_UNUSED) override {
+  VisitMethodResult EndMethod([[maybe_unused]] ArtMethod* m) override {
     return VisitMethodResult::kContinueMethod;
   }
 
-  void VisitWaitingObject(ObjPtr<mirror::Object> obj, ThreadState state ATTRIBUTE_UNUSED)
-      override
+  void VisitWaitingObject(ObjPtr<mirror::Object> obj, [[maybe_unused]] ThreadState state) override
       REQUIRES_SHARED(Locks::mutator_lock_) {
     PrintObject(obj, "  - waiting on ", ThreadList::kInvalidThreadId);
   }
@@ -2059,11 +2265,11 @@ struct StackDumpVisitor : public MonitorObjectsStackVisitor {
       REQUIRES_SHARED(Locks::mutator_lock_) {
     const char* msg;
     switch (state) {
-      case kBlocked:
+      case ThreadState::kBlocked:
         msg = "  - waiting to lock ";
         break;
 
-      case kWaitingForLockInflation:
+      case ThreadState::kWaitingForLockInflation:
         msg = "  - waiting for lock inflation of ";
         break;
 
@@ -2072,11 +2278,13 @@ struct StackDumpVisitor : public MonitorObjectsStackVisitor {
         UNREACHABLE();
     }
     PrintObject(obj, msg, owner_tid);
+    num_blocked++;
   }
   void VisitLockedObject(ObjPtr<mirror::Object> obj)
       override
       REQUIRES_SHARED(Locks::mutator_lock_) {
     PrintObject(obj, "  - locked ", ThreadList::kInvalidThreadId);
+    num_locked++;
   }
 
   void PrintObject(ObjPtr<mirror::Object> obj,
@@ -2085,19 +2293,27 @@ struct StackDumpVisitor : public MonitorObjectsStackVisitor {
     if (obj == nullptr) {
       os << msg << "an unknown object";
     } else {
-      if ((obj->GetLockWord(true).GetState() == LockWord::kThinLocked) &&
-          Locks::mutator_lock_->IsExclusiveHeld(Thread::Current())) {
-        // Getting the identity hashcode here would result in lock inflation and suspension of the
-        // current thread, which isn't safe if this is the only runnable thread.
-        os << msg << StringPrintf("<@addr=0x%" PRIxPTR "> (a %s)",
-                                  reinterpret_cast<intptr_t>(obj.Ptr()),
-                                  obj->PrettyTypeOf().c_str());
+      const std::string pretty_type(obj->PrettyTypeOf());
+      // It's often unsafe to allow lock inflation here. We may be the only runnable thread, or
+      // this may be called from a checkpoint. We get the hashcode on a best effort basis.
+      static constexpr int kNumRetries = 3;
+      static constexpr int kSleepMicros = 10;
+      int32_t hash_code;
+      for (int i = 0;; ++i) {
+        hash_code = obj->IdentityHashCodeNoInflation();
+        if (hash_code != 0 || i == kNumRetries) {
+          break;
+        }
+        usleep(kSleepMicros);
+      }
+      if (hash_code == 0) {
+        os << msg
+           << StringPrintf("<@addr=0x%" PRIxPTR "> (a %s)",
+                           reinterpret_cast<intptr_t>(obj.Ptr()),
+                           pretty_type.c_str());
       } else {
-        // - waiting on <0x6008c468> (a java.lang.Class<java.lang.ref.ReferenceQueue>)
-        // Call PrettyTypeOf before IdentityHashCode since IdentityHashCode can cause thread
-        // suspension and move pretty_object.
-        const std::string pretty_type(obj->PrettyTypeOf());
-        os << msg << StringPrintf("<0x%08x> (a %s)", obj->IdentityHashCode(), pretty_type.c_str());
+        // - waiting on <0x608c468> (a java.lang.Class<java.lang.ref.ReferenceQueue>)
+        os << msg << StringPrintf("<0x%08x> (a %s)", hash_code, pretty_type.c_str());
       }
     }
     if (owner_tid != ThreadList::kInvalidThreadId) {
@@ -2110,6 +2326,8 @@ struct StackDumpVisitor : public MonitorObjectsStackVisitor {
   ArtMethod* last_method;
   int last_line_number;
   size_t repetition_count;
+  size_t num_blocked = 0;
+  size_t num_locked = 0;
 };
 
 static bool ShouldShowNativeStack(const Thread* thread)
@@ -2117,12 +2335,14 @@ static bool ShouldShowNativeStack(const Thread* thread)
   ThreadState state = thread->GetState();
 
   // In native code somewhere in the VM (one of the kWaitingFor* states)? That's interesting.
-  if (state > kWaiting && state < kStarting) {
+  if (state > ThreadState::kWaiting && state < ThreadState::kStarting) {
     return true;
   }
 
   // In an Object.wait variant or Thread.sleep? That's not interesting.
-  if (state == kTimedWaiting || state == kSleeping || state == kWaiting) {
+  if (state == ThreadState::kTimedWaiting ||
+      state == ThreadState::kSleeping ||
+      state == ThreadState::kWaiting) {
     return false;
   }
 
@@ -2139,20 +2359,9 @@ static bool ShouldShowNativeStack(const Thread* thread)
   return current_method != nullptr && current_method->IsNative();
 }
 
-void Thread::DumpJavaStack(std::ostream& os, bool check_suspended, bool dump_locks) const {
-  // If flip_function is not null, it means we have run a checkpoint
-  // before the thread wakes up to execute the flip function and the
-  // thread roots haven't been forwarded.  So the following access to
-  // the roots (locks or methods in the frames) would be bad. Run it
-  // here. TODO: clean up.
-  {
-    Thread* this_thread = const_cast<Thread*>(this);
-    Closure* flip_func = this_thread->GetFlipFunction();
-    if (flip_func != nullptr) {
-      flip_func->Run(this_thread);
-    }
-  }
-
+Thread::DumpOrder Thread::DumpJavaStack(std::ostream& os,
+                                        bool check_suspended,
+                                        bool dump_locks) const {
   // Dumping the Java stack involves the verifier for locks. The verifier operates under the
   // assumption that there is no exception pending on entry. Thus, stash any pending exception.
   // Thread::Current() instead of this in case a thread is dumping the stack of another suspended
@@ -2163,12 +2372,28 @@ void Thread::DumpJavaStack(std::ostream& os, bool check_suspended, bool dump_loc
   StackDumpVisitor dumper(os, const_cast<Thread*>(this), context.get(),
                           !tls32_.throwing_OutOfMemoryError, check_suspended, dump_locks);
   dumper.WalkStack();
+  if (IsJitSensitiveThread()) {
+    return DumpOrder::kMain;
+  } else if (dumper.num_blocked > 0) {
+    return DumpOrder::kBlocked;
+  } else if (dumper.num_locked > 0) {
+    return DumpOrder::kLocked;
+  } else {
+    return DumpOrder::kDefault;
+  }
 }
 
-void Thread::DumpStack(std::ostream& os,
-                       bool dump_native_stack,
-                       BacktraceMap* backtrace_map,
-                       bool force_dump_stack) const {
+Thread::DumpOrder Thread::DumpStack(std::ostream& os,
+                                    bool dump_native_stack,
+                                    bool force_dump_stack) const {
+  unwindstack::AndroidLocalUnwinder unwinder;
+  return DumpStack(os, unwinder, dump_native_stack, force_dump_stack);
+}
+
+Thread::DumpOrder Thread::DumpStack(std::ostream& os,
+                                    unwindstack::AndroidLocalUnwinder& unwinder,
+                                    bool dump_native_stack,
+                                    bool force_dump_stack) const {
   // TODO: we call this code when dying but may not have suspended the thread ourself. The
   //       IsSuspended check is therefore racy with the use for dumping (normally we inhibit
   //       the race with the thread_suspend_count_lock_).
@@ -2179,21 +2404,29 @@ void Thread::DumpStack(std::ostream& os,
     // thread's stack in debug builds where we'll hit the not suspended check in the stack walk.
     safe_to_dump = (safe_to_dump || dump_for_abort);
   }
+  DumpOrder dump_order = DumpOrder::kDefault;
   if (safe_to_dump || force_dump_stack) {
+    uint64_t nanotime = NanoTime();
     // If we're currently in native code, dump that stack before dumping the managed stack.
     if (dump_native_stack && (dump_for_abort || force_dump_stack || ShouldShowNativeStack(this))) {
       ArtMethod* method =
           GetCurrentMethod(nullptr,
                            /*check_suspended=*/ !force_dump_stack,
                            /*abort_on_error=*/ !(dump_for_abort || force_dump_stack));
-      DumpNativeStack(os, GetTid(), backtrace_map, "  native: ", method);
+      DumpNativeStack(os, unwinder, GetTid(), "  native: ", method);
     }
-    DumpJavaStack(os,
-                  /*check_suspended=*/ !force_dump_stack,
-                  /*dump_locks=*/ !force_dump_stack);
+    dump_order = DumpJavaStack(os,
+                               /*check_suspended=*/ !force_dump_stack,
+                               /*dump_locks=*/ !force_dump_stack);
+    Runtime* runtime = Runtime::Current();
+    std::optional<uint64_t> start = runtime != nullptr ? runtime->SiqQuitNanoTime() : std::nullopt;
+    if (start.has_value()) {
+      os << "DumpLatencyMs: " << static_cast<float>(nanotime - start.value()) / 1000000.0 << "\n";
+    }
   } else {
     os << "Not able to dump stack of thread that isn't suspended";
   }
+  return dump_order;
 }
 
 void Thread::ThreadExitCallback(void* arg) {
@@ -2271,25 +2504,32 @@ void Thread::Shutdown() {
 }
 
 void Thread::NotifyThreadGroup(ScopedObjectAccessAlreadyRunnable& soa, jobject thread_group) {
-  ScopedLocalRef<jobject> thread_jobject(
-      soa.Env(), soa.Env()->AddLocalReference<jobject>(Thread::Current()->GetPeer()));
-  ScopedLocalRef<jobject> thread_group_jobject_scoped(
-      soa.Env(), nullptr);
-  jobject thread_group_jobject = thread_group;
+  ObjPtr<mirror::Object> thread_object = soa.Self()->GetPeer();
+  ObjPtr<mirror::Object> thread_group_object = soa.Decode<mirror::Object>(thread_group);
   if (thread_group == nullptr || kIsDebugBuild) {
     // There is always a group set. Retrieve it.
-    thread_group_jobject_scoped.reset(
-        soa.Env()->GetObjectField(thread_jobject.get(),
-                                  WellKnownClasses::java_lang_Thread_group));
-    thread_group_jobject = thread_group_jobject_scoped.get();
+    thread_group_object = WellKnownClasses::java_lang_Thread_group->GetObject(thread_object);
     if (kIsDebugBuild && thread_group != nullptr) {
-      CHECK(soa.Env()->IsSameObject(thread_group, thread_group_jobject));
+      CHECK(thread_group_object == soa.Decode<mirror::Object>(thread_group));
     }
   }
-  soa.Env()->CallNonvirtualVoidMethod(thread_group_jobject,
-                                      WellKnownClasses::java_lang_ThreadGroup,
-                                      WellKnownClasses::java_lang_ThreadGroup_add,
-                                      thread_jobject.get());
+  WellKnownClasses::java_lang_ThreadGroup_add->InvokeVirtual<'V', 'L'>(
+      soa.Self(), thread_group_object, thread_object);
+}
+
+void Thread::SignalExitFlags() {
+  ThreadExitFlag* next;
+  for (ThreadExitFlag* tef = tlsPtr_.thread_exit_flags; tef != nullptr; tef = next) {
+    DCHECK(!tef->exited_);
+    tef->exited_ = true;
+    next = tef->next_;
+    if (kIsDebugBuild) {
+      ThreadExitFlag* const garbage_tef = reinterpret_cast<ThreadExitFlag*>(1);
+      // Link fields should no longer be used.
+      tef->prev_ = tef->next_ = garbage_tef;
+    }
+  }
+  tlsPtr_.thread_exit_flags = nullptr;  // Now unused.
 }
 
 Thread::Thread(bool daemon)
@@ -2298,14 +2538,16 @@ Thread::Thread(bool daemon)
       is_runtime_thread_(false) {
   wait_mutex_ = new Mutex("a thread wait mutex", LockLevel::kThreadWaitLock);
   wait_cond_ = new ConditionVariable("a thread wait condition variable", *wait_mutex_);
-  tlsPtr_.instrumentation_stack =
-      new std::map<uintptr_t, instrumentation::InstrumentationStackFrame>;
-  tlsPtr_.name = new std::string(kThreadNameDuringStartup);
+  tlsPtr_.mutator_lock = Locks::mutator_lock_;
+  DCHECK(tlsPtr_.mutator_lock != nullptr);
+  tlsPtr_.name.store(kThreadNameDuringStartup, std::memory_order_relaxed);
+  CHECK_NE(GetStackOverflowProtectedSize(), 0u);
 
   static_assert((sizeof(Thread) % 4) == 0U,
                 "art::Thread has a size which is not a multiple of 4.");
-  tls32_.state_and_flags.as_struct.flags = 0;
-  tls32_.state_and_flags.as_struct.state = kNative;
+  DCHECK_EQ(GetStateAndFlags(std::memory_order_relaxed).GetValue(), 0u);
+  StateAndFlags state_and_flags = StateAndFlags(0u).WithState(ThreadState::kNative);
+  tls32_.state_and_flags.store(state_and_flags.GetValue(), std::memory_order_relaxed);
   tls32_.interrupted.store(false, std::memory_order_relaxed);
   // Initialize with no permit; if the java Thread was unparked before being
   // started, it will unpark itself before calling into java code.
@@ -2315,18 +2557,11 @@ Thread::Thread(bool daemon)
             tlsPtr_.rosalloc_runs + kNumRosAllocThreadLocalSizeBracketsInThread,
             gc::allocator::RosAlloc::GetDedicatedFullRun());
   tlsPtr_.checkpoint_function = nullptr;
-  for (uint32_t i = 0; i < kMaxSuspendBarriers; ++i) {
-    tlsPtr_.active_suspend_barriers[i] = nullptr;
-  }
-  tlsPtr_.flip_function = nullptr;
+  tlsPtr_.active_suspendall_barrier = nullptr;
+  tlsPtr_.active_suspend1_barriers = nullptr;
+  tlsPtr_.flip_function.store(nullptr, std::memory_order_relaxed);
   tlsPtr_.thread_local_mark_stack = nullptr;
-  tls32_.is_transitioning_to_runnable = false;
-  tls32_.use_mterp = false;
   ResetTlab();
-}
-
-void Thread::NotifyInTheadList() {
-  tls32_.use_mterp = interpreter::CanUseMterp();
 }
 
 bool Thread::CanLoadClasses() const {
@@ -2340,8 +2575,15 @@ bool Thread::IsStillStarting() const {
   // assigned fairly early on, and needs to be.
   // It turns out that the last thing to change is the thread name; that's a good proxy for "has
   // this thread _ever_ entered kRunnable".
+  // TODO: I believe that SetThreadName(), ThreadGroup::GetThreads() and many jvmti functions can
+  // call this while the thread is in the process of starting. Thus we appear to have data races
+  // here on opeer and jpeer, and our result may be obsolete by the time we return. Aside from the
+  // data races, it is not immediately clear whether clients are robust against this behavior.  It
+  // may make sense to acquire a per-thread lock during the transition, and have this function
+  // REQUIRE that. `runtime_shutdown_lock_` might almost work, but is global and currently not
+  // held long enough.
   return (tlsPtr_.jpeer == nullptr && tlsPtr_.opeer == nullptr) ||
-      (*tlsPtr_.name == kThreadNameDuringStartup);
+      (tlsPtr_.name.load() == kThreadNameDuringStartup);
 }
 
 void Thread::AssertPendingException() const {
@@ -2351,8 +2593,7 @@ void Thread::AssertPendingException() const {
 void Thread::AssertPendingOOMException() const {
   AssertPendingException();
   auto* e = GetException();
-  CHECK_EQ(e->GetClass(), DecodeJObject(WellKnownClasses::java_lang_OutOfMemoryError)->AsClass())
-      << e->Dump();
+  CHECK_EQ(e->GetClass(), WellKnownClasses::java_lang_OutOfMemoryError.Get()) << e->Dump();
 }
 
 void Thread::AssertNoPendingException() const {
@@ -2375,8 +2616,8 @@ class MonitorExitVisitor : public SingleRootVisitor {
   explicit MonitorExitVisitor(Thread* self) : self_(self) { }
 
   // NO_THREAD_SAFETY_ANALYSIS due to MonitorExit.
-  void VisitRoot(mirror::Object* entered_monitor, const RootInfo& info ATTRIBUTE_UNUSED)
-      override NO_THREAD_SAFETY_ANALYSIS {
+  void VisitRoot(mirror::Object* entered_monitor,
+                 [[maybe_unused]] const RootInfo& info) override NO_THREAD_SAFETY_ANALYSIS {
     if (self_->HoldsLock(entered_monitor)) {
       LOG(WARNING) << "Calling MonitorExit on object "
                    << entered_monitor << " (" << entered_monitor->PrettyTypeOf() << ")"
@@ -2390,7 +2631,7 @@ class MonitorExitVisitor : public SingleRootVisitor {
   Thread* const self_;
 };
 
-void Thread::Destroy() {
+void Thread::Destroy(bool should_run_callbacks) {
   Thread* self = this;
   DCHECK_EQ(self, Thread::Current());
 
@@ -2416,26 +2657,20 @@ void Thread::Destroy() {
   if (tlsPtr_.opeer != nullptr) {
     ScopedObjectAccess soa(self);
     // We may need to call user-supplied managed code, do this before final clean-up.
-    HandleUncaughtExceptions(soa);
-    RemoveFromThreadGroup(soa);
+    HandleUncaughtExceptions();
+    RemoveFromThreadGroup();
     Runtime* runtime = Runtime::Current();
-    if (runtime != nullptr) {
+    if (runtime != nullptr && should_run_callbacks) {
       runtime->GetRuntimeCallbacks()->ThreadDeath(self);
     }
 
     // this.nativePeer = 0;
-    if (Runtime::Current()->IsActiveTransaction()) {
-      jni::DecodeArtField(WellKnownClasses::java_lang_Thread_nativePeer)
-          ->SetLong<true>(tlsPtr_.opeer, 0);
-    } else {
-      jni::DecodeArtField(WellKnownClasses::java_lang_Thread_nativePeer)
-          ->SetLong<false>(tlsPtr_.opeer, 0);
-    }
+    SetNativePeer</*kSupportTransaction=*/ true>(tlsPtr_.opeer, nullptr);
 
     // Thread.join() is implemented as an Object.wait() on the Thread.lock object. Signal anyone
     // who is waiting.
     ObjPtr<mirror::Object> lock =
-        jni::DecodeArtField(WellKnownClasses::java_lang_Thread_lock)->GetObject(tlsPtr_.opeer);
+        WellKnownClasses::java_lang_Thread_lock->GetObject(tlsPtr_.opeer);
     // (This conditional is only needed for tests, where Thread.lock won't have been set.)
     if (lock != nullptr) {
       StackHandleScope<1> hs(self);
@@ -2443,16 +2678,21 @@ void Thread::Destroy() {
       ObjectLock<mirror::Object> locker(self, h_obj);
       locker.NotifyAll();
     }
+
     tlsPtr_.opeer = nullptr;
   }
 
   {
     ScopedObjectAccess soa(self);
     Runtime::Current()->GetHeap()->RevokeThreadLocalBuffers(this);
+
+    if (UNLIKELY(self->GetMethodTraceBuffer() != nullptr)) {
+      Trace::FlushThreadBuffer(self);
+    }
   }
   // Mark-stack revocation must be performed at the very end. No
   // checkpoint/flip-function or read-barrier should be called after this.
-  if (kUseReadBarrier) {
+  if (gUseReadBarrier) {
     Runtime::Current()->GetHeap()->ConcurrentCopyingCollector()->RevokeThreadLocalMarkStack(this);
   }
 }
@@ -2466,96 +2706,157 @@ Thread::~Thread() {
     delete tlsPtr_.jni_env;
     tlsPtr_.jni_env = nullptr;
   }
-  CHECK_NE(GetState(), kRunnable);
-  CHECK(!ReadFlag(kCheckpointRequest));
-  CHECK(!ReadFlag(kEmptyCheckpointRequest));
+  CHECK_NE(GetState(), ThreadState::kRunnable);
+  CHECK(!ReadFlag(ThreadFlag::kCheckpointRequest));
+  CHECK(!ReadFlag(ThreadFlag::kEmptyCheckpointRequest));
+  CHECK(!ReadFlag(ThreadFlag::kSuspensionImmune));
   CHECK(tlsPtr_.checkpoint_function == nullptr);
   CHECK_EQ(checkpoint_overflow_.size(), 0u);
-  CHECK(tlsPtr_.flip_function == nullptr);
-  CHECK_EQ(tls32_.is_transitioning_to_runnable, false);
+  // A pending flip function request is OK. FlipThreadRoots will have been notified that we
+  // exited, and nobody will attempt to process the request.
 
-  if (kUseReadBarrier) {
-    Runtime::Current()->GetHeap()->ConcurrentCopyingCollector()
-        ->AssertNoThreadMarkStackMapping(this);
-    gc::accounting::AtomicStack<mirror::Object>* tl_mark_stack = GetThreadLocalMarkStack();
-    CHECK(tl_mark_stack == nullptr) << "mark-stack: " << tl_mark_stack;
-  }
   // Make sure we processed all deoptimization requests.
   CHECK(tlsPtr_.deoptimization_context_stack == nullptr) << "Missed deoptimization";
   CHECK(tlsPtr_.frame_id_to_shadow_frame == nullptr) <<
       "Not all deoptimized frames have been consumed by the debugger.";
 
   // We may be deleting a still born thread.
-  SetStateUnsafe(kTerminated);
+  SetStateUnsafe(ThreadState::kTerminated);
 
   delete wait_cond_;
   delete wait_mutex_;
-
-  if (tlsPtr_.long_jump_context != nullptr) {
-    delete tlsPtr_.long_jump_context;
-  }
 
   if (initialized) {
     CleanupCpu();
   }
 
-  delete tlsPtr_.instrumentation_stack;
-  delete tlsPtr_.name;
+  SetCachedThreadName(nullptr);  // Deallocate name.
   delete tlsPtr_.deps_or_stack_trace_sample.stack_trace_sample;
+
+  CHECK_EQ(tlsPtr_.method_trace_buffer, nullptr);
 
   Runtime::Current()->GetHeap()->AssertThreadLocalBuffersAreRevoked(this);
 
   TearDownAlternateSignalStack();
 }
 
-void Thread::HandleUncaughtExceptions(ScopedObjectAccessAlreadyRunnable& soa) {
-  if (!IsExceptionPending()) {
+void Thread::HandleUncaughtExceptions() {
+  Thread* self = this;
+  DCHECK_EQ(self, Thread::Current());
+  if (!self->IsExceptionPending()) {
     return;
   }
-  ScopedLocalRef<jobject> peer(tlsPtr_.jni_env, soa.AddLocalReference<jobject>(tlsPtr_.opeer));
-  ScopedThreadStateChange tsc(this, kNative);
 
   // Get and clear the exception.
-  ScopedLocalRef<jthrowable> exception(tlsPtr_.jni_env, tlsPtr_.jni_env->ExceptionOccurred());
-  tlsPtr_.jni_env->ExceptionClear();
+  ObjPtr<mirror::Object> exception = self->GetException();
+  self->ClearException();
 
   // Call the Thread instance's dispatchUncaughtException(Throwable)
-  tlsPtr_.jni_env->CallVoidMethod(peer.get(),
-      WellKnownClasses::java_lang_Thread_dispatchUncaughtException,
-      exception.get());
+  WellKnownClasses::java_lang_Thread_dispatchUncaughtException->InvokeFinal<'V', 'L'>(
+      self, tlsPtr_.opeer, exception);
 
   // If the dispatchUncaughtException threw, clear that exception too.
-  tlsPtr_.jni_env->ExceptionClear();
+  self->ClearException();
 }
 
-void Thread::RemoveFromThreadGroup(ScopedObjectAccessAlreadyRunnable& soa) {
-  // this.group.removeThread(this);
+void Thread::RemoveFromThreadGroup() {
+  Thread* self = this;
+  DCHECK_EQ(self, Thread::Current());
+  // this.group.threadTerminated(this);
   // group can be null if we're in the compiler or a test.
-  ObjPtr<mirror::Object> ogroup = jni::DecodeArtField(WellKnownClasses::java_lang_Thread_group)
-      ->GetObject(tlsPtr_.opeer);
-  if (ogroup != nullptr) {
-    ScopedLocalRef<jobject> group(soa.Env(), soa.AddLocalReference<jobject>(ogroup));
-    ScopedLocalRef<jobject> peer(soa.Env(), soa.AddLocalReference<jobject>(tlsPtr_.opeer));
-    ScopedThreadStateChange tsc(soa.Self(), kNative);
-    tlsPtr_.jni_env->CallVoidMethod(group.get(),
-                                    WellKnownClasses::java_lang_ThreadGroup_removeThread,
-                                    peer.get());
+  ObjPtr<mirror::Object> group =
+      WellKnownClasses::java_lang_Thread_group->GetObject(tlsPtr_.opeer);
+  if (group != nullptr) {
+    WellKnownClasses::java_lang_ThreadGroup_threadTerminated->InvokeVirtual<'V', 'L'>(
+        self, group, tlsPtr_.opeer);
   }
 }
 
-bool Thread::HandleScopeContains(jobject obj) const {
-  StackReference<mirror::Object>* hs_entry =
-      reinterpret_cast<StackReference<mirror::Object>*>(obj);
-  for (BaseHandleScope* cur = tlsPtr_.top_handle_scope; cur!= nullptr; cur = cur->GetLink()) {
-    if (cur->Contains(hs_entry)) {
+template <bool kPointsToStack>
+class JniTransitionReferenceVisitor : public StackVisitor {
+ public:
+  JniTransitionReferenceVisitor(Thread* thread, void* obj) REQUIRES_SHARED(Locks::mutator_lock_)
+      : StackVisitor(thread, /*context=*/ nullptr, StackVisitor::StackWalkKind::kSkipInlinedFrames),
+        obj_(obj),
+        found_(false) {}
+
+  bool VisitFrame() override REQUIRES_SHARED(Locks::mutator_lock_) {
+    ArtMethod* m = GetMethod();
+    if (!m->IsNative() || m->IsCriticalNative()) {
+      return true;
+    }
+    if (kPointsToStack) {
+      uint8_t* sp = reinterpret_cast<uint8_t*>(GetCurrentQuickFrame());
+      size_t frame_size = GetCurrentQuickFrameInfo().FrameSizeInBytes();
+      uint32_t* current_vreg = reinterpret_cast<uint32_t*>(sp + frame_size + sizeof(ArtMethod*));
+      if (!m->IsStatic()) {
+        if (current_vreg == obj_) {
+          found_ = true;
+          return false;
+        }
+        current_vreg += 1u;
+      }
+      uint32_t shorty_length;
+      const char* shorty = m->GetShorty(&shorty_length);
+      for (size_t i = 1; i != shorty_length; ++i) {
+        switch (shorty[i]) {
+          case 'D':
+          case 'J':
+            current_vreg += 2u;
+            break;
+          case 'L':
+            if (current_vreg == obj_) {
+              found_ = true;
+              return false;
+            }
+            FALLTHROUGH_INTENDED;
+          default:
+            current_vreg += 1u;
+            break;
+        }
+      }
+      // Continue only if the object is somewhere higher on the stack.
+      return obj_ >= current_vreg;
+    } else {  // if (kPointsToStack)
+      if (m->IsStatic() && obj_ == m->GetDeclaringClassAddressWithoutBarrier()) {
+        found_ = true;
+        return false;
+      }
       return true;
     }
   }
-  // JNI code invoked from portable code uses shadow frames rather than the handle scope.
-  return tlsPtr_.managed_stack.ShadowFramesContain(hs_entry);
+
+  bool Found() const {
+    return found_;
+  }
+
+ private:
+  void* obj_;
+  bool found_;
+};
+
+bool Thread::IsRawObjOnQuickStack(uint8_t* raw_obj) const {
+  return (static_cast<size_t>(raw_obj - GetStackBegin<kQuickStackType>()) <
+          GetStackSize<kQuickStackType>());
 }
 
-void Thread::HandleScopeVisitRoots(RootVisitor* visitor, pid_t thread_id) {
+bool Thread::IsJniTransitionReference(jobject obj) const {
+  DCHECK(obj != nullptr);
+  // We need a non-const pointer for stack walk even if we're not modifying the thread state.
+  Thread* thread = const_cast<Thread*>(this);
+  uint8_t* raw_obj = reinterpret_cast<uint8_t*>(obj);
+  if (IsRawObjOnQuickStack(raw_obj)) {
+    JniTransitionReferenceVisitor</*kPointsToStack=*/ true> visitor(thread, raw_obj);
+    visitor.WalkStack();
+    return visitor.Found();
+  } else {
+    JniTransitionReferenceVisitor</*kPointsToStack=*/ false> visitor(thread, raw_obj);
+    visitor.WalkStack();
+    return visitor.Found();
+  }
+}
+
+void Thread::HandleScopeVisitRoots(RootVisitor* visitor, uint32_t thread_id) {
   BufferedRootVisitor<kDefaultBufferedRootCount> buffered_visitor(
       visitor, RootInfo(kRootNativeStack, thread_id));
   for (BaseHandleScope* cur = tlsPtr_.top_handle_scope; cur; cur = cur->GetLink()) {
@@ -2563,32 +2864,15 @@ void Thread::HandleScopeVisitRoots(RootVisitor* visitor, pid_t thread_id) {
   }
 }
 
-ObjPtr<mirror::Object> Thread::DecodeJObject(jobject obj) const {
-  if (obj == nullptr) {
-    return nullptr;
-  }
+ObjPtr<mirror::Object> Thread::DecodeGlobalJObject(jobject obj) const {
+  DCHECK(obj != nullptr);
   IndirectRef ref = reinterpret_cast<IndirectRef>(obj);
   IndirectRefKind kind = IndirectReferenceTable::GetIndirectRefKind(ref);
+  DCHECK_NE(kind, kJniTransition);
+  DCHECK_NE(kind, kLocal);
   ObjPtr<mirror::Object> result;
   bool expect_null = false;
-  // The "kinds" below are sorted by the frequency we expect to encounter them.
-  if (kind == kLocal) {
-    IndirectReferenceTable& locals = tlsPtr_.jni_env->locals_;
-    // Local references do not need a read barrier.
-    result = locals.Get<kWithoutReadBarrier>(ref);
-  } else if (kind == kHandleScopeOrInvalid) {
-    // TODO: make stack indirect reference table lookup more efficient.
-    // Check if this is a local reference in the handle scope.
-    if (LIKELY(HandleScopeContains(obj))) {
-      // Read from handle scope.
-      result = reinterpret_cast<StackReference<mirror::Object>*>(obj)->AsMirrorPtr();
-      VerifyObject(result);
-    } else {
-      tlsPtr_.jni_env->vm_->JniAbortF(nullptr, "use of invalid jobject %p", obj);
-      expect_null = true;
-      result = nullptr;
-    }
-  } else if (kind == kGlobal) {
+  if (kind == kGlobal) {
     result = tlsPtr_.jni_env->vm_->DecodeGlobal(ref);
   } else {
     DCHECK_EQ(kind, kWeakGlobal);
@@ -2600,10 +2884,9 @@ ObjPtr<mirror::Object> Thread::DecodeJObject(jobject obj) const {
     }
   }
 
-  if (UNLIKELY(!expect_null && result == nullptr)) {
-    tlsPtr_.jni_env->vm_->JniAbortF(nullptr, "use of deleted %s %p",
-                                   ToStr<IndirectRefKind>(kind).c_str(), obj);
-  }
+  DCHECK(expect_null || result != nullptr)
+      << "use of deleted " << ToStr<IndirectRefKind>(kind).c_str()
+      << " " << static_cast<const void*>(obj);
   return result;
 }
 
@@ -2716,16 +2999,15 @@ class FetchStackTraceVisitor : public StackVisitor {
   DISALLOW_COPY_AND_ASSIGN(FetchStackTraceVisitor);
 };
 
-template<bool kTransactionActive>
 class BuildInternalStackTraceVisitor : public StackVisitor {
  public:
-  BuildInternalStackTraceVisitor(Thread* self, Thread* thread, int skip_depth)
+  BuildInternalStackTraceVisitor(Thread* self, Thread* thread, uint32_t skip_depth)
       : StackVisitor(thread, nullptr, StackVisitor::StackWalkKind::kIncludeInlinedFrames),
         self_(self),
         skip_depth_(skip_depth),
         pointer_size_(Runtime::Current()->GetClassLinker()->GetImagePointerSize()) {}
 
-  bool Init(int depth) REQUIRES_SHARED(Locks::mutator_lock_) ACQUIRE(Roles::uninterruptible_) {
+  bool Init(uint32_t depth) REQUIRES_SHARED(Locks::mutator_lock_) ACQUIRE(Roles::uninterruptible_) {
     // Allocate method trace as an object array where the first element is a pointer array that
     // contains the ArtMethod pointers and dex PCs. The rest of the elements are the declaring
     // class of the ArtMethod pointers.
@@ -2736,8 +3018,8 @@ class BuildInternalStackTraceVisitor : public StackVisitor {
     // The first element is the methods and dex pc array, the other elements are declaring classes
     // for the methods to ensure classes in the stack trace don't get unloaded.
     Handle<mirror::ObjectArray<mirror::Object>> trace(
-        hs.NewHandle(
-            mirror::ObjectArray<mirror::Object>::Alloc(hs.Self(), array_class, depth + 1)));
+        hs.NewHandle(mirror::ObjectArray<mirror::Object>::Alloc(
+            hs.Self(), array_class, static_cast<int32_t>(depth) + 1)));
     if (trace == nullptr) {
       // Acquire uninterruptible_ in all paths.
       self_->StartAssertNoThreadSuspension("Building internal stack trace");
@@ -2752,7 +3034,7 @@ class BuildInternalStackTraceVisitor : public StackVisitor {
       self_->AssertPendingOOMException();
       return false;
     }
-    trace->Set(0, methods_and_pcs);
+    trace->Set</*kTransactionActive=*/ false, /*kCheckTransaction=*/ false>(0, methods_and_pcs);
     trace_ = trace.Get();
     // If We are called from native, use non-transactional mode.
     CHECK(last_no_suspend_cause == nullptr) << last_no_suspend_cause;
@@ -2780,15 +3062,25 @@ class BuildInternalStackTraceVisitor : public StackVisitor {
   }
 
   void AddFrame(ArtMethod* method, uint32_t dex_pc) REQUIRES_SHARED(Locks::mutator_lock_) {
-    ObjPtr<mirror::PointerArray> trace_methods_and_pcs = GetTraceMethodsAndPCs();
-    trace_methods_and_pcs->SetElementPtrSize<kTransactionActive>(count_, method, pointer_size_);
-    trace_methods_and_pcs->SetElementPtrSize<kTransactionActive>(
-        trace_methods_and_pcs->GetLength() / 2 + count_,
-        dex_pc,
-        pointer_size_);
+    ObjPtr<mirror::PointerArray> methods_and_pcs = GetTraceMethodsAndPCs();
+    methods_and_pcs->SetElementPtrSize</*kTransactionActive=*/ false, /*kCheckTransaction=*/ false>(
+        count_, method, pointer_size_);
+    methods_and_pcs->SetElementPtrSize</*kTransactionActive=*/ false, /*kCheckTransaction=*/ false>(
+        static_cast<uint32_t>(methods_and_pcs->GetLength()) / 2 + count_, dex_pc, pointer_size_);
     // Save the declaring class of the method to ensure that the declaring classes of the methods
-    // do not get unloaded while the stack trace is live.
-    trace_->Set(count_ + 1, method->GetDeclaringClass());
+    // do not get unloaded while the stack trace is live. However, this does not work for copied
+    // methods because the declaring class of a copied method points to an interface class which
+    // may be in a different class loader. Instead, retrieve the class loader associated with the
+    // allocator that holds the copied method. This is much cheaper than finding the actual class.
+    ObjPtr<mirror::Object> keep_alive;
+    if (UNLIKELY(method->IsCopied())) {
+      ClassLinker* class_linker = Runtime::Current()->GetClassLinker();
+      keep_alive = class_linker->GetHoldingClassLoaderOfCopiedMethod(self_, method);
+    } else {
+      keep_alive = method->GetDeclaringClass();
+    }
+    trace_->Set</*kTransactionActive=*/ false, /*kCheckTransaction=*/ false>(
+        static_cast<int32_t>(count_) + 1, keep_alive);
     ++count_;
   }
 
@@ -2803,13 +3095,17 @@ class BuildInternalStackTraceVisitor : public StackVisitor {
  private:
   Thread* const self_;
   // How many more frames to skip.
-  int32_t skip_depth_;
+  uint32_t skip_depth_;
   // Current position down stack trace.
   uint32_t count_ = 0;
-  // An object array where the first element is a pointer array that contains the ArtMethod
-  // pointers on the stack and dex PCs. The rest of the elements are the declaring
-  // class of the ArtMethod pointers. trace_[i+1] contains the declaring class of the ArtMethod of
-  // the i'th frame.
+  // An object array where the first element is a pointer array that contains the `ArtMethod`
+  // pointers on the stack and dex PCs. The rest of the elements are referencing objects
+  // that shall keep the methods alive, namely the declaring class of the `ArtMethod` for
+  // declared methods and the class loader for copied methods (because it's faster to find
+  // the class loader than the actual class that holds the copied method). The `trace_[i+1]`
+  // contains the declaring class or class loader of the `ArtMethod` of the i'th frame.
+  // We're initializing a newly allocated trace, so we do not need to record that under
+  // a transaction. If the transaction is aborted, the whole trace shall be unreachable.
   mirror::ObjectArray<mirror::Object>* trace_ = nullptr;
   // For cross compilation.
   const PointerSize pointer_size_;
@@ -2817,8 +3113,8 @@ class BuildInternalStackTraceVisitor : public StackVisitor {
   DISALLOW_COPY_AND_ASSIGN(BuildInternalStackTraceVisitor);
 };
 
-template<bool kTransactionActive>
-jobject Thread::CreateInternalStackTrace(const ScopedObjectAccessAlreadyRunnable& soa) const {
+ObjPtr<mirror::ObjectArray<mirror::Object>> Thread::CreateInternalStackTrace(
+    const ScopedObjectAccessAlreadyRunnable& soa) const {
   // Compute depth of stack, save frames if possible to avoid needing to recompute many.
   constexpr size_t kMaxSavedFrames = 256;
   std::unique_ptr<ArtMethodDexPcPair[]> saved_frames(new ArtMethodDexPcPair[kMaxSavedFrames]);
@@ -2830,9 +3126,8 @@ jobject Thread::CreateInternalStackTrace(const ScopedObjectAccessAlreadyRunnable
   const uint32_t skip_depth = count_visitor.GetSkipDepth();
 
   // Build internal stack trace.
-  BuildInternalStackTraceVisitor<kTransactionActive> build_trace_visitor(soa.Self(),
-                                                                         const_cast<Thread*>(this),
-                                                                         skip_depth);
+  BuildInternalStackTraceVisitor build_trace_visitor(
+      soa.Self(), const_cast<Thread*>(this), skip_depth);
   if (!build_trace_visitor.Init(depth)) {
     return nullptr;  // Allocation failed.
   }
@@ -2856,12 +3151,8 @@ jobject Thread::CreateInternalStackTrace(const ScopedObjectAccessAlreadyRunnable
       CHECK(method != nullptr);
     }
   }
-  return soa.AddLocalReference<jobject>(trace);
+  return trace;
 }
-template jobject Thread::CreateInternalStackTrace<false>(
-    const ScopedObjectAccessAlreadyRunnable& soa) const;
-template jobject Thread::CreateInternalStackTrace<true>(
-    const ScopedObjectAccessAlreadyRunnable& soa) const;
 
 bool Thread::IsExceptionThrownByCurrentMethod(ObjPtr<mirror::Throwable> exception) const {
   // Only count the depth since we do not pass a stack frame array as an argument.
@@ -2900,7 +3191,7 @@ static ObjPtr<mirror::StackTraceElement> CreateStackTraceElement(
       // Make the line_number field of StackTraceElement hold the dex pc.
       // source_name_object is intentionally left null if we failed to map the dex pc to
       // a line number (most probably because there is no debug info). See b/30183883.
-      line_number = dex_pc;
+      line_number = static_cast<int32_t>(dex_pc);
     } else {
       if (source_file != nullptr) {
         source_name_object.Assign(mirror::String::AllocFromModifiedUtf8(soa.Self(), source_file));
@@ -2949,7 +3240,7 @@ jobjectArray Thread::InternalStackTraceToStackTraceElementArray(
   } else {
     // Create java_trace array and place in local reference table
     ObjPtr<mirror::ObjectArray<mirror::StackTraceElement>> java_traces =
-        class_linker->AllocStackTraceElementArray(soa.Self(), depth);
+        class_linker->AllocStackTraceElementArray(soa.Self(), static_cast<size_t>(depth));
     if (java_traces == nullptr) {
       return nullptr;
     }
@@ -2960,7 +3251,7 @@ jobjectArray Thread::InternalStackTraceToStackTraceElementArray(
     *stack_depth = depth;
   }
 
-  for (int32_t i = 0; i < depth; ++i) {
+  for (uint32_t i = 0; i < static_cast<uint32_t>(depth); ++i) {
     ObjPtr<mirror::ObjectArray<mirror::Object>> decoded_traces =
         soa.Decode<mirror::Object>(internal)->AsObjectArray<mirror::Object>();
     // Methods and dex PC trace is element 0.
@@ -2970,35 +3261,164 @@ jobjectArray Thread::InternalStackTraceToStackTraceElementArray(
     // Prepare parameters for StackTraceElement(String cls, String method, String file, int line)
     ArtMethod* method = method_trace->GetElementPtrSize<ArtMethod*>(i, kRuntimePointerSize);
     uint32_t dex_pc = method_trace->GetElementPtrSize<uint32_t>(
-        i + method_trace->GetLength() / 2, kRuntimePointerSize);
+        i + static_cast<uint32_t>(method_trace->GetLength()) / 2, kRuntimePointerSize);
     const ObjPtr<mirror::StackTraceElement> obj = CreateStackTraceElement(soa, method, dex_pc);
     if (obj == nullptr) {
       return nullptr;
     }
     // We are called from native: use non-transactional mode.
-    soa.Decode<mirror::ObjectArray<mirror::StackTraceElement>>(result)->Set<false>(i, obj);
+    soa.Decode<mirror::ObjectArray<mirror::StackTraceElement>>(result)->Set<false>(
+        static_cast<int32_t>(i), obj);
   }
   return result;
+}
+
+[[nodiscard]] static ObjPtr<mirror::StackFrameInfo> InitStackFrameInfo(
+    const ScopedObjectAccessAlreadyRunnable& soa,
+    ClassLinker* class_linker,
+    Handle<mirror::StackFrameInfo> stackFrameInfo,
+    ArtMethod* method,
+    uint32_t dex_pc) REQUIRES_SHARED(Locks::mutator_lock_) {
+  StackHandleScope<4> hs(soa.Self());
+  int32_t line_number;
+  auto source_name_object(hs.NewHandle<mirror::String>(nullptr));
+  if (method->IsProxyMethod()) {
+    line_number = -1;
+    // source_name_object intentionally left null for proxy methods
+  } else {
+    line_number = method->GetLineNumFromDexPC(dex_pc);
+    if (line_number == -1) {
+      // Make the line_number field of StackFrameInfo hold the dex pc.
+      // source_name_object is intentionally left null if we failed to map the dex pc to
+      // a line number (most probably because there is no debug info). See b/30183883.
+      line_number = static_cast<int32_t>(dex_pc);
+    } else {
+      const char* source_file = method->GetDeclaringClassSourceFile();
+      if (source_file != nullptr) {
+        source_name_object.Assign(mirror::String::AllocFromModifiedUtf8(soa.Self(), source_file));
+        if (source_name_object == nullptr) {
+          soa.Self()->AssertPendingOOMException();
+          return nullptr;
+        }
+      }
+    }
+  }
+
+  Handle<mirror::Class> declaring_class_object(
+      hs.NewHandle<mirror::Class>(method->GetDeclaringClass()));
+
+  ArtMethod* interface_method = method->GetInterfaceMethodIfProxy(kRuntimePointerSize);
+  const char* method_name = interface_method->GetName();
+  CHECK(method_name != nullptr);
+  Handle<mirror::String> method_name_object(
+      hs.NewHandle(mirror::String::AllocFromModifiedUtf8(soa.Self(), method_name)));
+  if (method_name_object == nullptr) {
+    soa.Self()->AssertPendingOOMException();
+    return nullptr;
+  }
+
+  dex::ProtoIndex proto_idx =
+      method->GetDexFile()->GetIndexForProtoId(interface_method->GetPrototype());
+  Handle<mirror::MethodType> method_type_object(hs.NewHandle<mirror::MethodType>(
+      class_linker->ResolveMethodType(soa.Self(), proto_idx, interface_method)));
+  if (method_type_object == nullptr) {
+    soa.Self()->AssertPendingOOMException();
+    return nullptr;
+  }
+
+  stackFrameInfo->AssignFields(declaring_class_object,
+                               method_type_object,
+                               method_name_object,
+                               source_name_object,
+                               line_number,
+                               static_cast<int32_t>(dex_pc));
+  return stackFrameInfo.Get();
+}
+
+constexpr jlong FILL_CLASS_REFS_ONLY = 0x2;  // StackStreamFactory.FILL_CLASS_REFS_ONLY
+
+jint Thread::InternalStackTraceToStackFrameInfoArray(
+    const ScopedObjectAccessAlreadyRunnable& soa,
+    jlong mode,  // See java.lang.StackStreamFactory for the mode flags
+    jobject internal,
+    jint startLevel,
+    jint batchSize,
+    jint startBufferIndex,
+    jobjectArray output_array) {
+  // Decode the internal stack trace into the depth, method trace and PC trace.
+  // Subtract one for the methods and PC trace.
+  int32_t depth = soa.Decode<mirror::Array>(internal)->GetLength() - 1;
+  DCHECK_GE(depth, 0);
+
+  StackHandleScope<6> hs(soa.Self());
+  Handle<mirror::ObjectArray<mirror::Object>> framesOrClasses =
+      hs.NewHandle(soa.Decode<mirror::ObjectArray<mirror::Object>>(output_array));
+
+  jint endBufferIndex = startBufferIndex;
+
+  if (startLevel < 0 || startLevel >= depth) {
+    return endBufferIndex;
+  }
+
+  int32_t bufferSize = framesOrClasses->GetLength();
+  if (startBufferIndex < 0 || startBufferIndex >= bufferSize) {
+    return endBufferIndex;
+  }
+
+  // The FILL_CLASS_REFS_ONLY flag is defined in AbstractStackWalker.fetchStackFrames() javadoc.
+  bool isClassArray = (mode & FILL_CLASS_REFS_ONLY) != 0;
+
+  Handle<mirror::ObjectArray<mirror::Object>> decoded_traces =
+      hs.NewHandle(soa.Decode<mirror::Object>(internal)->AsObjectArray<mirror::Object>());
+  // Methods and dex PC trace is element 0.
+  DCHECK(decoded_traces->Get(0)->IsIntArray() || decoded_traces->Get(0)->IsLongArray());
+  Handle<mirror::PointerArray> method_trace =
+      hs.NewHandle(ObjPtr<mirror::PointerArray>::DownCast(decoded_traces->Get(0)));
+
+  ClassLinker* const class_linker = Runtime::Current()->GetClassLinker();
+  Handle<mirror::Class> sfi_class =
+      hs.NewHandle(class_linker->FindSystemClass(soa.Self(), "Ljava/lang/StackFrameInfo;"));
+  DCHECK(sfi_class != nullptr);
+
+  MutableHandle<mirror::StackFrameInfo> frame = hs.NewHandle<mirror::StackFrameInfo>(nullptr);
+  MutableHandle<mirror::Class> clazz = hs.NewHandle<mirror::Class>(nullptr);
+  for (uint32_t i = static_cast<uint32_t>(startLevel); i < static_cast<uint32_t>(depth); ++i) {
+    if (endBufferIndex >= startBufferIndex + batchSize || endBufferIndex >= bufferSize) {
+      break;
+    }
+
+    ArtMethod* method = method_trace->GetElementPtrSize<ArtMethod*>(i, kRuntimePointerSize);
+    if (isClassArray) {
+      clazz.Assign(method->GetDeclaringClass());
+      framesOrClasses->Set(endBufferIndex, clazz.Get());
+    } else {
+      // Prepare parameters for fields in StackFrameInfo
+      uint32_t dex_pc = method_trace->GetElementPtrSize<uint32_t>(
+          i + static_cast<uint32_t>(method_trace->GetLength()) / 2, kRuntimePointerSize);
+
+      ObjPtr<mirror::Object> frameObject = framesOrClasses->Get(endBufferIndex);
+      // If libcore didn't allocate the object, we just stop here, but it's unlikely.
+      if (frameObject == nullptr || !frameObject->InstanceOf(sfi_class.Get())) {
+        break;
+      }
+      frame.Assign(ObjPtr<mirror::StackFrameInfo>::DownCast(frameObject));
+      frame.Assign(InitStackFrameInfo(soa, class_linker, frame, method, dex_pc));
+      // Break if InitStackFrameInfo fails to allocate objects or assign the fields.
+      if (frame == nullptr) {
+        break;
+      }
+    }
+
+    ++endBufferIndex;
+  }
+
+  return endBufferIndex;
 }
 
 jobjectArray Thread::CreateAnnotatedStackTrace(const ScopedObjectAccessAlreadyRunnable& soa) const {
   // This code allocates. Do not allow it to operate with a pending exception.
   if (IsExceptionPending()) {
     return nullptr;
-  }
-
-  // If flip_function is not null, it means we have run a checkpoint
-  // before the thread wakes up to execute the flip function and the
-  // thread roots haven't been forwarded.  So the following access to
-  // the roots (locks or methods in the frames) would be bad. Run it
-  // here. TODO: clean up.
-  // Note: copied from DumpJavaStack.
-  {
-    Thread* this_thread = const_cast<Thread*>(this);
-    Closure* flip_func = this_thread->GetFlipFunction();
-    if (flip_func != nullptr) {
-      flip_func->Run(this_thread);
-    }
   }
 
   class CollectFramesAndLocksStackVisitor : public MonitorObjectsStackVisitor {
@@ -3012,8 +3432,7 @@ jobjectArray Thread::CreateAnnotatedStackTrace(const ScopedObjectAccessAlreadyRu
           soaa_(soaa_in) {}
 
    protected:
-    VisitMethodResult StartMethod(ArtMethod* m, size_t frame_nr ATTRIBUTE_UNUSED)
-        override
+    VisitMethodResult StartMethod(ArtMethod* m, [[maybe_unused]] size_t frame_nr) override
         REQUIRES_SHARED(Locks::mutator_lock_) {
       ObjPtr<mirror::StackTraceElement> obj = CreateStackTraceElement(
           soaa_, m, GetDexPc(/* abort on error */ false));
@@ -3024,7 +3443,7 @@ jobjectArray Thread::CreateAnnotatedStackTrace(const ScopedObjectAccessAlreadyRu
       return VisitMethodResult::kContinueMethod;
     }
 
-    VisitMethodResult EndMethod(ArtMethod* m ATTRIBUTE_UNUSED) override {
+    VisitMethodResult EndMethod([[maybe_unused]] ArtMethod* m) override {
       lock_objects_.push_back({});
       lock_objects_[lock_objects_.size() - 1].swap(frame_lock_objects_);
 
@@ -3033,8 +3452,7 @@ jobjectArray Thread::CreateAnnotatedStackTrace(const ScopedObjectAccessAlreadyRu
       return VisitMethodResult::kContinueMethod;
     }
 
-    void VisitWaitingObject(ObjPtr<mirror::Object> obj, ThreadState state ATTRIBUTE_UNUSED)
-        override
+    void VisitWaitingObject(ObjPtr<mirror::Object> obj, [[maybe_unused]] ThreadState state) override
         REQUIRES_SHARED(Locks::mutator_lock_) {
       wait_jobject_.reset(soaa_.AddLocalReference<jobject>(obj));
     }
@@ -3044,9 +3462,8 @@ jobjectArray Thread::CreateAnnotatedStackTrace(const ScopedObjectAccessAlreadyRu
       wait_jobject_.reset(soaa_.AddLocalReference<jobject>(obj));
     }
     void VisitBlockedOnObject(ObjPtr<mirror::Object> obj,
-                              ThreadState state ATTRIBUTE_UNUSED,
-                              uint32_t owner_tid ATTRIBUTE_UNUSED)
-        override
+                              [[maybe_unused]] ThreadState state,
+                              [[maybe_unused]] uint32_t owner_tid) override
         REQUIRES_SHARED(Locks::mutator_lock_) {
       block_jobject_.reset(soaa_.AddLocalReference<jobject>(obj));
     }
@@ -3105,17 +3522,17 @@ jobjectArray Thread::CreateAnnotatedStackTrace(const ScopedObjectAccessAlreadyRu
     return nullptr;
   }
 
-  ArtField* stack_trace_element_field = h_aste_class->FindField(
-      soa.Self(), h_aste_class.Get(), "stackTraceElement", "Ljava/lang/StackTraceElement;");
+  ArtField* stack_trace_element_field =
+      h_aste_class->FindDeclaredInstanceField("stackTraceElement", "Ljava/lang/StackTraceElement;");
   DCHECK(stack_trace_element_field != nullptr);
-  ArtField* held_locks_field = h_aste_class->FindField(
-        soa.Self(), h_aste_class.Get(), "heldLocks", "[Ljava/lang/Object;");
+  ArtField* held_locks_field =
+      h_aste_class->FindDeclaredInstanceField("heldLocks", "[Ljava/lang/Object;");
   DCHECK(held_locks_field != nullptr);
-  ArtField* blocked_on_field = h_aste_class->FindField(
-        soa.Self(), h_aste_class.Get(), "blockedOn", "Ljava/lang/Object;");
+  ArtField* blocked_on_field =
+      h_aste_class->FindDeclaredInstanceField("blockedOn", "Ljava/lang/Object;");
   DCHECK(blocked_on_field != nullptr);
 
-  size_t length = dumper.stack_trace_elements_.size();
+  int32_t length = static_cast<int32_t>(dumper.stack_trace_elements_.size());
   ObjPtr<mirror::ObjectArray<mirror::Object>> array =
       mirror::ObjectArray<mirror::Object>::Alloc(soa.Self(), h_aste_array_class.Get(), length);
   if (array == nullptr) {
@@ -3128,7 +3545,7 @@ jobjectArray Thread::CreateAnnotatedStackTrace(const ScopedObjectAccessAlreadyRu
   MutableHandle<mirror::Object> handle(hs.NewHandle<mirror::Object>(nullptr));
   MutableHandle<mirror::ObjectArray<mirror::Object>> handle2(
       hs.NewHandle<mirror::ObjectArray<mirror::Object>>(nullptr));
-  for (size_t i = 0; i != length; ++i) {
+  for (size_t i = 0; i != static_cast<size_t>(length); ++i) {
     handle.Assign(h_aste_class->AllocObject(soa.Self()));
     if (handle == nullptr) {
       soa.Self()->AssertPendingOOMException();
@@ -3141,9 +3558,8 @@ jobjectArray Thread::CreateAnnotatedStackTrace(const ScopedObjectAccessAlreadyRu
 
     // Create locked-on array.
     if (!dumper.lock_objects_[i].empty()) {
-      handle2.Assign(mirror::ObjectArray<mirror::Object>::Alloc(soa.Self(),
-                                                                h_o_array_class.Get(),
-                                                                dumper.lock_objects_[i].size()));
+      handle2.Assign(mirror::ObjectArray<mirror::Object>::Alloc(
+          soa.Self(), h_o_array_class.Get(), static_cast<int32_t>(dumper.lock_objects_[i].size())));
       if (handle2 == nullptr) {
         soa.Self()->AssertPendingOOMException();
         return nullptr;
@@ -3169,7 +3585,7 @@ jobjectArray Thread::CreateAnnotatedStackTrace(const ScopedObjectAccessAlreadyRu
     }
 
     ScopedLocalRef<jobject> elem(soa.Env(), soa.AddLocalReference<jobject>(handle.Get()));
-    soa.Env()->SetObjectArrayElement(result.get(), i, elem.get());
+    soa.Env()->SetObjectArrayElement(result.get(), static_cast<jsize>(i), elem.get());
     DCHECK(!soa.Self()->IsExceptionPending());
   }
 
@@ -3210,13 +3626,24 @@ void Thread::ThrowNewWrappedException(const char* exception_class_descriptor,
   DCHECK_EQ(this, Thread::Current());
   ScopedObjectAccessUnchecked soa(this);
   StackHandleScope<3> hs(soa.Self());
+
+  // Disable public sdk checks if we need to throw exceptions.
+  // The checks are only used in AOT compilation and may block (exception) class
+  // initialization if it needs access to private fields (e.g. serialVersionUID).
+  //
+  // Since throwing an exception will EnsureInitialization and the public sdk may
+  // block that, disable the checks. It's ok to do so, because the thrown exceptions
+  // are not part of the application code that needs to verified.
+  ScopedDisablePublicSdkChecker sdpsc;
+
   Handle<mirror::ClassLoader> class_loader(hs.NewHandle(GetCurrentClassLoader(soa.Self())));
   ScopedLocalRef<jobject> cause(GetJniEnv(), soa.AddLocalReference<jobject>(GetException()));
   ClearException();
   Runtime* runtime = Runtime::Current();
   auto* cl = runtime->GetClassLinker();
   Handle<mirror::Class> exception_class(
-      hs.NewHandle(cl->FindClass(this, exception_class_descriptor, class_loader)));
+      hs.NewHandle(cl->FindClass(
+          this, exception_class_descriptor, strlen(exception_class_descriptor), class_loader)));
   if (UNLIKELY(exception_class == nullptr)) {
     CHECK(IsExceptionPending());
     LOG(ERROR) << "No exception class " << PrettyDescriptor(exception_class_descriptor);
@@ -3228,7 +3655,7 @@ void Thread::ThrowNewWrappedException(const char* exception_class_descriptor,
     DCHECK(IsExceptionPending());
     return;
   }
-  DCHECK(!runtime->IsStarted() || exception_class->IsThrowableClass());
+  DCHECK_IMPLIES(runtime->IsStarted(), exception_class->IsThrowableClass());
   Handle<mirror::Throwable> exception(
       hs.NewHandle(ObjPtr<mirror::Throwable>::DownCast(exception_class->AllocObject(this))));
 
@@ -3278,12 +3705,9 @@ void Thread::ThrowNewWrappedException(const char* exception_class_descriptor,
     if (cause.get() != nullptr) {
       exception->SetCause(DecodeJObject(cause.get())->AsThrowable());
     }
-    ScopedLocalRef<jobject> trace(GetJniEnv(),
-                                  Runtime::Current()->IsActiveTransaction()
-                                      ? CreateInternalStackTrace<true>(soa)
-                                      : CreateInternalStackTrace<false>(soa));
-    if (trace.get() != nullptr) {
-      exception->SetStackState(DecodeJObject(trace.get()).Ptr());
+    ObjPtr<mirror::ObjectArray<mirror::Object>> trace = CreateInternalStackTrace(soa);
+    if (trace != nullptr) {
+      exception->SetStackState(trace.Ptr());
     }
     SetException(exception.Get());
   } else {
@@ -3311,6 +3735,7 @@ void Thread::ThrowOutOfMemoryError(const char* msg) {
                << '"' << msg << '"'
                << " (VmSize " << GetProcessStatus("VmSize")
                << (tls32_.throwing_OutOfMemoryError ? ", recursive case)" : ")");
+  ScopedTrace trace("OutOfMemoryError");
   if (!tls32_.throwing_OutOfMemoryError) {
     tls32_.throwing_OutOfMemoryError = true;
     ThrowNewException("Ljava/lang/OutOfMemoryError;", msg);
@@ -3423,11 +3848,11 @@ void Thread::DumpThreadOffset(std::ostream& os, uint32_t offset) {
   QUICK_ENTRY_POINT_INFO(pGetObjStatic)
   QUICK_ENTRY_POINT_INFO(pAputObject)
   QUICK_ENTRY_POINT_INFO(pJniMethodStart)
-  QUICK_ENTRY_POINT_INFO(pJniMethodStartSynchronized)
   QUICK_ENTRY_POINT_INFO(pJniMethodEnd)
-  QUICK_ENTRY_POINT_INFO(pJniMethodEndSynchronized)
-  QUICK_ENTRY_POINT_INFO(pJniMethodEndWithReference)
-  QUICK_ENTRY_POINT_INFO(pJniMethodEndWithReferenceSynchronized)
+  QUICK_ENTRY_POINT_INFO(pJniMethodEntryHook)
+  QUICK_ENTRY_POINT_INFO(pJniDecodeReferenceResult)
+  QUICK_ENTRY_POINT_INFO(pJniLockObject)
+  QUICK_ENTRY_POINT_INFO(pJniUnlockObject)
   QUICK_ENTRY_POINT_INFO(pQuickGenericJniTrampoline)
   QUICK_ENTRY_POINT_INFO(pLockObject)
   QUICK_ENTRY_POINT_INFO(pUnlockObject)
@@ -3479,6 +3904,7 @@ void Thread::DumpThreadOffset(std::ostream& os, uint32_t offset) {
   QUICK_ENTRY_POINT_INFO(pInvokeSuperTrampolineWithAccessCheck)
   QUICK_ENTRY_POINT_INFO(pInvokeVirtualTrampolineWithAccessCheck)
   QUICK_ENTRY_POINT_INFO(pInvokePolymorphic)
+  QUICK_ENTRY_POINT_INFO(pInvokePolymorphicWithHiddenReceiver)
   QUICK_ENTRY_POINT_INFO(pTestSuspend)
   QUICK_ENTRY_POINT_INFO(pDeliverException)
   QUICK_ENTRY_POINT_INFO(pThrowArrayBounds)
@@ -3490,6 +3916,7 @@ void Thread::DumpThreadOffset(std::ostream& os, uint32_t offset) {
   QUICK_ENTRY_POINT_INFO(pA64Store)
   QUICK_ENTRY_POINT_INFO(pNewEmptyString)
   QUICK_ENTRY_POINT_INFO(pNewStringFromBytes_B)
+  QUICK_ENTRY_POINT_INFO(pNewStringFromBytes_BB)
   QUICK_ENTRY_POINT_INFO(pNewStringFromBytes_BI)
   QUICK_ENTRY_POINT_INFO(pNewStringFromBytes_BII)
   QUICK_ENTRY_POINT_INFO(pNewStringFromBytes_BIII)
@@ -3504,7 +3931,8 @@ void Thread::DumpThreadOffset(std::ostream& os, uint32_t offset) {
   QUICK_ENTRY_POINT_INFO(pNewStringFromString)
   QUICK_ENTRY_POINT_INFO(pNewStringFromStringBuffer)
   QUICK_ENTRY_POINT_INFO(pNewStringFromStringBuilder)
-  QUICK_ENTRY_POINT_INFO(pReadBarrierJni)
+  QUICK_ENTRY_POINT_INFO(pNewStringFromUtf16Bytes_BII)
+  QUICK_ENTRY_POINT_INFO(pJniReadBarrier)
   QUICK_ENTRY_POINT_INFO(pReadBarrierMarkReg00)
   QUICK_ENTRY_POINT_INFO(pReadBarrierMarkReg01)
   QUICK_ENTRY_POINT_INFO(pReadBarrierMarkReg02)
@@ -3537,26 +3965,29 @@ void Thread::DumpThreadOffset(std::ostream& os, uint32_t offset) {
   QUICK_ENTRY_POINT_INFO(pReadBarrierMarkReg29)
   QUICK_ENTRY_POINT_INFO(pReadBarrierSlow)
   QUICK_ENTRY_POINT_INFO(pReadBarrierForRootSlow)
-
-  QUICK_ENTRY_POINT_INFO(pJniMethodFastStart)
-  QUICK_ENTRY_POINT_INFO(pJniMethodFastEnd)
 #undef QUICK_ENTRY_POINT_INFO
 
   os << offset;
 }
 
-void Thread::QuickDeliverException() {
+std::unique_ptr<Context> Thread::QuickDeliverException(bool skip_method_exit_callbacks) {
   // Get exception from thread.
   ObjPtr<mirror::Throwable> exception = GetException();
   CHECK(exception != nullptr);
   if (exception == GetDeoptimizationException()) {
-    artDeoptimize(this);
-    UNREACHABLE();
+    // This wasn't a real exception, so just clear it here. If there was an actual exception it
+    // will be recorded in the DeoptimizationContext and it will be restored later.
+    ClearException();
+    return Deoptimize(DeoptimizationKind::kFullFrame,
+                      /*single_frame=*/ false,
+                      skip_method_exit_callbacks);
   }
 
   ReadBarrier::MaybeAssertToSpaceInvariant(exception.Ptr());
 
-  // This is a real exception: let the instrumentation know about it.
+  // This is a real exception: let the instrumentation know about it. Exception throw listener
+  // could set a breakpoint or install listeners that might require a deoptimization. Hence the
+  // deoptimization check needs to happen after calling the listener.
   instrumentation::Instrumentation* instrumentation = Runtime::Current()->GetInstrumentation();
   if (instrumentation->HasExceptionThrownListeners() &&
       IsExceptionThrownByCurrentMethod(exception)) {
@@ -3569,63 +4000,38 @@ void Thread::QuickDeliverException() {
   // Note: we do this *after* reporting the exception to instrumentation in case it now requires
   // deoptimization. It may happen if a debugger is attached and requests new events (single-step,
   // breakpoint, ...) when the exception is reported.
-  //
-  // Note we need to check for both force_frame_pop and force_retry_instruction. The first is
-  // expected to happen fairly regularly but the second can only happen if we are using
-  // instrumentation trampolines (for example with DDMS tracing). That forces us to do deopt later
-  // and see every frame being popped. We don't need to handle it any differently.
-  ShadowFrame* cf;
-  bool force_deopt = false;
-  if (Runtime::Current()->AreNonStandardExitsEnabled() || kIsDebugBuild) {
+  // Frame pop can be requested on a method unwind callback which requires a deopt. We could
+  // potentially check after each unwind callback to see if a frame pop was requested and deopt if
+  // needed. Since this is a debug only feature and this path is only taken when an exception is
+  // thrown, it is not performance critical and we keep it simple by just deopting if method exit
+  // listeners are installed and frame pop feature is supported.
+  bool needs_deopt =
+      instrumentation->HasMethodExitListeners() && Runtime::Current()->AreNonStandardExitsEnabled();
+  if (Dbg::IsForcedInterpreterNeededForException(this) || IsForceInterpreter() || needs_deopt) {
     NthCallerVisitor visitor(this, 0, false);
     visitor.WalkStack();
-    cf = visitor.GetCurrentShadowFrame();
-    if (cf == nullptr) {
-      cf = FindDebuggerShadowFrame(visitor.GetFrameId());
-    }
-    bool force_frame_pop = cf != nullptr && cf->GetForcePopFrame();
-    bool force_retry_instr = cf != nullptr && cf->GetForceRetryInstruction();
-    if (kIsDebugBuild && force_frame_pop) {
-      DCHECK(Runtime::Current()->AreNonStandardExitsEnabled());
-      NthCallerVisitor penultimate_visitor(this, 1, false);
-      penultimate_visitor.WalkStack();
-      ShadowFrame* penultimate_frame = penultimate_visitor.GetCurrentShadowFrame();
-      if (penultimate_frame == nullptr) {
-        penultimate_frame = FindDebuggerShadowFrame(penultimate_visitor.GetFrameId());
+    if (visitor.GetCurrentQuickFrame() != nullptr) {
+      if (Runtime::Current()->IsAsyncDeoptimizeable(visitor.GetOuterMethod(), visitor.caller_pc)) {
+        // method_type shouldn't matter due to exception handling.
+        const DeoptimizationMethodType method_type = DeoptimizationMethodType::kDefault;
+        // Save the exception into the deoptimization context so it can be restored
+        // before entering the interpreter.
+        PushDeoptimizationContext(
+            JValue(),
+            /* is_reference= */ false,
+            exception,
+            /* from_code= */ false,
+            method_type);
+        return Deoptimize(DeoptimizationKind::kFullFrame,
+                          /*single_frame=*/ false,
+                          skip_method_exit_callbacks);
+      } else {
+        LOG(WARNING) << "Got a deoptimization request on un-deoptimizable method "
+                     << visitor.caller->PrettyMethod();
       }
-    }
-    if (force_retry_instr) {
-      DCHECK(Runtime::Current()->AreNonStandardExitsEnabled());
-    }
-    force_deopt = force_frame_pop || force_retry_instr;
-  }
-  if (Dbg::IsForcedInterpreterNeededForException(this) || force_deopt || IsForceInterpreter()) {
-    NthCallerVisitor visitor(this, 0, false);
-    visitor.WalkStack();
-    if (Runtime::Current()->IsAsyncDeoptimizeable(visitor.caller_pc)) {
-      // method_type shouldn't matter due to exception handling.
-      const DeoptimizationMethodType method_type = DeoptimizationMethodType::kDefault;
-      // Save the exception into the deoptimization context so it can be restored
-      // before entering the interpreter.
-      if (force_deopt) {
-        VLOG(deopt) << "Deopting " << cf->GetMethod()->PrettyMethod() << " for frame-pop";
-        DCHECK(Runtime::Current()->AreNonStandardExitsEnabled());
-        // Get rid of the exception since we are doing a framepop instead.
-        LOG(WARNING) << "Suppressing pending exception for retry-instruction/frame-pop: "
-                     << exception->Dump();
-        ClearException();
-      }
-      PushDeoptimizationContext(
-          JValue(),
-          /* is_reference= */ false,
-          (force_deopt ? nullptr : exception),
-          /* from_code= */ false,
-          method_type);
-      artDeoptimize(this);
-      UNREACHABLE();
-    } else if (visitor.caller != nullptr) {
-      LOG(WARNING) << "Got a deoptimization request on un-deoptimizable method "
-                   << visitor.caller->PrettyMethod();
+    } else {
+      // This is either top of call stack, or shadow frame.
+      DCHECK(visitor.caller == nullptr || visitor.IsShadowFrame());
     }
   }
 
@@ -3633,7 +4039,7 @@ void Thread::QuickDeliverException() {
   // resolution.
   ClearException();
   QuickExceptionHandler exception_handler(this, false);
-  exception_handler.FindCatch(exception);
+  exception_handler.FindCatch(exception, skip_method_exit_callbacks);
   if (exception_handler.GetClearException()) {
     // Exception was cleared as part of delivery.
     DCHECK(!IsExceptionPending());
@@ -3643,18 +4049,39 @@ void Thread::QuickDeliverException() {
     // Check the to-space invariant on the re-installed exception (if applicable).
     ReadBarrier::MaybeAssertToSpaceInvariant(GetException());
   }
-  exception_handler.DoLongJump();
+  return exception_handler.PrepareLongJump();
 }
 
-Context* Thread::GetLongJumpContext() {
-  Context* result = tlsPtr_.long_jump_context;
-  if (result == nullptr) {
-    result = Context::Create();
-  } else {
-    tlsPtr_.long_jump_context = nullptr;  // Avoid context being shared.
-    result->Reset();
+std::unique_ptr<Context> Thread::Deoptimize(DeoptimizationKind kind,
+                                            bool single_frame,
+                                            bool skip_method_exit_callbacks) {
+  Runtime::Current()->IncrementDeoptimizationCount(kind);
+  if (VLOG_IS_ON(deopt)) {
+    if (single_frame) {
+      // Deopt logging will be in DeoptimizeSingleFrame. It is there to take advantage of the
+      // specialized visitor that will show whether a method is Quick or Shadow.
+    } else {
+      LOG(INFO) << "Deopting:";
+      Dump(LOG_STREAM(INFO));
+    }
   }
-  return result;
+
+  AssertHasDeoptimizationContext();
+  QuickExceptionHandler exception_handler(this, true);
+  if (single_frame) {
+    exception_handler.DeoptimizeSingleFrame(kind);
+  } else {
+    exception_handler.DeoptimizeStack(skip_method_exit_callbacks);
+  }
+  if (exception_handler.IsFullFragmentDone()) {
+    return exception_handler.PrepareLongJump(/*smash_caller_saves=*/ true);
+  } else {
+    exception_handler.DeoptimizePartialFragmentFixup();
+    // We cannot smash the caller-saves, as we need the ArtMethod in a parameter register that would
+    // be caller-saved. This has the downside that we cannot track incorrect register usage down the
+    // line.
+    return exception_handler.PrepareLongJump(/*smash_caller_saves=*/ false);
+  }
 }
 
 ArtMethod* Thread::GetCurrentMethod(uint32_t* dex_pc_out,
@@ -3700,10 +4127,11 @@ class ReferenceMapVisitor : public StackVisitor {
  public:
   ReferenceMapVisitor(Thread* thread, Context* context, RootVisitor& visitor)
       REQUIRES_SHARED(Locks::mutator_lock_)
-        // We are visiting the references in compiled frames, so we do not need
-        // to know the inlined frames.
+      // We are visiting the references in compiled frames, so we do not need
+      // to know the inlined frames.
       : StackVisitor(thread, context, StackVisitor::StackWalkKind::kSkipInlinedFrames),
-        visitor_(visitor) {}
+        visitor_(visitor),
+        visit_declaring_class_(!Runtime::Current()->GetHeap()->IsPerformingUffdCompaction()) {}
 
   bool VisitFrame() override REQUIRES_SHARED(Locks::mutator_lock_) {
     if (false) {
@@ -3748,6 +4176,9 @@ class ReferenceMapVisitor : public StackVisitor {
   void VisitDeclaringClass(ArtMethod* method)
       REQUIRES_SHARED(Locks::mutator_lock_)
       NO_THREAD_SAFETY_ANALYSIS {
+    if (!visit_declaring_class_) {
+      return;
+    }
     ObjPtr<mirror::Class> klass = method->GetDeclaringClassUnchecked<kWithoutReadBarrier>();
     // klass can be null for runtime methods.
     if (klass != nullptr) {
@@ -3817,8 +4248,62 @@ class ReferenceMapVisitor : public StackVisitor {
     ArtMethod* m = *cur_quick_frame;
     VisitDeclaringClass(m);
 
-    // Process register map (which native and runtime methods don't have)
-    if (!m->IsNative() && !m->IsRuntimeMethod() && (!m->IsProxyMethod() || m->IsConstructor())) {
+    if (m->IsNative()) {
+      // TODO: Spill the `this` reference in the AOT-compiled String.charAt()
+      // slow-path for throwing SIOOBE, so that we can remove this carve-out.
+      if (UNLIKELY(m->IsIntrinsic()) && m->GetIntrinsic() == Intrinsics::kStringCharAt) {
+        // The String.charAt() method is AOT-compiled with an intrinsic implementation
+        // instead of a JNI stub. It has a slow path that constructs a runtime frame
+        // for throwing SIOOBE and in that path we do not get the `this` pointer
+        // spilled on the stack, so there is nothing to visit. We can distinguish
+        // this from the GenericJni path by checking that the PC is in the boot image
+        // (PC shall be known thanks to the runtime frame for throwing SIOOBE).
+        // Note that JIT does not emit that intrinic implementation.
+        const void* pc = reinterpret_cast<const void*>(GetCurrentQuickFramePc());
+        if (pc != nullptr && Runtime::Current()->GetHeap()->IsInBootImageOatFile(pc)) {
+          return;
+        }
+      }
+      // Native methods spill their arguments to the reserved vregs in the caller's frame
+      // and use pointers to these stack references as jobject, jclass, jarray, etc.
+      // Note: We can come here for a @CriticalNative method when it needs to resolve the
+      // target native function but there would be no references to visit below.
+      const size_t frame_size = GetCurrentQuickFrameInfo().FrameSizeInBytes();
+      const size_t method_pointer_size = static_cast<size_t>(kRuntimePointerSize);
+      uint32_t* current_vreg = reinterpret_cast<uint32_t*>(
+          reinterpret_cast<uint8_t*>(cur_quick_frame) + frame_size + method_pointer_size);
+      auto visit = [&]() REQUIRES_SHARED(Locks::mutator_lock_) {
+        auto* ref_addr = reinterpret_cast<StackReference<mirror::Object>*>(current_vreg);
+        mirror::Object* ref = ref_addr->AsMirrorPtr();
+        if (ref != nullptr) {
+          mirror::Object* new_ref = ref;
+          visitor_(&new_ref, /* vreg= */ JavaFrameRootInfo::kNativeReferenceArgument, this);
+          if (ref != new_ref) {
+            ref_addr->Assign(new_ref);
+          }
+        }
+      };
+      const char* shorty = m->GetShorty();
+      if (!m->IsStatic()) {
+        visit();
+        current_vreg += 1u;
+      }
+      for (shorty += 1u; *shorty != 0; ++shorty) {
+        switch (*shorty) {
+          case 'D':
+          case 'J':
+            current_vreg += 2u;
+            break;
+          case 'L':
+            visit();
+            FALLTHROUGH_INTENDED;
+          default:
+            current_vreg += 1u;
+            break;
+        }
+      }
+    } else if (!m->IsRuntimeMethod() && (!m->IsProxyMethod() || m->IsConstructor())) {
+      // Process register map (which native, runtime and proxy methods don't have)
       const OatQuickMethodHeader* method_header = GetCurrentOatQuickMethodHeader();
       DCHECK(method_header->IsOptimized());
       StackReference<mirror::Object>* vreg_base =
@@ -3849,7 +4334,7 @@ class ReferenceMapVisitor : public StackVisitor {
       }
       // Visit callee-save registers that hold pointers.
       uint32_t register_mask = code_info.GetRegisterMaskOf(map);
-      for (size_t i = 0; i < BitSizeOf<uint32_t>(); ++i) {
+      for (uint32_t i = 0; i < BitSizeOf<uint32_t>(); ++i) {
         if (register_mask & (1 << i)) {
           mirror::Object** ref_addr = reinterpret_cast<mirror::Object**>(GetGPRAddress(i));
           if (kIsDebugBuild && ref_addr == nullptr) {
@@ -3894,26 +4379,23 @@ class ReferenceMapVisitor : public StackVisitor {
 
   void VisitQuickFrameNonPrecise() REQUIRES_SHARED(Locks::mutator_lock_) {
     struct UndefinedVRegInfo {
-      UndefinedVRegInfo(ArtMethod* method ATTRIBUTE_UNUSED,
-                        const CodeInfo& code_info ATTRIBUTE_UNUSED,
-                        const StackMap& map ATTRIBUTE_UNUSED,
+      UndefinedVRegInfo([[maybe_unused]] ArtMethod* method,
+                        [[maybe_unused]] const CodeInfo& code_info,
+                        [[maybe_unused]] const StackMap& map,
                         RootVisitor& _visitor)
-          : visitor(_visitor) {
-      }
+          : visitor(_visitor) {}
 
       ALWAYS_INLINE
       void VisitStack(mirror::Object** ref,
-                      size_t stack_index ATTRIBUTE_UNUSED,
-                      const StackVisitor* stack_visitor)
-          REQUIRES_SHARED(Locks::mutator_lock_) {
+                      [[maybe_unused]] size_t stack_index,
+                      const StackVisitor* stack_visitor) REQUIRES_SHARED(Locks::mutator_lock_) {
         visitor(ref, JavaFrameRootInfo::kImpreciseVreg, stack_visitor);
       }
 
       ALWAYS_INLINE
       void VisitRegister(mirror::Object** ref,
-                         size_t register_index ATTRIBUTE_UNUSED,
-                         const StackVisitor* stack_visitor)
-          REQUIRES_SHARED(Locks::mutator_lock_) {
+                         [[maybe_unused]] size_t register_index,
+                         const StackVisitor* stack_visitor) REQUIRES_SHARED(Locks::mutator_lock_) {
         visitor(ref, JavaFrameRootInfo::kImpreciseVreg, stack_visitor);
       }
 
@@ -3986,6 +4468,7 @@ class ReferenceMapVisitor : public StackVisitor {
 
   // Visitor for when we visit a root.
   RootVisitor& visitor_;
+  bool visit_declaring_class_;
 };
 
 class RootCallbackVisitor {
@@ -4010,9 +4493,13 @@ void Thread::VisitReflectiveTargets(ReflectiveValueVisitor* visitor) {
   }
 }
 
+// FIXME: clang-r433403 reports the below function exceeds frame size limit.
+// http://b/197647048
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wframe-larger-than="
 template <bool kPrecise>
 void Thread::VisitRoots(RootVisitor* visitor) {
-  const pid_t thread_id = GetThreadId();
+  const uint32_t thread_id = GetThreadId();
   visitor->VisitRootIfNonNull(&tlsPtr_.opeer, RootInfo(kRootThreadObject, thread_id));
   if (tlsPtr_.exception != nullptr && tlsPtr_.exception != GetDeoptimizationException()) {
     visitor->VisitRoot(reinterpret_cast<mirror::Object**>(&tlsPtr_.exception),
@@ -4059,54 +4546,92 @@ void Thread::VisitRoots(RootVisitor* visitor) {
       mapper.VisitShadowFrame(record->GetShadowFrame());
     }
   }
-  for (auto* verifier = tlsPtr_.method_verifier; verifier != nullptr; verifier = verifier->link_) {
-    verifier->VisitRoots(visitor, RootInfo(kRootNativeStack, thread_id));
-  }
   // Visit roots on this thread's stack
   RuntimeContextType context;
   RootCallbackVisitor visitor_to_callback(visitor, thread_id);
   ReferenceMapVisitor<RootCallbackVisitor, kPrecise> mapper(this, &context, visitor_to_callback);
   mapper.template WalkStack<StackVisitor::CountTransitions::kNo>(false);
-  for (auto& entry : *GetInstrumentationStack()) {
-    visitor->VisitRootIfNonNull(&entry.second.this_object_, RootInfo(kRootVMInternal, thread_id));
+}
+#pragma GCC diagnostic pop
+
+static void SweepCacheEntry(IsMarkedVisitor* visitor, const Instruction* inst, size_t* value)
+    REQUIRES_SHARED(Locks::mutator_lock_) {
+  if (inst == nullptr) {
+    return;
+  }
+  using Opcode = Instruction::Code;
+  Opcode opcode = inst->Opcode();
+  switch (opcode) {
+    case Opcode::NEW_INSTANCE:
+    case Opcode::CHECK_CAST:
+    case Opcode::INSTANCE_OF:
+    case Opcode::NEW_ARRAY:
+    case Opcode::CONST_CLASS: {
+      mirror::Class* klass = reinterpret_cast<mirror::Class*>(*value);
+      if (klass == nullptr || klass == Runtime::GetWeakClassSentinel()) {
+        return;
+      }
+      mirror::Class* new_klass = down_cast<mirror::Class*>(visitor->IsMarked(klass));
+      if (new_klass == nullptr) {
+        *value = reinterpret_cast<size_t>(Runtime::GetWeakClassSentinel());
+      } else if (new_klass != klass) {
+        *value = reinterpret_cast<size_t>(new_klass);
+      }
+      return;
+    }
+    case Opcode::CONST_STRING:
+    case Opcode::CONST_STRING_JUMBO: {
+      mirror::Object* object = reinterpret_cast<mirror::Object*>(*value);
+      if (object == nullptr) {
+        return;
+      }
+      mirror::Object* new_object = visitor->IsMarked(object);
+      // We know the string is marked because it's a strongly-interned string that
+      // is always alive (see b/117621117 for trying to make those strings weak).
+      if (kIsDebugBuild && new_object == nullptr) {
+        // (b/275005060) Currently the problem is reported only on CC GC.
+        // Therefore we log it with more information. But since the failure rate
+        // is quite high, sampling it.
+        if (gUseReadBarrier) {
+          Runtime* runtime = Runtime::Current();
+          gc::collector::ConcurrentCopying* cc = runtime->GetHeap()->ConcurrentCopyingCollector();
+          CHECK_NE(cc, nullptr);
+          LOG(FATAL) << cc->DumpReferenceInfo(object, "string")
+                     << " string interned: " << std::boolalpha
+                     << runtime->GetInternTable()->LookupStrong(Thread::Current(),
+                                                                down_cast<mirror::String*>(object))
+                     << std::noboolalpha;
+        } else {
+          // Other GCs
+          LOG(FATAL) << __FUNCTION__
+                     << ": IsMarked returned null for a strongly interned string: " << object;
+        }
+      } else if (new_object != object) {
+        *value = reinterpret_cast<size_t>(new_object);
+      }
+      return;
+    }
+    default:
+      // The following opcode ranges store non-reference values.
+      if ((Opcode::IGET <= opcode && opcode <= Opcode::SPUT_SHORT) ||
+          (Opcode::INVOKE_VIRTUAL <= opcode && opcode <= Opcode::INVOKE_INTERFACE_RANGE)) {
+        return;  // Nothing to do for the GC.
+      }
+      // New opcode is using the cache. We need to explicitly handle it in this method.
+      DCHECK(false) << "Unhandled opcode " << inst->Opcode();
   }
 }
 
 void Thread::SweepInterpreterCache(IsMarkedVisitor* visitor) {
   for (InterpreterCache::Entry& entry : GetInterpreterCache()->GetArray()) {
-    const Instruction* inst = reinterpret_cast<const Instruction*>(entry.first);
-    if (inst != nullptr) {
-      if (inst->Opcode() == Instruction::NEW_INSTANCE ||
-          inst->Opcode() == Instruction::CHECK_CAST ||
-          inst->Opcode() == Instruction::INSTANCE_OF ||
-          inst->Opcode() == Instruction::NEW_ARRAY ||
-          inst->Opcode() == Instruction::CONST_CLASS) {
-        mirror::Class* cls = reinterpret_cast<mirror::Class*>(entry.second);
-        if (cls == nullptr || cls == Runtime::GetWeakClassSentinel()) {
-          // Entry got deleted in a previous sweep.
-          continue;
-        }
-        Runtime::ProcessWeakClass(
-            reinterpret_cast<GcRoot<mirror::Class>*>(&entry.second),
-            visitor,
-            Runtime::GetWeakClassSentinel());
-      } else if (inst->Opcode() == Instruction::CONST_STRING ||
-                 inst->Opcode() == Instruction::CONST_STRING_JUMBO) {
-        mirror::Object* object = reinterpret_cast<mirror::Object*>(entry.second);
-        mirror::Object* new_object = visitor->IsMarked(object);
-        // We know the string is marked because it's a strongly-interned string that
-        // is always alive (see b/117621117 for trying to make those strings weak).
-        // The IsMarked implementation of the CMS collector returns
-        // null for newly allocated objects, but we know those haven't moved. Therefore,
-        // only update the entry if we get a different non-null string.
-        if (new_object != nullptr && new_object != object) {
-          entry.second = reinterpret_cast<size_t>(new_object);
-        }
-      }
-    }
+    SweepCacheEntry(visitor, reinterpret_cast<const Instruction*>(entry.first), &entry.second);
   }
 }
 
+// FIXME: clang-r433403 reports the below function exceeds frame size limit.
+// http://b/197647048
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wframe-larger-than="
 void Thread::VisitRoots(RootVisitor* visitor, VisitRootFlags flags) {
   if ((flags & VisitRootFlags::kVisitRootFlagPrecise) != 0) {
     VisitRoots</* kPrecise= */ true>(visitor);
@@ -4114,11 +4639,12 @@ void Thread::VisitRoots(RootVisitor* visitor, VisitRootFlags flags) {
     VisitRoots</* kPrecise= */ false>(visitor);
   }
 }
+#pragma GCC diagnostic pop
 
 class VerifyRootVisitor : public SingleRootVisitor {
  public:
-  void VisitRoot(mirror::Object* root, const RootInfo& info ATTRIBUTE_UNUSED)
-      override REQUIRES_SHARED(Locks::mutator_lock_) {
+  void VisitRoot(mirror::Object* root, [[maybe_unused]] const RootInfo& info) override
+      REQUIRES_SHARED(Locks::mutator_lock_) {
     VerifyObject(root);
   }
 };
@@ -4133,28 +4659,6 @@ void Thread::VerifyStackImpl() {
   }
 }
 
-// Set the stack end to that to be used during a stack overflow
-void Thread::SetStackEndForStackOverflow() {
-  // During stack overflow we allow use of the full stack.
-  if (tlsPtr_.stack_end == tlsPtr_.stack_begin) {
-    // However, we seem to have already extended to use the full stack.
-    LOG(ERROR) << "Need to increase kStackOverflowReservedBytes (currently "
-               << GetStackOverflowReservedBytes(kRuntimeISA) << ")?";
-    DumpStack(LOG_STREAM(ERROR));
-    LOG(FATAL) << "Recursive stack overflow.";
-  }
-
-  tlsPtr_.stack_end = tlsPtr_.stack_begin;
-
-  // Remove the stack overflow protection if is it set up.
-  bool implicit_stack_check = !Runtime::Current()->ExplicitStackOverflowChecks();
-  if (implicit_stack_check) {
-    if (!UnprotectStack()) {
-      LOG(ERROR) << "Unable to remove stack protection for stack overflow";
-    }
-  }
-}
-
 void Thread::SetTlab(uint8_t* start, uint8_t* end, uint8_t* limit) {
   DCHECK_LE(start, end);
   DCHECK_LE(end, limit);
@@ -4166,6 +4670,15 @@ void Thread::SetTlab(uint8_t* start, uint8_t* end, uint8_t* limit) {
 }
 
 void Thread::ResetTlab() {
+  gc::Heap* const heap = Runtime::Current()->GetHeap();
+  if (heap->GetHeapSampler().IsEnabled()) {
+    // Note: We always ResetTlab before SetTlab, therefore we can do the sample
+    // offset adjustment here.
+    heap->AdjustSampleOffset(GetTlabPosOffset());
+    VLOG(heap) << "JHP: ResetTlab, Tid: " << GetTid()
+               << " adjustment = "
+               << (tlsPtr_.thread_local_pos - tlsPtr_.thread_local_start);
+  }
   SetTlab(nullptr, nullptr, nullptr);
 }
 
@@ -4179,39 +4692,42 @@ bool Thread::HasTlab() const {
   return has_tlab;
 }
 
+void Thread::AdjustTlab(size_t slide_bytes) {
+  if (HasTlab()) {
+    tlsPtr_.thread_local_start -= slide_bytes;
+    tlsPtr_.thread_local_pos -= slide_bytes;
+    tlsPtr_.thread_local_end -= slide_bytes;
+    tlsPtr_.thread_local_limit -= slide_bytes;
+  }
+}
+
 std::ostream& operator<<(std::ostream& os, const Thread& thread) {
   thread.ShortDump(os);
   return os;
 }
 
+template <StackType stack_type>
 bool Thread::ProtectStack(bool fatal_on_error) {
-  void* pregion = tlsPtr_.stack_begin - kStackOverflowProtectedSize;
+  void* pregion = GetStackBegin<stack_type>() - GetStackOverflowProtectedSize();
   VLOG(threads) << "Protecting stack at " << pregion;
-  if (mprotect(pregion, kStackOverflowProtectedSize, PROT_NONE) == -1) {
+  if (mprotect(pregion, GetStackOverflowProtectedSize(), PROT_NONE) == -1) {
     if (fatal_on_error) {
-      LOG(FATAL) << "Unable to create protected region in stack for implicit overflow check. "
+      // b/249586057, LOG(FATAL) times out
+      LOG(ERROR) << "Unable to create protected region in stack for implicit overflow check. "
           "Reason: "
-          << strerror(errno) << " size:  " << kStackOverflowProtectedSize;
+          << strerror(errno) << " size:  " << GetStackOverflowProtectedSize();
+      exit(1);
     }
     return false;
   }
   return true;
 }
 
+template <StackType stack_type>
 bool Thread::UnprotectStack() {
-  void* pregion = tlsPtr_.stack_begin - kStackOverflowProtectedSize;
+  void* pregion = GetStackBegin<stack_type>() - GetStackOverflowProtectedSize();
   VLOG(threads) << "Unprotecting stack at " << pregion;
-  return mprotect(pregion, kStackOverflowProtectedSize, PROT_READ|PROT_WRITE) == 0;
-}
-
-void Thread::PushVerifier(verifier::MethodVerifier* verifier) {
-  verifier->link_ = tlsPtr_.method_verifier;
-  tlsPtr_.method_verifier = verifier;
-}
-
-void Thread::PopVerifier(verifier::MethodVerifier* verifier) {
-  CHECK_EQ(tlsPtr_.method_verifier, verifier);
-  tlsPtr_.method_verifier = verifier->link_;
+  return mprotect(pregion, GetStackOverflowProtectedSize(), PROT_READ|PROT_WRITE) == 0;
 }
 
 size_t Thread::NumberOfHeldMutexes() const {
@@ -4225,25 +4741,29 @@ size_t Thread::NumberOfHeldMutexes() const {
 void Thread::DeoptimizeWithDeoptimizationException(JValue* result) {
   DCHECK_EQ(GetException(), Thread::GetDeoptimizationException());
   ClearException();
-  ShadowFrame* shadow_frame =
-      PopStackedShadowFrame(StackedShadowFrameType::kDeoptimizationShadowFrame);
   ObjPtr<mirror::Throwable> pending_exception;
   bool from_code = false;
   DeoptimizationMethodType method_type;
   PopDeoptimizationContext(result, &pending_exception, &from_code, &method_type);
   SetTopOfStack(nullptr);
-  SetTopOfShadowStack(shadow_frame);
 
   // Restore the exception that was pending before deoptimization then interpret the
   // deoptimized frames.
   if (pending_exception != nullptr) {
     SetException(pending_exception);
   }
-  interpreter::EnterInterpreterFromDeoptimize(this,
-                                              shadow_frame,
-                                              result,
-                                              from_code,
-                                              method_type);
+
+  ShadowFrame* shadow_frame = MaybePopDeoptimizedStackedShadowFrame();
+  // We may not have a shadow frame if we deoptimized at the return of the
+  // quick_to_interpreter_bridge which got directly called by art_quick_invoke_stub.
+  if (shadow_frame != nullptr) {
+    SetTopOfShadowStack(shadow_frame);
+    interpreter::EnterInterpreterFromDeoptimize(this,
+                                                shadow_frame,
+                                                result,
+                                                from_code,
+                                                method_type);
+  }
 }
 
 void Thread::SetAsyncException(ObjPtr<mirror::Throwable> new_exception) {
@@ -4285,16 +4805,50 @@ bool Thread::IsAotCompiler() {
   return Runtime::Current()->IsAotCompiler();
 }
 
-mirror::Object* Thread::GetPeerFromOtherThread() const {
-  DCHECK(tlsPtr_.jpeer == nullptr);
-  mirror::Object* peer = tlsPtr_.opeer;
-  if (kUseReadBarrier && Current()->GetIsGcMarking()) {
-    // We may call Thread::Dump() in the middle of the CC thread flip and this thread's stack
-    // may have not been flipped yet and peer may be a from-space (stale) ref. So explicitly
-    // mark/forward it here.
-    peer = art::ReadBarrier::Mark(peer);
+mirror::Object* Thread::GetPeerFromOtherThread() {
+  Thread* self = Thread::Current();
+  if (this == self) {
+    // We often call this on every thread, including ourselves.
+    return GetPeer();
   }
-  return peer;
+  // If "this" thread is not suspended, it could disappear.
+  DCHECK(IsSuspended()) << *this;
+  DCHECK(tlsPtr_.jpeer == nullptr);
+  // Some JVMTI code may unfortunately hold thread_list_lock_, but if it does, it should hold the
+  // mutator lock in exclusive mode, and we should not have a pending flip function.
+  if (kIsDebugBuild && Locks::thread_list_lock_->IsExclusiveHeld(self)) {
+    Locks::mutator_lock_->AssertExclusiveHeld(self);
+    CHECK(!ReadFlag(ThreadFlag::kPendingFlipFunction));
+  }
+  // Ensure that opeer is not obsolete.
+  EnsureFlipFunctionStarted(self, this);
+  if (ReadFlag(ThreadFlag::kRunningFlipFunction)) {
+    // Does not release mutator lock. Hence no new flip requests can be issued.
+    WaitForFlipFunction(self);
+  }
+  return tlsPtr_.opeer;
+}
+
+mirror::Object* Thread::LockedGetPeerFromOtherThread(ThreadExitFlag* tef) {
+  DCHECK(tlsPtr_.jpeer == nullptr);
+  Thread* self = Thread::Current();
+  Locks::thread_list_lock_->AssertHeld(self);
+  if (ReadFlag(ThreadFlag::kPendingFlipFunction)) {
+    // It is unsafe to call EnsureFlipFunctionStarted with thread_list_lock_. Thus we temporarily
+    // release it, taking care to handle the case in which "this" thread disapppears while we no
+    // longer hold it.
+    Locks::thread_list_lock_->Unlock(self);
+    EnsureFlipFunctionStarted(self, this, StateAndFlags(0), tef);
+    Locks::thread_list_lock_->Lock(self);
+    if (tef->HasExited()) {
+      return nullptr;
+    }
+  }
+  if (ReadFlag(ThreadFlag::kRunningFlipFunction)) {
+    // Does not release mutator lock. Hence no new flip requests can be issued.
+    WaitForFlipFunction(self);
+  }
+  return tlsPtr_.opeer;
 }
 
 void Thread::SetReadBarrierEntrypoints() {
@@ -4311,38 +4865,50 @@ void Thread::ClearAllInterpreterCaches() {
   Runtime::Current()->GetThreadList()->RunCheckpoint(&closure);
 }
 
-
-void Thread::ReleaseLongJumpContextInternal() {
-  // Each QuickExceptionHandler gets a long jump context and uses
-  // it for doing the long jump, after finding catch blocks/doing deoptimization.
-  // Both finding catch blocks and deoptimization can trigger another
-  // exception such as a result of class loading. So there can be nested
-  // cases of exception handling and multiple contexts being used.
-  // ReleaseLongJumpContext tries to save the context in tlsPtr_.long_jump_context
-  // for reuse so there is no need to always allocate a new one each time when
-  // getting a context. Since we only keep one context for reuse, delete the
-  // existing one since the passed in context is yet to be used for longjump.
-  delete tlsPtr_.long_jump_context;
-}
-
 void Thread::SetNativePriority(int new_priority) {
-  PaletteStatus status = PaletteSchedSetPriority(GetTid(), new_priority);
-  CHECK(status == PaletteStatus::kOkay || status == PaletteStatus::kCheckErrno);
+  palette_status_t status = PaletteSchedSetPriority(GetTid(), new_priority);
+  CHECK(status == PALETTE_STATUS_OK || status == PALETTE_STATUS_CHECK_ERRNO);
 }
 
 int Thread::GetNativePriority() const {
   int priority = 0;
-  PaletteStatus status = PaletteSchedGetPriority(GetTid(), &priority);
-  CHECK(status == PaletteStatus::kOkay || status == PaletteStatus::kCheckErrno);
+  palette_status_t status = PaletteSchedGetPriority(GetTid(), &priority);
+  CHECK(status == PALETTE_STATUS_OK || status == PALETTE_STATUS_CHECK_ERRNO);
   return priority;
+}
+
+void Thread::AbortInThis(const std::string& message) {
+  std::string thread_name;
+  Thread::Current()->GetThreadName(thread_name);
+  LOG(ERROR) << message;
+  LOG(ERROR) << "Aborting culprit thread";
+  Runtime::Current()->SetAbortMessage(("Caused " + thread_name + " failure : " + message).c_str());
+  // Unlike Runtime::Abort() we do not fflush(nullptr), since we want to send the signal with as
+  // little delay as possible.
+  int res = pthread_kill(tlsPtr_.pthread_self, SIGABRT);
+  if (res != 0) {
+    LOG(ERROR) << "pthread_kill failed with " << res << " " << strerror(res) << " target was "
+               << tls32_.tid;
+  } else {
+    // Wait for our process to be aborted.
+    sleep(10 /* seconds */);
+  }
+  // The process should have died long before we got here. Never return.
+  LOG(FATAL) << "Failed to abort in culprit thread: " << message;
+  UNREACHABLE();
 }
 
 bool Thread::IsSystemDaemon() const {
   if (GetPeer() == nullptr) {
     return false;
   }
-  return jni::DecodeArtField(
-      WellKnownClasses::java_lang_Thread_systemDaemon)->GetBoolean(GetPeer());
+  return WellKnownClasses::java_lang_Thread_systemDaemon->GetBoolean(GetPeer());
+}
+
+std::string Thread::StateAndFlagsAsHexString() const {
+  std::stringstream result_stream;
+  result_stream << std::hex << GetStateAndFlags(std::memory_order_relaxed).GetValue();
+  return result_stream.str();
 }
 
 ScopedExceptionStorage::ScopedExceptionStorage(art::Thread* self)
@@ -4354,7 +4920,9 @@ void ScopedExceptionStorage::SuppressOldException(const char* message) {
   CHECK(self_->IsExceptionPending()) << *self_;
   ObjPtr<mirror::Throwable> old_suppressed(excp_.Get());
   excp_.Assign(self_->GetException());
-  LOG(WARNING) << message << "Suppressing old exception: " << old_suppressed->Dump();
+  if (old_suppressed != nullptr) {
+    LOG(WARNING) << message << "Suppressing old exception: " << old_suppressed->Dump();
+  }
   self_->ClearException();
 }
 
@@ -4366,3 +4934,5 @@ ScopedExceptionStorage::~ScopedExceptionStorage() {
 }
 
 }  // namespace art
+
+#pragma clang diagnostic pop  // -Wconversion

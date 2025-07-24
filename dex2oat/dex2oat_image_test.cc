@@ -34,7 +34,6 @@
 #include "base/file_utils.h"
 #include "base/macros.h"
 #include "base/mem_map.h"
-#include "base/string_view_cpp20.h"
 #include "base/unix_file/fd_file.h"
 #include "base/utils.h"
 #include "dex/art_dex_file_loader.h"
@@ -114,8 +113,8 @@ class Dex2oatImageTest : public CommonRuntimeTest {
     // Extend to both directions for maximum relocation difference.
     static_assert(ART_BASE_ADDRESS_MIN_DELTA < 0);
     static_assert(ART_BASE_ADDRESS_MAX_DELTA > 0);
-    static_assert(IsAligned<kPageSize>(ART_BASE_ADDRESS_MIN_DELTA));
-    static_assert(IsAligned<kPageSize>(ART_BASE_ADDRESS_MAX_DELTA));
+    static_assert(IsAligned<kElfSegmentAlignment>(ART_BASE_ADDRESS_MIN_DELTA));
+    static_assert(IsAligned<kElfSegmentAlignment>(ART_BASE_ADDRESS_MAX_DELTA));
     constexpr size_t kExtra = ART_BASE_ADDRESS_MAX_DELTA - ART_BASE_ADDRESS_MIN_DELTA;
     uint32_t min_relocated_address = kBaseAddress + ART_BASE_ADDRESS_MIN_DELTA;
     return MemMap::MapAnonymous("Reservation",
@@ -129,7 +128,7 @@ class Dex2oatImageTest : public CommonRuntimeTest {
   }
 
   void CopyDexFiles(const std::string& dir, /*inout*/std::vector<std::string>* dex_files) {
-    CHECK(EndsWith(dir, "/"));
+    CHECK(dir.ends_with("/"));
     for (std::string& dex_file : *dex_files) {
       size_t slash_pos = dex_file.rfind('/');
       CHECK(OS::FileExists(dex_file.c_str())) << dex_file;
@@ -184,13 +183,11 @@ TEST_F(Dex2oatImageTest, TestModesAndFilters) {
   }
   // Compile only a subset of the libcore dex files to make this test shorter.
   std::vector<std::string> libcore_dex_files = GetLibCoreDexFileNames();
-  // The primary image must contain at least core-oj and core-libart to initialize the runtime
-  // and we also need the core-icu4j if we want to compile these with full profile.
+  // The primary image must contain at least core-oj and core-libart to initialize the runtime.
   ASSERT_NE(std::string::npos, libcore_dex_files[0].find("core-oj"));
   ASSERT_NE(std::string::npos, libcore_dex_files[1].find("core-libart"));
-  ASSERT_NE(std::string::npos, libcore_dex_files[2].find("core-icu4j"));
   ArrayRef<const std::string> dex_files =
-      ArrayRef<const std::string>(libcore_dex_files).SubArray(/*pos=*/ 0u, /*length=*/ 3u);
+      ArrayRef<const std::string>(libcore_dex_files).SubArray(/*pos=*/ 0u, /*length=*/ 2u);
 
   ImageSizes base_sizes = CompileImageAndGetSizes(dex_files, {});
   ImageSizes everything_sizes;
@@ -201,10 +198,10 @@ TEST_F(Dex2oatImageTest, TestModesAndFilters) {
   ArrayRef<const std::string> libcore_dexes_array(libcore_dexes);
   {
     ScratchFile profile_file;
-    GenerateProfile(libcore_dexes_array,
-                    profile_file.GetFile(),
-                    /*method_frequency=*/ 1u,
-                    /*type_frequency=*/ 1u);
+    GenerateBootProfile(libcore_dexes_array,
+                        profile_file.GetFile(),
+                        /*method_frequency=*/ 1u,
+                        /*type_frequency=*/ 1u);
     everything_sizes = CompileImageAndGetSizes(
         dex_files,
         {"--profile-file=" + profile_file.GetFilename(),
@@ -213,7 +210,7 @@ TEST_F(Dex2oatImageTest, TestModesAndFilters) {
     std::cout << "All methods and classes sizes " << everything_sizes << std::endl;
     // Putting all classes as image classes should increase art size
     EXPECT_GE(everything_sizes.art_size, base_sizes.art_size);
-    // Sanity check that dex is the same size.
+    // Check that dex is the same size.
     EXPECT_EQ(everything_sizes.vdex_size, base_sizes.vdex_size);
   }
   static size_t kMethodFrequency = 3;
@@ -221,10 +218,10 @@ TEST_F(Dex2oatImageTest, TestModesAndFilters) {
   // Test compiling fewer methods and classes.
   {
     ScratchFile profile_file;
-    GenerateProfile(libcore_dexes_array,
-                    profile_file.GetFile(),
-                    kMethodFrequency,
-                    kTypeFrequency);
+    GenerateBootProfile(libcore_dexes_array,
+                        profile_file.GetFile(),
+                        kMethodFrequency,
+                        kTypeFrequency);
     filter_sizes = CompileImageAndGetSizes(
         dex_files,
         {"--profile-file=" + profile_file.GetFilename(),
@@ -249,9 +246,36 @@ TEST_F(Dex2oatImageTest, TestModesAndFilters) {
     classes.Close();
     std::cout << "Dirty image object sizes " << image_classes_sizes << std::endl;
   }
+  // Test multiple dirty image objects.
+  {
+    std::array<ScratchFile, 2> files;
+    int idx = 0;
+    VisitDexes(
+        libcore_dexes_array,
+        VoidFunctor(),
+        [&](TypeReference ref) {
+          WriteLine(files[idx].GetFile(), ref.dex_file->PrettyType(ref.TypeIndex()));
+          idx = (idx + 1) % files.size();
+        },
+        /*method_frequency=*/1u,
+        /*class_frequency=*/1u);
+    ImageSizes image_classes_sizes =
+        CompileImageAndGetSizes(dex_files,
+                                {"--dirty-image-objects=" + files[0].GetFilename(),
+                                 "--dirty-image-objects=" + files[1].GetFilename()});
+    for (ScratchFile& file : files) {
+      file.Close();
+    }
+    std::cout << "Dirty image object sizes " << image_classes_sizes << std::endl;
+  }
 }
 
 TEST_F(Dex2oatImageTest, TestExtension) {
+  // TODO(b/376621099): investigate LUCI failures (timeouts?) and re-enable this test.
+  // This is probably not related to riscv64 arch, but a combination of riscv64 and running
+  // on VM, but we don't use TEST_DISABLED_ON_VM to keep running it on other VM builders.
+  TEST_DISABLED_FOR_RISCV64();
+
   std::string error_msg;
   MemMap reservation = ReserveCoreImageAddressSpace(&error_msg);
   ASSERT_TRUE(reservation.IsValid()) << error_msg;
@@ -261,7 +285,7 @@ TEST_F(Dex2oatImageTest, TestExtension) {
   std::string image_dir = scratch_dir + GetInstructionSetString(kRuntimeISA);
   int mkdir_result = mkdir(image_dir.c_str(), 0700);
   ASSERT_EQ(0, mkdir_result);
-  std::string filename_prefix = image_dir + "/core";
+  std::string filename_prefix = image_dir + "/boot";
 
   // Copy the libcore dex files to a custom dir inside `scratch_dir` so that we do not
   // accidentally load pre-compiled core images from their original directory based on BCP paths.
@@ -274,25 +298,23 @@ TEST_F(Dex2oatImageTest, TestExtension) {
 
   ArrayRef<const std::string> full_bcp(libcore_dex_files);
   size_t total_dex_files = full_bcp.size();
-  ASSERT_GE(total_dex_files, 5u);  // 3 for "head", 1 for "tail", at least one for "mid", see below.
+  ASSERT_GE(total_dex_files, 4u);  // 2 for "head", 1 for "tail", at least one for "mid", see below.
 
-  // The primary image must contain at least core-oj and core-libart to initialize the runtime
-  // and we also need the core-icu4j if we want to compile these with full profile.
+  // The primary image must contain at least core-oj and core-libart to initialize the runtime.
   ASSERT_NE(std::string::npos, full_bcp[0].find("core-oj"));
   ASSERT_NE(std::string::npos, full_bcp[1].find("core-libart"));
-  ASSERT_NE(std::string::npos, full_bcp[2].find("core-icu4j"));
-  ArrayRef<const std::string> head_dex_files = full_bcp.SubArray(/*pos=*/ 0u, /*length=*/ 3u);
+  ArrayRef<const std::string> head_dex_files = full_bcp.SubArray(/*pos=*/ 0u, /*length=*/ 2u);
   // Middle part is everything else except for conscrypt.
   ASSERT_NE(std::string::npos, full_bcp[full_bcp.size() - 1u].find("conscrypt"));
   ArrayRef<const std::string> mid_bcp =
       full_bcp.SubArray(/*pos=*/ 0u, /*length=*/ total_dex_files - 1u);
-  ArrayRef<const std::string> mid_dex_files = mid_bcp.SubArray(/*pos=*/ 3u);
+  ArrayRef<const std::string> mid_dex_files = mid_bcp.SubArray(/*pos=*/ 2u);
   // Tail is just the conscrypt.
   ArrayRef<const std::string> tail_dex_files =
       full_bcp.SubArray(/*pos=*/ total_dex_files - 1u, /*length=*/ 1u);
 
   // Prepare the "head", "mid" and "tail" names and locations.
-  std::string base_name = "core.art";
+  std::string base_name = "boot.art";
   std::string base_location = scratch_dir + base_name;
   std::vector<std::string> expanded_mid = gc::space::ImageSpace::ExpandMultiImageLocations(
       mid_dex_files.SubArray(/*pos=*/ 0u, /*length=*/ 1u),
@@ -314,22 +336,22 @@ TEST_F(Dex2oatImageTest, TestExtension) {
 
   // Create profiles.
   ScratchFile head_profile_file;
-  GenerateProfile(head_dex_files,
-                  head_profile_file.GetFile(),
-                  /*method_frequency=*/ 1u,
-                  /*type_frequency=*/ 1u);
+  GenerateBootProfile(head_dex_files,
+                      head_profile_file.GetFile(),
+                      /*method_frequency=*/ 1u,
+                      /*type_frequency=*/ 1u);
   const std::string& head_profile_filename = head_profile_file.GetFilename();
   ScratchFile mid_profile_file;
-  GenerateProfile(mid_dex_files,
-                  mid_profile_file.GetFile(),
-                  /*method_frequency=*/ 5u,
-                  /*type_frequency=*/ 4u);
+  GenerateBootProfile(mid_dex_files,
+                      mid_profile_file.GetFile(),
+                      /*method_frequency=*/ 5u,
+                      /*type_frequency=*/ 4u);
   const std::string& mid_profile_filename = mid_profile_file.GetFilename();
   ScratchFile tail_profile_file;
-  GenerateProfile(tail_dex_files,
-                  tail_profile_file.GetFile(),
-                  /*method_frequency=*/ 5u,
-                  /*type_frequency=*/ 4u);
+  GenerateBootProfile(tail_dex_files,
+                      tail_profile_file.GetFile(),
+                      /*method_frequency=*/ 5u,
+                      /*type_frequency=*/ 4u);
   const std::string& tail_profile_filename = tail_profile_file.GetFilename();
 
   // Compile the "head", i.e. the primary boot image.
@@ -360,7 +382,7 @@ TEST_F(Dex2oatImageTest, TestExtension) {
   ASSERT_FALSE(tail_ok) << error_msg;
 
   // Now compile the tail against both "head" and "mid".
-  CHECK(StartsWith(extra_args.back(), "--boot-image="));
+  CHECK(extra_args.back().starts_with("--boot-image="));
   extra_args.back() = "--boot-image=" + base_location + ':' + mid_location;
   tail_ok = CompileBootImage(extra_args, filename_prefix, tail_dex_files, &error_msg);
   ASSERT_TRUE(tail_ok) << error_msg;
@@ -373,17 +395,17 @@ TEST_F(Dex2oatImageTest, TestExtension) {
   std::string single_image_dir = single_dir + GetInstructionSetString(kRuntimeISA);
   mkdir_result = mkdir(single_image_dir.c_str(), 0700);
   ASSERT_EQ(0, mkdir_result);
-  std::string single_filename_prefix = single_image_dir + "/core";
+  std::string single_filename_prefix = single_image_dir + "/boot";
 
   // The dex files for the single-image are everything not in the "head".
   ArrayRef<const std::string> single_dex_files = full_bcp.SubArray(/*pos=*/ head_dex_files.size());
 
   // Create a smaller profile for the single-image test that squashes the "mid" and "tail".
   ScratchFile single_profile_file;
-  GenerateProfile(single_dex_files,
-                  single_profile_file.GetFile(),
-                  /*method_frequency=*/ 5u,
-                  /*type_frequency=*/ 4u);
+  GenerateBootProfile(single_dex_files,
+                      single_profile_file.GetFile(),
+                      /*method_frequency=*/ 5u,
+                      /*type_frequency=*/ 4u);
   const std::string& single_profile_filename = single_profile_file.GetFilename();
 
   // Prepare the single image name and location.
@@ -424,17 +446,22 @@ TEST_F(Dex2oatImageTest, TestExtension) {
     boot_image_spaces.clear();
     extra_reservation = MemMap::Invalid();
     ScopedObjectAccess soa(Thread::Current());
-    return gc::space::ImageSpace::LoadBootImage(/*boot_class_path=*/ boot_class_path,
-                                                /*boot_class_path_locations=*/ libcore_dex_files,
-                                                image_location,
-                                                kRuntimeISA,
-                                                gc::space::ImageSpaceLoadingOrder::kSystemFirst,
-                                                relocate,
-                                                /*executable=*/ true,
-                                                /*is_zygote=*/ false,
-                                                /*extra_reservation_size=*/ 0u,
-                                                &boot_image_spaces,
-                                                &extra_reservation);
+    return gc::space::ImageSpace::LoadBootImage(
+        /*boot_class_path=*/boot_class_path,
+        /*boot_class_path_locations=*/libcore_dex_files,
+        /*boot_class_path_files=*/{},
+        /*boot_class_path_image_files=*/{},
+        /*boot_class_path_vdex_files=*/{},
+        /*boot_class_path_oat_files=*/{},
+        android::base::Split(image_location, ":"),
+        kRuntimeISA,
+        relocate,
+        /*executable=*/true,
+        /*extra_reservation_size=*/0u,
+        /*allow_in_memory_compilation=*/true,
+        Runtime::GetApexVersions(ArrayRef<const std::string>(libcore_dex_files)),
+        &boot_image_spaces,
+        &extra_reservation);
   };
   auto silent_load = [&](const std::string& image_location) {
     ScopedLogSeverity quiet(LogSeverity::FATAL);
@@ -461,33 +488,33 @@ TEST_F(Dex2oatImageTest, TestExtension) {
     ASSERT_FALSE(load_ok);
 
     // Load the primary and first extension with full path.
-    load_ok = load(base_location + ':' + mid_location);
+    load_ok = load(ART_FORMAT("{}:{}", base_location, mid_location));
     ASSERT_TRUE(load_ok) << error_msg;
     ASSERT_EQ(mid_bcp.size(), boot_image_spaces.size());
 
     // Load the primary with full path and fail to load first extension without full path.
-    load_ok = load(base_location + ':' + mid_name);
+    load_ok = load(ART_FORMAT("{}:{}", base_location, mid_name));
     ASSERT_TRUE(load_ok) << error_msg;  // Primary image loaded successfully.
     ASSERT_EQ(head_dex_files.size(), boot_image_spaces.size());  // But only the primary image.
 
     // Load all the libcore images with full paths.
-    load_ok = load(base_location + ':' + mid_location + ':' + tail_location);
+    load_ok = load(ART_FORMAT("{}:{}:{}", base_location, mid_location, tail_location));
     ASSERT_TRUE(load_ok) << error_msg;
     ASSERT_EQ(full_bcp.size(), boot_image_spaces.size());
 
     // Load the primary and first extension with full paths, fail to load second extension by name.
-    load_ok = load(base_location + ':' + mid_location + ':' + tail_name);
+    load_ok = load(ART_FORMAT("{}:{}:{}", base_location, mid_location, tail_name));
     ASSERT_TRUE(load_ok) << error_msg;
     ASSERT_EQ(mid_bcp.size(), boot_image_spaces.size());
 
     // Load the primary with full path and fail to load first extension without full path,
     // fail to load second extension because it depends on the first.
-    load_ok = load(base_location + ':' + mid_name + ':' + tail_location);
+    load_ok = load(ART_FORMAT("{}:{}:{}", base_location, mid_name, tail_location));
     ASSERT_TRUE(load_ok) << error_msg;  // Primary image loaded successfully.
     ASSERT_EQ(head_dex_files.size(), boot_image_spaces.size());  // But only the primary image.
 
     // Load the primary with full path and extensions with a specified search path.
-    load_ok = load(base_location + ':' + scratch_dir + '*');
+    load_ok = load(ART_FORMAT("{}:{}*", base_location, scratch_dir));
     ASSERT_TRUE(load_ok) << error_msg;
     ASSERT_EQ(full_bcp.size(), boot_image_spaces.size());
 
@@ -516,33 +543,33 @@ TEST_F(Dex2oatImageTest, TestExtension) {
     ASSERT_FALSE(load_ok);
 
     // Load the primary and first extension without paths.
-    load_ok = load(base_name + ':' + mid_name);
+    load_ok = load(ART_FORMAT("{}:{}", base_name, mid_name));
     ASSERT_TRUE(load_ok) << error_msg;
     ASSERT_EQ(mid_bcp.size(), boot_image_spaces.size());
 
     // Load the primary without path and first extension with path.
-    load_ok = load(base_name + ':' + mid_location);
+    load_ok = load(ART_FORMAT("{}:{}", base_name, mid_location));
     ASSERT_TRUE(load_ok) << error_msg;
     ASSERT_EQ(mid_bcp.size(), boot_image_spaces.size());
 
     // Load the primary with full path and the first extension without full path.
-    load_ok = load(base_location + ':' + mid_name);
+    load_ok = load(ART_FORMAT("{}:{}", base_location, mid_name));
     ASSERT_TRUE(load_ok) << error_msg;  // Loaded successfully.
     ASSERT_EQ(mid_bcp.size(), boot_image_spaces.size());  // Including the extension.
 
     // Load all the libcore images without paths.
-    load_ok = load(base_name + ':' + mid_name + ':' + tail_name);
+    load_ok = load(ART_FORMAT("{}:{}:{}", base_name, mid_name, tail_name));
     ASSERT_TRUE(load_ok) << error_msg;
     ASSERT_EQ(full_bcp.size(), boot_image_spaces.size());
 
     // Load the primary and first extension with full paths and second extension by name.
-    load_ok = load(base_location + ':' + mid_location + ':' + tail_name);
+    load_ok = load(ART_FORMAT("{}:{}:{}", base_location, mid_location, tail_name));
     ASSERT_TRUE(load_ok) << error_msg;
     ASSERT_EQ(full_bcp.size(), boot_image_spaces.size());
 
     // Load the primary with full path, first extension without path,
     // and second extension with full path.
-    load_ok = load(base_location + ':' + mid_name + ':' + tail_location);
+    load_ok = load(ART_FORMAT("{}:{}:{}", base_location, mid_name, tail_location));
     ASSERT_TRUE(load_ok) << error_msg;  // Loaded successfully.
     ASSERT_EQ(full_bcp.size(), boot_image_spaces.size());  // Including both extensions.
 
@@ -552,18 +579,18 @@ TEST_F(Dex2oatImageTest, TestExtension) {
     ASSERT_EQ(full_bcp.size(), boot_image_spaces.size());
 
     // Fail to load any images with invalid image locations (named component after search paths).
-    load_ok = silent_load(base_location + ":*:" + tail_location);
+    load_ok = silent_load(ART_FORMAT("{}:*:{}", base_location, tail_location));
     ASSERT_FALSE(load_ok);
-    load_ok = silent_load(base_location + ':' + scratch_dir + "*:" + tail_location);
+    load_ok = silent_load(ART_FORMAT("{}:{}*:{}", base_location, scratch_dir, tail_location));
     ASSERT_FALSE(load_ok);
 
     // Load the primary and single-image extension with full path.
-    load_ok = load(base_location + ':' + single_location);
+    load_ok = load(ART_FORMAT("{}:{}", base_location, single_location));
     ASSERT_TRUE(load_ok) << error_msg;
     ASSERT_EQ(head_dex_files.size() + 1u, boot_image_spaces.size());
 
     // Load the primary with full path and single-image extension with a specified search path.
-    load_ok = load(base_location + ':' + single_dir + '*');
+    load_ok = load(ART_FORMAT("{}:{}*", base_location, single_dir));
     ASSERT_TRUE(load_ok) << error_msg;
     ASSERT_EQ(head_dex_files.size() + 1u, boot_image_spaces.size());
   }
@@ -594,30 +621,32 @@ TEST_F(Dex2oatImageTest, TestExtension) {
   for (bool r : { false, true }) {
     relocate = r;
 
-    // Try and fail to load everything as compiled extension.
-    bool load_ok = silent_load(base_location + "!" + single_profile_filename);
-    ASSERT_FALSE(load_ok);
+    // Load primary boot image with a profile name.
+    bool load_ok = silent_load(ART_FORMAT("{}!{}", base_location, single_profile_filename));
+    ASSERT_TRUE(load_ok);
 
     // Try and fail to load with invalid spec, two profile name separators.
-    load_ok = silent_load(base_location + ":" + single_location + "!!arbitrary-profile-name");
+    load_ok =
+        silent_load(ART_FORMAT("{}:{}!!arbitrary-profile-name", base_location, single_location));
     ASSERT_FALSE(load_ok);
 
     // Try and fail to load with invalid spec, missing profile name.
-    load_ok = silent_load(base_location + ":" + single_location + "!");
+    load_ok = silent_load(ART_FORMAT("{}:{}!", base_location, single_location));
     ASSERT_FALSE(load_ok);
 
     // Try and fail to load with invalid spec, missing component name.
-    load_ok = silent_load(base_location + ":!" + single_profile_filename);
+    load_ok = silent_load(ART_FORMAT("{}:!{}", base_location, single_profile_filename));
     ASSERT_FALSE(load_ok);
 
     // Load primary boot image, specifying invalid extension component and profile name.
-    load_ok = load(base_location + ":/non-existent/" + single_name + "!non-existent-profile-name");
+    load_ok = load(
+        ART_FORMAT("{}:/non-existent/{}!non-existent-profile-name", base_location, single_name));
     ASSERT_TRUE(load_ok) << error_msg;
     ASSERT_EQ(head_dex_files.size(), boot_image_spaces.size());
 
     // Load primary boot image and the single extension, specifying invalid profile name.
     // (Load extension from file.)
-    load_ok = load(base_location + ":" + single_location + "!non-existent-profile-name");
+    load_ok = load(ART_FORMAT("{}:{}!non-existent-profile-name", base_location, single_location));
     ASSERT_TRUE(load_ok) << error_msg;
     ASSERT_EQ(head_dex_files.size() + 1u, boot_image_spaces.size());
     ASSERT_EQ(single_dex_files.size(),
@@ -627,7 +656,8 @@ TEST_F(Dex2oatImageTest, TestExtension) {
     // invalid extension component name but a valid profile file.
     // (Running dex2oat to compile extension is disabled.)
     ASSERT_FALSE(Runtime::Current()->IsImageDex2OatEnabled());
-    load_ok = load(base_location + ":/non-existent/" + single_name + "!" + single_profile_filename);
+    load_ok = load(
+        ART_FORMAT("{}:/non-existent/{}!{}", base_location, single_name, single_profile_filename));
     ASSERT_TRUE(load_ok) << error_msg;
     ASSERT_EQ(head_dex_files.size(), boot_image_spaces.size());
 
@@ -635,7 +665,8 @@ TEST_F(Dex2oatImageTest, TestExtension) {
 
     // Load primary boot image and the single extension, specifying invalid extension
     // component name but a valid profile file. (Compile extension by running dex2oat.)
-    load_ok = load(base_location + ":/non-existent/" + single_name + "!" + single_profile_filename);
+    load_ok = load(
+        ART_FORMAT("{}:/non-existent/{}!{}", base_location, single_name, single_profile_filename));
     ASSERT_TRUE(load_ok) << error_msg;
     ASSERT_EQ(head_dex_files.size() + 1u, boot_image_spaces.size());
     ASSERT_EQ(single_dex_files.size(),
@@ -643,8 +674,12 @@ TEST_F(Dex2oatImageTest, TestExtension) {
 
     // Load primary boot image and two extensions, specifying invalid extension component
     // names but valid profile files. (Compile extensions by running dex2oat.)
-    load_ok = load(base_location + ":/non-existent/" + mid_name + "!" + mid_profile_filename
-                                 + ":/non-existent/" + tail_name + "!" + tail_profile_filename);
+    load_ok = load(ART_FORMAT("{}:/non-existent/{}!{}:/non-existent/{}!{}",
+                              base_location,
+                              mid_name,
+                              mid_profile_filename,
+                              tail_name,
+                              tail_profile_filename));
     ASSERT_TRUE(load_ok) << error_msg;
     ASSERT_EQ(head_dex_files.size() + 2u, boot_image_spaces.size());
     ASSERT_EQ(mid_dex_files.size(),
@@ -655,8 +690,11 @@ TEST_F(Dex2oatImageTest, TestExtension) {
     // Load primary boot image and fail to load extensions, specifying invalid component
     // names but valid profile file only for the second one. As we fail to load the first
     // extension, the second extension has a missing dependency and cannot be compiled.
-    load_ok = load(base_location + ":/non-existent/" + mid_name
-                                 + ":/non-existent/" + tail_name + "!" + tail_profile_filename);
+    load_ok = load(ART_FORMAT("{}:/non-existent/{}:/non-existent/{}!{}",
+                              base_location,
+                              mid_name,
+                              tail_name,
+                              tail_profile_filename));
     ASSERT_TRUE(load_ok) << error_msg;
     ASSERT_EQ(head_dex_files.size(), boot_image_spaces.size());
 

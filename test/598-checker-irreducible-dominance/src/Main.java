@@ -15,11 +15,8 @@
  */
 
 public class Main {
-  // Workaround for b/18051191.
-  class InnerClass {}
-
-  public static void main(String[] args) {
-    // Nothing to run. This regression test merely makes sure the smali test
-    // case successfully compiles.
-  }
+    public static void main(String[] args) {
+        // Nothing to run. This regression test merely makes sure the smali test
+        // case successfully compiles.
+    }
 }

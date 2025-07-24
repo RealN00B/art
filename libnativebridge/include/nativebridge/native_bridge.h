@@ -29,13 +29,23 @@ namespace android {
 extern "C" {
 #endif  // __cplusplus
 
+enum JNICallType {
+  kJNICallTypeRegular = 1,
+  kJNICallTypeCriticalNative = 2,
+};
+
+// Loads a shared library from the system linker namespace, suitable for
+// platform libraries in /system/lib(64). If linker namespaces don't exist (i.e.
+// on host), this simply calls dlopen().
+void* OpenSystemLibrary(const char* path, int flags);
+
 struct NativeBridgeRuntimeCallbacks;
 struct NativeBridgeRuntimeValues;
 
 // Function pointer type for sigaction. This is mostly the signature of a signal handler, except
 // for the return type. The runtime needs to know whether the signal was handled or should be given
 // to the chain.
-typedef bool (*NativeBridgeSignalHandlerFn)(int, siginfo_t*, void*);
+typedef bool (*NativeBridgeSignalHandlerFn)(int, siginfo_t*, void*);  // NOLINT
 
 // Open the native bridge, if any. Should be called by Runtime::Init(). A null library filename
 // signals that we do not want to load a native bridge.
@@ -76,7 +86,19 @@ bool NativeBridgeInitialized();
 void* NativeBridgeLoadLibrary(const char* libpath, int flag);
 
 // Get a native bridge trampoline for specified native method.
+// This version is deprecated - please use NativeBridgeGetTrampoline2
 void* NativeBridgeGetTrampoline(void* handle, const char* name, const char* shorty, uint32_t len);
+
+void* NativeBridgeGetTrampoline2(void* handle,
+                                 const char* name,
+                                 const char* shorty,
+                                 uint32_t len,
+                                 enum JNICallType jni_call_type);
+
+void* NativeBridgeGetTrampolineForFunctionPointer(const void* method,
+                                                  const char* shorty,
+                                                  uint32_t len,
+                                                  enum JNICallType jni_call_type);
 
 // True if native library paths are valid and is for an ABI that is supported by native bridge.
 // The *libpath* must point to a library.
@@ -123,18 +145,6 @@ struct native_bridge_namespace_t;
 // Starting with v3, NativeBridge has two scenarios: with/without namespace.
 // Use NativeBridgeIsSupported() instead in non-namespace scenario.
 bool NativeBridgeIsPathSupported(const char* path);
-
-// Initializes anonymous namespace.
-// NativeBridge's peer of android_init_anonymous_namespace() of dynamic linker.
-//
-// The anonymous namespace is used in the case when a NativeBridge implementation
-// cannot identify the caller of dlopen/dlsym which happens for the code not loaded
-// by dynamic linker; for example calls from the mono-compiled code.
-//
-// Starting with v3, NativeBridge has two scenarios: with/without namespace.
-// Should not use in non-namespace scenario.
-bool NativeBridgeInitAnonymousNamespace(const char* public_ns_sonames,
-                                        const char* anon_ns_library_path);
 
 // Create new namespace in which native libraries will be loaded.
 // NativeBridge's peer of android_create_namespace() of dynamic linker.
@@ -201,7 +211,7 @@ struct NativeBridgeCallbacks {
   void* (*loadLibrary)(const char* libpath, int flag);
 
   // Get a native bridge trampoline for specified native method. The trampoline has same
-  // sigature as the native method.
+  // signature as the native method.
   //
   // Parameters:
   //   handle [IN] the handle returned from loadLibrary
@@ -209,6 +219,9 @@ struct NativeBridgeCallbacks {
   //   len [IN] length of shorty
   // Returns:
   //   address of trampoline if successful, otherwise NULL
+  // Deprecated in v7
+  //   Starting with version 7 native bridge uses getTrampolineWithJNICallType
+  //   instead
   void* (*getTrampoline)(void* handle, const char* name, const char* shorty, uint32_t len);
 
   // Check whether native library is valid and is for an ABI that is supported by native bridge.
@@ -289,23 +302,8 @@ struct NativeBridgeCallbacks {
   // Use isSupported instead in non-namespace scenario.
   bool (*isPathSupported)(const char* library_path);
 
-  // Initializes anonymous namespace at native bridge side.
-  // NativeBridge's peer of android_init_anonymous_namespace() of dynamic linker.
-  //
-  // The anonymous namespace is used in the case when a NativeBridge implementation
-  // cannot identify the caller of dlopen/dlsym which happens for the code not loaded
-  // by dynamic linker; for example calls from the mono-compiled code.
-  //
-  // Parameters:
-  //   public_ns_sonames [IN] the name of "public" libraries.
-  //   anon_ns_library_path [IN] the library search path of (anonymous) namespace.
-  // Returns:
-  //   true if the pass is ok.
-  //   Otherwise, false.
-  //
-  // Starting with v3, NativeBridge has two scenarios: with/without namespace.
-  // Should not use in non-namespace scenario.
-  bool (*initAnonymousNamespace)(const char* public_ns_sonames, const char* anon_ns_library_path);
+  // No longer used.
+  bool (*unused_initAnonymousNamespace)(const char*, const char*);
 
   // Create new namespace in which native libraries will be loaded.
   // NativeBridge's peer of android_create_namespace() of dynamic linker.
@@ -382,6 +380,39 @@ struct NativeBridgeCallbacks {
   // If native bridge is used in app-zygote (in doPreload()) this callback is
   // required to clean-up the environment before the fork (see b/146904103).
   void (*preZygoteFork)();
+
+  // This replaces previous getTrampoline call starting with version 7 of the
+  // interface.
+  //
+  // Get a native bridge trampoline for specified native method. The trampoline
+  // has same signature as the native method.
+  //
+  // Parameters:
+  //   handle [IN] the handle returned from loadLibrary
+  //   shorty [IN] short descriptor of native method
+  //   len [IN] length of shorty
+  //   jni_call_type [IN] the type of JNI call
+  // Returns:
+  //   address of trampoline if successful, otherwise NULL
+  void* (*getTrampolineWithJNICallType)(void* handle,
+                                        const char* name,
+                                        const char* shorty,
+                                        uint32_t len,
+                                        enum JNICallType jni_call_type);
+
+  // Get a native bridge trampoline for specified native method implementation pointer.
+  //
+  // Parameters:
+  //   method [IN] pointer to method implementation (ususally registered via call to
+  //   RegisterNatives).
+  //   shorty [IN] short descriptor of native method len [IN] length of shorty
+  //   jni_call_type [IN] the type of JNI call
+  // Returns:
+  //   address of trampoline if successful, otherwise NULL
+  void* (*getTrampolineForFunctionPointer)(const void* method,
+                                           const char* shorty,
+                                           uint32_t len,
+                                           enum JNICallType jni_call_type);
 };
 
 // Runtime interfaces to native bridge.

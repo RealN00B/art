@@ -25,7 +25,11 @@
 #include "obj_ptr.h"
 #include "reference_table.h"
 
-namespace art {
+namespace art HIDDEN {
+
+namespace linker {
+class ImageWriter;
+}  // namespace linker
 
 namespace mirror {
 class Array;
@@ -37,6 +41,7 @@ class Libraries;
 class ParsedOptions;
 class Runtime;
 struct RuntimeArgumentMap;
+class ScopedObjectAccess;
 
 class JavaVMExt;
 // Hook definition for runtime plugins.
@@ -98,11 +103,11 @@ class JavaVMExt : public JavaVM {
    * Returns 'true' on success. On failure, sets 'error_msg' to a
    * human-readable description of the error.
    */
-  bool LoadNativeLibrary(JNIEnv* env,
-                         const std::string& path,
-                         jobject class_loader,
-                         jclass caller_class,
-                         std::string* error_msg);
+  EXPORT bool LoadNativeLibrary(JNIEnv* env,
+                                const std::string& path,
+                                jobject class_loader,
+                                jclass caller_class,
+                                std::string* error_msg);
 
   // Unload native libraries with cleared class loaders.
   void UnloadNativeLibraries()
@@ -118,7 +123,7 @@ class JavaVMExt : public JavaVM {
    * Returns a pointer to the code for the native method 'm', found
    * using dlsym(3) on every native library that's been loaded so far.
    */
-  void* FindCodeForNativeMethod(ArtMethod* m)
+  void* FindCodeForNativeMethod(ArtMethod* m, std::string* error_msg, bool can_suspend)
       REQUIRES_SHARED(Locks::mutator_lock_);
 
   void DumpForSigQuit(std::ostream& os)
@@ -134,7 +139,7 @@ class JavaVMExt : public JavaVM {
 
   bool SetCheckJniEnabled(bool enabled);
 
-  void VisitRoots(RootVisitor* visitor) REQUIRES_SHARED(Locks::mutator_lock_)
+  EXPORT void VisitRoots(RootVisitor* visitor) REQUIRES_SHARED(Locks::mutator_lock_)
       REQUIRES(!Locks::jni_globals_lock_);
 
   void DisallowNewWeakGlobals()
@@ -146,21 +151,21 @@ class JavaVMExt : public JavaVM {
   void BroadcastForNewWeakGlobals()
       REQUIRES(!Locks::jni_weak_globals_lock_);
 
-  jobject AddGlobalRef(Thread* self, ObjPtr<mirror::Object> obj)
-      REQUIRES_SHARED(Locks::mutator_lock_)
-      REQUIRES(!Locks::jni_globals_lock_);
+  EXPORT jobject AddGlobalRef(Thread* self, ObjPtr<mirror::Object> obj)
+      REQUIRES_SHARED(Locks::mutator_lock_) REQUIRES(!Locks::jni_globals_lock_);
 
-  jweak AddWeakGlobalRef(Thread* self, ObjPtr<mirror::Object> obj)
-      REQUIRES_SHARED(Locks::mutator_lock_)
-      REQUIRES(!Locks::jni_weak_globals_lock_);
+  EXPORT jweak AddWeakGlobalRef(Thread* self, ObjPtr<mirror::Object> obj)
+      REQUIRES_SHARED(Locks::mutator_lock_) REQUIRES(!Locks::jni_weak_globals_lock_);
 
-  void DeleteGlobalRef(Thread* self, jobject obj) REQUIRES(!Locks::jni_globals_lock_);
+  EXPORT void DeleteGlobalRef(Thread* self, jobject obj) REQUIRES(!Locks::jni_globals_lock_);
 
-  void DeleteWeakGlobalRef(Thread* self, jweak obj) REQUIRES(!Locks::jni_weak_globals_lock_);
+  EXPORT void DeleteWeakGlobalRef(Thread* self, jweak obj) REQUIRES(!Locks::jni_weak_globals_lock_);
 
   void SweepJniWeakGlobals(IsMarkedVisitor* visitor)
       REQUIRES_SHARED(Locks::mutator_lock_)
-      REQUIRES(!Locks::jni_weak_globals_lock_);
+      REQUIRES(!Locks::jni_weak_globals_lock_) {
+    weak_globals_.SweepJniWeakGlobals(visitor);
+  }
 
   ObjPtr<mirror::Object> DecodeGlobal(IndirectRef ref)
       REQUIRES_SHARED(Locks::mutator_lock_);
@@ -176,6 +181,11 @@ class JavaVMExt : public JavaVM {
   ObjPtr<mirror::Object> DecodeWeakGlobalLocked(Thread* self, IndirectRef ref)
       REQUIRES_SHARED(Locks::mutator_lock_)
       REQUIRES(Locks::jni_weak_globals_lock_);
+
+  // Decode weak global as strong. Use only if the target object is known to be alive.
+  ObjPtr<mirror::Object> DecodeWeakGlobalAsStrong(IndirectRef ref)
+      REQUIRES_SHARED(Locks::mutator_lock_)
+      REQUIRES(!Locks::jni_weak_globals_lock_);
 
   // Like DecodeWeakGlobal() but to be used only during a runtime shutdown where self may be
   // null.
@@ -199,9 +209,10 @@ class JavaVMExt : public JavaVM {
   void TrimGlobals() REQUIRES_SHARED(Locks::mutator_lock_)
       REQUIRES(!Locks::jni_globals_lock_);
 
-  jint HandleGetEnv(/*out*/void** env, jint version);
+  jint HandleGetEnv(/*out*/void** env, jint version)
+      REQUIRES(!env_hooks_lock_);
 
-  void AddEnvironmentHook(GetEnvHook hook);
+  EXPORT void AddEnvironmentHook(GetEnvHook hook) REQUIRES(!env_hooks_lock_);
 
   static bool IsBadJniVersion(int version);
 
@@ -211,17 +222,24 @@ class JavaVMExt : public JavaVM {
   static jstring GetLibrarySearchPath(JNIEnv* env, jobject class_loader);
 
  private:
-  // The constructor should not be called directly. It may leave the object in
-  // an erroneous state, and the result needs to be checked.
-  JavaVMExt(Runtime* runtime, const RuntimeArgumentMap& runtime_options, std::string* error_msg);
+  // The constructor should not be called directly. Use `Create()` that initializes
+  // the new `JavaVMExt` object by calling `Initialize()`.
+  JavaVMExt(Runtime* runtime, const RuntimeArgumentMap& runtime_options);
+
+  // Initialize the `JavaVMExt` object.
+  bool Initialize(std::string* error_msg);
 
   // Return true if self can currently access weak globals.
-  bool MayAccessWeakGlobalsUnlocked(Thread* self) const REQUIRES_SHARED(Locks::mutator_lock_);
-  bool MayAccessWeakGlobals(Thread* self) const
+  bool MayAccessWeakGlobals(Thread* self) const REQUIRES_SHARED(Locks::mutator_lock_);
+
+  void WaitForWeakGlobalsAccess(Thread* self)
       REQUIRES_SHARED(Locks::mutator_lock_)
       REQUIRES(Locks::jni_weak_globals_lock_);
 
   void CheckGlobalRefAllocationTracking();
+
+  inline void MaybeTraceGlobals() REQUIRES(Locks::jni_globals_lock_);
+  inline void MaybeTraceWeakGlobals() REQUIRES(Locks::jni_weak_globals_lock_);
 
   Runtime* const runtime_;
 
@@ -237,7 +255,6 @@ class JavaVMExt : public JavaVM {
   // Extra diagnostics.
   const std::string trace_;
 
-  // Not guarded by globals_lock since we sometimes use SynchronizedGet in Thread::DecodeJObject.
   IndirectReferenceTable globals_;
 
   // No lock annotation since UnloadNativeLibraries is called on libraries_ but locks the
@@ -249,19 +266,29 @@ class JavaVMExt : public JavaVM {
 
   // Since weak_globals_ contain weak roots, be careful not to
   // directly access the object references in it. Use Get() with the
-  // read barrier enabled.
-  // Not guarded by weak_globals_lock since we may use SynchronizedGet in DecodeWeakGlobal.
+  // read barrier enabled or disabled based on the use case.
   IndirectReferenceTable weak_globals_;
-  // Not guarded by weak_globals_lock since we may use SynchronizedGet in DecodeWeakGlobal.
   Atomic<bool> allow_accessing_weak_globals_;
   ConditionVariable weak_globals_add_condition_ GUARDED_BY(Locks::jni_weak_globals_lock_);
 
   // TODO Maybe move this to Runtime.
-  std::vector<GetEnvHook> env_hooks_;
+  ReaderWriterMutex env_hooks_lock_ BOTTOM_MUTEX_ACQUIRED_AFTER;
+  std::vector<GetEnvHook> env_hooks_ GUARDED_BY(env_hooks_lock_);
 
   size_t enable_allocation_tracking_delta_;
   std::atomic<bool> allocation_tracking_enabled_;
   std::atomic<bool> old_allocation_tracking_state_;
+
+  // We report the number of global references after every kGlobalRefReportInterval changes.
+  static constexpr uint32_t kGlobalRefReportInterval = 17;
+  uint32_t weak_global_ref_report_counter_ GUARDED_BY(Locks::jni_weak_globals_lock_)
+      = kGlobalRefReportInterval;
+  uint32_t global_ref_report_counter_ GUARDED_BY(Locks::jni_globals_lock_)
+      = kGlobalRefReportInterval;
+
+  friend class linker::ImageWriter;  // Uses `globals_` and `weak_globals_` without read barrier.
+  friend IndirectReferenceTable* GetIndirectReferenceTable(ScopedObjectAccess& soa,
+                                                           IndirectRefKind kind);
 
   DISALLOW_COPY_AND_ASSIGN(JavaVMExt);
 };

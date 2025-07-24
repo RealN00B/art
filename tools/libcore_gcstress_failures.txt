@@ -13,14 +13,15 @@
 {
   description: "Timeouts.",
   result: EXEC_FAILED,
-  names: ["libcore.java.lang.ref.ReferenceQueueTest#testRemoveWithDelayedResultAndNoTimeout"]
+  bug: 187140709,
+  names: ["libcore.java.lang.ref.ReferenceQueueTest#testRemoveWithDelayedResultAndNoTimeout",
+          "libcore.java.lang.ref.ReferenceQueueTest#testRemoveWithDelayedResultAndTimeout"]
 },
 {
   description: "Timeouts.",
   result: EXEC_FAILED,
   modes: [host],
-  names: ["libcore.java.lang.ref.ReferenceQueueTest#testRemoveWithDelayedResultAndTimeout",
-          "org.apache.harmony.luni.tests.internal.net.www.protocol.http.HttpURLConnectionTest#testGetOutputStream",
+  names: ["org.apache.harmony.luni.tests.internal.net.www.protocol.http.HttpURLConnectionTest#testGetOutputStream",
           "org.apache.harmony.luni.tests.internal.net.www.protocol.http.HttpURLConnectionTest#testProxyAuthorization"]
 },
 {
@@ -28,13 +29,33 @@
   result: EXEC_FAILED,
   modes: [device],
   names: ["jsr166.TimeUnitTest#testConvert",
+          "libcore.java.lang.invoke.MethodHandleCombinersTest#testCollectorMultiThreaded",
+          "libcore.java.lang.invoke.MethodHandleCombinersTest#testCollectArgumentsMultiThreaded",
+          "libcore.java.lang.invoke.MethodHandleCombinersTest#testConstantMultithreaded",
+          "libcore.java.lang.invoke.MethodHandleCombinersTest#testGuardWithTestMultiThreaded",
+          "libcore.java.lang.invoke.MethodHandleCombinersTest#testPermuteArgumentsMultiThreaded",
+          "libcore.java.lang.invoke.MethodHandleCombinersTest#testReferenceArrayGetterMultiThreaded",
           "libcore.java.lang.StringTest#testFastPathString_wellFormedUtf8Sequence",
-          "libcore.java.text.DecimalFormatTest#testCurrencySymbolSpacing",
+          "libcore.java.math.BigIntegerTest#test_Constructor_IILjava_util_Random",
+          "libcore.java.math.BigIntegerTest#test_probablePrime",
           "libcore.java.text.SimpleDateFormatTest#testLocales",
+          "libcore.java.util.stream.CollectorsTest#counting_largeStream",
           "org.apache.harmony.tests.java.lang.ref.ReferenceQueueTest#test_remove",
           "org.apache.harmony.tests.java.lang.String2Test#test_getBytes",
           "org.apache.harmony.tests.java.text.DateFormatTest#test_getAvailableLocales",
           "org.apache.harmony.tests.java.util.TimerTest#testOverdueTaskExecutesImmediately",
-          "org.apache.harmony.tests.java.util.WeakHashMapTest#test_keySet_hasNext"]
+          "org.apache.harmony.tests.java.util.WeakHashMapTest#test_keySet_hasNext",
+          "test.java.math.BigDecimal.DivideMcTests#mcDivideTests",
+          "test.java.math.BigInteger.BigIntegerTest#testConstructor",
+          "test.java.util.Collections.RacingCollections#main"]
+},
+{
+  description: "Timeouts.",
+  result: EXEC_FAILED,
+  bug: 157520256,
+  modes: [device],
+  names: ["jsr166.ForkJoinPoolTest#testIsQuiescent",
+          "org.apache.harmony.tests.java.util.regex.MatcherTest#testAllCodePoints_P",
+          "org.apache.harmony.tests.java.util.regex.MatcherTest#testAllCodePoints_p"]
 }
 ]

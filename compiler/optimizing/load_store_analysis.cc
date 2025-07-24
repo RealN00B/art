@@ -16,7 +16,10 @@
 
 #include "load_store_analysis.h"
 
-namespace art {
+#include "base/scoped_arena_allocator.h"
+#include "optimizing/escape.h"
+
+namespace art HIDDEN {
 
 // A cap for the number of heap locations to prevent pathological time/space consumption.
 // The number of heap locations for most of the methods stays below this threshold.
@@ -38,7 +41,7 @@ static bool CanBinaryOpAndIndexAlias(const HBinaryOperation* idx1,
     // We currently only support Add and Sub operations.
     return true;
   }
-  if (idx1->AsBinaryOperation()->GetLeastConstantLeft() != idx2) {
+  if (idx1->GetLeastConstantLeft() != idx2) {
     // Cannot analyze [i+CONST1] and [j].
     return true;
   }
@@ -48,9 +51,9 @@ static bool CanBinaryOpAndIndexAlias(const HBinaryOperation* idx1,
 
   // Since 'i' are the same in [i+CONST] and [i],
   // further compare [CONST] and [0].
-  int64_t l1 = idx1->IsAdd() ?
-               idx1->GetConstantRight()->AsIntConstant()->GetValue() :
-               -idx1->GetConstantRight()->AsIntConstant()->GetValue();
+  int64_t l1 = idx1->IsAdd()
+      ? idx1->GetConstantRight()->AsIntConstant()->GetValue()
+      : -idx1->GetConstantRight()->AsIntConstant()->GetValue();
   int64_t l2 = 0;
   int64_t h1 = l1 + (vector_length1 - 1);
   int64_t h2 = l2 + (vector_length2 - 1);
@@ -65,8 +68,7 @@ static bool CanBinaryOpsAlias(const HBinaryOperation* idx1,
     // We currently only support Add and Sub operations.
     return true;
   }
-  if (idx1->AsBinaryOperation()->GetLeastConstantLeft() !=
-      idx2->AsBinaryOperation()->GetLeastConstantLeft()) {
+  if (idx1->GetLeastConstantLeft() != idx2->GetLeastConstantLeft()) {
     // Cannot analyze [i+CONST1] and [j+CONST2].
     return true;
   }
@@ -77,15 +79,56 @@ static bool CanBinaryOpsAlias(const HBinaryOperation* idx1,
 
   // Since 'i' are the same in [i+CONST1] and [i+CONST2],
   // further compare [CONST1] and [CONST2].
-  int64_t l1 = idx1->IsAdd() ?
-               idx1->GetConstantRight()->AsIntConstant()->GetValue() :
-               -idx1->GetConstantRight()->AsIntConstant()->GetValue();
-  int64_t l2 = idx2->IsAdd() ?
-               idx2->GetConstantRight()->AsIntConstant()->GetValue() :
-               -idx2->GetConstantRight()->AsIntConstant()->GetValue();
+  int64_t l1 = idx1->IsAdd()
+      ? idx1->GetConstantRight()->AsIntConstant()->GetValue()
+      : -idx1->GetConstantRight()->AsIntConstant()->GetValue();
+  int64_t l2 = idx2->IsAdd()
+      ? idx2->GetConstantRight()->AsIntConstant()->GetValue()
+      : -idx2->GetConstantRight()->AsIntConstant()->GetValue();
   int64_t h1 = l1 + (vector_length1 - 1);
   int64_t h2 = l2 + (vector_length2 - 1);
   return CanIntegerRangesOverlap(l1, h1, l2, h2);
+}
+
+bool HeapLocationCollector::InstructionEligibleForLSERemoval(HInstruction* inst) const {
+  if (inst->IsNewInstance()) {
+    return !inst->AsNewInstance()->NeedsChecks();
+  } else if (inst->IsNewArray()) {
+    HInstruction* array_length = inst->AsNewArray()->GetLength();
+    bool known_array_length =
+        array_length->IsIntConstant() && array_length->AsIntConstant()->GetValue() >= 0;
+    return known_array_length &&
+           std::all_of(inst->GetUses().cbegin(),
+                       inst->GetUses().cend(),
+                       [&](const HUseListNode<HInstruction*>& user) {
+                         if (user.GetUser()->IsArrayGet() || user.GetUser()->IsArraySet()) {
+                           return user.GetUser()->InputAt(1)->IsIntConstant();
+                         }
+                         return true;
+                       });
+  } else {
+    return false;
+  }
+}
+
+void HeapLocationCollector::DumpReferenceStats(OptimizingCompilerStats* stats) {
+  if (stats == nullptr) {
+    return;
+  }
+  std::vector<bool> seen_instructions(GetGraph()->GetCurrentInstructionId(), false);
+  for (auto hl : heap_locations_) {
+    auto ri = hl->GetReferenceInfo();
+    if (ri == nullptr || seen_instructions[ri->GetReference()->GetId()]) {
+      continue;
+    }
+    auto instruction = ri->GetReference();
+    seen_instructions[instruction->GetId()] = true;
+    if (ri->IsSingletonAndRemovable()) {
+      if (InstructionEligibleForLSERemoval(instruction)) {
+        MaybeRecordStat(stats, MethodCompilationStat::kFullLSEPossible);
+      }
+    }
+  }
 }
 
 bool HeapLocationCollector::CanArrayElementsAlias(const HInstruction* idx1,
@@ -149,6 +192,13 @@ bool HeapLocationCollector::CanArrayElementsAlias(const HInstruction* idx1,
 }
 
 bool LoadStoreAnalysis::Run() {
+  // Currently load_store analysis can't handle predicated load/stores; specifically pairs of
+  // memory operations with different predicates.
+  // TODO: support predicated SIMD.
+  if (graph_->HasPredicatedSIMD()) {
+    return false;
+  }
+
   for (HBasicBlock* block : graph_->GetReversePostOrder()) {
     heap_location_collector_.VisitBasicBlock(block);
   }
@@ -163,15 +213,8 @@ bool LoadStoreAnalysis::Run() {
     heap_location_collector_.CleanUp();
     return false;
   }
-  if (heap_location_collector_.HasVolatile() || heap_location_collector_.HasMonitorOps()) {
-    // Don't do load/store elimination if the method has volatile field accesses or
-    // monitor operations, for now.
-    // TODO: do it right.
-    heap_location_collector_.CleanUp();
-    return false;
-  }
-
   heap_location_collector_.BuildAliasingMatrix();
+  heap_location_collector_.DumpReferenceStats(stats_);
   return true;
 }
 

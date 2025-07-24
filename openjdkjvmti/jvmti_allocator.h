@@ -46,13 +46,13 @@ template <typename T> class JvmtiAllocator;
 template <>
 class JvmtiAllocator<void> {
  public:
-  typedef void value_type;
-  typedef void* pointer;
-  typedef const void* const_pointer;
+  using value_type = void;
+  using pointer = void*;
+  using const_pointer = const void*;
 
   template <typename U>
   struct rebind {
-    typedef JvmtiAllocator<U> other;
+    using other = JvmtiAllocator<U>;
   };
 
   explicit JvmtiAllocator(jvmtiEnv* env) : env_(env) {}
@@ -79,17 +79,17 @@ class JvmtiAllocator<void> {
 template <typename T>
 class JvmtiAllocator {
  public:
-  typedef T value_type;
-  typedef T* pointer;
-  typedef T& reference;
-  typedef const T* const_pointer;
-  typedef const T& const_reference;
-  typedef size_t size_type;
-  typedef ptrdiff_t difference_type;
+  using value_type = T;
+  using pointer = T*;
+  using reference = T&;
+  using const_pointer = const T*;
+  using const_reference = const T&;
+  using size_type = size_t;
+  using difference_type = ptrdiff_t;
 
   template <typename U>
   struct rebind {
-    typedef JvmtiAllocator<U> other;
+    using other = JvmtiAllocator<U>;
   };
 
   explicit JvmtiAllocator(jvmtiEnv* env) : env_(env) {}
@@ -110,7 +110,7 @@ class JvmtiAllocator {
   pointer address(reference x) const { return &x; }
   const_pointer address(const_reference x) const { return &x; }
 
-  pointer allocate(size_type n, JvmtiAllocator<void>::pointer hint ATTRIBUTE_UNUSED = nullptr) {
+  pointer allocate(size_type n, [[maybe_unused]] JvmtiAllocator<void>::pointer hint = nullptr) {
     DCHECK_LE(n, max_size());
     if (env_ == nullptr) {
       T* result = reinterpret_cast<T*>(AllocUtil::AllocateImpl(n * sizeof(T)));
@@ -123,7 +123,7 @@ class JvmtiAllocator {
       return reinterpret_cast<T*>(result);
     }
   }
-  void deallocate(pointer p, size_type n ATTRIBUTE_UNUSED) {
+  void deallocate(pointer p, [[maybe_unused]] size_type n) {
     if (env_ == nullptr) {
       AllocUtil::DeallocateImpl(reinterpret_cast<unsigned char*>(p));
     } else {

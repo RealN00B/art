@@ -21,7 +21,7 @@
 #include "art_method.h"
 #include "base/bit_utils.h"
 #include "base/malloc_arena_pool.h"
-#include "compiled_method-inl.h"
+#include "driver/compiled_method-inl.h"
 #include "driver/compiler_driver.h"
 #include "entrypoints/quick/quick_entrypoints_enum.h"
 #include "heap_poisoning.h"
@@ -29,11 +29,10 @@
 #include "lock_word.h"
 #include "mirror/array-inl.h"
 #include "mirror/object.h"
-#include "oat.h"
-#include "oat_quick_method_header.h"
+#include "oat/oat.h"
+#include "oat/oat_quick_method_header.h"
 #include "read_barrier.h"
 #include "stream/output_stream.h"
-#include "utils/arm64/assembler_arm64.h"
 
 namespace art {
 namespace linker {
@@ -62,13 +61,19 @@ inline bool IsAdrpPatch(const LinkerPatch& patch) {
     case LinkerPatch::Type::kBakerReadBarrierBranch:
       return false;
     case LinkerPatch::Type::kIntrinsicReference:
-    case LinkerPatch::Type::kDataBimgRelRo:
+    case LinkerPatch::Type::kBootImageRelRo:
     case LinkerPatch::Type::kMethodRelative:
+    case LinkerPatch::Type::kMethodAppImageRelRo:
     case LinkerPatch::Type::kMethodBssEntry:
+    case LinkerPatch::Type::kJniEntrypointRelative:
     case LinkerPatch::Type::kTypeRelative:
+    case LinkerPatch::Type::kTypeAppImageRelRo:
     case LinkerPatch::Type::kTypeBssEntry:
+    case LinkerPatch::Type::kPublicTypeBssEntry:
+    case LinkerPatch::Type::kPackageTypeBssEntry:
     case LinkerPatch::Type::kStringRelative:
     case LinkerPatch::Type::kStringBssEntry:
+    case LinkerPatch::Type::kMethodTypeBssEntry:
       return patch.LiteralOffset() == patch.PcInsnOffset();
   }
 }
@@ -249,27 +254,35 @@ void Arm64RelativePatcher::PatchPcRelativeReference(std::vector<uint8_t>* code,
   } else {
     if ((insn & 0xfffffc00) == 0x91000000) {
       // ADD immediate, 64-bit with imm12 == 0 (unset).
-      if (!kEmitCompilerReadBarrier) {
+      if (kUseBakerReadBarrier) {
         DCHECK(patch.GetType() == LinkerPatch::Type::kIntrinsicReference ||
                patch.GetType() == LinkerPatch::Type::kMethodRelative ||
                patch.GetType() == LinkerPatch::Type::kTypeRelative ||
                patch.GetType() == LinkerPatch::Type::kStringRelative) << patch.GetType();
       } else {
-        // With the read barrier (non-Baker) enabled, it could be kStringBssEntry or kTypeBssEntry.
+        // With the read barrier (non-Baker) enabled, it could be kStringBssEntry or k*TypeBssEntry.
         DCHECK(patch.GetType() == LinkerPatch::Type::kIntrinsicReference ||
                patch.GetType() == LinkerPatch::Type::kMethodRelative ||
                patch.GetType() == LinkerPatch::Type::kTypeRelative ||
                patch.GetType() == LinkerPatch::Type::kStringRelative ||
                patch.GetType() == LinkerPatch::Type::kTypeBssEntry ||
+               patch.GetType() == LinkerPatch::Type::kPublicTypeBssEntry ||
+               patch.GetType() == LinkerPatch::Type::kPackageTypeBssEntry ||
                patch.GetType() == LinkerPatch::Type::kStringBssEntry) << patch.GetType();
       }
       shift = 0u;  // No shift for ADD.
     } else {
       // LDR/STR 32-bit or 64-bit with imm12 == 0 (unset).
-      DCHECK(patch.GetType() == LinkerPatch::Type::kDataBimgRelRo ||
+      DCHECK(patch.GetType() == LinkerPatch::Type::kBootImageRelRo ||
+             patch.GetType() == LinkerPatch::Type::kMethodAppImageRelRo ||
              patch.GetType() == LinkerPatch::Type::kMethodBssEntry ||
+             patch.GetType() == LinkerPatch::Type::kJniEntrypointRelative ||
+             patch.GetType() == LinkerPatch::Type::kTypeAppImageRelRo ||
              patch.GetType() == LinkerPatch::Type::kTypeBssEntry ||
-             patch.GetType() == LinkerPatch::Type::kStringBssEntry) << patch.GetType();
+             patch.GetType() == LinkerPatch::Type::kPublicTypeBssEntry ||
+             patch.GetType() == LinkerPatch::Type::kPackageTypeBssEntry ||
+             patch.GetType() == LinkerPatch::Type::kStringBssEntry ||
+             patch.GetType() == LinkerPatch::Type::kMethodTypeBssEntry) << patch.GetType();
       DCHECK_EQ(insn & 0xbfbffc00, 0xb9000000) << std::hex << insn;
     }
     if (kIsDebugBuild) {

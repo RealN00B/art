@@ -29,7 +29,7 @@
 #include "mirror/object_reference.h"
 #include "offsets.h"
 
-namespace art {
+namespace art HIDDEN {
 
 class Thread;
 
@@ -39,13 +39,7 @@ class Object;
 }  // namespace mirror
 
 namespace gc {
-
 class Heap;
-
-namespace accounting {
-template <typename T> class AtomicStack;
-typedef AtomicStack<mirror::Object> ObjectStack;
-}  // namespace accounting
 
 namespace space {
 class ContinuousMemMapAllocSpace;
@@ -53,7 +47,6 @@ class ContinuousSpace;
 }  // namespace space
 
 namespace collector {
-
 class SemiSpace : public GarbageCollector {
  public:
   // If true, use remembered sets in the generational mode.
@@ -143,7 +136,7 @@ class SemiSpace : public GarbageCollector {
   void SweepLargeObjects(bool swap_bitmaps) REQUIRES(Locks::heap_bitmap_lock_);
 
   void SweepSystemWeaks()
-      REQUIRES_SHARED(Locks::heap_bitmap_lock_, Locks::mutator_lock_);
+      REQUIRES_SHARED(Locks::heap_bitmap_lock_) REQUIRES(Locks::mutator_lock_);
 
   void VisitRoots(mirror::Object*** roots, size_t count, const RootInfo& info) override
       REQUIRES(Locks::mutator_lock_, Locks::heap_bitmap_lock_);

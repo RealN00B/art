@@ -31,7 +31,7 @@
 #include "thread.h"
 #include "thread_list.h"
 
-namespace art {
+namespace art HIDDEN {
 namespace gc {
 namespace space {
 
@@ -152,7 +152,7 @@ RosAllocSpace* RosAllocSpace::Create(const std::string& name,
   // Note: making this value large means that large allocations are unlikely to succeed as rosalloc
   // will ask for this memory from sys_alloc which will fail as the footprint (this value plus the
   // size of the large allocation) will be greater than the footprint limit.
-  size_t starting_size = Heap::kDefaultStartingSize;
+  size_t starting_size = Heap::GetDefaultStartingSize();
   MemMap mem_map = CreateMemMap(name, starting_size, &initial_size, &growth_limit, &capacity);
   if (!mem_map.IsValid()) {
     LOG(ERROR) << "Failed to create mem map for alloc space (" << name << ") of size "
@@ -396,7 +396,7 @@ void RosAllocSpace::InspectAllRosAlloc(void (*callback)(void *start, void *end, 
     // The mutators are not suspended yet and we have a shared access
     // to the mutator lock. Temporarily release the shared access by
     // transitioning to the suspend state, and suspend the mutators.
-    ScopedThreadSuspension sts(self, kSuspended);
+    ScopedThreadSuspension sts(self, ThreadState::kSuspended);
     InspectAllRosAllocWithSuspendAll(callback, arg, do_null_callback_at_end);
   } else {
     // The mutators are not suspended yet. Suspend the mutators.

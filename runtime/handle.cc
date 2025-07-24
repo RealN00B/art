@@ -38,10 +38,11 @@
 #include "mirror/throwable.h"
 #include "mirror/var_handle.h"
 
-#include "class_root.h"
+#include "class_root-inl.h"
 
-namespace art {
+namespace art HIDDEN {
 
+// NOLINTBEGIN(bugprone-macro-parentheses)
 #define MAKE_OBJECT_FOR_GDB(ROOT, NAME, MIRROR)                 \
   template <> MIRROR* Handle<MIRROR>::GetFromGdb() {            \
     return Get();                                               \
@@ -53,5 +54,6 @@ namespace art {
 CLASS_MIRROR_ROOT_LIST(MAKE_OBJECT_FOR_GDB)
 
 #undef MAKE_OBJECT_FOR_GDB
+// NOLINTEND(bugprone-macro-parentheses)
 
 }  // namespace art

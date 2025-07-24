@@ -20,7 +20,7 @@
 #include "data_type.h"
 #include "dex/primitive.h"
 
-namespace art {
+namespace art HIDDEN {
 
 // Note: Not declared in data_type.h to avoid pulling in "primitive.h".
 constexpr DataType::Type DataTypeFromPrimitive(Primitive::Type type) {
@@ -36,8 +36,25 @@ constexpr DataType::Type DataTypeFromPrimitive(Primitive::Type type) {
     case Primitive::kPrimDouble: return DataType::Type::kFloat64;
     case Primitive::kPrimVoid: return DataType::Type::kVoid;
   }
-  LOG(FATAL) << "Unreachable";
-  UNREACHABLE();
+}
+
+// Note: Not declared in data_type.h to avoid pulling in "primitive.h".
+constexpr Primitive::Type DataTypeToPrimitive(DataType::Type type) {
+  switch (type) {
+    case DataType::Type::kReference: return Primitive::kPrimNot;
+    case DataType::Type::kBool: return Primitive::kPrimBoolean;
+    case DataType::Type::kInt8: return Primitive::kPrimByte;
+    case DataType::Type::kUint16: return Primitive::kPrimChar;
+    case DataType::Type::kInt16: return Primitive::kPrimShort;
+    case DataType::Type::kInt32: return Primitive::kPrimInt;
+    case DataType::Type::kInt64: return Primitive::kPrimLong;
+    case DataType::Type::kFloat32: return Primitive::kPrimFloat;
+    case DataType::Type::kFloat64: return Primitive::kPrimDouble;
+    case DataType::Type::kVoid: return Primitive::kPrimVoid;
+    default:
+      LOG(FATAL) << "Unexpected type " << type;
+      UNREACHABLE();
+  }
 }
 
 constexpr DataType::Type DataType::FromShorty(char type) {
@@ -62,8 +79,6 @@ constexpr char DataType::TypeId(DataType::Type type) {
     case DataType::Type::kReference: return 'l';  // Java reference (L).
     case DataType::Type::kVoid: return 'v';       // Java void (V).
   }
-  LOG(FATAL) << "Unreachable";
-  UNREACHABLE();
 }
 
 }  // namespace art

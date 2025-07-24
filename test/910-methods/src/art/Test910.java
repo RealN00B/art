@@ -33,8 +33,11 @@ public class Test910 {
 
     testMethod(getProxyClass(), "run");
 
-    // Find a synthetic method in the dummy inner class. Do not print the name. Javac and Jack
+    // Find a synthetic method in the placeholder inner class. Do not print the name. Javac and Jack
     // disagree on the naming of synthetic accessors.
+    //
+    // Also don't print modifiers as synthetic methods may (or may not) be marked as bridged
+    // methods depending on Java source level (b/215524097).
     testMethod(findSyntheticMethod(), NestedSynthetic.class, false);
   }
 
@@ -50,12 +53,12 @@ public class Test910 {
     testMethod(m, base, true);
   }
 
-  private static void testMethod(Method m, Class<?> base, boolean printName) {
+  private static void testMethod(Method m, Class<?> base, boolean printAll) {
     String[] result = getMethodName(m);
     if (!result[0].equals(m.getName())) {
       throw new RuntimeException("Name not equal: " + m.getName() + " vs " + result[0]);
     }
-    if (printName) {
+    if (printAll) {
       System.out.println(Arrays.toString(result));
     }
 
@@ -69,7 +72,9 @@ public class Test910 {
     if (modifiers != m.getModifiers()) {
       throw new RuntimeException("Modifiers not equal: " + m.getModifiers() + " vs " + modifiers);
     }
-    System.out.println(modifiers);
+    if (printAll) {
+        System.out.println(modifiers);
+    }
 
     System.out.print("Max locals: ");
     try {
@@ -106,11 +111,11 @@ public class Test910 {
 
   private static class NestedSynthetic {
     // Accessing this private field will create a synthetic accessor method;
-    private static String dummy;
+    private static String placeholder;
   }
 
-  private static void dummyAccess() {
-    System.out.println(NestedSynthetic.dummy);
+  private static void placeholderAccess() {
+    System.out.println(NestedSynthetic.placeholder);
   }
 
   private static Method findSyntheticMethod() throws Exception {

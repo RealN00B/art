@@ -29,7 +29,6 @@
 #include "base/mutex.h"
 #include "base/utils.h"
 #include "class_linker.h"
-#include "class_root.h"
 #include "deopt_manager.h"
 #include "dex/primitive.h"
 #include "events-inl.h"
@@ -212,11 +211,11 @@ jint ReportPrimitiveArray(art::ObjPtr<art::mirror::Object> obj,
 }
 
 template <typename UserData>
-bool VisitorFalse(art::ObjPtr<art::mirror::Object> obj ATTRIBUTE_UNUSED,
-                  art::ObjPtr<art::mirror::Class> klass ATTRIBUTE_UNUSED,
-                  art::ArtField& field ATTRIBUTE_UNUSED,
-                  size_t field_index ATTRIBUTE_UNUSED,
-                  UserData* user_data ATTRIBUTE_UNUSED) {
+bool VisitorFalse([[maybe_unused]] art::ObjPtr<art::mirror::Object> obj,
+                  [[maybe_unused]] art::ObjPtr<art::mirror::Class> klass,
+                  [[maybe_unused]] art::ArtField& field,
+                  [[maybe_unused]] size_t field_index,
+                  [[maybe_unused]] UserData* user_data) {
   return false;
 }
 
@@ -416,8 +415,7 @@ class FieldVisitor {
         Visit(self, klass->GetSuperClass(), visitor);
       }
       for (uint32_t i = 0; i != klass->NumDirectInterfaces(); ++i) {
-        art::ObjPtr<art::mirror::Class> inf_klass =
-            art::mirror::Class::GetDirectInterface(self, klass, i);
+        art::ObjPtr<art::mirror::Class> inf_klass = klass->GetDirectInterface(i);
         DCHECK(inf_klass != nullptr);
         VisitInterface(self, inf_klass, visitor);
       }
@@ -437,8 +435,7 @@ class FieldVisitor {
 
       // Now visit the superinterfaces.
       for (uint32_t i = 0; i != inf_klass->NumDirectInterfaces(); ++i) {
-        art::ObjPtr<art::mirror::Class> super_inf_klass =
-            art::mirror::Class::GetDirectInterface(self, inf_klass, i);
+        art::ObjPtr<art::mirror::Class> super_inf_klass = inf_klass->GetDirectInterface(i);
         DCHECK(super_inf_klass != nullptr);
         VisitInterface(self, super_inf_klass, visitor);
       }
@@ -479,11 +476,11 @@ class FieldVisitor {
 // Debug helper. Prints the structure of an object.
 template <bool kStatic, bool kRef>
 struct DumpVisitor {
-  static bool Callback(art::ObjPtr<art::mirror::Object> obj ATTRIBUTE_UNUSED,
-                       art::ObjPtr<art::mirror::Class> klass ATTRIBUTE_UNUSED,
+  static bool Callback([[maybe_unused]] art::ObjPtr<art::mirror::Object> obj,
+                       [[maybe_unused]] art::ObjPtr<art::mirror::Class> klass,
                        art::ArtField& field,
                        size_t field_index,
-                       void* user_data ATTRIBUTE_UNUSED)
+                       [[maybe_unused]] void* user_data)
       REQUIRES_SHARED(art::Locks::mutator_lock_) {
     LOG(ERROR) << (kStatic ? "static " : "instance ")
                << (kRef ? "ref " : "primitive ")
@@ -493,8 +490,7 @@ struct DumpVisitor {
     return false;
   }
 };
-ATTRIBUTE_UNUSED
-void DumpObjectFields(art::ObjPtr<art::mirror::Object> obj)
+[[maybe_unused]] void DumpObjectFields(art::ObjPtr<art::mirror::Object> obj)
     REQUIRES_SHARED(art::Locks::mutator_lock_) {
   if (obj->IsClass()) {
     FieldVisitor<void, false>:: ReportFields(obj,
@@ -760,7 +756,8 @@ static jvmtiError DoIterateThroughHeap(T fn,
 
   bool stop_reports = false;
   const HeapFilter heap_filter(heap_filter_int);
-  art::ObjPtr<art::mirror::Class> filter_klass = soa.Decode<art::mirror::Class>(klass);
+  art::StackHandleScope<1> hs(self);
+  art::Handle<art::mirror::Class> filter_klass(hs.NewHandle(soa.Decode<art::mirror::Class>(klass)));
   auto visitor = [&](art::mirror::Object* obj) REQUIRES_SHARED(art::Locks::mutator_lock_) {
     // Early return, as we can't really stop visiting.
     if (stop_reports) {
@@ -782,7 +779,7 @@ static jvmtiError DoIterateThroughHeap(T fn,
     }
 
     if (filter_klass != nullptr) {
-      if (filter_klass != klass) {
+      if (filter_klass.Get() != klass) {
         return;
       }
     }
@@ -827,14 +824,13 @@ jvmtiError HeapUtil::IterateThroughHeap(jvmtiEnv* env,
                                         jclass klass,
                                         const jvmtiHeapCallbacks* callbacks,
                                         const void* user_data) {
-  auto JvmtiIterateHeap = [](art::mirror::Object* obj ATTRIBUTE_UNUSED,
+  auto JvmtiIterateHeap = []([[maybe_unused]] art::mirror::Object* obj,
                              const jvmtiHeapCallbacks* cb_callbacks,
                              jlong class_tag,
                              jlong size,
                              jlong* tag,
                              jint length,
-                             void* cb_user_data)
-      REQUIRES_SHARED(art::Locks::mutator_lock_) {
+                             void* cb_user_data) REQUIRES_SHARED(art::Locks::mutator_lock_) {
     return cb_callbacks->heap_iteration_callback(class_tag,
                                                  size,
                                                  tag,
@@ -979,6 +975,13 @@ class FollowReferencesHelper final {
     jvmtiHeapReferenceKind GetReferenceKind(const art::RootInfo& info,
                                             jvmtiHeapReferenceInfo* ref_info)
         REQUIRES_SHARED(art::Locks::mutator_lock_) {
+      // We do not necessarily hold thread_list_lock_ here, but we may if we are called from
+      // VisitThreadRoots, which can happen from JVMTI FollowReferences. If it was acquired in
+      // ThreadList::VisitRoots, it's unsafe to temporarily release it. Thus we act as if we did
+      // not hold the thread_list_lock_ here, and relax CHECKs appropriately. If it does happen,
+      // we are in a SuspendAll situation with concurrent GC disabled, and should not need to run
+      // flip functions. TODO: Find a way to clean this up.
+
       // TODO: Fill in ref_info.
       memset(ref_info, 0, sizeof(jvmtiHeapReferenceInfo));
 
@@ -1110,31 +1113,33 @@ class FollowReferencesHelper final {
     }
 
     // All instance fields.
-    auto report_instance_field = [&](art::ObjPtr<art::mirror::Object> src,
-                                     art::ObjPtr<art::mirror::Class> obj_klass ATTRIBUTE_UNUSED,
-                                     art::ArtField& field,
-                                     size_t field_index,
-                                     void* user_data ATTRIBUTE_UNUSED)
-        REQUIRES_SHARED(art::Locks::mutator_lock_)
-        REQUIRES(!*tag_table_->GetAllowDisallowLock()) {
-      art::ObjPtr<art::mirror::Object> field_value = field.GetObject(src);
-      if (field_value != nullptr) {
-        jvmtiHeapReferenceInfo reference_info;
-        memset(&reference_info, 0, sizeof(reference_info));
+    auto report_instance_field =
+        [&](art::ObjPtr<art::mirror::Object> src,
+            [[maybe_unused]] art::ObjPtr<art::mirror::Class> obj_klass,
+            art::ArtField& field,
+            size_t field_index,
+            [[maybe_unused]] void* user_data) REQUIRES_SHARED(art::Locks::mutator_lock_)
+            REQUIRES(!*tag_table_->GetAllowDisallowLock()) {
+              art::ObjPtr<art::mirror::Object> field_value = field.GetObject(src);
+              if (field_value != nullptr) {
+                jvmtiHeapReferenceInfo reference_info;
+                memset(&reference_info, 0, sizeof(reference_info));
 
-        reference_info.field.index = field_index;
+                reference_info.field.index = field_index;
 
-        jvmtiHeapReferenceKind kind =
-            field.GetOffset().Int32Value() == art::mirror::Object::ClassOffset().Int32Value()
-                ? JVMTI_HEAP_REFERENCE_CLASS
-                : JVMTI_HEAP_REFERENCE_FIELD;
-        const jvmtiHeapReferenceInfo* reference_info_ptr =
-            kind == JVMTI_HEAP_REFERENCE_CLASS ? nullptr : &reference_info;
+                jvmtiHeapReferenceKind kind =
+                    field.GetOffset().Int32Value() ==
+                            art::mirror::Object::ClassOffset().Int32Value() ?
+                        JVMTI_HEAP_REFERENCE_CLASS :
+                        JVMTI_HEAP_REFERENCE_FIELD;
+                const jvmtiHeapReferenceInfo* reference_info_ptr =
+                    kind == JVMTI_HEAP_REFERENCE_CLASS ? nullptr : &reference_info;
 
-        return !ReportReferenceMaybeEnqueue(kind, reference_info_ptr, src.Ptr(), field_value.Ptr());
-      }
-      return false;
-    };
+                return !ReportReferenceMaybeEnqueue(
+                    kind, reference_info_ptr, src.Ptr(), field_value.Ptr());
+              }
+              return false;
+            };
     stop_reports_ = FieldVisitor<void, true>::ReportFields(obj,
                                                            nullptr,
                                                            VisitorFalse<void>,
@@ -1243,27 +1248,27 @@ class FollowReferencesHelper final {
     DCHECK_EQ(h_klass.Get(), klass);
 
     // Declared static fields.
-    auto report_static_field = [&](art::ObjPtr<art::mirror::Object> obj ATTRIBUTE_UNUSED,
-                                   art::ObjPtr<art::mirror::Class> obj_klass,
-                                   art::ArtField& field,
-                                   size_t field_index,
-                                   void* user_data ATTRIBUTE_UNUSED)
-        REQUIRES_SHARED(art::Locks::mutator_lock_)
-        REQUIRES(!*tag_table_->GetAllowDisallowLock()) {
-      art::ObjPtr<art::mirror::Object> field_value = field.GetObject(obj_klass);
-      if (field_value != nullptr) {
-        jvmtiHeapReferenceInfo reference_info;
-        memset(&reference_info, 0, sizeof(reference_info));
+    auto report_static_field =
+        [&]([[maybe_unused]] art::ObjPtr<art::mirror::Object> obj,
+            art::ObjPtr<art::mirror::Class> obj_klass,
+            art::ArtField& field,
+            size_t field_index,
+            [[maybe_unused]] void* user_data) REQUIRES_SHARED(art::Locks::mutator_lock_)
+            REQUIRES(!*tag_table_->GetAllowDisallowLock()) {
+              art::ObjPtr<art::mirror::Object> field_value = field.GetObject(obj_klass);
+              if (field_value != nullptr) {
+                jvmtiHeapReferenceInfo reference_info;
+                memset(&reference_info, 0, sizeof(reference_info));
 
-        reference_info.field.index = static_cast<jint>(field_index);
+                reference_info.field.index = static_cast<jint>(field_index);
 
-        return !ReportReferenceMaybeEnqueue(JVMTI_HEAP_REFERENCE_STATIC_FIELD,
-                                            &reference_info,
-                                            obj_klass.Ptr(),
-                                            field_value.Ptr());
-      }
-      return false;
-    };
+                return !ReportReferenceMaybeEnqueue(JVMTI_HEAP_REFERENCE_STATIC_FIELD,
+                                                    &reference_info,
+                                                    obj_klass.Ptr(),
+                                                    field_value.Ptr());
+              }
+              return false;
+            };
     stop_reports_ = FieldVisitor<void, false>::ReportFields(klass,
                                                             nullptr,
                                                             VisitorFalse<void>,
@@ -1405,7 +1410,7 @@ jvmtiError HeapUtil::FollowReferences(jvmtiEnv* env,
   {
     art::ScopedObjectAccess soa(self);      // Now we know we have the shared lock.
     art::jni::ScopedEnableSuspendAllJniIdQueries sjni;  // make sure we can get JNI ids.
-    art::ScopedThreadSuspension sts(self, art::kWaitingForVisitObjects);
+    art::ScopedThreadSuspension sts(self, art::ThreadState::kWaitingForVisitObjects);
     art::ScopedSuspendAll ssa("FollowReferences");
 
     art::ObjPtr<art::mirror::Class> class_filter = klass == nullptr
@@ -1475,7 +1480,7 @@ jvmtiError HeapUtil::GetLoadedClasses(jvmtiEnv* env,
   return ERR(NONE);
 }
 
-jvmtiError HeapUtil::ForceGarbageCollection(jvmtiEnv* env ATTRIBUTE_UNUSED) {
+jvmtiError HeapUtil::ForceGarbageCollection([[maybe_unused]] jvmtiEnv* env) {
   art::Runtime::Current()->GetHeap()->CollectGarbage(/* clear_soft_references= */ false);
 
   return ERR(NONE);
@@ -1668,7 +1673,7 @@ static void ReplaceObjectReferences(const ObjectMap& map)
           }
 
           // java.lang.ref.Reference visitor.
-          void operator()(art::ObjPtr<art::mirror::Class> klass ATTRIBUTE_UNUSED,
+          void operator()([[maybe_unused]] art::ObjPtr<art::mirror::Class> klass,
                           art::ObjPtr<art::mirror::Reference> ref) const
               REQUIRES_SHARED(art::Locks::mutator_lock_) {
             operator()(ref, art::mirror::Reference::ReferentOffset(), /* is_static */ false);
@@ -1782,7 +1787,7 @@ static void ReplaceStrongRoots(art::Thread* self, const ObjectMap& map)
       // already have.
       // TODO We technically only need to do this if the frames are not already being interpreted.
       // The cost for doing an extra stack walk is unlikely to be worth it though.
-      instr->InstrumentThreadStack(t);
+      instr->InstrumentThreadStack(t, /* force_deopt= */ true);
     }
   }
 }
@@ -1853,7 +1858,9 @@ static void ReplaceWeakRoots(art::Thread* self,
     const ObjectMap& map_;
   };
   ReplaceWeaksVisitor rwv(map);
-  art::Runtime::Current()->SweepSystemWeaks(&rwv);
+  art::Runtime* runtime = art::Runtime::Current();
+  runtime->SweepSystemWeaks(&rwv);
+  runtime->GetThreadList()->SweepInterpreterCaches(&rwv);
   // Re-add the object tags. At this point all weak-references to the old_obj_ptr are gone.
   event_handler->ForEachEnv(self, [&](ArtJvmTiEnv* env) {
     // Cannot have REQUIRES(art::Locks::mutator_lock_) since ForEachEnv doesn't require it.

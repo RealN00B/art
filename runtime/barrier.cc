@@ -23,7 +23,7 @@
 #include "base/time_utils.h"
 #include "thread.h"
 
-namespace art {
+namespace art HIDDEN {
 
 Barrier::Barrier(int count, bool verify_count_on_shutdown)
     : count_(count),
@@ -38,6 +38,11 @@ template void Barrier::Increment<Barrier::kDisallowHoldingLocks>(Thread* self, i
 void Barrier::Pass(Thread* self) {
   MutexLock mu(self, *GetLock());
   SetCountLocked(self, count_ - 1);
+}
+
+void Barrier::IncrementNoWait(Thread* self) {
+  MutexLock mu(self, *GetLock());
+  SetCountLocked(self, count_ + 1);
 }
 
 void Barrier::Wait(Thread* self) {

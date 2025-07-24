@@ -52,8 +52,8 @@ extern "C" JNIEXPORT jobject JNICALL Java_art_Test989_returnValueNative(JNIEnv* 
   return env->CallStaticObjectMethod(klass, targetMethod);
 }
 
-extern "C" JNIEXPORT void JNICALL Java_art_Test989_doNothingNative(JNIEnv* env ATTRIBUTE_UNUSED,
-                                                                   jclass klass ATTRIBUTE_UNUSED) {
+extern "C" JNIEXPORT void JNICALL Java_art_Test989_doNothingNative([[maybe_unused]] JNIEnv* env,
+                                                                   [[maybe_unused]] jclass klass) {
   return;
 }
 
@@ -61,6 +61,12 @@ extern "C" JNIEXPORT void JNICALL Java_art_Test989_throwANative(JNIEnv* env,
                                                                 jclass klass) {
   jmethodID targetMethod = env->GetStaticMethodID(klass, "doThrowA", "()V");
   env->CallStaticVoidMethod(klass, targetMethod);
+}
+
+extern "C" JNIEXPORT void JNICALL Java_art_Test989_doThrowNative(JNIEnv* env,
+                                                                 [[maybe_unused]] jclass klass) {
+  jclass exception_cls = env->FindClass("java/lang/Error");
+  env->ThrowNew(exception_cls, "Error");
 }
 
 extern "C" JNIEXPORT void JNICALL Java_art_Test989_acceptValueNative(JNIEnv* env,

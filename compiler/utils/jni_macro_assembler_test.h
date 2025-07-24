@@ -20,6 +20,7 @@
 #include "jni_macro_assembler.h"
 
 #include "assembler_test_base.h"
+#include "base/macros.h"
 #include "base/malloc_arena_pool.h"
 #include "common_runtime_test.h"  // For ScratchFile
 
@@ -30,16 +31,16 @@
 #include <fstream>
 #include <iterator>
 
-namespace art {
+namespace art HIDDEN {
 
 template<typename Ass>
-class JNIMacroAssemblerTest : public testing::Test {
+class JNIMacroAssemblerTest : public AssemblerTestBase {
  public:
   Ass* GetAssembler() {
     return assembler_.get();
   }
 
-  typedef std::string (*TestFn)(JNIMacroAssemblerTest* assembler_test, Ass* assembler);
+  using TestFn = std::string (*)(JNIMacroAssemblerTest *, Ass *);
 
   void DriverFn(TestFn f, const std::string& test_name) {
     DriverWrapper(f(this, assembler_.get()), test_name);
@@ -50,32 +51,18 @@ class JNIMacroAssemblerTest : public testing::Test {
     DriverWrapper(assembly_string, test_name);
   }
 
-  // This is intended to be run as a test.
-  bool CheckTools() {
-    return test_helper_->CheckTools();
-  }
-
  protected:
   JNIMacroAssemblerTest() {}
 
   void SetUp() override {
+    AssemblerTestBase::SetUp();
     allocator_.reset(new ArenaAllocator(&pool_));
     assembler_.reset(CreateAssembler(allocator_.get()));
-    test_helper_.reset(
-        new AssemblerTestInfrastructure(GetArchitectureString(),
-                                        GetAssemblerCmdName(),
-                                        GetAssemblerParameters(),
-                                        GetObjdumpCmdName(),
-                                        GetObjdumpParameters(),
-                                        GetDisassembleCmdName(),
-                                        GetDisassembleParameters(),
-                                        GetAssemblyHeader()));
-
     SetUpHelpers();
   }
 
   void TearDown() override {
-    test_helper_.reset();  // Clean up the helper.
+    AssemblerTestBase::TearDown();
     assembler_.reset();
     allocator_.reset();
   }
@@ -88,62 +75,23 @@ class JNIMacroAssemblerTest : public testing::Test {
   // Override this to set up any architecture-specific things, e.g., register vectors.
   virtual void SetUpHelpers() {}
 
-  // Get the typically used name for this architecture, e.g., aarch64, x86_64, ...
-  virtual std::string GetArchitectureString() = 0;
-
-  // Get the name of the assembler, e.g., "as" by default.
-  virtual std::string GetAssemblerCmdName() {
-    return "as";
-  }
-
-  // Switches to the assembler command. Default none.
-  virtual std::string GetAssemblerParameters() {
-    return "";
-  }
-
-  // Get the name of the objdump, e.g., "objdump" by default.
-  virtual std::string GetObjdumpCmdName() {
-    return "objdump";
-  }
-
-  // Switches to the objdump command. Default is " -h".
-  virtual std::string GetObjdumpParameters() {
-    return " -h";
-  }
-
-  // Get the name of the objdump, e.g., "objdump" by default.
-  virtual std::string GetDisassembleCmdName() {
-    return "objdump";
-  }
-
-  // Switches to the objdump command. As it's a binary, one needs to push the architecture and
-  // such to objdump, so it's architecture-specific and there is no default.
-  virtual std::string GetDisassembleParameters() = 0;
-
-  // If the assembly file needs a header, return it in a sub-class.
-  virtual const char* GetAssemblyHeader() {
-    return nullptr;
-  }
-
  private:
   // Override this to pad the code with NOPs to a certain size if needed.
-  virtual void Pad(std::vector<uint8_t>& data ATTRIBUTE_UNUSED) {
-  }
+  virtual void Pad([[maybe_unused]] std::vector<uint8_t>& data) {}
 
   void DriverWrapper(const std::string& assembly_text, const std::string& test_name) {
     assembler_->FinalizeCode();
     size_t cs = assembler_->CodeSize();
     std::unique_ptr<std::vector<uint8_t>> data(new std::vector<uint8_t>(cs));
     MemoryRegion code(&(*data)[0], data->size());
-    assembler_->FinalizeInstructions(code);
+    assembler_->CopyInstructions(code);
     Pad(*data);
-    test_helper_->Driver(*data, assembly_text, test_name);
+    Driver(*data, assembly_text, test_name);
   }
 
   MallocArenaPool pool_;
   std::unique_ptr<ArenaAllocator> allocator_;
   std::unique_ptr<Ass> assembler_;
-  std::unique_ptr<AssemblerTestInfrastructure> test_helper_;
 
   DISALLOW_COPY_AND_ASSIGN(JNIMacroAssemblerTest);
 };

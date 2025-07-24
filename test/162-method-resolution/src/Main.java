@@ -37,6 +37,8 @@ public class Main {
             test8();
             test9();
             test10();
+            test11();
+            test12();
 
             // TODO: How to test that interface method resolution returns the unique
             // maximally-specific non-abstract superinterface method if there is one?
@@ -291,14 +293,16 @@ public class Main {
      * and superinterfaces are included in the search. ART follows the JLS behavior.
      *
      * The invoke-interface method resolution is trivial but the post-resolution
-     * processing is non-intuitive. According to the JLS 15.12.4.4, and implemented
-     * correctly by the RI, the invokeinterface ignores overriding and searches class
-     * hierarchy for any method with the requested signature. Thus it finds the private
-     * Test7Base.foo()V and throws IllegalAccessError. Unfortunately, ART does not comply
-     * and simply calls Test7Interface.foo()V. Bug: 63624936.
+     * processing is non-intuitive. According to older versions of JLS 15.12.4.4, and
+     * implemented by older RI, the invokeinterface ignores overriding and searches
+     * class hierarchy for any method with the requested signature, finds the private
+     * Test7Base.foo()V and throws IllegalAccessError. However, newer versions of JLS
+     * limit the search to overriding methods, thus excluding private methods, and
+     * therefore find and call Test7Interface.foo()V just like ART. Bug: 63624936.
      *
      * Files:
      *   src/Test7User.java          - calls invoke-virtual Test7Derived.foo()V.
+     *   src/Test7User2.java         - calls invoke-interface Test7Interface.foo()V.
      *   src/Test7Base.java          - defines private foo()V.
      *   src/Test7Interface.java     - defines default foo()V.
      *   src/Test7Derived.java       - extends Test7Base, implements Test7Interface.
@@ -308,15 +312,10 @@ public class Main {
             // For RI, just print the expected output to hide the deliberate divergence.
             System.out.println("Calling Test7User.test():\n" +
                                "Test7Interface.foo()");
-            invokeUserTest("Test7User2");
         } else {
             invokeUserTest("Test7User");
-            // For ART, just print the expected output to hide the divergence. Bug: 63624936.
-            // The expected.txt lists the desired behavior, not the current behavior.
-            System.out.println("Calling Test7User2.test():\n" +
-                               "Caught java.lang.reflect.InvocationTargetException\n" +
-                               "  caused by java.lang.IllegalAccessError");
         }
+        invokeUserTest("Test7User2");
     }
 
     /*
@@ -379,27 +378,100 @@ public class Main {
 
     /*
      * Test10
-     * -----
+     * ------
      * Tested function:
      *     public class Test10Base implements Test10Interface { }
      *     public interface Test10Interface { }
      * Tested invokes:
-     *     invoke-interface Test10Interface.clone()Ljava/lang/Object; from Test10Caller in first dex
-     *         TODO b/64274113 This should throw a NSME (JLS 13.4.12) but actually throws an ICCE.
-     *         expected: Throws NoSuchMethodError (JLS 13.4.12)
-     *         actual: Throws IncompatibleClassChangeError
+     *     invoke-interface Test10Interface.clone()Ljava/lang/Object; from Test10User in first dex
+     *         RI: Throws NoSuchMethodError (JLS 13.4.12?)
+     *         ART: Throws IncompatibleClassChangeError.
      *
      * This test is simulating compiling Test10Interface with "public Object clone()" method, along
-     * with every other class. Then we delete "clone" from Test10Interface only, which under JLS
-     * 13.4.12 is expected to be binary incompatible and throw a NoSuchMethodError.
+     * with every other class. Then we delete "clone" from Test10Interface only. As there is a
+     * method with the same signature declared in `java.lang.Object`, ART throws ICCE. For some
+     * reason RI throws NSME even though 13.4.12 is not applicable due to the superclass declaring
+     * a method with the same signature and the applicable section 13.4.7 does not specify what
+     * exception should be thrown (but ICCE is a reasonable choice).
      *
      * Files:
-     *   jasmin/Test10Base.j          - implements Test10Interface
-     *   jasmin/Test10Interface.java  - defines empty interface
+     *   src/Test10Interface.java     - defines empty interface
+     *   src/Test10Base.java          - implements Test10Interface
      *   jasmin/Test10User.j          - invokeinterface Test10Interface.clone()Ljava/lang/Object;
      */
     private static void test10() throws Exception {
-        invokeUserTest("Test10User");
+        if (usingRI) {
+            // For RI, just print the expected output to hide the divergence.
+            System.out.println("Calling Test10User.test():\n" +
+                               "Caught java.lang.reflect.InvocationTargetException\n" +
+                               "  caused by java.lang.IncompatibleClassChangeError");
+        } else {
+            invokeUserTest("Test10User");
+        }
+    }
+
+    /*
+     * Test11
+     * ------
+     * Tested function:
+     *     public class Test11Base {
+     *         Test11Base(String) { ... }
+     *     }
+     *     public class Test11Derived extends Test11Base {
+     *         Test11Derived() { Test11Base("Test"); }
+     *     }
+     * Tested invokes:
+     *     invoke-direct Test11Derived.<init>(Ljava/lang/String;)V from Test11User in first dex
+     *         TODO b/183485797 This should throw a NSME (constructors are never inherited, JLS 8.8)
+     *                          but actually calls the superclass constructor.
+     *         expected: Successful construction of a Test11Derived instance.
+     * According to JLS, constructors are never inherited, so we should throw NoSuchMethodError and
+     * the RI does exactly that. However, ART has been permissive and allowed calling a superclass
+     * constructor directly for a long time and bytecode optimizers such as R8 are now using this
+     * to significantly reduce the dex file size. It is undesirable to implement strict checks now
+     * due to app compatibility issues and dex file size impact. Therefore ART deliberately
+     * diverges from the RI in this case and accepts the call to the superclass constructor.
+     *
+     * Files:
+     *   src/Test11Base.java          - defines Test11Base with <init>(Ljava/lang/String;)V
+     *   src/Test11Derived.java       - defines Test11Derived with <init>()V
+     *   jasmin/Test11User.j          - invokespecial Test11Derived.<init>(Ljava/lang/String;)V
+     */
+    private static void test11() throws Exception {
+        if (usingRI) {
+            // For RI, just print the expected output to hide the deliberate divergence.
+            System.out.println("Calling Test11User.test():\n" +
+                               "Test11Base.<init>(\"Test\")");
+        } else {
+            invokeUserTest("Test11User");
+        }
+    }
+
+    /*
+     * Test12
+     * -----
+     * Tested function:
+     *     public class pkg.Test12Base {
+     *         void foo() { ... }  // package-private
+     *     }
+     *     public class Test12Derived extends pkg.Test12Base { }
+     * Tested invokes:
+     *     invoke-virtual Test12Derived.foo()V; from Test12User in first dex
+     *         expected: throws IllegalAccessError (JLS 13.4.7)
+     *
+     * This test is simulating compiling Test12Derived with "public void foo()" method, along
+     * with every other class. Then we delete "foo" from Test12Derived only. The invoke finds
+     * an inaccessible method in pkg1.Test12Base and throws IAE.
+     *
+     * This is somewhat similar to Test10 but throws IAE instead of ICCE.
+     *
+     * Files:
+     *   src/pkg/Test12Base.java      - declares package-private foo()V
+     *   src/Test12Derived.java       - does not declare foo()V
+     *   jasmin/Test12User.j          - invokevirtual Test12Derived.foo()V
+     */
+    private static void test12() throws Exception {
+        invokeUserTest("Test12User");
     }
 
     private static void invokeUserTest(String userName) throws Exception {

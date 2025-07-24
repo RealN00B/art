@@ -17,10 +17,11 @@
 #ifndef ART_COMPILER_UTILS_X86_MANAGED_REGISTER_X86_H_
 #define ART_COMPILER_UTILS_X86_MANAGED_REGISTER_X86_H_
 
+#include "base/macros.h"
 #include "constants_x86.h"
 #include "utils/managed_register.h"
 
-namespace art {
+namespace art HIDDEN {
 namespace x86 {
 
 // Values for register pairs.
@@ -214,7 +215,7 @@ std::ostream& operator<<(std::ostream& os, const X86ManagedRegister& reg);
 
 }  // namespace x86
 
-constexpr inline x86::X86ManagedRegister ManagedRegister::AsX86() const {
+constexpr x86::X86ManagedRegister ManagedRegister::AsX86() const {
   x86::X86ManagedRegister reg(id_);
   CHECK(reg.IsNoRegister() || reg.IsValidManagedRegister());
   return reg;

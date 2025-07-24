@@ -22,7 +22,7 @@
 #include "gc/accounting/heap_bitmap.h"
 #include "mirror/object-inl.h"
 
-namespace art {
+namespace art HIDDEN {
 namespace gc {
 namespace collector {
 
@@ -62,8 +62,8 @@ inline void SemiSpace::MarkObject(CompressedReferenceType* obj_ptr) {
     DCHECK(!to_space_->HasAddress(obj)) << "Tried to mark " << obj << " in to-space";
     auto slow_path = [this](const mirror::Object* ref) {
       CHECK(!to_space_->HasAddress(ref)) << "Marking " << ref << " in to_space_";
-      // Marking a large object, make sure its aligned as a sanity check.
-      CHECK_ALIGNED(ref, kPageSize);
+      // Marking a large object, make sure its aligned as a consistency check.
+      CHECK_ALIGNED_PARAM(ref, space::LargeObjectSpace::ObjectAlignment());
     };
     if (!mark_bitmap_->Set(obj, slow_path)) {
       // This object was not previously marked.

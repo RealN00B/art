@@ -1,79 +1,169 @@
 %def op_check_cast():
-  jmp NterpCheckCast
+%  slow_path = add_slow_path(op_check_cast_slow_path)
+   // Fast-path which gets the class from thread-local cache.
+%  fetch_from_thread_cache("%rsi", miss_label="2f")
+1:
+   GET_VREG %edi, rINSTq
+   testl %edi, %edi
+   je .L${opcode}_resume
+   // Fast path without read barriers.
+   POISON_HEAP_REF esi  // Poison class reference for in-memory comparison.
+   cmpl MIRROR_OBJECT_CLASS_OFFSET(%edi), %esi
+   jne ${slow_path}
+.L${opcode}_resume:
+   ADVANCE_PC_FETCH_AND_GOTO_NEXT 2
+2:
+   EXPORT_PC
+   movq rSELF:THREAD_SELF_OFFSET, %rdi
+   movq 0(%rsp), %rsi
+   movq rPC, %rdx
+   call nterp_get_class
+   movq %rax, %rsi
+   jmp 1b
+
+%def op_check_cast_slow_path():
+   UNPOISON_HEAP_REF esi  // Unpoison class reference poisoned in main path.
+   testl $$MIRROR_CLASS_IS_INTERFACE_FLAG, MIRROR_CLASS_ACCESS_FLAGS_OFFSET(%rsi)
+   jne 2f
+   movl MIRROR_OBJECT_CLASS_OFFSET(%edi), %eax
+   UNPOISON_HEAP_REF eax
+   cmpl $$0, MIRROR_CLASS_COMPONENT_TYPE_OFFSET(%rsi)
+   jne 2f
+1:
+   movl MIRROR_CLASS_SUPER_CLASS_OFFSET(%eax), %eax
+   UNPOISON_HEAP_REF eax
+   cmpl %eax, %esi
+   je .L${opcode}_resume
+   testl %eax, %eax
+   jne 1b
+2:
+   cmpq $$0, rSELF:THREAD_READ_BARRIER_MARK_REG00_OFFSET
+   jne 4f
+3:
+   EXPORT_PC
+   call art_quick_check_instance_of
+   jmp .L${opcode}_resume
+4:
+   // 06 is %rsi
+   call art_quick_read_barrier_mark_reg06
+   jmp 3b
+5:
+   movl MIRROR_CLASS_COMPONENT_TYPE_OFFSET(%eax), %eax
+   UNPOISON_HEAP_REF eax
+   // Check if object is an array.
+   testl %eax, %eax
+   je 2b
+   movl MIRROR_CLASS_COMPONENT_TYPE_OFFSET(%esi), %ecx
+   UNPOISON_HEAP_REF ecx
+   cmpl $$0, MIRROR_CLASS_SUPER_CLASS_OFFSET(%ecx)
+   jne 2b
+   cmpw $$0, MIRROR_CLASS_OBJECT_PRIMITIVE_TYPE_OFFSET(%ecx)
+   jne 2b
+   // %ecx is Object[]
+   // Check if the object is a primitive array.
+   cmpw $$0, MIRROR_CLASS_OBJECT_PRIMITIVE_TYPE_OFFSET(%eax)
+   je .L${opcode}_resume
+   jmp 2b
 
 %def op_iget_boolean():
    jmp NterpGetBooleanInstanceField
 
-%def op_iget_boolean_quick():
-%  op_iget_quick(load="movsbl")
-
 %def op_iget_byte():
    jmp NterpGetByteInstanceField
-
-%def op_iget_byte_quick():
-%  op_iget_quick(load="movsbl")
 
 %def op_iget_char():
    jmp NterpGetCharInstanceField
 
-%def op_iget_char_quick():
-%  op_iget_quick(load="movzwl")
-
 %def op_iget_object():
     jmp NterpGetObjectInstanceField
-
-%def op_iget_object_quick():
-   movzwq  2(rPC), %rax                    # eax <- field byte offset
-   movl    rINST, %ecx                     # rcx <- BA
-   sarl    $$4, %ecx                       # ecx <- B
-   GET_VREG %ecx, %rcx                     # vB (object we're operating on)
-   testl   %ecx, %ecx                      # is object null?
-   je      common_errNullObject
-   testb $$READ_BARRIER_TEST_VALUE, GRAY_BYTE_OFFSET(%ecx)
-   movl (%rcx,%rax,1), %eax
-   jnz 2f
-1:
-   andb    $$0xf,rINSTbl                   # rINST <- A
-   SET_VREG_OBJECT %eax, rINSTq            # fp[A] <- value
-   ADVANCE_PC_FETCH_AND_GOTO_NEXT 2
-2:
-   // reg00 is eax
-   call art_quick_read_barrier_mark_reg00
-   jmp 1b
-
-%def op_iget_quick(load="movl", wide="0"):
-    /* For: iget-quick, iget-boolean-quick, iget-byte-quick, iget-char-quick, iget-short-quick, iget-wide-quick */
-    /* op vA, vB, offset@CCCC */
-    movl    rINST, %ecx                     # rcx <- BA
-    sarl    $$4, %ecx                       # ecx <- B
-    GET_VREG %ecx, %rcx                     # vB (object we're operating on)
-    movzwq  2(rPC), %rax                    # eax <- field byte offset
-    testl   %ecx, %ecx                      # is object null?
-    je      common_errNullObject
-    andb    $$0xf,rINSTbl                   # rINST <- A
-    .if $wide
-    movq (%rcx,%rax,1), %rax
-    SET_WIDE_VREG %rax, rINSTq              # fp[A] <- value
-    .else
-    ${load} (%rcx,%rax,1), %eax
-    SET_VREG %eax, rINSTq                   # fp[A] <- value
-    .endif
-    ADVANCE_PC_FETCH_AND_GOTO_NEXT 2
 
 %def op_iget_short():
    jmp NterpGetShortInstanceField
 
-%def op_iget_short_quick():
-%  op_iget_quick(load="movswl")
-
 %def op_iget_wide():
    jmp NterpGetWideInstanceField
 
-%def op_iget_wide_quick():
-%  op_iget_quick(load="movq", wide="1")
-
 %def op_instance_of():
-   jmp NterpInstanceOf
+%  slow_path = add_slow_path(op_instance_of_slow_path)
+    /* instance-of vA, vB, class@CCCC */
+   // Fast-path which gets the class from thread-local cache.
+%  fetch_from_thread_cache("%rsi", miss_label=".L"+opcode+"_init")
+.L${opcode}_start:
+   movzbl  rINSTbl,%edi
+   sarl    $$4,%edi                          # edi<- B
+   GET_VREG %edi %rdi                        # edi<- vB (object)
+   andb    $$0xf,rINSTbl                     # rINST<- A
+   testl %edi, %edi
+   je .L${opcode}_set_vreg
+   // Fast path without read barriers.
+   POISON_HEAP_REF esi  // Poison class reference for in-memory comparison.
+   cmpl MIRROR_OBJECT_CLASS_OFFSET(%edi), %esi
+   jne ${slow_path}
+.L${opcode}_set_one:
+   movl $$1, %edi
+.L${opcode}_set_vreg:
+   SET_VREG %edi, rINSTq
+.L${opcode}_resume:
+   ADVANCE_PC_FETCH_AND_GOTO_NEXT 2
+
+%def op_instance_of_slow_path():
+   UNPOISON_HEAP_REF esi  // Unpoison class reference poisoned in main path.
+   // Go slow path if we are marking. Checking now allows
+   // not going to slow path if the super class hierarchy check fails.
+   cmpq $$0, rSELF:THREAD_READ_BARRIER_MARK_REG00_OFFSET
+   jne 4f
+   testl $$MIRROR_CLASS_IS_INTERFACE_FLAG, MIRROR_CLASS_ACCESS_FLAGS_OFFSET(%rsi)
+   jne 5f
+   movl MIRROR_OBJECT_CLASS_OFFSET(%edi), %eax
+   UNPOISON_HEAP_REF eax
+   cmpl $$0, MIRROR_CLASS_COMPONENT_TYPE_OFFSET(%rsi)
+   jne 3f
+1:
+   movl MIRROR_CLASS_SUPER_CLASS_OFFSET(%eax), %eax
+   UNPOISON_HEAP_REF eax
+   cmpl %eax, %esi
+   je .L${opcode}_set_one
+   testl %eax, %eax
+   jne 1b
+2:
+   SET_VREG $$0, rINSTq            # fp[A] <- value
+   jmp       .L${opcode}_resume
+3:
+   movl MIRROR_CLASS_COMPONENT_TYPE_OFFSET(%eax), %eax
+   UNPOISON_HEAP_REF eax
+   // Check if object is an array.
+   testl %eax, %eax
+   je 2b
+   movl MIRROR_CLASS_COMPONENT_TYPE_OFFSET(%esi), %ecx
+   UNPOISON_HEAP_REF ecx
+   cmpl $$0, MIRROR_CLASS_SUPER_CLASS_OFFSET(%ecx)
+   jne 5f
+   cmpw $$0, MIRROR_CLASS_OBJECT_PRIMITIVE_TYPE_OFFSET(%ecx)
+   jne 2b
+   // %ecx is Object[]
+   // Check if the object is a primitive array.
+   xorl %ecx, %ecx
+   cmpw $$0, MIRROR_CLASS_OBJECT_PRIMITIVE_TYPE_OFFSET(%eax)
+   sete %cl
+   SET_VREG %ecx, rINSTq
+   jmp .L${opcode}_resume
+4:
+   // 06 is %rsi
+   call art_quick_read_barrier_mark_reg06
+5:
+   EXPORT_PC
+   call artInstanceOfFromCode
+   SET_VREG %eax, rINSTq            # fp[A] <- value
+   jmp .L${opcode}_resume
+
+.L${opcode}_init:
+   EXPORT_PC
+   movq rSELF:THREAD_SELF_OFFSET, %rdi
+   movq 0(%rsp), %rsi
+   movq rPC, %rdx
+   call nterp_get_class
+   movq %rax, %rsi
+   jmp .L${opcode}_start
 
 %def op_iget():
    jmp NterpGetInstanceField
@@ -84,78 +174,20 @@
 %def op_iput_boolean():
    jmp NterpPutBooleanInstanceField
 
-%def op_iput_boolean_quick():
-%  op_iput_quick(reg="rINSTbl", store="movb")
-
 %def op_iput_byte():
    jmp NterpPutByteInstanceField
-
-%def op_iput_byte_quick():
-%  op_iput_quick(reg="rINSTbl", store="movb")
 
 %def op_iput_char():
    jmp NterpPutCharInstanceField
 
-%def op_iput_char_quick():
-%  op_iput_quick(reg="rINSTw", store="movw")
-
 %def op_iput_object():
     jmp NterpPutObjectInstanceField
-
-%def op_iput_object_quick():
-   movzwq  2(rPC), %rax                    # eax <- field byte offset
-   movzbq  rINSTbl, %rcx                   # rcx <- BA
-   sarl    $$4, %ecx                       # ecx <- B
-   GET_VREG %ecx, %rcx                     # vB (object we're operating on)
-   testl   %ecx, %ecx                      # is object null?
-   je      common_errNullObject
-   andb    $$0xf, rINSTbl                  # rINST <- A
-   GET_VREG rINST, rINSTq                  # rINST <- v[A]
-   movl rINST, (%rcx,%rax,1)
-   testl rINST, rINST
-   je 1f
-   movq rSELF:THREAD_CARD_TABLE_OFFSET, %rax
-   shrq $$CARD_TABLE_CARD_SHIFT, %rcx
-   movb %al, (%rcx, %rax, 1)
-1:
-   ADVANCE_PC_FETCH_AND_GOTO_NEXT 2
-
-%def op_iput_quick(reg="rINST", store="movl"):
-    /* For: iput-quick, iput-object-quick */
-    /* op vA, vB, offset@CCCC */
-    movzbq  rINSTbl, %rcx                   # rcx <- BA
-    sarl    $$4, %ecx                       # ecx <- B
-    GET_VREG %ecx, %rcx                     # vB (object we're operating on)
-    testl   %ecx, %ecx                      # is object null?
-    je      common_errNullObject
-    andb    $$0xf, rINSTbl                  # rINST <- A
-    GET_VREG rINST, rINSTq                  # rINST <- v[A]
-    movzwq  2(rPC), %rax                    # rax <- field byte offset
-    ${store}    ${reg}, (%rcx,%rax,1)
-    ADVANCE_PC_FETCH_AND_GOTO_NEXT 2
 
 %def op_iput_short():
    jmp NterpPutShortInstanceField
 
-%def op_iput_short_quick():
-%  op_iput_quick(reg="rINSTw", store="movw")
-
 %def op_iput_wide():
    jmp NterpPutWideInstanceField
-
-%def op_iput_wide_quick():
-    /* iput-wide-quick vA, vB, offset@CCCC */
-    movzbq    rINSTbl, %rcx                 # rcx<- BA
-    sarl      $$4, %ecx                     # ecx<- B
-    GET_VREG  %ecx, %rcx                    # vB (object we're operating on)
-    testl     %ecx, %ecx                    # is object null?
-    je        common_errNullObject
-    movzwq    2(rPC), %rax                  # rax<- field byte offset
-    leaq      (%rcx,%rax,1), %rcx           # ecx<- Address of 64-bit target
-    andb      $$0xf, rINSTbl                # rINST<- A
-    GET_WIDE_VREG %rax, rINSTq              # rax<- fp[A]/fp[A+1]
-    movq      %rax, (%rcx)                  # obj.field<- r0/r1
-    ADVANCE_PC_FETCH_AND_GOTO_NEXT 2
 
 %def op_sget(load="movl", wide="0"):
    jmp NterpGetIntStaticField

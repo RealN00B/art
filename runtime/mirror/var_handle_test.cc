@@ -24,7 +24,7 @@
 #include "class-inl.h"
 #include "class_linker-inl.h"
 #include "class_loader.h"
-#include "class_root.h"
+#include "class_root-inl.h"
 #include "common_runtime_test.h"
 #include "handle_scope-inl.h"
 #include "jvalue-inl.h"
@@ -34,12 +34,16 @@
 #include "reflection.h"
 #include "scoped_thread_state_change-inl.h"
 
-namespace art {
+namespace art HIDDEN {
 namespace mirror {
 
 // Tests for mirror::VarHandle and it's descendents.
 class VarHandleTest : public CommonRuntimeTest {
  public:
+  VarHandleTest() {
+    use_boot_image_ = true;  // Make the Runtime creation cheaper.
+  }
+
   static ObjPtr<FieldVarHandle> CreateFieldVarHandle(Thread* const self,
                                                      ArtField* art_field,
                                                      int32_t access_modes_bit_mask)
@@ -133,6 +137,26 @@ class VarHandleTest : public CommonRuntimeTest {
     return AccessModesBitMask(first) | AccessModesBitMask(args...);
   }
 
+  ObjPtr<MethodType> MethodTypeOf(const std::string& method_descriptor);
+
+  template <typename VH>
+  bool AccessModeExactMatch(Handle<VH> vh,
+                            VarHandle::AccessMode access_mode,
+                            const char* descriptor)
+      REQUIRES_SHARED(Locks::mutator_lock_);
+
+  template <typename VH>
+  bool AccessModeWithConversionsMatch(Handle<VH> vh,
+                                      VarHandle::AccessMode access_mode,
+                                      const char* descriptor)
+      REQUIRES_SHARED(Locks::mutator_lock_);
+
+  template <typename VH>
+  bool AccessModeNoMatch(Handle<VH> vh,
+                         VarHandle::AccessMode access_mode,
+                         const char* descriptor)
+      REQUIRES_SHARED(Locks::mutator_lock_);
+
  private:
   static void InitializeVarHandle(ObjPtr<VarHandle> vh,
                                   Handle<Class> var_type,
@@ -165,7 +189,7 @@ class VarHandleTest : public CommonRuntimeTest {
 
 // Convenience method for constructing MethodType instances from
 // well-formed method descriptors.
-static ObjPtr<MethodType> MethodTypeOf(const std::string& method_descriptor) {
+ObjPtr<MethodType> VarHandleTest::MethodTypeOf(const std::string& method_descriptor) {
   std::vector<std::string> descriptors;
 
   auto it = method_descriptor.cbegin();
@@ -222,10 +246,9 @@ static ObjPtr<MethodType> MethodTypeOf(const std::string& method_descriptor) {
       ObjectArray<Class>::Alloc(Thread::Current(), array_of_class, ptypes_count));
   Handle<mirror::ClassLoader> boot_class_loader = hs.NewHandle<mirror::ClassLoader>(nullptr);
   for (int i = 0; i < ptypes_count; ++i) {
-    ptypes->Set(i, class_linker->FindClass(self, descriptors[i].c_str(), boot_class_loader));
+    ptypes->Set(i, FindClass(descriptors[i].c_str(), boot_class_loader));
   }
-  Handle<Class> rtype =
-      hs.NewHandle(class_linker->FindClass(self, descriptors.back().c_str(), boot_class_loader));
+  Handle<Class> rtype = hs.NewHandle(FindClass(descriptors.back().c_str(), boot_class_loader));
   return MethodType::Create(self, rtype, ptypes);
 }
 
@@ -238,10 +261,9 @@ static bool AccessModeMatch(ObjPtr<VarHandle> vh,
 }
 
 template <typename VH>
-static bool AccessModeExactMatch(Handle<VH> vh,
-                                 VarHandle::AccessMode access_mode,
-                                 const char* descriptor)
-    REQUIRES_SHARED(Locks::mutator_lock_) {
+bool VarHandleTest::AccessModeExactMatch(Handle<VH> vh,
+                                         VarHandle::AccessMode access_mode,
+                                         const char* descriptor) {
   ObjPtr<MethodType> method_type = MethodTypeOf(descriptor);
   return AccessModeMatch(vh.Get(),
                          access_mode,
@@ -250,10 +272,9 @@ static bool AccessModeExactMatch(Handle<VH> vh,
 }
 
 template <typename VH>
-static bool AccessModeWithConversionsMatch(Handle<VH> vh,
-                                          VarHandle::AccessMode access_mode,
-                                          const char* descriptor)
-    REQUIRES_SHARED(Locks::mutator_lock_) {
+bool VarHandleTest::AccessModeWithConversionsMatch(Handle<VH> vh,
+                                                   VarHandle::AccessMode access_mode,
+                                                   const char* descriptor) {
   ObjPtr<MethodType> method_type = MethodTypeOf(descriptor);
   return AccessModeMatch(vh.Get(),
                          access_mode,
@@ -262,10 +283,9 @@ static bool AccessModeWithConversionsMatch(Handle<VH> vh,
 }
 
 template <typename VH>
-static bool AccessModeNoMatch(Handle<VH> vh,
-                              VarHandle::AccessMode access_mode,
-                              const char* descriptor)
-    REQUIRES_SHARED(Locks::mutator_lock_) {
+bool VarHandleTest::AccessModeNoMatch(Handle<VH> vh,
+                                      VarHandle::AccessMode access_mode,
+                                      const char* descriptor) {
   ObjPtr<MethodType> method_type = MethodTypeOf(descriptor);
   return AccessModeMatch(vh.Get(),
                          access_mode,
@@ -278,14 +298,14 @@ TEST_F(VarHandleTest, InstanceFieldVarHandle) {
   ScopedObjectAccess soa(self);
 
   ObjPtr<Object> i = BoxPrimitive(Primitive::kPrimInt, JValue::FromPrimitive<int32_t>(37));
-  ArtField* value = mirror::Class::FindField(self, i->GetClass(), "value", "I");
+  ArtField* value = i->GetClass()->FindDeclaredInstanceField("value", "I");
   int32_t mask = AccessModesBitMask(VarHandle::AccessMode::kGet,
                                     VarHandle::AccessMode::kGetAndSet,
                                     VarHandle::AccessMode::kGetAndBitwiseXor);
   StackHandleScope<6> hs(self);
   Handle<mirror::FieldVarHandle> fvh(hs.NewHandle(CreateFieldVarHandle(self, value, mask)));
   EXPECT_FALSE(fvh.IsNull());
-  EXPECT_EQ(value, fvh->GetField());
+  EXPECT_EQ(value, fvh->GetArtField());
 
   // Check access modes
   EXPECT_TRUE(fvh->IsAccessModeSupported(VarHandle::AccessMode::kGet));
@@ -417,19 +437,78 @@ TEST_F(VarHandleTest, InstanceFieldVarHandle) {
   }
 }
 
+TEST_F(VarHandleTest, AccessModeTemplate) {
+  EXPECT_EQ(VarHandle::AccessModeTemplate::kGet,
+            VarHandle::GetAccessModeTemplate(VarHandle::AccessMode::kGet));
+  EXPECT_EQ(VarHandle::AccessModeTemplate::kSet,
+            VarHandle::GetAccessModeTemplate(VarHandle::AccessMode::kSet));
+  EXPECT_EQ(VarHandle::AccessModeTemplate::kGet,
+            VarHandle::GetAccessModeTemplate(VarHandle::AccessMode::kGetVolatile));
+  EXPECT_EQ(VarHandle::AccessModeTemplate::kSet,
+            VarHandle::GetAccessModeTemplate(VarHandle::AccessMode::kSetVolatile));
+  EXPECT_EQ(VarHandle::AccessModeTemplate::kGet,
+            VarHandle::GetAccessModeTemplate(VarHandle::AccessMode::kGetAcquire));
+  EXPECT_EQ(VarHandle::AccessModeTemplate::kSet,
+            VarHandle::GetAccessModeTemplate(VarHandle::AccessMode::kSetRelease));
+  EXPECT_EQ(VarHandle::AccessModeTemplate::kGet,
+            VarHandle::GetAccessModeTemplate(VarHandle::AccessMode::kGetOpaque));
+  EXPECT_EQ(VarHandle::AccessModeTemplate::kSet,
+            VarHandle::GetAccessModeTemplate(VarHandle::AccessMode::kSetOpaque));
+  EXPECT_EQ(VarHandle::AccessModeTemplate::kCompareAndSet,
+            VarHandle::GetAccessModeTemplate(VarHandle::AccessMode::kCompareAndSet));
+  EXPECT_EQ(VarHandle::AccessModeTemplate::kCompareAndExchange,
+            VarHandle::GetAccessModeTemplate(VarHandle::AccessMode::kCompareAndExchange));
+  EXPECT_EQ(VarHandle::AccessModeTemplate::kCompareAndExchange,
+            VarHandle::GetAccessModeTemplate(VarHandle::AccessMode::kCompareAndExchangeAcquire));
+  EXPECT_EQ(VarHandle::AccessModeTemplate::kCompareAndExchange,
+            VarHandle::GetAccessModeTemplate(VarHandle::AccessMode::kCompareAndExchangeRelease));
+  EXPECT_EQ(VarHandle::AccessModeTemplate::kCompareAndSet,
+            VarHandle::GetAccessModeTemplate(VarHandle::AccessMode::kWeakCompareAndSetPlain));
+  EXPECT_EQ(VarHandle::AccessModeTemplate::kCompareAndSet,
+            VarHandle::GetAccessModeTemplate(VarHandle::AccessMode::kWeakCompareAndSet));
+  EXPECT_EQ(VarHandle::AccessModeTemplate::kCompareAndSet,
+            VarHandle::GetAccessModeTemplate(VarHandle::AccessMode::kWeakCompareAndSetAcquire));
+  EXPECT_EQ(VarHandle::AccessModeTemplate::kCompareAndSet,
+            VarHandle::GetAccessModeTemplate(VarHandle::AccessMode::kWeakCompareAndSetRelease));
+  EXPECT_EQ(VarHandle::AccessModeTemplate::kGetAndUpdate,
+            VarHandle::GetAccessModeTemplate(VarHandle::AccessMode::kGetAndSet));
+  EXPECT_EQ(VarHandle::AccessModeTemplate::kGetAndUpdate,
+            VarHandle::GetAccessModeTemplate(VarHandle::AccessMode::kGetAndSetAcquire));
+  EXPECT_EQ(VarHandle::AccessModeTemplate::kGetAndUpdate,
+            VarHandle::GetAccessModeTemplate(VarHandle::AccessMode::kGetAndSetRelease));
+  EXPECT_EQ(VarHandle::AccessModeTemplate::kGetAndUpdate,
+            VarHandle::GetAccessModeTemplate(VarHandle::AccessMode::kGetAndBitwiseOr));
+  EXPECT_EQ(VarHandle::AccessModeTemplate::kGetAndUpdate,
+            VarHandle::GetAccessModeTemplate(VarHandle::AccessMode::kGetAndBitwiseOrRelease));
+  EXPECT_EQ(VarHandle::AccessModeTemplate::kGetAndUpdate,
+            VarHandle::GetAccessModeTemplate(VarHandle::AccessMode::kGetAndBitwiseOrAcquire));
+  EXPECT_EQ(VarHandle::AccessModeTemplate::kGetAndUpdate,
+            VarHandle::GetAccessModeTemplate(VarHandle::AccessMode::kGetAndBitwiseAnd));
+  EXPECT_EQ(VarHandle::AccessModeTemplate::kGetAndUpdate,
+            VarHandle::GetAccessModeTemplate(VarHandle::AccessMode::kGetAndBitwiseAndRelease));
+  EXPECT_EQ(VarHandle::AccessModeTemplate::kGetAndUpdate,
+            VarHandle::GetAccessModeTemplate(VarHandle::AccessMode::kGetAndBitwiseAndAcquire));
+  EXPECT_EQ(VarHandle::AccessModeTemplate::kGetAndUpdate,
+            VarHandle::GetAccessModeTemplate(VarHandle::AccessMode::kGetAndBitwiseXor));
+  EXPECT_EQ(VarHandle::AccessModeTemplate::kGetAndUpdate,
+            VarHandle::GetAccessModeTemplate(VarHandle::AccessMode::kGetAndBitwiseXorRelease));
+  EXPECT_EQ(VarHandle::AccessModeTemplate::kGetAndUpdate,
+            VarHandle::GetAccessModeTemplate(VarHandle::AccessMode::kGetAndBitwiseXorAcquire));
+}
+
 TEST_F(VarHandleTest, StaticFieldVarHandle) {
   Thread * const self = Thread::Current();
   ScopedObjectAccess soa(self);
 
   ObjPtr<Object> i = BoxPrimitive(Primitive::kPrimInt, JValue::FromPrimitive<int32_t>(37));
-  ArtField* value = mirror::Class::FindField(self, i->GetClass(), "MIN_VALUE", "I");
+  ArtField* value = i->GetClass()->FindDeclaredStaticField("MIN_VALUE", "I");
   int32_t mask = AccessModesBitMask(VarHandle::AccessMode::kSet,
                                     VarHandle::AccessMode::kGetOpaque,
                                     VarHandle::AccessMode::kGetAndBitwiseAndRelease);
   StackHandleScope<6> hs(self);
   Handle<mirror::FieldVarHandle> fvh(hs.NewHandle(CreateFieldVarHandle(self, value, mask)));
   EXPECT_FALSE(fvh.IsNull());
-  EXPECT_EQ(value, fvh->GetField());
+  EXPECT_EQ(value, fvh->GetArtField());
 
   // Check access modes
   EXPECT_FALSE(fvh->IsAccessModeSupported(VarHandle::AccessMode::kGet));

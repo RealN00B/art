@@ -20,9 +20,10 @@
 #include <iterator>
 #include "array.h"
 #include "base/iteration_range.h"
+#include "base/macros.h"
 #include "obj_ptr.h"
 
-namespace art {
+namespace art HIDDEN {
 namespace mirror {
 
 template<typename T, typename Container> class ArrayIter;
@@ -34,6 +35,8 @@ template <typename T> using HandleArrayIter = ArrayIter<T, Handle<ObjectArray<T>
 template<class T>
 class MANAGED ObjectArray: public Array {
  public:
+  MIRROR_CLASS("[Ljava/lang/Object;");
+
   // The size of Object[].class.
   static uint32_t ClassSize(PointerSize pointer_size) {
     return Array::ClassSize(pointer_size);
@@ -148,6 +151,10 @@ class MANAGED ObjectArray: public Array {
   // REQUIRES_SHARED(Locks::mutator_lock_).
   template<typename Visitor>
   void VisitReferences(const Visitor& visitor) NO_THREAD_SAFETY_ANALYSIS;
+  template<typename Visitor>
+  void VisitReferences(const Visitor& visitor,
+                       MemberOffset begin,
+                       MemberOffset end) NO_THREAD_SAFETY_ANALYSIS;
 
   friend class Object;  // For VisitReferences
   DISALLOW_IMPLICIT_CONSTRUCTORS(ObjectArray);
@@ -156,11 +163,17 @@ class MANAGED ObjectArray: public Array {
 // Everything is NO_THREAD_SAFETY_ANALYSIS to work-around STL incompat with thread-annotations.
 // Everything should have REQUIRES_SHARED(Locks::mutator_lock_).
 template <typename T, typename Container>
-class ArrayIter : public std::iterator<std::forward_iterator_tag, ObjPtr<T>> {
+class ArrayIter {
  private:
   using Iter = ArrayIter<T, Container>;
 
  public:
+  using iterator_category = std::forward_iterator_tag;
+  using value_type = ObjPtr<T>;
+  using difference_type = ptrdiff_t;
+  using pointer = value_type*;
+  using reference = value_type&;
+
   ArrayIter(Container array, int32_t idx) NO_THREAD_SAFETY_ANALYSIS : array_(array), idx_(idx) {
     CheckIdx();
   }

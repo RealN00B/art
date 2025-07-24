@@ -16,6 +16,8 @@
 
 #include "dlmalloc_space-inl.h"
 
+#include <sys/mman.h>
+
 #include "base/logging.h"  // For VLOG.
 #include "base/time_utils.h"
 #include "base/utils.h"
@@ -32,11 +34,59 @@
 #include "thread.h"
 #include "thread_list.h"
 
-namespace art {
+namespace art HIDDEN {
 namespace gc {
 namespace space {
 
 static constexpr bool kPrefetchDuringDlMallocFreeList = true;
+
+// Callback for mspace_inspect_all that will madvise(2) unused pages back to
+// the kernel.
+void DlmallocMadviseCallback(void* start, void* end, size_t used_bytes, void* arg) {
+  // Is this chunk in use?
+  if (used_bytes != 0) {
+    return;
+  }
+  // Do we have any whole pages to give back?
+  start = reinterpret_cast<void*>(art::RoundUp(reinterpret_cast<uintptr_t>(start), art::gPageSize));
+  end = reinterpret_cast<void*>(art::RoundDown(reinterpret_cast<uintptr_t>(end), art::gPageSize));
+  if (end > start) {
+    size_t length = reinterpret_cast<uint8_t*>(end) - reinterpret_cast<uint8_t*>(start);
+    int rc = madvise(start, length, MADV_DONTNEED);
+    if (UNLIKELY(rc != 0)) {
+      errno = rc;
+      PLOG(FATAL) << "madvise failed during heap trimming";
+    }
+    size_t* reclaimed = reinterpret_cast<size_t*>(arg);
+    *reclaimed += length;
+  }
+}
+
+// Callback for mspace_inspect_all that will count the number of bytes
+// allocated.
+void DlmallocBytesAllocatedCallback([[maybe_unused]] void* start,
+                                    [[maybe_unused]] void* end,
+                                    size_t used_bytes,
+                                    void* arg) {
+  if (used_bytes == 0) {
+    return;
+  }
+  size_t* bytes_allocated = reinterpret_cast<size_t*>(arg);
+  *bytes_allocated += used_bytes + sizeof(size_t);
+}
+
+// Callback for mspace_inspect_all that will count the number of objects
+// allocated.
+void DlmallocObjectsAllocatedCallback([[maybe_unused]] void* start,
+                                      [[maybe_unused]] void* end,
+                                      size_t used_bytes,
+                                      void* arg) {
+  if (used_bytes == 0) {
+    return;
+  }
+  size_t* objects_allocated = reinterpret_cast<size_t*>(arg);
+  ++(*objects_allocated);
+}
 
 DlMallocSpace::DlMallocSpace(MemMap&& mem_map,
                              size_t initial_size,
@@ -126,7 +176,7 @@ DlMallocSpace* DlMallocSpace::Create(const std::string& name,
   // Note: making this value large means that large allocations are unlikely to succeed as dlmalloc
   // will ask for this memory from sys_alloc which will fail as the footprint (this value plus the
   // size of the large allocation) will be greater than the footprint limit.
-  size_t starting_size = kPageSize;
+  size_t starting_size = gPageSize;
   MemMap mem_map = CreateMemMap(name, starting_size, &initial_size, &growth_limit, &capacity);
   if (!mem_map.IsValid()) {
     LOG(ERROR) << "Failed to create mem map for alloc space (" << name << ") of size "
@@ -184,7 +234,7 @@ mirror::Object* DlMallocSpace::AllocWithGrowth(Thread* self, size_t num_bytes,
     // Zero freshly allocated memory, done while not holding the space's lock.
     memset(result, 0, num_bytes);
     // Check that the result is contained in the space.
-    CHECK(!kDebugSpaces || Contains(result));
+    CHECK_IMPLIES(kDebugSpaces, Contains(result));
   }
   return result;
 }
@@ -350,27 +400,39 @@ void DlMallocSpace::CheckMoreCoreForPrecondition() {
 }
 #endif
 
+struct MspaceCbArgs {
+  size_t max_contiguous;
+  size_t used;
+};
+
 static void MSpaceChunkCallback(void* start, void* end, size_t used_bytes, void* arg) {
   size_t chunk_size = reinterpret_cast<uint8_t*>(end) - reinterpret_cast<uint8_t*>(start);
+  MspaceCbArgs* mspace_cb_args = reinterpret_cast<MspaceCbArgs*>(arg);
+  mspace_cb_args->used += used_bytes;
   if (used_bytes < chunk_size) {
     size_t chunk_free_bytes = chunk_size - used_bytes;
-    size_t& max_contiguous_allocation = *reinterpret_cast<size_t*>(arg);
+    size_t& max_contiguous_allocation = mspace_cb_args->max_contiguous;
     max_contiguous_allocation = std::max(max_contiguous_allocation, chunk_free_bytes);
   }
 }
 
-void DlMallocSpace::LogFragmentationAllocFailure(std::ostream& os,
-                                                 size_t failed_alloc_bytes ATTRIBUTE_UNUSED) {
+bool DlMallocSpace::LogFragmentationAllocFailure(std::ostream& os,
+                                                 size_t failed_alloc_bytes) {
   Thread* const self = Thread::Current();
-  size_t max_contiguous_allocation = 0;
+  MspaceCbArgs mspace_cb_args = {0, 0};
   // To allow the Walk/InspectAll() to exclusively-lock the mutator
   // lock, temporarily release the shared access to the mutator
   // lock here by transitioning to the suspended state.
   Locks::mutator_lock_->AssertSharedHeld(self);
-  ScopedThreadSuspension sts(self, kSuspended);
-  Walk(MSpaceChunkCallback, &max_contiguous_allocation);
-  os << "; failed due to fragmentation (largest possible contiguous allocation "
-     <<  max_contiguous_allocation << " bytes)";
+  ScopedThreadSuspension sts(self, ThreadState::kSuspended);
+  Walk(MSpaceChunkCallback, &mspace_cb_args);
+  if (failed_alloc_bytes > mspace_cb_args.max_contiguous) {
+    os << "; failed due to malloc_space fragmentation (largest possible contiguous allocation "
+       << mspace_cb_args.max_contiguous << " bytes, space in use " << mspace_cb_args.used
+       << " bytes, capacity = " << Capacity() << ")";
+    return true;
+  }
+  return false;
 }
 
 }  // namespace space

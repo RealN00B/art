@@ -21,28 +21,25 @@
 
 #include "gc/accounting/read_barrier_table.h"
 #include "gc/collector/concurrent_copying-inl.h"
+#include "gc/collector/mark_compact.h"
 #include "gc/heap.h"
 #include "mirror/object-readbarrier-inl.h"
 #include "mirror/object_reference.h"
 #include "mirror/reference.h"
 #include "runtime.h"
 
-namespace art {
-
-// Disabled for performance reasons.
-static constexpr bool kCheckDebugDisallowReadBarrierCount = false;
+namespace art HIDDEN {
 
 template <typename MirrorType, bool kIsVolatile, ReadBarrierOption kReadBarrierOption,
           bool kAlwaysUpdateField>
 inline MirrorType* ReadBarrier::Barrier(
     mirror::Object* obj, MemberOffset offset, mirror::HeapReference<MirrorType>* ref_addr) {
   constexpr bool with_read_barrier = kReadBarrierOption == kWithReadBarrier;
-  if (kUseReadBarrier && with_read_barrier) {
+  if (gUseReadBarrier && with_read_barrier) {
     if (kCheckDebugDisallowReadBarrierCount) {
       Thread* const self = Thread::Current();
-      if (self != nullptr) {
-        CHECK_EQ(self->GetDebugDisallowReadBarrierCount(), 0u);
-      }
+      CHECK(self != nullptr);
+      CHECK_EQ(self->GetDebugDisallowReadBarrierCount(), 0u);
     }
     if (kUseBakerReadBarrier) {
       // fake_address_dependency (must be zero) is used to create artificial data dependency from
@@ -72,9 +69,6 @@ inline MirrorType* ReadBarrier::Barrier(
       }
       AssertToSpaceInvariant(obj, offset, ref);
       return ref;
-    } else if (kUseBrooksReadBarrier) {
-      // To be implemented.
-      return ref_addr->template AsMirrorPtr<kIsVolatile>();
     } else if (kUseTableLookupReadBarrier) {
       MirrorType* ref = ref_addr->template AsMirrorPtr<kIsVolatile>();
       MirrorType* old_ref = ref;
@@ -97,6 +91,12 @@ inline MirrorType* ReadBarrier::Barrier(
       LOG(FATAL) << "Unexpected read barrier type";
       UNREACHABLE();
     }
+  } else if (kReadBarrierOption == kWithFromSpaceBarrier) {
+    DCHECK(gUseUserfaultfd);
+    MirrorType* old = ref_addr->template AsMirrorPtr<kIsVolatile>();
+    mirror::Object* ref =
+        Runtime::Current()->GetHeap()->MarkCompactCollector()->GetFromSpaceAddrFromBarrier(old);
+    return reinterpret_cast<MirrorType*>(ref);
   } else {
     // No read barrier.
     return ref_addr->template AsMirrorPtr<kIsVolatile>();
@@ -108,12 +108,11 @@ inline MirrorType* ReadBarrier::BarrierForRoot(MirrorType** root,
                                                GcRootSource* gc_root_source) {
   MirrorType* ref = *root;
   const bool with_read_barrier = kReadBarrierOption == kWithReadBarrier;
-  if (kUseReadBarrier && with_read_barrier) {
-    if (kIsDebugBuild) {
+  if (gUseReadBarrier && with_read_barrier) {
+    if (kCheckDebugDisallowReadBarrierCount) {
       Thread* const self = Thread::Current();
-      if (self != nullptr) {
-        CHECK_EQ(self->GetDebugDisallowReadBarrierCount(), 0u);
-      }
+      CHECK(self != nullptr);
+      CHECK_EQ(self->GetDebugDisallowReadBarrierCount(), 0u);
     }
     if (kUseBakerReadBarrier) {
       // TODO: separate the read barrier code from the collector code more.
@@ -122,9 +121,6 @@ inline MirrorType* ReadBarrier::BarrierForRoot(MirrorType** root,
         ref = reinterpret_cast<MirrorType*>(Mark(ref));
       }
       AssertToSpaceInvariant(gc_root_source, ref);
-      return ref;
-    } else if (kUseBrooksReadBarrier) {
-      // To be implemented.
       return ref;
     } else if (kUseTableLookupReadBarrier) {
       Thread* self = Thread::Current();
@@ -145,6 +141,11 @@ inline MirrorType* ReadBarrier::BarrierForRoot(MirrorType** root,
       LOG(FATAL) << "Unexpected read barrier type";
       UNREACHABLE();
     }
+  } else if (kReadBarrierOption == kWithFromSpaceBarrier) {
+    DCHECK(gUseUserfaultfd);
+    mirror::Object* from_ref =
+        Runtime::Current()->GetHeap()->MarkCompactCollector()->GetFromSpaceAddrFromBarrier(ref);
+    return reinterpret_cast<MirrorType*>(from_ref);
   } else {
     return ref;
   }
@@ -156,34 +157,46 @@ inline MirrorType* ReadBarrier::BarrierForRoot(mirror::CompressedReference<Mirro
                                                GcRootSource* gc_root_source) {
   MirrorType* ref = root->AsMirrorPtr();
   const bool with_read_barrier = kReadBarrierOption == kWithReadBarrier;
-  if (with_read_barrier && kUseBakerReadBarrier) {
-    // TODO: separate the read barrier code from the collector code more.
-    Thread* self = Thread::Current();
-    if (self != nullptr && self->GetIsGcMarking()) {
-      ref = reinterpret_cast<MirrorType*>(Mark(ref));
+  if (gUseReadBarrier && with_read_barrier) {
+    if (kCheckDebugDisallowReadBarrierCount) {
+      Thread* const self = Thread::Current();
+      CHECK(self != nullptr);
+      CHECK_EQ(self->GetDebugDisallowReadBarrierCount(), 0u);
     }
-    AssertToSpaceInvariant(gc_root_source, ref);
-    return ref;
-  } else if (with_read_barrier && kUseBrooksReadBarrier) {
-    // To be implemented.
-    return ref;
-  } else if (with_read_barrier && kUseTableLookupReadBarrier) {
-    Thread* self = Thread::Current();
-    if (self != nullptr &&
-        self->GetIsGcMarking() &&
-        Runtime::Current()->GetHeap()->GetReadBarrierTable()->IsSet(ref)) {
-      auto old_ref = mirror::CompressedReference<MirrorType>::FromMirrorPtr(ref);
-      ref = reinterpret_cast<MirrorType*>(Mark(ref));
-      auto new_ref = mirror::CompressedReference<MirrorType>::FromMirrorPtr(ref);
-      // Update the field atomically. This may fail if mutator updates before us, but it's ok.
-      if (new_ref.AsMirrorPtr() != old_ref.AsMirrorPtr()) {
-        auto* atomic_root =
-            reinterpret_cast<Atomic<mirror::CompressedReference<MirrorType>>*>(root);
-        atomic_root->CompareAndSetStrongRelaxed(old_ref, new_ref);
+    if (kUseBakerReadBarrier) {
+      // TODO: separate the read barrier code from the collector code more.
+      Thread* self = Thread::Current();
+      if (self != nullptr && self->GetIsGcMarking()) {
+        ref = reinterpret_cast<MirrorType*>(Mark(ref));
       }
+      AssertToSpaceInvariant(gc_root_source, ref);
+      return ref;
+    } else if (kUseTableLookupReadBarrier) {
+      Thread* self = Thread::Current();
+      if (self != nullptr &&
+          self->GetIsGcMarking() &&
+          Runtime::Current()->GetHeap()->GetReadBarrierTable()->IsSet(ref)) {
+        auto old_ref = mirror::CompressedReference<MirrorType>::FromMirrorPtr(ref);
+        ref = reinterpret_cast<MirrorType*>(Mark(ref));
+        auto new_ref = mirror::CompressedReference<MirrorType>::FromMirrorPtr(ref);
+        // Update the field atomically. This may fail if mutator updates before us, but it's ok.
+        if (new_ref.AsMirrorPtr() != old_ref.AsMirrorPtr()) {
+          auto* atomic_root =
+              reinterpret_cast<Atomic<mirror::CompressedReference<MirrorType>>*>(root);
+          atomic_root->CompareAndSetStrongRelaxed(old_ref, new_ref);
+        }
+      }
+      AssertToSpaceInvariant(gc_root_source, ref);
+      return ref;
+    } else {
+      LOG(FATAL) << "Unexpected read barrier type";
+      UNREACHABLE();
     }
-    AssertToSpaceInvariant(gc_root_source, ref);
-    return ref;
+  } else if (kReadBarrierOption == kWithFromSpaceBarrier) {
+    DCHECK(gUseUserfaultfd);
+    mirror::Object* from_ref =
+        Runtime::Current()->GetHeap()->MarkCompactCollector()->GetFromSpaceAddrFromBarrier(ref);
+    return reinterpret_cast<MirrorType*>(from_ref);
   } else {
     return ref;
   }
@@ -193,7 +206,7 @@ template <typename MirrorType>
 inline MirrorType* ReadBarrier::IsMarked(MirrorType* ref) {
   // Only read-barrier configurations can have mutators run while
   // the GC is marking.
-  if (!kUseReadBarrier) {
+  if (!gUseReadBarrier) {
     return ref;
   }
   // IsMarked does not handle null, so handle it here.

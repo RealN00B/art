@@ -138,7 +138,8 @@ target_config = {
         }
     },
     'art-tracing' : {
-        'run-test' : ['--trace']
+        'run-test' : ['--trace',
+                      '--stream']
     },
     'art-interpreter-tracing' : {
         'run-test' : ['--interpreter',
@@ -159,13 +160,10 @@ target_config = {
     },
     'art-heap-poisoning' : {
         'run-test' : ['--interpreter',
-                      '--optimizing',
-                      '--cdex-none'],
+                      '--optimizing'],
         'env' : {
             'ART_USE_READ_BARRIER' : 'false',
-            'ART_HEAP_POISONING' : 'true',
-            # Disable compact dex to get coverage of standard dex file usage.
-            'ART_DEFAULT_COMPACT_DEX_LEVEL' : 'none'
+            'ART_HEAP_POISONING' : 'true'
         }
     },
     'art-preopt' : {
@@ -203,9 +201,7 @@ target_config = {
         'make' :  'test-art-host-gtest',
         'env': {
             'ART_DEFAULT_GC_TYPE' : 'SS',
-            'ART_USE_READ_BARRIER' : 'false',
-            # Disable compact dex to get coverage of standard dex file usage.
-            'ART_DEFAULT_COMPACT_DEX_LEVEL' : 'none'
+            'ART_USE_READ_BARRIER' : 'false'
         }
     },
     # TODO: Consider removing this configuration when it is no longer used by
@@ -241,6 +237,20 @@ target_config = {
 
     'art-gtest-asan': {
         'make' : 'test-art-host-gtest',
+        'env': {
+            'SANITIZE_HOST' : 'address',
+            'ASAN_OPTIONS' : 'detect_leaks=0'
+        }
+    },
+    'art-gtest-asan32': {
+        'make' : 'test-art-host-gtest32',
+        'env': {
+            'SANITIZE_HOST' : 'address',
+            'ASAN_OPTIONS' : 'detect_leaks=0'
+        }
+    },
+    'art-gtest-asan64': {
+        'make' : 'test-art-host-gtest64',
         'env': {
             'SANITIZE_HOST' : 'address',
             'ASAN_OPTIONS' : 'detect_leaks=0'
@@ -290,20 +300,5 @@ target_config = {
     },
     'art-golem-linux-x64': {
         'golem' : 'linux-x64'
-    },
-    'art-linux-bionic-x64': {
-        'build': '{ANDROID_BUILD_TOP}/art/tools/build_linux_bionic_tests.sh {MAKE_OPTIONS}',
-        'run-test': ['--run-test-option=--bionic',
-                     '--host',
-                     '--64',
-                     '--no-build-dependencies'],
-    },
-    'art-linux-bionic-x64-zipapex': {
-        'build': '{ANDROID_BUILD_TOP}/art/tools/build_linux_bionic_tests.sh {MAKE_OPTIONS} com.android.art.host',
-        'run-test': ['--run-test-option=--bionic',
-                     "--runtime-zipapex={SOONG_OUT_DIR}/host/linux_bionic-x86/apex/com.android.art.host.zipapex",
-                     '--host',
-                     '--64',
-                     '--no-build-dependencies'],
     },
 }

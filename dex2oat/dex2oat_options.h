@@ -25,10 +25,9 @@
 #include "base/variant_map.h"
 #include "cmdline_types.h"  // TODO: don't need to include this file here
 #include "compiler.h"
-#include "dex/compact_dex_level.h"
 #include "driver/compiler_options_map.h"
-#include "image.h"
 #include "linker/oat_writer.h"
+#include "oat/image.h"
 
 namespace art {
 
@@ -71,6 +70,8 @@ struct Dex2oatArgumentMap : CompilerOptionsMap<Dex2oatArgumentMap, Dex2oatArgume
 #define DEX2OAT_OPTIONS_KEY(Type, Name, ...) static const Key<Type> (Name);
 #include "dex2oat_options.def"
 };
+
+CmdlineParser<Dex2oatArgumentMap, Dex2oatArgumentMap::Key> CreateDex2oatArgumentParser();
 
 extern template struct CompilerOptionsMap<Dex2oatArgumentMap, Dex2oatArgumentMapKey>;
 
